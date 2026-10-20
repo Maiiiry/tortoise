@@ -28,7 +28,8 @@ mutation set. It is not a driver either: `psycopg2` is imported lazily inside
 so importing this module costs no driver and the DB-free tests stay DB-free.
 
 ──────────────────────────────────────────────────────────────────────────────
-THE FIVE DECISIONS #9187 ASKED THE SCOPE STAGE TO RESOLVE — AND THE ANSWER
+THE FIVE DECISIONS #9187 ASKED THE SCOPE STAGE TO RESOLVE — AND THE SIXTH
+#9192 ADDED (the tenant's authority, below)
 ──────────────────────────────────────────────────────────────────────────────
 
 **1. Which connection, and whose DSN.** The record's OWN DSN —
@@ -107,6 +108,33 @@ moment a second process writes, and a per-record source of truth already
 exists — the append-only journal. A re-run after a crash re-derives the same
 offset from the same durable facts, so nothing renumbers.
 
+**6. WHO may name the tenant — the scope in a multi-tenant process, the env
+pair only on a DECLARED single-tenant one (#9192).** The tenant is a
+per-request fact, so the per-request carrier (`use_record_tenant`) always wins.
+The env pair is process-global and therefore only correct where the process
+serves one graph; an operator states that with
+:data:`RECORD_SINGLE_TENANT_ENV`. Undeclared ⇒ **multi-tenant** ⇒ the pair is
+IGNORED and the armed write is refused (`no_tenant`, counted + warned), because
+the alternative is not "a less precise tenant", it is tenant A's rows under
+tenant B's organisation with no error at any layer — the row is well-formed and
+the FK only checks the graph exists. An env fallback with no declaration in
+front of it is reachable from the live door on any deployment that sets the
+pair, which is exactly the hazard the declaration removes.
+
+``OVERRIDES:`` the industry default (and #9078's scope decision 3's own
+inference) of treating the mere PRESENCE of a process-global pair as proof that
+the deployment is single-tenant — :data:`RECORD_SINGLE_TENANT_ENV` must be set,
+because single-tenancy is a deployment fact that has to be STATED, and an
+inferred one is exactly what a multi-tenant process would satisfy silently
+(#9192 ask 2).
+
+This does not remove #9078's scope decision 3 — a single-tenant deployment
+still arms by env — but it DOES change the operational contract for an
+UNDECLARED one: it armed before and refuses now, until it declares. That change
+fails closed (counted + warned, nothing misfiled), and the amended decision is
+relayed to #9078, documented in ``.env.example`` and in
+``monitoring.record_record_write_failure``.
+
 **THE TRANSACTION.** The seam never calls `commit()` and never calls
 `rollback()` (pinned by a test whose fake connection counts both and asserts
 they are zero). When the caller injects `conn=`, the boundary is unambiguously
@@ -132,22 +160,25 @@ import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from . import record_projection, status_vocabulary
+from .env_truthy import env_flag
 
 _logger = logging.getLogger(__name__)
 
 __all__ = [
     "CONNECT_TIMEOUT_SECONDS",
     "LIVE_WRITE_BREAKER_SECONDS",
-    "POSITION_ROW_DEFERRED_ON",
+    "POSITION_ORDINAL_SOURCE",
+    "POSITION_UNPROVEN_WARN_SECONDS",
     "RECORD_DSN_ENV",
     "RECORD_GRAPH_ENV",
     "RECORD_ORG_ENV",
+    "RECORD_SINGLE_TENANT_ENV",
     "RecordConnectError",
     "RecordWrite",
     "RecordWriteError",
@@ -156,20 +187,22 @@ __all__ = [
     "current_record_tenant",
     "record_dsn",
     "record_tenant",
+    "single_tenant_declared",
     "use_record_tenant",
     "write_live_record",
     "write_records",
 ]
 
-#: The record's position row (`public.journal_event`) is NOT written by the live
-#: path yet: a position is a fact only a bounded replay can derive, and the live
-#: chokepoint has no ordinal (`EventLog.append` reports nothing; there is no
-#: count accessor). Writing one anyway would collide on `(org_id, graph_id,
-#: seq)` with a later full replay's numbering — in silence. #9190 owns the
-#: ordinal; the live write passes `position=False` until it lands, and the FOUR
-#: ontology layers are unaffected (the position row is bookkeeping ABOUT them,
-#: not one of them).
-POSITION_ROW_DEFERRED_ON = "#9190"
+#: The record's position row (`public.journal_event` — layer 1, exposed as
+#: `public.record_event_stream`) is written BY THE LIVE PATH, from the ordinal
+#: `EventLog.append` returns (#9190, landed on main in `b3b4c2fb1`). The `seq` is
+#: the journal's own fact: the replay numbers records ``enumerate(records,
+#: start=1)`` over the same read, so a live write and a full replay give one
+#: record one number by construction. What this constant names is the ISSUE that
+#: supplied that ordinal — it used to name a deferral ("the live chokepoint has
+#: no ordinal"), and that premise is closed; leaving the note here is what keeps
+#: the next reader from re-deriving the deferral from an old comment.
+POSITION_ORDINAL_SOURCE = "#9190"
 
 #: The arming key. Present ⇒ armed; unset/blank ⇒ ``NOT_ARMED``. See the module
 #: docstring, decision 2 — and note it is a DSN, not a boolean, so a second
@@ -187,6 +220,21 @@ RECORD_DSN_ENV = "TORTOISE_RECORD_DSN"
 #: sets :func:`use_record_tenant` per request, and that always wins.
 RECORD_ORG_ENV = "TORTOISE_RECORD_ORG_ID"
 RECORD_GRAPH_ENV = "TORTOISE_RECORD_GRAPH_ID"
+
+#: The DECLARATION that this deployment serves exactly ONE record tenant, which
+#: is what makes the env pair above a valid answer (#9192). Default ABSENT ⇒
+#: **multi-tenant**, the fail-closed default: the pair is then IGNORED and an
+#: armed write with no request scope is refused (`no_tenant`) rather than filed
+#: under a process-global tenant that every other tenant in the process would
+#: share. Environments differ in whether they can name their tenant at all, so
+#: the declaration is what an operator states — never something we infer from
+#: which module happens to be imported, or from the control plane's mode (a
+#: registry-plane self-host process can serve several orgs too).
+#:
+#: Read with :func:`env_flag` (typo ⇒ the default, never a flip): a typo'd
+#: ``TORTOISE_RECORD_SINGLE_TENANT=yes-please`` leaves the process MULTI-tenant,
+#: which refuses rows rather than misfiling them.
+RECORD_SINGLE_TENANT_ENV = "TORTOISE_RECORD_SINGLE_TENANT"
 
 #: The bound on OPENING the record's connection, in seconds. libpq's default is
 #: ``0`` — wait forever — and the live door opens one connection per journal
@@ -220,6 +268,18 @@ LIVE_WRITE_BREAKER_SECONDS = 60.0
 #: When the live breaker closes again, on ``time.monotonic()`` (0.0 = closed).
 #: Module-level on purpose: the cost it bounds is per PROCESS, not per call.
 _breaker_open_until = 0.0
+
+#: How often the "position unproven" WARNING may repeat, in seconds. One line
+#: per unproven append would be a warning per record on a large journal whose
+#: `EventLog.append` is in a REPEATABLE unproven window (#9252: the
+#: ``_FLOCK_UNHEALTHY`` / ``_POSITION_CACHE_DEAD`` states), which teaches an
+#: operator to ignore the line. ``0.0`` disables the throttle (every unproven
+#: append warns) — the seam the tests use.
+POSITION_UNPROVEN_WARN_SECONDS = 300.0
+
+#: When the position-unproven warning last fired, on ``time.monotonic()``;
+#: ``-inf`` so the FIRST one always fires.
+_unproven_position_warned_at = float("-inf")
 
 #: The DSN schemes a DB-API Postgres driver accepts. A value outside this set is
 #: a *misconfiguration*, never an unarmed state.
@@ -293,7 +353,9 @@ class RecordWrite:
     #: Journal position of ``records[0]`` on an APPLIED call.
     first_seq: int = 1
     #: Journal position of the LAST record consumed (``first_seq - 1`` when
-    #: nothing was consumed — an empty batch, or a not-armed call), so a caller
+    #: nothing was consumed — an empty batch, a not-armed call, or the live
+    #: door's write with no PROVEN ordinal: `write_live_record` reports that
+    #: spelling rather than claiming a position it did not write), so a caller
     #: can advance its offset without re-deriving. Never a rewind: it is always
     #: derived from the caller's own ``first_seq``.
     last_seq: int = 0
@@ -360,17 +422,15 @@ def record_dsn(explicit: str | None = None) -> str | None:
     return dsn
 
 
-#: The TENANT a live write is filed under, per call, resolved by the caller's
-#: own scope (`use_record_tenant`). #9192's hazard is a process-global tenant: a
-#: hosted process serves many tenant graphs, so a module-level or
-#: environment-supplied org/graph files tenant A's rows under tenant B with no
-#: error (the row is well-formed and the FK only checks that the graph exists).
-#: So this is a ContextVar the REQUEST sets. It is NOT the only surface — the
-#: env pair is the single-tenant arming surface, resolved by
-#: :func:`record_tenant` — but it is the only one that can be per-request, so a
-#: scope ALWAYS wins over env (env is process-global: the same single value for
-#: every tenant the process serves, #9192). Neither set ⇒ an armed write is
-#: REFUSED and counted (`no_tenant`), never guessed. Ask
+#: The TENANT a live write is filed under, per call, resolved from the caller's
+#: own scope (`use_record_tenant`) — see :func:`record_tenant`. #9192's hazard is
+#: a PROCESS-GLOBAL tenant: a hosted process serves many tenant graphs, so a
+#: module-level or environment-supplied org/graph files tenant A's rows under
+#: tenant B with no error (the row is well-formed and the FK only checks that
+#: the graph exists). So the carrier a request sets is a ContextVar, and the
+#: env pair is reachable only on a deployment that DECLARED itself single-tenant
+#: (:func:`single_tenant_declared`). A scope ALWAYS wins over env. Neither set ⇒
+#: an armed write is REFUSED and counted (`no_tenant`), never guessed. Ask
 #: :func:`record_tenant` — not :func:`current_record_tenant` — to learn whether
 #: an armed write will be refused.
 _RECORD_TENANT: contextvars.ContextVar[tuple[str, str] | None] = (
@@ -417,6 +477,21 @@ def current_record_tenant() -> tuple[str, str] | None:
     return _RECORD_TENANT.get()
 
 
+def single_tenant_declared() -> bool:
+    """True when this deployment declared it serves exactly ONE record tenant.
+
+    The env pair (:data:`RECORD_ORG_ENV`/:data:`RECORD_GRAPH_ENV`) is
+    PROCESS-GLOBAL, so it can only be correct where the process serves one
+    graph. This is the operator's statement of exactly that (#9192), and the
+    default is the safe direction: **absent ⇒ multi-tenant ⇒ the pair is
+    ignored**. A deployment that sets the pair without the declaration gets
+    refused rows and a warning naming this variable — never a cross-tenant
+    write, which is silent (the row is well-formed and the FK only checks that
+    the graph exists).
+    """
+    return env_flag(RECORD_SINGLE_TENANT_ENV, default=False)
+
+
 def record_tenant() -> tuple[str, str] | None:
     """The tenant a LIVE write is filed under: the scope's, else the env pair.
 
@@ -428,15 +503,67 @@ def record_tenant() -> tuple[str, str] | None:
     the record would require a code change at every call site, which is how a
     capability ends up with no production caller again. A HALF-configured pair
     is not a tenant: it is refused, not completed.
+
+    ⛔ The pair is consulted ONLY when the deployment declared single tenancy
+    (:func:`single_tenant_declared`, #9192). Env is process-global, so on a
+    process serving several tenants it is not a weaker answer than the scope —
+    it is a WRONG one, and it fails silently: tenant A's rows land under tenant
+    B's organisation, well-formed, FK satisfied. So an undeclared process gets
+    ``None`` here (⇒ the write is REFUSED and counted ``no_tenant``), which is
+    the one failure mode a live door may have (#9192).
     """
     scoped = _RECORD_TENANT.get()
     if scoped is not None:
         return scoped
+    if not single_tenant_declared():
+        return None
     org_id = (os.environ.get(RECORD_ORG_ENV) or "").strip()
     graph_id = (os.environ.get(RECORD_GRAPH_ENV) or "").strip()
     if org_id and graph_id:
         return (org_id, graph_id)
     return None
+
+
+def _refused_tenant_env_note() -> str:
+    """Why the env pair did not arm this write — and what to do instead.
+
+    Only for the refusal WARNING. Two operator situations produce a `no_tenant`
+    refusal and each needs its own sentence:
+
+    * the pair IS set and the process has not declared itself single-tenant —
+      the operator needs the name of the missing declaration, not a generic "no
+      tenant in scope" that reads as if their configuration vanished;
+    * nothing is set at all (no scope, no pair) — the common case on the MCP
+      lane, where a credential that names no graph installs no scope. Telling
+      that operator to "wrap the write in ``use_record_tenant``" is advice they
+      cannot act on (the lane already does it per request); the actionable
+      sentence is the one naming a graph-bound credential (#9192 review A5).
+    """
+    org_id = (os.environ.get(RECORD_ORG_ENV) or "").strip()
+    graph_id = (os.environ.get(RECORD_GRAPH_ENV) or "").strip()
+    if org_id and graph_id:
+        return (
+            f" {RECORD_ORG_ENV}/{RECORD_GRAPH_ENV} ARE set, but this process "
+            f"has not declared itself single-tenant, so the process-global "
+            f"tenant was REFUSED instead of filing every tenant's rows under "
+            f"one graph (#9192): set {RECORD_SINGLE_TENANT_ENV}=1 ONLY in a "
+            f"deployment that serves exactly one graph, and wrap a "
+            f"multi-tenant write in record_writer.use_record_tenant(...)."
+        )
+    if org_id or graph_id:
+        return (
+            f" {RECORD_ORG_ENV}/{RECORD_GRAPH_ENV} is a HALF pair (one set, "
+            f"one empty) — that is a misconfiguration, not a tenant, and it is "
+            f"never completed by guesswork."
+        )
+    return (
+        " No tenant was in scope and no env pair is set: on the MCP lane the "
+        "scope is installed from a GRAPH-bound key per request, so this means "
+        "the credential named no graph (use a graph-bound `tk_` key); a "
+        "single-tenant deployment instead sets "
+        f"{RECORD_ORG_ENV}/{RECORD_GRAPH_ENV} AND "
+        f"{RECORD_SINGLE_TENANT_ENV}=1."
+    )
 
 
 def _default_connect(dsn: str) -> Any:
@@ -509,11 +636,12 @@ class RecordWriter:
             the journal append and this projection in ONE transaction; the seam
             then neither opens nor closes nor commits it.
         :param position: write the per-record ``journal_event`` position row
-            (default ``True``). The LIVE path passes ``False``: it has no
-            ordinal to record (
-            :data:`POSITION_ROW_DEFERRED_ON`, #9190), and a guessed one would
-            collide with a later replay's numbering in silence. The four
-            ontology layers are written either way.
+            (default ``True``). The LIVE path writes it too, keyed on the
+            ordinal the journal's own append reported (:data:`POSITION_ORDINAL_SOURCE`,
+            #9190) — never on a number this call derives. A caller that HAS no
+            ordinal passes ``False``; a guessed ``seq`` still collides with a
+            later replay's numbering in silence, and the four ontology layers
+            are written either way.
 
         :raises RecordWriteError: the record was ARMED and the write did not
             happen (malformed DSN, unreachable record, totality refusal, or a
@@ -668,8 +796,45 @@ def _count_non_journal_skip(reason: str = "no_durable_journal") -> None:
         monitoring.record_non_journal_skip(reason)
 
 
+def _count_position_unproven() -> None:
+    """Count one armed write whose journal append proved no position (#9307 F1).
+
+    Same swallow and same reason as its siblings: the caller's append is already
+    committed, so a metrics failure may never escape this door.
+    """
+    with contextlib.suppress(Exception):
+        from . import monitoring
+        monitoring.record_position_unproven()
+
+
+def _note_unproven_position(record: Mapping[str, Any]) -> None:
+    """Count AND (at most once per window) WARN that layer 1 skipped a record.
+
+    The skipped record is not lost — it is in the journal, and `replay` writes
+    its `journal_event` row — but a silent skip is exactly the gap #9078 exists
+    to close, so it is named on the metrics surface and in the log rather than
+    left to be noticed by its absence.
+    """
+    global _unproven_position_warned_at
+    _count_position_unproven()
+    now = time.monotonic()
+    if now - _unproven_position_warned_at < POSITION_UNPROVEN_WARN_SECONDS:
+        return
+    _unproven_position_warned_at = now
+    _logger.warning(
+        "no layer-1 position row for this record (position_unproven) — the "
+        "journal append SUCCEEDED but could not prove the record's position "
+        "(see EventLog.append's None states), so layer 1 is one record behind "
+        "the journal until a replay heals it. Counted on "
+        "monitoring.metrics()[\"record_position_unproven\"]; this line repeats "
+        "at most once per %.0fs: %s", POSITION_UNPROVEN_WARN_SECONDS,
+        record.get("type"),
+    )
+
+
 def write_live_record(record: Mapping[str, Any], *,
-                      durable: bool = True) -> RecordWrite | None:
+                      durable: bool = True,
+                      seq: int | None = None) -> RecordWrite | None:
     """The LIVE door: one journal record that has ALREADY been appended.
 
     Called at each of the three places the journal is appended on a live write
@@ -704,6 +869,12 @@ def write_live_record(record: Mapping[str, Any], *,
     contract is enforced, not just intended: every counter call goes through
     :func:`_count_write_failure`, which suppresses its own failures.
 
+    The RETURNED WATERMARK describes journal POSITIONS, so a write with no
+    proven ordinal consumed none: it reports ``last_seq == first_seq - 1``, this
+    class's own "nothing consumed" spelling (see :attr:`RecordWrite.last_seq`),
+    rather than claiming position 1 was written. ``applied`` still answers the
+    other question truthfully — the four ontology layers WERE written.
+
     The transaction is THIS write's own (the journal append was a file append,
     so there is nothing to span): the seam opens the connection, this commits
     it, and it is closed on every path.
@@ -721,6 +892,46 @@ def write_live_record(record: Mapping[str, Any], *,
     is refused locally (counted ``circuit_open``) instead of paying that
     timeout once per record — N records used to cost N × 10 s inside one
     ``capture_session`` call, which is a wedged capture, not a degraded one.
+
+    ``seq`` is the record's OWN journal position — what `EventLog.append`
+    returned (#9190). It is a fact of the journal, never an allocator: the replay
+    numbers records ``enumerate(records, start=1)`` over the same read, so a live
+    write and a full replay give one record one number by construction, and the
+    position row lands in layer 1 (`public.journal_event`, and the
+    `public.record_event_stream` view over it) on the live path.
+
+    ``None`` names ONE population, and it is NOT the in-memory capture lane
+    (#9307 review F1 — this paragraph used to say it was, which is false): that
+    lane is declined EARLIER, at ``durable=False``, and counted
+    ``no_durable_journal``, so it never reaches the position decision. What
+    arrives here is a DURABLE journal whose ``append`` SUCCEEDED but could not
+    PROVE the record's position — the ``None`` states listed by
+    :meth:`tortoise.log.EventLog.append` (a tail it could not size, a
+    cross-process lock it could not take, a journal it could not count, a peer
+    writing unserialised inside its window, an inode swapped under the path).
+    Two of those are documented as REPEATABLE windows on a large journal
+    (#9252), so this is not a one-record curiosity. Such a record writes no
+    position row — nothing there could be numbered, and inventing one is the
+    #9190 defect — and the row arrives on a later replay, which re-numbers the
+    SAME journal. The skip is therefore NAMED rather than silent: counted on
+    ``monitoring.metrics()["record_position_unproven"]``, WARNed once per
+    :data:`POSITION_UNPROVEN_WARN_SECONDS`, and the returned watermark does not
+    claim the position it did not consume (see RETURN below).
+
+    ⚠️ RESIDUAL — the one shape the paragraph above does not cover: a tenant with
+    TWO durable journals. "One record one number by
+    construction" holds per JOURNAL FILE, while `journal_event`'s key is per
+    `(org_id, graph_id, seq)`: two durable journals under one tenant each number
+    their records from 1, so the second journal's rows are absorbed by
+    `ON CONFLICT (org_id, graph_id, seq) DO NOTHING` and the existing row keeps
+    the OTHER journal's `event_type`/`payload` while the layer row underneath
+    belongs to a different record. That was reachable before this change only
+    replay-vs-replay; the live path now participates, so it is stated here
+    rather than left to be rediscovered (#9307 review P2 — tracked on #9318).
+    The fix is journal IDENTITY in the key (a column identifying the
+    journal, or a per-tenant ordinal allocator), not a number this door can
+    derive — do NOT paper it over by declining position rows on the live path,
+    which is the #9190 defect this door exists to close.
 
     ``OVERRIDES:`` the module's decision 3 (`Armed but unreachable ⇒ the write
     FAILS (RecordWriteError)`) does not apply to this door, and that is a
@@ -758,10 +969,8 @@ def write_live_record(record: Mapping[str, Any], *,
         _count_write_failure("no_tenant")
         _logger.warning(
             "the record write did not happen (no_tenant) — the record is armed "
-            "but no tenant is in scope: wrap the write in "
-            "record_writer.use_record_tenant(org_id, graph_id) or set "
-            "%s/%s for a single-tenant deployment", RECORD_ORG_ENV,
-            RECORD_GRAPH_ENV,
+            "but no tenant could be named for this write.%s",
+            _refused_tenant_env_note(),
         )
         return None
     org_id, graph_id = tenant
@@ -778,13 +987,30 @@ def write_live_record(record: Mapping[str, Any], *,
         )
         return None
     connection: Any | None = None
+    if seq is None:
+        # A DURABLE journal whose append could not prove the record's position
+        # (see `seq` above): layer 1 gets no row for this record, which is a
+        # NAMED skip and never a silent one (#9307 review F1).
+        _note_unproven_position(record)
     try:
+        # #9190's ordinal, straight from the append. `position=False` only when
+        # a durable journal could not PROVE the record's position (see `seq`): a
+        # row needs a number, and inventing one collides with a later replay's
+        # numbering. Counted and warned above, so the skip is observable.
         write = write_records([record], org_id=org_id, graph_id=graph_id,
-                              position=False)  # #9190: never invent a position
+                              position=seq is not None,
+                              first_seq=seq if seq is not None else 1)
         _close_live_breaker()
         connection = write.connection
         if connection is not None:
             connection.commit()
+        if seq is None:
+            # No position was consumed, so the watermark must not report one
+            # as if it had been (a caller advancing `last_seq + 1` must neither
+            # rewind nor skip): the seam was handed the default `first_seq=1`
+            # for a row-less write, and `first_seq - 1` is this class's own
+            # spelling for "nothing consumed".
+            return replace(write, last_seq=write.first_seq - 1)
         return write
     except Exception as exc:
         if isinstance(exc, RecordConnectError):

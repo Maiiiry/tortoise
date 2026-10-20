@@ -6839,11 +6839,16 @@ class TortoiseSDK:
             # prescribed an action it had no way to perform; naming the exits
             # (in-process clear, or restart this worker) plus where the state is
             # visible does not.
-            # ⚠️ BOTH DIAGNOSES ARE REPORTED, not just the latest (#9208
-            # review): a graph can fail twice for different reasons
-            # (`append-unverified` then `append`), and the FIRST is often the
-            # only provable one — `record_degraded` keeps it for exactly this
-            # reader, and reporting only the latest would discard it.
+            # ⚠️ THE FIRST DIAGNOSIS IS REPORTED WHEN ITS STAGE DIFFERS, not
+            # only the latest (#9208 review): a graph can fail twice for
+            # different reasons (`append` then `append-unverified`), and the
+            # FIRST is often the only provable one — `record_degraded` keeps it
+            # for exactly this reader, and reporting only the latest would
+            # discard it. The stage check below is what keeps the appended
+            # "the stage named above is the LATEST" sentence TRUE; a same-stage
+            # repeat keeps `first_error` for `degraded_graphs()` but this detail
+            # names only the latest message (docs/durability-posture.md states
+            # the same rule — keep the two in step).
             first = ""
             if state.get("first_stage") and state["first_stage"] != state["stage"]:
                 # ⚠️ `first` is APPENDED to the message, so the latest stage is
@@ -7188,7 +7193,10 @@ class TortoiseSDK:
         if _jsonl_actor is not None:
             event["actor_user_id"] = _jsonl_actor
         try:
-            log.append(event)
+            # #9190: the append's return value IS the record's journal position;
+            # it is threaded to the record so layer 1 stops being empty on live
+            # writes. `None` (an in-memory log) means there is nothing to number.
+            seq = log.append(event)
         except Exception as exc:
             # The graph mutation already succeeded — a log-write failure must
             # not crash the caller or pretend the write failed. Rebuild parity
@@ -7237,10 +7245,11 @@ class TortoiseSDK:
         # for a record that persisted while killing the fold too. The loss is
         # observable instead (``monitoring.metrics()["record_write_failures"]``)
         # and ``replay`` heals it from the journal.
-        self._write_record_projection(event)
+        self._write_record_projection(event, seq=seq)
         return True
 
-    def _write_record_projection(self, record: dict) -> None:
+    def _write_record_projection(self, record: dict,
+                                 seq: int | None) -> None:
         """Hand one just-appended journal record to the Postgres record (#9188).
 
         THE production call site. Until this existed, `tortoise/record_projection.py`
@@ -7252,6 +7261,19 @@ class TortoiseSDK:
         `EventAPI._emit`, `ConversationMiner._emit_event`) and a second
         implementation of this boundary is how one door's records come to
         differ from another's.
+
+        ``seq`` is REQUIRED, and that is the point rather than a style choice
+        (#9307 review F2). It is the ordinal the journal append returned, and
+        the seam treats ``None`` as "this log reported no position" — so a
+        default here would make a caller that forgot to pass it take
+        ``position=False`` on a live write, leaving layer 1
+        (`public.journal_event`) empty with no error, no count and a green
+        wiring gate: exactly the #9190 defect this change closes. Required, an
+        omission is a ``TypeError`` at the call site. `None` is still a legal
+        VALUE (`_InMemoryEventLog` reports no position — no row, never an
+        invented number); it is the silent default that is removed, and
+        `tools/record_wiring_check.py::live_call_sites_pass_the_ordinal` holds
+        every caller to it.
 
         Deliberately fail-soft: the graph write and the journal append have
         already committed, so a record failure is a LOSS TO REPORT (counted in
@@ -7274,7 +7296,7 @@ class TortoiseSDK:
         # nothing was lost (#9231 review P2).
         log = self._event_log
         durable = log is not None and getattr(log, "durable", True)
-        record_writer.write_live_record(record, durable=durable)
+        record_writer.write_live_record(record, durable=durable, seq=seq)
 
     def _record_write_failure(self, reason: str, exc: BaseException) -> None:
         """Count and report one armed record write that did not happen (#9188).

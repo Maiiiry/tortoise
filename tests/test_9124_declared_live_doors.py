@@ -136,12 +136,16 @@ _APPEND_NOT_A_RECORD = {
 #: _onboarding_write_scope(cypher):` around the dispatch in
 #: `tortoise/onboarding/state.py`) — a lane declared through a module-local
 #: helper is still declared, and leaving it out reported that module as
-#: undeclared while it was the opposite.
+#: undeclared while it was the opposite. `_prewipe_restore_write_scope` is
+#: `#9210`'s restore funnel (`FalkorProjection._restore_write`): omitted, the
+#: census classified a writer that DOES declare a lane as undeclared and left
+#: it in the `provable` remainder the owner's last-step flip requires cleared.
 _SCOPE_CALL_NAMES = (
     "_live_write_scope",
     "_replay_write_scope",
     "_graph_metadata_write_scope",
     "_onboarding_write_scope",
+    "_prewipe_restore_write_scope",
     "_cache_write_authorized",
     "_declares_live_write_lane",
 )
@@ -2435,8 +2439,11 @@ def test_the_event_store_declares_every_writer():
     assert not undeclared, (
         "every event_store write must declare a lane — "
         "`_graph_metadata_write_scope` for the store's own bookkeeping (schema, "
-        "seq allocator, append, retention) or `_replay_write_scope` for the "
-        "wipe+replay repair. Undeclared:\n  " + "\n  ".join(
+        "seq allocator, append, retention), or `_cache_write_authorized("
+        "restore_reason or \"replay\")` at the write for the wipe+replay "
+        "repair (`#9224` for the replay lane, `#9210` for the restore lane; "
+        "the helper opens it there because an inner scope shadows any `with` "
+        "at the call site). Undeclared:\n  " + "\n  ".join(
             f"{name}:{fact['lineno']} {fact['writes'][0][1]}: "
             f"{fact['writes'][0][2]!r}" for name, fact in undeclared.items()))
     # The store is small enough to pin exactly: a NEW write here must be a
@@ -2445,6 +2452,38 @@ def test_the_event_store_declares_every_writer():
         "ensure_event_schema", "next_seq", "reestablish_watermark",
         "append_event", "purge_expired", "purge_overflow", "_refresh_first_seq",
     }, f"unexpected event_store handle surface: {sorted(surface)}"
+
+
+def test_the_prewipe_restore_funnel_is_declared_not_a_remainder():
+    """`#9210`'s funnel DECLARES a lane, so the census must not call it undeclared.
+
+    `FalkorProjection._restore_write` reaches the handle inside
+    `_prewipe_restore_write_scope(reason)`. The census recognises a lane by the
+    OPENER NAME it can see, so an opener missing from `_SCOPE_CALL_NAMES`
+    reported a writer that DOES declare as undeclared — an instrument that
+    cannot see its own declaration, and its message would then instruct the
+    next lane to declare a lane that is already there. It was not red while the
+    guard was measuring (`_HANDLE_GUARD_ENFORCES is False`), but it sat in the
+    `provable` remainder that the owner's last-step flip
+    (`test_arming_the_guard_requires_a_fully_declared_surface`) requires to be
+    cleared, so the flip would have been blocked by a false positive.
+
+    RED before the opener is registered: `scopes == []`, the write is outside
+    every span, and `_writes_are_inside_a_lane` is False — on correct product
+    code.
+    """
+    surface = enumerate_handle_surface(
+        (ROOT / "tortoise" / "projection" / "__init__.py").read_text(),
+        "tortoise/projection/__init__.py")
+    fact = surface["FalkorProjection._restore_write"]
+    openers = {opener for _lineno, opener in fact["scopes"]}
+    assert openers == {"_prewipe_restore_write_scope"}, (
+        "the restore funnel's write must be seen inside its own opener — an "
+        "opener the census does not know makes a declared writer look "
+        f"undeclared: scopes={fact['scopes']!r}")
+    assert _writes_are_inside_a_lane(fact), (
+        "the census placed the restore funnel's write OUTSIDE every lane "
+        f"span: writes={fact['writes']!r} spans={fact['scope_spans']!r}")
 
 
 # ── non-vacuity: the detector fires on a synthetic undeclared door ────────
@@ -2789,21 +2828,82 @@ def _modules_reaching_the_handle():
 
 #: Package-wide `(module, SCOPE-QUALIFIED key)` pairs whose statement the census cannot
 #: resolve but a human has PROVEN read-only (it is a `MATCH … RETURN` whose
-#: interpolated fragment carries no write clause). Empty in part 1, and the flip
-#: is blocked without it. Bucketing is PER FUNCTION, so of the 308 unresolved
-#: statements in the population 226 sit in the "unproven" bucket, 44 sit in
-#: functions that already declare a lane (no bucket), and 38 ride in a function
-#: that also has a provable write (so they are listed as a missing lane, not as
-#: unproven — the per-function granularity is the limit of a source-order
-#: census). Filling one in is a reviewed act — and it is never the right remedy
-#: to wrap a read in a write lane.
+#: interpolated fragment carries no write clause). Empty in part 1; it carries the
+#: two `#9261` calibration READ statements today (`#9063`'s universe query and the
+#: audit that reuses it — see the entry's own note).
+#:
+#: ⚠️ THIS REGISTER IS THE #9124 ARMING GATE'S ALLOWLIST, so an entry written
+#: here pre-clears the surface `test_arming_the_guard_requires_a_fully_declared_surface`
+#: requires before `_HANDLE_GUARD_ENFORCES` may flip. The two entries landed in
+#: #9218's branch because `origin/main` was RED without them (that gate's
+#: `test_every_mutating_sdk_entry_point_is_declared_or_inventoried` reported both
+#: `#9261` functions as "NO declared lane and no inventory entry"); they are
+#: `#9261`'s verdicts, named in this PR's description rather than inherited
+#: silently. And the register is PER FUNCTION: an entry proves the STATEMENTS
+#: the census saw in that function today, so a WRITE added inside
+#: `calibrate_summary` tomorrow is exempted by this entry — a reason to keep the
+#: entries verified against the function's real statements, not a reason to
+#: widen them. That verification is a MECHANISM, not an intention: each entry pins
+#: the statements it was proven to issue in `_PROVEN_READ_STATEMENTS` below, and
+#: `test_every_proven_read_names_a_real_census_entry` refuses an entry whose
+#: function reaches the handle with a different set — so a second statement added
+#: to a registered name cannot inherit the old verdict.
+#:
+#: Bucketing is PER FUNCTION, so the statements the census cannot resolve are
+#: accounted for in four places: the "unproven" bucket (a function whose every
+#: mutating call is unresolved), functions that already declare a lane (no
+#: bucket), functions that also hold a provable write (listed as a missing lane,
+#: not as unproven — the per-function granularity is the limit of a source-order
+#: census), and this register. Filling one in is a reviewed act — and it is
+#: never the right remedy to wrap a read in a write lane.
+#:
+#: THE FIGURES BELOW ARE A READING, NOT A STATE — re-derive them (this file's own
+#: `_modules_reaching_the_handle()` + bucketing) before quoting them, because they
+#: went stale once already: the previous snapshot said "308 unresolved … 226 / 44
+#: / 38" and #9218's review found it beside an edit that had moved two statements
+#: out of the unproven bucket. MEASURED 2026-10-20 over 59 modules: 307 unresolved
+#: statements in the population — 226 in the unproven bucket, 40 in functions
+#: that already declare a lane (no bucket), 39 in a function that also holds a
+#: provable write, and the 2 proven reads above.
 #:
 #: ⛔ THE KEY IS WHAT `enumerate_handle_surface` EMITS — scope-qualified, e.g.
 #: `("tortoise/sdk.py", "TortoiseSDK.delete_point")`, NOT `"delete_point"`. A
 #: bare-name entry is a SILENT NO-OP: accepted into the set, it changes nothing,
 #: and the gate keeps blocking the statement while its author believes it was
 #: proven read-only. `test_every_proven_read_names_a_real_census_entry` pins it.
-_PROVEN_READS: set[tuple[str, str]] = set()
+_PROVEN_READS: set[tuple[str, str]] = {
+    # #9261 (#9063): the calibration gate's demand universe, and the audit that
+    # reuses it. Both statements are `MATCH … RETURN` READS, but the census
+    # cannot resolve them statically — `_uncalibrated_ep_participants` passes a
+    # `query` VARIABLE it composes per label (`name` argument, not a literal),
+    # and `calibrate_summary` interpolates a `where` fragment built above the
+    # call. Proven read-only in review: neither statement carries a
+    # SET/CREATE/DELETE/MERGE arm, and `proj.g.query` is a pure read of the
+    # graph here — declaring a lane would be a WRITE declaration on a read,
+    # which the register's own note calls the wrong remedy.
+    ("tortoise/sdk.py", "TortoiseSDK.calibrate_summary"),
+    ("tortoise/sdk.py", "TortoiseSDK._uncalibrated_ep_participants"),
+}
+
+#: WHAT WAS PROVEN, not only whose statement was — keyed like `_PROVEN_READS`,
+#: holding the census's call-kind names for that function's unresolved statements,
+#: IN ORDER.
+#:
+#: ⛔ WHY THE REGISTER ALONE IS NOT ENOUGH. Both gates `continue` on a registered
+#: name BEFORE classifying what the function now does, so a POSITIVE verdict
+#: pinned to a NAME blesses every later edit of that name: a second statement
+#: added to `calibrate_summary` tomorrow would inherit today's verdict and pass
+#: both static gates silently (a *provable* write is still caught —
+#: `_is_unresolved_only` fails — but a second UNRESOLVED one is not). The runtime
+#: door classifies the real text, so it is not a fail-open on writes; it is a
+#: static gate that stops looking. Pin the statements, so the verdict has an
+#: extent.
+_PROVEN_READ_STATEMENTS: dict[tuple[str, str], tuple[str, ...]] = {
+    # one `g.query`, resolving to `MATCH (n:Point) {where} … RETURN …`
+    ("tortoise/sdk.py", "TortoiseSDK.calibrate_summary"): ("query",),
+    # one `g.query`, resolving to `MATCH (n:{label}) WHERE … RETURN n.id [LIMIT n]`
+    ("tortoise/sdk.py", "TortoiseSDK._uncalibrated_ep_participants"): ("query",),
+}
 
 
 def test_every_proven_read_names_a_real_census_entry():
@@ -2811,8 +2911,16 @@ def test_every_proven_read_names_a_real_census_entry():
 
     Both consumers index the register with the SCOPE-QUALIFIED key, so an entry
     in any other form would sit in the set and change nothing — the "stale flag
-    that is never revalidated" failure this suite exists to prevent. Empty today;
-    a part-2 entry must still prove its key.
+    that is never revalidated" failure this suite exists to prevent. It held no
+    entries in part 1; the `#9261` calibration reads are the first, and each one's
+    key is proved here.
+
+    The VERDICT'S EXTENT is proved too: `_PROVEN_READ_STATEMENTS` must name the
+    exact call kinds of that function's unresolved statements, in order. A
+    positive verdict pinned to a NAME would otherwise bless a second statement
+    added to the same function later — the register is consulted before the
+    census classifies anything, so the new statement would inherit the old
+    verdict and pass both static gates silently.
     """
     surfaces = dict(_modules_reaching_the_handle())
     offenders = []
@@ -2831,6 +2939,26 @@ def test_every_proven_read_names_a_real_census_entry():
         "census key is scope-qualified — `TortoiseSDK.delete_point`, not "
         "`delete_point`) — the pin would be a silent no-op:\n  "
         + "\n  ".join(offenders))
+
+    # ── the extent: every registered name pins WHAT it was proven to do ──
+    unmatched = sorted(set(_PROVEN_READS) ^ set(_PROVEN_READ_STATEMENTS))
+    assert not unmatched, (
+        "`_PROVEN_READS` and `_PROVEN_READ_STATEMENTS` disagree about "
+        f"{unmatched} — every proven read must pin its statements, or its verdict "
+        "covers whatever that function grows into next")
+    drift = []
+    for (rel, key), expected in sorted(_PROVEN_READ_STATEMENTS.items()):
+        fact = surfaces[rel][key]
+        got = tuple(write[1] for write in fact["writes"])
+        if got != expected:
+            drift.append(
+                f"{rel}::{key} now issues {got} (lines "
+                f"{[w[0] for w in fact['writes']]}) but was proven as {expected}")
+    assert not drift, (
+        "a registered read-only function changed what it reaches the handle with, "
+        "so the read-only verdict no longer covers it — re-prove the statements "
+        "(and update `_PROVEN_READ_STATEMENTS`) or drop the entry so the census "
+        "classifies it again:\n  " + "\n  ".join(drift))
 
 
 def _is_unresolved_only(fact) -> bool:
@@ -3026,8 +3154,15 @@ def test_a_proven_read_entry_must_be_unproven_and_undeclared(monkeypatch):
     """The register pins the VERDICT, not just the key form.
 
     A provable write blessed as a "proven read" would be skipped by BOTH gates,
-    so an entry in the right key form but the wrong shape must be refused.
+    so an entry in the right key form but the wrong shape must be refused. The
+    third clause pins the verdict's EXTENT: a registered name whose statement set
+    changed (or that pins no extent at all) is refused, because both gates consult
+    the register BEFORE classifying anything, so the old verdict would otherwise
+    cover whatever the function grew into.
     """
+    # Captured BEFORE any patch: the real register the extent clauses probe.
+    real_register = set(_PROVEN_READS)
+    real_statements = dict(_PROVEN_READ_STATEMENTS)
     surfaces = dict(_modules_reaching_the_handle())
     sdk = surfaces["tortoise/sdk.py"]
     # A REAL key, so the entry reaches the VERDICT clause rather than the
@@ -3044,6 +3179,26 @@ def test_a_proven_read_entry_must_be_unproven_and_undeclared(monkeypatch):
         "test_9124_declared_live_doors._PROVEN_READS",
         {("tortoise/sdk.py", declared[0].split(".")[-1])})
     with pytest.raises(AssertionError, match="names no census entry"):
+        test_every_proven_read_names_a_real_census_entry()
+
+    # ── the EXTENT clauses, on the REAL register (non-empty since #9261) ──
+    assert real_register, (
+        "`_PROVEN_READS` is empty, so the extent probe below would pass "
+        "vacuously — it is only meaningful while a verdict spans statements")
+    monkeypatch.setattr("test_9124_declared_live_doors._PROVEN_READS", real_register)
+    grown = dict(real_statements)
+    first = sorted(grown)[0]
+    # A SECOND statement appeared in a function blessed as read-only: the verdict
+    # no longer covers it, and the pin must say so.
+    grown[first] = grown[first] + ("query",)
+    monkeypatch.setattr("test_9124_declared_live_doors._PROVEN_READ_STATEMENTS", grown)
+    with pytest.raises(AssertionError, match="read-only verdict no longer covers"):
+        test_every_proven_read_names_a_real_census_entry()
+    # A registered name with NO pinned extent is refused the other way round.
+    monkeypatch.setattr(
+        "test_9124_declared_live_doors._PROVEN_READ_STATEMENTS",
+        {key: value for key, value in real_statements.items() if key != first})
+    with pytest.raises(AssertionError, match="every proven read must pin its statements"):
         test_every_proven_read_names_a_real_census_entry()
 
 

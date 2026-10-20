@@ -3301,6 +3301,34 @@ def _journal_safe_params(params, cypher=None):
 #     — including what those properties do NOT claim (the epoch value rides the
 #     record as each Point's `ep_dirty_at`, and the epoch is an ordering BOUND
 #     a reset inverts for a while, `#5166`).
+#   * `_prewipe_restore_write_scope(...)` — the PRE-WIPE RESTORE lane: the
+#     writes that put back, verbatim, state CAPTURED FROM THIS GRAPH
+#     immediately before its wipe (`:Batch` + `batch_id`, `:Session` +
+#     `CONTAINS`, the onboarding state machine — node, `onboards` anchor and
+#     `COMPLETED_STEP` links, `:TeamMeta`, the config registry, the `#4305`
+#     derived Point properties, the `:GraphEventMeta` watermark). Every one of
+#     these classes rides NO journal record — which is exactly why the replay
+#     lane's contract ("this content came FROM the record") is FALSE for them,
+#     and why `rebuild_all` may not hand them the replay permit (#9210: one
+#     method-wide permit made every future addition to that engine inherit a
+#     claim that was never true of the restore). ⚠️ TWO legs differ in
+#     MECHANISM while staying in this lane, so the "rides no journal record"
+#     clause must not be extended to either of them unqualified:
+#       · `#4305` — the journal owns `content_hash` and `embedding` when it
+#         wrote them, so those are re-applied only where it did not, and the
+#         NON-derived `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`,
+#         `posterior_alpha`, `posterior_beta`) apply to a graph-only id only —
+#         journal-independent by design;
+#       · `#3947` — the `:Session` NODE is journal-carried for a post-`#3664`
+#         journal: the durable carrier is the `SessionRecorded` record, folded
+#         by `_fold_session_recorded`, and the restore's own writer comment
+#         says exactly that (#3664 is why it no longer depends on the
+#         snapshot). Only the `CONTAINS` edge and the re-application of the
+#         node's properties ride no record; the restore runs idempotently
+#         over both, so its lane is unchanged — but "`#3947` says so at its
+#         writer" is NOT this leg's evidence, because its writer says the
+#         reverse.
+#     See the obligations it states at `_prewipe_restore_write_scope`.
 #   * `onboarding.metadata` (`tortoise/onboarding/state.py`, #9121) — the
 #     onboarding FLOW metadata (`:OnboardingState`, `:OnboardingStep`, the
 #     `COMPLETED_STEP` edges) is graph-resident org-level metadata, not a
@@ -3620,6 +3648,134 @@ def _live_write_scope(reason: str = "live-door"):
 def _replay_write_scope():
     """The replay engines' scope: the record came FROM the journal."""
     return _cache_write_authorized("replay")
+
+
+#: The reason prefix every pre-wipe restore write carries. Pinned as a
+#: literal because a test reads it back AT THE WRITE HANDLE (`#9210`): a lane
+#: that renames itself silently is a lane the next reader cannot find.
+_PREWIPE_RESTORE_LANE = "pre-wipe-restore"
+
+
+def _prewipe_restore_write_scope(reason: str):
+    """The PRE-WIPE RESTORE lane: state copied from THIS graph, not replayed.
+
+    `rebuild_all` does two different things under one method body. The FOLD
+    pass projects records that came from the journal — `_replay_write_scope`
+    states the truth for it. But the same engine also puts back, verbatim,
+    state it CAPTURED FROM THE GRAPH THAT IS ABOUT TO BE DESTROYED (the `#548`
+    snapshot, and its durable `#2943` sidecar): `:Batch` markers and
+    `Point.batch_id`, `:Session` containers and their `CONTAINS` edges, the
+    `:OnboardingState` machine (node, `onboards` anchor, `COMPLETED_STEP`
+    links), the `:TeamMeta` first-org marker, the `#2814` config registry, the
+    `#4305` derived Point properties, and the `:GraphEventMeta` watermark.
+
+    **None of those writes is a projection of a journal record** — the classes
+    ride no record at all (`#5353`, `#4641`, `#990`, `#2814`, `#4653` each say
+    so at their writer), and the restore re-establishes them from the pre-wipe
+    capture instead. ⚠️ **TWO legs are exceptions in MECHANISM, not in
+    lane.**
+
+    * `#4305`: the journal owns `content_hash` and `embedding` when it wrote
+      them, so those fields are re-applied only where it did not, and the
+      NON-derived `_REPLAY_GAP_PROPS` (`outdated`, `expiredAt`,
+      `posterior_alpha`, `posterior_beta`) are applied to a graph-only id only
+      — journal-independent by design. So "rides no journal record" is not
+      this leg's story; "the value exists only in the pre-wipe capture" is.
+    * `#3947`: the `:Session` NODE **is** journal-carried for a post-`#3664`
+      journal — its durable carrier is the `SessionRecorded` record, folded by
+      `_fold_session_recorded`, which is what its writer comment below states
+      ("a journaled capture no longer depends on this snapshot"). Only the
+      `CONTAINS` edge and the re-application of the node's properties ride no
+      record. That is why `#3947` is NOT cited here as a writer that "says so":
+      its writer says the opposite, and the restore is idempotent over both
+      halves, which is the property this lane actually needs.
+
+    Handing them the replay permit would authorize
+    them under a contract that is FALSE for them, which is what `#9210`
+    removes: the restore is now a NAMED declaration, so "which writes are
+    authorized by replay" stays answerable for every restore statement that
+    exists. ⚠️ That last clause is bounded by the mechanism, not by intent:
+    the funnel is VOLUNTARY — a future restore added to that engine as a bare
+    `self.g.query(...)` still inherits `"replay"`, which is the residual the
+    bullet list below states in full.
+
+    What it claims, and what it does NOT:
+
+    * the content came from THIS GRAPH's own pre-wipe capture, not from the
+      record — so it is recoverable only through that carrier (the in-memory
+      snapshot, or the durable sidecar beside the event log), never by
+      replaying the journal;
+    * it is **not** a permit for a record fold: a write a journal record could
+      describe belongs on `_live_write_scope` (append first, then fold) or on
+      `_replay_write_scope` (the record came from the journal). `#9068` is the
+      shape this must never become — a declaration that blesses an
+      unjournalled cache write of RECOVERABLE state; the classes here are
+      disclosed as captured-and-restored, not as journal-derived;
+    * it does not make those classes durable. The `#4641` onboarding fallback
+      gap (`tortoise/backup.py`'s JSONL path) and the `#4664` unrestored
+      `:GraphEvent` rows are unchanged by this lane; naming a gap is not
+      closing it;
+    * **it covers the DIRECT restore writes only.** `rebuild_all` also carries
+      graph-only Points back by building `synthetic_events` from the same
+      pre-wipe capture and FOLDING them (`events = list(synthetic_events) +
+      journal_events`), so that half is authorized by whatever permit the
+      caller opened over the engine (`"replay"` under the `#9124`/`#9213`
+      shape), not by this lane. Disclosed, not claimed;
+    * **one write in the SAME engine is not a restore and keeps `"replay"`,
+      correctly — so it is disclosed here instead of being declared.** On the
+      post-restore config-verification FAILURE branch `_rebuild_all_replay`
+      calls `set_config_reset_marker()` (`#2814`, the sticky `config_reset`
+      marker). That statement carries the whole-property-map shape every
+      restore leg uses (`… SET n += $props`) while its props are AUTHORED at
+      write time (`_config_reset_props(read_config_reset(g), reason)`), never
+      captured before the wipe — so this lane would be FALSE for it. It is
+      therefore exempted STATEMENT-EXACTLY from the pin's shape rule
+      (`tests/test_9210_rebuild_declares_restore.py`'s
+      `_NOT_A_RESTORE_STATEMENTS`), rather than left to red against correct
+      code; its writer is shared with `residency.declare_residency`
+      (`#7952`), which reaches it from `rebuild_from_record` instead.
+      Disclosed, not claimed;
+    * **it is VOLUNTARY, so "a future addition has to choose a lane" is a
+      convention, not a gate.** `_rebuild_all_replay` is under a method-wide
+      `_replay_write_scope()` (`#9213`), and nothing forces it to route a
+      restore statement through `_restore_write`. A twelfth restore added as a
+      bare `self.g.query(...)` tomorrow is authorized as `"replay"` — exactly
+      the false contract this lane removes — and `_LEGS` cannot see it, because
+      a table of the eleven statements that exist says nothing about a
+      twelfth. Enforced only as far as the pin reaches: the whole-property-map
+      shape every restore leg uses (`… SET <alias> += $props`) is matched by
+      SHAPE, table-independently, and reds on its reason; every other restore
+      shape (a `SET <alias>.<field> = $param` link, a bare edge `MERGE`) is
+      caught only while it stays in the table. The unbounded guarantee needs
+      `#9124`'s handle guard armed — nothing here claims it today.
+
+    WHERE THE WATERMARK'S DECLARATION LIVES — at the write, in
+    `tortoise/event_store.py`. That leg's statement is in another module, so a
+    `with` here could not declare it (an inner scope shadows an outer one); the
+    lane is instead handed to `reestablish_watermark(..., restore_reason=...)`,
+    which opens it around its own `MERGE`. The helper's OTHER caller, the
+    journal engine `rebuild()` / `_replay_log`, ALSO puts back a value it
+    CAPTURED from this graph before its own wipe (`capture_watermark`), and it
+    still keeps declaring `"replay"` — the same class of defect this lane
+    removes for `:TeamMeta`, deliberately left to `#9213` rather than fixed
+    inside one engine's `try` body. ⚠️ Do not call that claim "truthful": it is
+    DEFERRED and disclosed, and a blanket restore reason is not the honest fix
+    there either, because `reestablish_watermark` stores
+    `max(carried, max(:GraphEvent.seq))` — the value can come from the replayed
+    log when it is higher, so the two sources must be split before one lane can
+    describe the write (pinned at the helper seam by
+    `tests/test_rebuild_event_meta_watermark_4653.py::test_reestablish_watermark_never_moves_below_the_replayed_log`,
+    and the deferred lane itself is measured by
+    `tests/test_9210_rebuild_declares_restore.py::test_the_journal_engines_watermark_stays_disclosed_as_deferred`).
+
+    NESTING is the property that makes it load-bearing under an over-broad
+    permit: the reason is a `ContextVar`, so an inner restore declaration
+    SHADOWS an outer `_replay_write_scope()` over the same statements. A
+    restore write therefore cannot be authorized as a replay even when the
+    caller wrapped the whole rebuild in one — pinned at the write handle by
+    `tests/test_9210_rebuild_declares_restore.py`.
+    """
+    return _cache_write_authorized(f"{_PREWIPE_RESTORE_LANE}: {reason}")
 
 
 def _declares_live_write_lane(reason: str):
@@ -10660,6 +10816,57 @@ class FalkorProjection(
         if prior is None or self._replay_seq > prior:
             mints[key] = self._replay_seq
 
+    def _restore_write(self, cypher: str, *, params=None, reason: str):
+        """Issue ONE pre-wipe snapshot-restore write under its own declaration.
+
+        The declaration travels WITH the write (a required `reason`, never a
+        method-wide scope) so a restore leg cannot be added to `rebuild_all`
+        without stating what it is: a caller that reaches for `self.g.query`
+        here is not declaring anything, and the `#9210` test reads the reason
+        back at the handle. See `_prewipe_restore_write_scope` for the
+        contract (state captured from THIS graph, not a journal replay).
+
+        ⚠️ **The funnel is VOLUNTARY, and its exceptions are named so neither
+        is read as covered.** Two of them, and the second one is not bounded:
+
+        1. the `:GraphEventMeta` watermark is restored by
+           `event_store.reestablish_watermark` (two probe reads + one `MERGE`
+           in ANOTHER module), so the declaration cannot be a `with` here —
+           the helper's own scope would shadow it. It is therefore stated by
+           handing that helper THIS lane's reason (`restore_reason=…`, #9210):
+           the lane still sits at the write, inside `event_store.py`, which is
+           what `#9124`'s rule requires and what `#9224` asserted for its
+           other caller. A write a future edit adds INSIDE that helper
+           inherits the lane its caller stated rather than this funnel's
+           required-`reason` contract, so
+           `tests/test_9210_rebuild_declares_restore.py` classifies the
+           watermark's `MERGE` by its own fragment and
+           `tests/test_9124_declared_live_doors.py` pins the module's opener.
+        2. **NOTHING makes `_rebuild_all_replay` call this method.** It is a
+           helper the eleven known restore statements happen to use, not a
+           gate they must pass: a restore statement added tomorrow as a bare
+           `self.g.query(...)` compiles, runs, and is authorized by the
+           enclosing method-wide `_replay_write_scope()` — i.e. it inherits
+           the very false contract this lane removes. `_LEGS` pins the eleven
+           statements that exist, so it cannot see a twelfth. What DOES bite
+           today is the table-independent half of the pin: a bare restore
+           written in the whole-property-map shape every restore leg uses
+           (`… SET <alias> += $props`) is caught by SHAPE, with no table
+           entry, and goes red on the reason (`"replay"`). Read this as "the
+           restore statements we have are declared, and the map-shaped ones
+           cannot be silently un-declared", NOT as "`rebuild_all` can no
+           longer authorize an undeclared restore". That guarantee needs
+           `#9124`'s handle guard armed. `_prewipe_restore_write_scope`
+           states the same residual where the claim is made. ⚠️ WHICH
+           statements the map-shaped half judges is stated exactly, not
+           approximately: it exempts the ONE statement in that shape that is
+           not a restore (`set_config_reset_marker()`'s `config_reset`
+           marker, whose props are authored at write time), so it cannot
+           blame this lane for a write this lane does not describe.
+        """
+        with _prewipe_restore_write_scope(reason):
+            return self.g.query(cypher, params=params)
+
     @_clears_replay_anchors
     @_fail_closed("rebuild_all")
     @tolerates_altered_numbers
@@ -10668,17 +10875,33 @@ class FalkorProjection(
                     require_empty: bool = False) -> dict:
         """#9124: declare the REPLAY lane, then run the rebuild.
 
-        Every write ``rebuild_all`` performs — the whole-graph wipe, and the
-        per-record folds that follow it — is the cache being reconstructed FROM
-        the journal. That is precisely the lane ``_replay_write_scope`` names
-        (#7951), and it is the declaration §17.1's THIRD door requires before it
-        will let a mutating statement reach ``proj.g``.
+        TWO lanes run inside this method, and the difference is the point of
+        #9210. The whole-graph wipe and the per-record folds are the cache being
+        reconstructed FROM the journal — that is the lane ``_replay_write_scope``
+        names (#7951), and it is the declaration §17.1's THIRD door requires
+        before it will let a mutating statement reach ``proj.g``. The eleven
+        SNAPSHOT-RESTORE statements in the body are NOT, and they do not ride
+        it: they put back state captured from this graph immediately before the
+        wipe (``:Batch`` markers, the onboarding machine, ``:TeamMeta``, the
+        ``#2814`` config registry, the derived ``#4305`` properties, the
+        ``:GraphEventMeta`` watermark), so each one shadows this permit with its
+        own named leg through ``_restore_write`` / ``_prewipe_restore_write_scope``.
+        The replay lane's contract ("this content came FROM the record") is
+        false for them, and #9210 is what stopped them from claiming it.
 
-        Without it, the guard refuses the replay of the first ``PointAdded``
-        record (measured: ``MERGE (n:Point {id:$id}) … SET n.content=…`` raises
-        ``DirectCacheWriteRefused``) and the rebuild path — the very tool the
-        journal exists for — breaks. ``rebuild`` (single-log) already declares
-        this scope; ``rebuild_all`` did not, which is the asymmetry this fixes.
+        DISCLOSED RESIDUALS of that split, so this docstring does not read as a
+        claim it cannot keep: the graph-only ``:Point`` rows carried back through
+        ``synthetic_events`` ARE folded, so that half stays on this permit, and a
+        twelfth restore written as a bare ``self.g.query(...)`` tomorrow still
+        inherits ``"replay"`` — the funnel is voluntary until #9124's handle
+        guard is armed.
+
+        Without the replay lane, the guard refuses the replay of the first
+        ``PointAdded`` record (measured: ``MERGE (n:Point {id:$id}) …
+        SET n.content=…`` raises ``DirectCacheWriteRefused``) and the rebuild
+        path — the very tool the journal exists for — breaks. ``rebuild``
+        (single-log) already declares this scope; ``rebuild_all`` did not, which
+        is the asymmetry this fixes.
 
         The scope is also what makes the wipe legitimate at the third door: a
         wipe REMOVES derived state so the record can be replayed into it, and
@@ -13148,14 +13371,16 @@ class FalkorProjection(
                 _log_identity_skip("Batch", bid, "id (MERGE key)")
                 continue
             clean = {k: v for k, v in props.items() if k != "id"}
-            self.g.query(
+            self._restore_write(
                 "MERGE (b:Batch {id:$id}) SET b += $props",
                 params={"id": bid, "props": clean},
+                reason=":Batch markers (#990)",
             )
         for pid, bid in batch_point_links:
-            self.g.query(
+            self._restore_write(
                 "MATCH (p:Point {id:$pid}) SET p.batch_id = $bid",
                 params={"pid": pid, "bid": bid},
+                reason="Point.batch_id links (#990)",
             )
 
         # Pass 1b tail (#2943, #4305): re-apply the snapshot Point properties
@@ -13272,10 +13497,11 @@ class FalkorProjection(
                     clauses.append(set_embedding_clause("n", "$emb"))
                 params["emb"] = list(emb)
             try:
-                self.g.query(
+                self._restore_write(
                     "MATCH (n:Point {id:$pid}) " + restore_guard
                     + "SET " + ", ".join(clauses),
                     params=params,
+                    reason="Point derived properties (#4305)",
                 )
             except Exception as e:
                 # #4305 review P2: this runs AFTER the wipe, so a value the
@@ -13340,15 +13566,17 @@ class FalkorProjection(
                 _log_identity_skip("Session snapshot", sid, "id (MERGE key)")
                 continue
             clean = {k: v for k, v in props.items() if k != "id"}
-            self.g.query(
+            self._restore_write(
                 "MERGE (s:Session {id:$id}) SET s += $props",
                 params={"id": sid, "props": clean},
+                reason=":Session containers (#3947)",
             )
         for sid, pid in session_point_links:
-            self.g.query(
+            self._restore_write(
                 "MATCH (s:Session {id:$sid}), (p:Point {id:$pid}) "
                 "MERGE (s)-[:CONTAINS]->(p)",
                 params={"sid": sid, "pid": pid},
+                reason=":Session CONTAINS links (#3947)",
             )
 
         # ── #4641: restore the onboarding state machine ─────────────────
@@ -13382,10 +13610,11 @@ class FalkorProjection(
                 continue
             clean = {k: v for k, v in props.items() if k != "org_id"}
             try:
-                self.g.query(
+                self._restore_write(
                     f"MERGE (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) "
                     "SET n += $props",
                     params={"oid": oid, "props": clean},
+                    reason="onboarding state machine (#4641)",
                 )
             except Exception as e:
                 onboarding_restore_failures += 1
@@ -13410,11 +13639,12 @@ class FalkorProjection(
             sid = props.get("org_subject_id")
             if isinstance(sid, str):
                 try:
-                    self.g.query(
+                    self._restore_write(
                         f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}), "
                         "(s:Subject {id:$sid}) "
                         f"MERGE (n)-[:{ONBOARDS_EDGE}]->(s)",
                         params={"oid": oid, "sid": sid},
+                        reason="onboarding onboards edge (#4641)",
                     )
                 except Exception as e:
                     onboarding_restore_failures += 1
@@ -13434,12 +13664,13 @@ class FalkorProjection(
                 onboarding_restore_failures += 1
                 continue
             try:
-                self.g.query(
+                self._restore_write(
                     f"MATCH (n:{ONBOARDING_NODE_LABEL} {{org_id:$oid}}) "
                     f"MERGE (s:{ONBOARDING_STEP_LABEL} "
                     "{org_id:$oid, step_id:$step_id}) "
                     f"MERGE (n)-[:{COMPLETED_STEP_EDGE}]->(s)",
                     params={"oid": oid, "step_id": step_id},
+                    reason="onboarding COMPLETED_STEP links (#4641)",
                 )
             except Exception as e:
                 onboarding_restore_failures += 1
@@ -13639,9 +13870,10 @@ class FalkorProjection(
         team_meta_missing = False
         for props in team_meta_snapshot:
             try:
-                self.g.query(
+                self._restore_write(
                     f"MERGE (m:{_TEAM_META_LABEL}) ON CREATE SET m += $props",
                     params={"props": props},
+                    reason=":TeamMeta first-org marker (#5353)",
                 )
             except Exception as e:
                 team_meta_restore_failures += 1
@@ -13774,12 +14006,13 @@ class FalkorProjection(
                 continue
             identity_prop = spec.identity_prop
             try:
-                self.g.query(
+                self._restore_write(
                     f"MERGE (n:{spec.label} "
                     f"{{{identity_prop}:$identity}}) SET n += $props",
                     params={"identity": identity,
                             "props": {k: v for k, v in props.items()
                                       if k != identity_prop}},
+                    reason=f"config registry {spec.label} (#2814)",
                 )
             except Exception as e:
                 config_restore_failures += 1
@@ -14695,7 +14928,16 @@ class FalkorProjection(
             leftover_carry = (None if leftover is None else
                               _event_meta_last_seq(leftover.get("event_meta")))
             restored = reestablish_watermark(
-                self, _event_meta_last_seq(event_meta_snapshot))
+                    self, _event_meta_last_seq(event_meta_snapshot),
+                    # #9210: the value is the one CAPTURED from this graph
+                    # before the wipe, so this leg states its own lane instead
+                    # of riding the caller's replay permit. The lane has to be
+                    # named HERE and opened INSIDE the helper: an inner scope
+                    # shadows an outer one, so wrapping this call would have
+                    # been silently discarded (#9224 declares `"replay"` for
+                    # the journal engine's call).
+                    restore_reason=f"{_PREWIPE_RESTORE_LANE}: "
+                                   ":GraphEventMeta watermark (#4653)")
             if restored is None:
                 if leftover is not None:
                     logger.error(

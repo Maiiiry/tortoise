@@ -1229,6 +1229,16 @@ surfaces:
   # tool) and this one is load-bearing for the `__main__.py` diff. Pinned by
   # `tests/test_ci_selection.py::test_9078_guard_runs_on_a_main_only_diff`.
   - test_9078_record_written_by_production_path.py
+  # #9192: DUAL-REGISTERED with `core` (below), for exactly the #2969 reason
+  # above. `tortoise/mcp_auth.py` IS a `SOURCE_PATTERNS["api"]` entry, so a
+  # middleware-only diff selects `api` and REPLACES the `core` fallback
+  # (`select()` adds `core` only in its `if not found:` branch) — measured on
+  # this entry's absence: `--changed-files tortoise/mcp_auth.py` yielded
+  # surfaces=['api'] with the file ABSENT, so the nine legs that justify a
+  # fail-closed tenant change would not have run on the very diff class that
+  # breaks them. `core` remains load-bearing for the other input,
+  # `tortoise/record_writer.py`, which matches no SOURCE_PATTERN.
+  - test_9192_tenant_armed_by_request.py
   battery:
   - test_battery_arms.py
   # (removed a duplicate test_battery_derive_truth_leg.py entry here on the
@@ -1382,6 +1392,15 @@ surfaces:
   # DB-free except its last leg, which SKIPS unless `TEST_RECORD_DB_URI` names a
   # Postgres carrying the record migrations — the `TEST_AUDIT_DB_URI` pattern.
   - test_9078_record_written_by_production_path.py
+  # #9192: the production caller of the record's tenant scope + the arming
+  # gate. `core` is load-bearing for `tortoise/record_writer.py` (no
+  # SOURCE_PATTERN → the `core` fallback); the companion `api` arm above is
+  # load-bearing for `tortoise/mcp_auth.py`, which IS named. Without BOTH, a
+  # diff touching only one of the two files runs none of these legs — the
+  # #1349/#2938/#3154/#4367 silent-drop class. DB-free: it drives a mounted
+  # FastMCP app over an embedded registry with planted credentials and spies on
+  # `record_writer.write_records`, so it needs no graph and no URI.
+  - test_9192_tenant_armed_by_request.py
   # #9190: `EventLog.append()` returns the record's journal position (the `seq`
   # `record_projection.replay_plan` keys `journal_event` on) and
   # `EventLog.position()` exposes the count. Same anchor as the #5612 entry
@@ -1393,6 +1412,20 @@ surfaces:
   # even on a push, whose fast pool is built from the manifest, not from the
   # `tests/` glob).
   - test_9190_journal_position.py
+  # #9325/#9326: the record's schema ships as a MAPPED package
+  # (`pyproject.toml` `package-dir` -> `supabase/migrations`), so BOTH Dockerfiles
+  # must COPY that tree or the editable install cannot resolve — and the two
+  # workflows that build them must give the SAME answer on whether the tree is a
+  # rebuild trigger. `core` because the name-gate half pins
+  # `tortoise/record_projection.py` (the `core` fallback). A workflow-only diff
+  # (`.github/workflows/*.yml` is unclassified -> FULL matrix) runs this file
+  # regardless; this entry is what makes it classify at all — `--integrity` reds
+  # an unclassified test file, and a PUSH leg's fast pool is built from the
+  # manifest, not from the `tests/` glob, so without it the file also runs
+  # NOWHERE on a push. Its `test_the_record_reader_is_name_gated` is the evidence
+  # under the 'not a trigger' answer: delete it only together with a real
+  # runtime reader of the directory (see the module docstring).
+  - test_9231_record_migrations_trigger.py
   - test_kind_vocabulary_consistency.py
   # #9123 (§17.1's THIRD lane): the `:EpMeta` epoch declaration. BOTH its
   # subjects — `tortoise/projection/__init__.py` (the new
@@ -3331,6 +3364,14 @@ surfaces:
   # post-restore marker verification, both in tortoise/projection/ (core
   # fallback), over the `#2789` guard's probe in tortoise/hosted_api.py.
   - test_rebuild_team_meta_marker_5353.py
+  # #9210: the SAME wipe+replay, read from the other side — every non-record
+  # snapshot-restore leg (`:Batch`, `:Session`, onboarding, `:TeamMeta`, the
+  # config registry, the `#4305` derived Point properties, the
+  # `:GraphEventMeta` watermark) must observe its own named §17.1 declaration
+  # AT THE WRITE HANDLE, and must not inherit the replay lane even when the
+  # engine is wrapped in one. `tortoise/projection/` is the file it pins, so a
+  # projection change must run it.
+  - test_9210_rebuild_declares_restore.py
   - test_projection_embedded_socket_timeout.py  # #3350: embedded lane socket timeout + bounded retry (carve-out)
   - test_projection_lifecycle.py
   - test_projection_maxmemory_message.py  # #2981: a full-but-healthy DB is not corrupt — maxmemory write-refusal gets its own error, never the rebuild advice
@@ -6656,6 +6697,23 @@ durations:
   # of 88: a duration is a property of the runner, and a figure taken from a
   # saturated box over-weights the shard on every future run.
   test_9190_journal_position.py: 6.0
+  # #9078's guard, added by a PR: a new fast-pool file can never have a CI
+  # duration at PR time (`tools/ci_timing.py --refresh-durations` samples
+  # push-to-main runs), so this row carries a LOCAL measurement. Measured on
+  # this host 2026-10-20 at 34 tests, DB-free
+  # (`TORTOISE_TEST_CARVE_OUT=1`, `TORTOISE_DB_URI` unset, so the two
+  # Postgres legs skip): "2 passed, 34 deselected in 12.82s" for the pair
+  # this row and the #9190 sibling now cover, and the whole file ran
+  # 33-passed/2-skipped in 206s — the weight below is the FAST-POOL share,
+  # which is what the split packs. Entered LOW, the #2517/#4883 precedent
+  # for a newly-added file, so the duration-coverage floor is not spent; the
+  # first post-merge push re-measures it.
+  test_9078_record_written_by_production_path.py: 2.0
+  # #9192: nine legs, DB-free (mounted FastMCP app over an embedded registry with
+  # planted credentials; `write_records` is spied, never a real connection).
+  # Entered LOW per the #2517/#4883 precedent for a newly-added file, so the
+  # duration-coverage floor is not spent; the first post-merge push re-measures.
+  test_9192_tenant_armed_by_request.py: 2.0
   test_5917_torn_tail_seal.py: 2.0
   test_longmem_costing.py: 0.2
   test_longmem_errors.py: 0.1
@@ -7017,6 +7075,25 @@ durations:
   test_graph_delete_hygiene_report.py: 1.8
   test_graph_name_ownership.py: 0.1
   test_graph_storage.py: 5.2
+  # #9210: added by a PR, so no CI reading exists yet (#3400 trap). 7 test
+  # functions, 7 collected cases (both counts are 7 today — the file carries no
+  # parametrization since the eleven table-only cases were deleted; the sixth is
+  # the shape rule's ONE exemption, `_NOT_A_RESTORE_STATEMENTS`, added in round 3
+  # so the rule cannot red on the `config_reset` marker write, and the seventh
+  # pins the sibling `rebuild()` engine's watermark on the engine's `"replay"`
+  # as a DISCLOSED deferral to #9213 — so it reds when that lane changes, not
+  # after someone re-reads the sentence it replaced).
+  # MEASURED locally in the embedded lane: 27.3 s on a quiet box and 35.1 s
+  # under fleet load, of which ~15 s is the FIRST `create_point`'s one-time
+  # embedding-model load — the same artefact #9123 recorded for its own file.
+  # The whole file measured 7.3 s / 6.2 s warm over two runs on 2026-10-20 with
+  # the seventh case in it (the model already loaded in-process), so the
+  # declared 45.0 stays ABOVE the highest LOADED reading and a busy leg cannot
+  # under-pack it. The
+  # weight is unchanged by the deletion of the eleven table-only parametrized
+  # cases (they never executed product code, so they were never part of this
+  # measurement).
+  test_9210_rebuild_declares_restore.py: 45.0
   # #4492: added by a PR, so no CI reading exists yet (`--refresh-durations`
   # samples push-to-main runs only). Hermetic — no DB, no network, no PGlite
   # (the SQL is asserted separately by the PGlite suite, which does not run in

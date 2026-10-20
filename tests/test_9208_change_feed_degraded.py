@@ -34,8 +34,12 @@ from __future__ import annotations
 
 import functools
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -575,7 +579,7 @@ def test_the_degraded_state_is_atomic_across_threads():
     #3498 `graph` pool (`_cp_offload` -> `monitoring.run_control_plane_call`),
     NOT `asyncio.to_thread`'s shared default pool (#3060) — and
     `degraded_graphs()` runs on the event loop from the `async def` health
-    route (`_health_payload` -> `_change_feed_health`) — two thread populations,
+    route (`hosted_api.health()` -> `_change_feed_health`) — two thread populations,
     over one module dict. What the lock guarantees, and what is asserted here:
     `lost` is an exact
     read-modify-write (that count is quoted to the consumer verbatim, so an
@@ -938,6 +942,303 @@ def test_every_writer_takes_the_degraded_map_lock_and_the_reader_does_not(
     assert enters_during(event_store.clear_degraded) == 1, (
         "`clear_degraded` mutates the map, so it must hold the lock")
     event_store.clear_degraded()
+
+
+def test_the_writer_holds_the_lock_across_its_whole_read_modify_write(
+        monkeypatch):
+    """`lost` can only be exact if the READ half is inside the lock too (#9208 review).
+
+    The acquisition-counting pin above proves the lock is TAKEN; it cannot see
+    its SCOPE. Narrowing `record_degraded`'s critical section to
+    `with _DEGRADED_LOCK: previous = _DEGRADED.get(key)` and writing the state
+    after the `with` still shows exactly one `__enter__`, so that test stays
+    green while the unlocked `previous["lost"] + 1` it exists to prevent comes
+    back. This one records, per dict access, whether the lock was HELD at the
+    moment of the access, and reds on any read or write of the map that the
+    writer performs outside it.
+
+    MUTATION that reds it: move either half of the read-modify-write out of the
+    `with` block in `tortoise/event_store.py::record_degraded`.
+    """
+    from types import SimpleNamespace
+
+    held: list[tuple[str, bool]] = []
+    real_lock = event_store._DEGRADED_LOCK
+
+    class _AccessProbe(dict):
+        """A dict that records whether `_DEGRADED_LOCK` was held per access."""
+
+        def get(self, key, default=None):
+            held.append(("get", real_lock.locked()))
+            return super().get(key, default)
+
+        def __setitem__(self, key, value):
+            held.append(("setitem", real_lock.locked()))
+            super().__setitem__(key, value)
+
+    probe = _AccessProbe()
+    monkeypatch.setattr(event_store, "_DEGRADED", probe)
+    proj = SimpleNamespace(_path="/rmw.db", _host=None, graph_name="rmw",
+                           db=None)
+
+    try:
+        event_store.record_degraded(proj, "append", "PointAdded", None,
+                                    RuntimeError("first"))
+        event_store.record_degraded(proj, "append", "PointAdded", None,
+                                    RuntimeError("second"))
+
+        assert [op for op, was_held in held if not was_held] == [], (
+            "every read and write `record_degraded` performs on `_DEGRADED` must "
+            "happen with the lock held — `lost` is an exact read-modify-write and "
+            f"its count is quoted to the consumer: {held}")
+        assert [op for op, _ in held] == ["get", "setitem", "get", "setitem"], (
+            f"the second record is the read-modify-write arm and must read first: {held}")
+        assert probe[next(iter(probe))]["lost"] == 2
+    finally:
+        event_store.clear_degraded()
+
+
+def test_the_LISTING_carries_both_diagnoses_an_operator_needs():
+    """`degraded_graphs()` must forward BOTH diagnoses, not just the current one.
+
+    `degraded(proj)` carries `first_stage`/`first_error` beside the current pair
+    because a graph can fail twice for different reasons and the first is often
+    the only provable one. The listing is the OPERATOR-facing seam (`/health`),
+    and it forwarded `first_stage` with no `first_error` — so a reporter could
+    see that the first failure was a different stage while the sentence the
+    consumer is told quotes only the latest error.
+
+    MUTATION that reds it: drop `first_stage` or `first_error` from the row
+    built in `degraded_graphs()`.
+    """
+    from types import SimpleNamespace
+
+    event_store.clear_degraded()
+    proj = SimpleNamespace(_path="/listing.db", _host=None, graph_name="listing",
+                           db=None)
+    event_store.record_degraded(proj, "append-unverified", "PointAdded", None,
+                                RuntimeError("readback failed"))
+    event_store.record_degraded(proj, "append", "PointAdded", None,
+                                RuntimeError("row absent"))
+    try:
+        rows = event_store.degraded_graphs()
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row["stage"] == "append", row
+        assert row["error"].endswith("row absent"), row
+        assert row["first_stage"] == "append-unverified", row
+        assert row["first_error"].endswith("readback failed"), (
+            "the listing must carry the FIRST error, not only the current one: "
+            f"{row}")
+        assert row["lost"] == 2
+    finally:
+        event_store.clear_degraded()
+
+
+def test_a_recorded_store_identity_does_not_move_when_the_cwd_or_a_symlink_does(
+        monkeypatch, tmp_path):
+    """Canonicalising the path must not make the KEY follow mutable ambient state.
+
+    `_store_identity` folds the process cwd (`abspath`) and the symlinks along
+    the path (`realpath`) into the key, and BOTH the writer and the reader
+    re-derive it. Un-memoised, a recorded loss stops being findable by the very
+    poll it must refuse: after a `chdir` (a relative `_path` is exactly what
+    `TortoiseSDK("rel.db")` produces) or a repointed symlinked deployment dir,
+    `degraded(proj)` answers `None` and `poll_events` returns `[]` over the
+    lost event — the silence this module exists to break.
+
+    MUTATION that reds it: drop `@functools.cache` from `_canonical_path`
+    (`functools.lru_cache(maxsize=None)` is the same decorator spelled long).
+    """
+    from types import SimpleNamespace
+
+    event_store.clear_degraded()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+
+    # 1. a RELATIVE spelling, plus a cwd that moves after the record.
+    monkeypatch.chdir(first)
+    relative = SimpleNamespace(_path="relative.db", _host=None, graph_name="rel",
+                               db=None)
+    event_store.record_degraded(relative, "append", "PointAdded", None,
+                               RuntimeError("lost"))
+    monkeypatch.chdir(second)
+    try:
+        assert event_store.degraded(relative) is not None, (
+            "the key must not move with the process cwd: a recorded loss has "
+            "to stay findable by the poll it refuses")
+
+        # 2. a SYMLINKED parent, repointed after the record.
+        target_a = tmp_path / "store_a"
+        target_b = tmp_path / "store_b"
+        target_a.mkdir()
+        target_b.mkdir()
+        link = tmp_path / "current"
+        link.symlink_to(target_a, target_is_directory=True)
+        symlinked = SimpleNamespace(_path=str(link / "sym.db"), _host=None,
+                                    graph_name="sym", db=None)
+        event_store.record_degraded(symlinked, "append", "PointAdded", None,
+                                    RuntimeError("lost"))
+        link.unlink()
+        link.symlink_to(target_b, target_is_directory=True)
+        assert event_store.degraded(symlinked) is not None, (
+            "a repointed symlinked parent must not change the identity of a "
+            "store whose loss is already recorded")
+    finally:
+        event_store.clear_degraded()
+
+
+#: The child module the behavioural fixture pin runs. ONE pytest session, TWO
+#: tests, in file order: the first latches a degraded feed and never clears it,
+#: the second degrades a feed and clears it in a `finally`. The assertion is on
+#: the CHILD's outcome, because a fixture's teardown body cannot be entered from
+#: inside the session it tears down.
+_ATTRIBUTION_CHILD = '''\
+from types import SimpleNamespace
+
+from tortoise import event_store
+
+
+def _proj():
+    return SimpleNamespace(_path="/child.db", _host=None, graph_name="childfeed",
+                           db=None)
+
+
+def test_polluter_leaves_a_degraded_feed_behind():
+    event_store.record_degraded(_proj(), "append", "PointAdded", None,
+                                RuntimeError("lost"))
+
+
+def test_clean_degrades_then_clears_in_a_finally():
+    try:
+        event_store.record_degraded(_proj(), "emit", "PointAdded", None,
+                                    RuntimeError("lost"))
+    finally:
+        event_store.clear_degraded()
+'''
+
+
+def test_the_attribution_fixture_fails_the_polluter_and_only_the_polluter():
+    """The isolation fixture's LOUD half is exercised, end to end (#9208 review P1).
+
+    `tests/test_9208_change_feed_degraded.py` pinned the DECISION
+    (`tests._change_feed_isolation.leaked_state_message`) but nothing drove the
+    fixture that calls it, so deleting `pytest.fail(message)` from
+    `tests/conftest.py::_change_feed_state_isolation` restored the silent-clear
+    shape this PR exists to remove and NO test went red — the mechanism the PR
+    headlines was, behaviourally, unpinned.
+
+    This runs a real child pytest session over the child module above and
+    asserts the OUTCOME, not the source: the polluter's own nodeid is the thing
+    that errors, it carries the attribution message (so the state was SAMPLED
+    before it was cleared), and the test that clears in a `finally` still passes
+    (so the fixture does not fail a well-behaved test, and the cleared state
+    cannot poison the next test in the same session).
+
+    The child module is written INSIDE `tests/` rather than into `tmp_path`: a
+    child session rooted outside the repo re-derives its `rootdir` from the
+    argument, and the suite's tmpdir hygiene guard then refuses its own walk
+    (#3752).
+
+    ⛔ The file is named `attribution_child_case.py`, NOT `test_*.py`, and that
+    is load-bearing — not tidiness (#9320 review P1). pytest gates recursive
+    collection on `python_files`, NOT on the directory name (this repo sets no
+    `testpaths`/`norecursedirs`), so a `test_*` name here is collected by any
+    peer `pytest tests/` **and** reported as unclassified drift by
+    `tools/ci_selection.py --integrity`, whose `tests/test_ci_selection.py`
+    runs the real check over the real tree. The child is invoked by explicit
+    path, and an explicitly-passed file is collected regardless of the pattern,
+    so nothing is lost. The directory is unique per (pid, uuid) and `mkdir` +
+    `write_text` sit INSIDE the `try`, so a partial write still hits the
+    `finally`.
+
+    MUTATION that reds it: delete the `pytest.fail(message)` from the fixture
+    (the child then exits 0), or move the pre-test clear AFTER the sample (the
+    polluter is no longer named).
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    child_dir = (repo_root / "tests"
+                 / f"_cf_attribution_{os.getpid()}_{uuid.uuid4().hex[:8]}")
+    child = child_dir / "attribution_child_case.py"
+    # ⛔ The child env is EXPLICIT, not inherited (#9320 round 3, P1): stripping
+    # only `TORTOISE_DB_URI` and `PYTEST_*` leaves the child with the PARENT
+    # LANE's shape, and on the docker/full lane that is `EXPECT_URI=1` with no
+    # URI — the child then dies at session start (`tests/conftest.py`:
+    # "TORTOISE_TEST_EXPECT_URI=1 but TORTOISE_DB_URI unset"), names no polluter,
+    # and reds this test on every push. `CARVE_OUT` must be ASSIGNED, not
+    # `setdefault`: the full lane exports it present-but-EMPTY, and an empty
+    # value is falsy, so `setdefault` leaves the embedded lane disarmed. The
+    # `PYTEST_*` strip is the same hazard one level down — `--tb=no` suppresses
+    # the traceback that CARRIES the attribution message (measured).
+    _LANE_VARS = ("TORTOISE_DB_URI", "TORTOISE_TEST_EXPECT_URI",
+                  "TORTOISE_TEST_CARVE_OUT")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("PYTEST_") and k not in _LANE_VARS}
+    # The child is the EMBEDDED carve-out lane: no URI, expected-but-absent URI
+    # assertions off, carve-out on.
+    env["TORTOISE_TEST_CARVE_OUT"] = "1"
+    try:
+        child_dir.mkdir(parents=True)
+        child.write_text(_ATTRIBUTION_CHILD, encoding="utf-8")
+        # `Popen` + `communicate(timeout=…)` in a NEW SESSION, rather than
+        # `subprocess.run(timeout=600)` (#9320 review P2): the item budget is
+        # 300s (pyproject `timeout`), so a 600s bound can never fire — and the
+        # item's SIGALRM unwinds `communicate()` into `Popen.__exit__`, whose
+        # `wait()` is UNBOUNDED, so a hung child would outlive every guard here.
+        # 120s is ~30x the measured ~4s child, and the kill is on the process
+        # GROUP so the child's own pytest can never be orphaned.
+        child_proc = subprocess.Popen(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider",
+             "-q", "--no-header", "-c", "pyproject.toml", "--rootdir", ".",
+             str(child)],
+            cwd=str(repo_root), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env,
+            start_new_session=True)
+        try:
+            out, err = child_proc.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(child_proc.pid, 9)
+            out, err = child_proc.communicate()
+            pytest.fail(
+                "the child pytest session did not finish in 120s — the "
+                "fixture pin cannot measure anything from a hung session "
+                f"(#9320); output so far:\n{out}{err}")
+        finally:
+            # Kill on EVERY exit, not just the timeout (#9320 round 3, P2): an
+            # exception from `communicate()` that is not `TimeoutExpired`
+            # (`pytest-timeout`'s handler, `KeyboardInterrupt`) would otherwise
+            # leave the child running past this test — and past the `rmtree` of
+            # the module it is executing, which is the orphan this test exists
+            # to avoid; the child is in its own session, so nothing else reaps it.
+            if child_proc.poll() is None:
+                os.killpg(child_proc.pid, 9)
+                child_proc.wait(timeout=30)
+        returncode = child_proc.returncode
+    finally:
+        shutil.rmtree(child_dir, ignore_errors=True)
+
+    output = (out or "") + (err or "")
+    summary = output.split("short test summary info")[-1]
+    assert returncode != 0, (
+        "the polluter must red the child session — a green child means the "
+        f"fixture cleared the leak silently again:\n{output}")
+    assert ("TORTOISE_TEST_EXPECT_URI=1 but" not in output
+            and "requires TORTOISE_DB_URI" not in output), (
+        "the child died of a LANE mismatch, not of the polluter: the child env "
+        "must be the embedded carve-out shape, whatever lane the PARENT is "
+        f"running (#9320 round 3):\n{output}")
+    assert "test_polluter_leaves_a_degraded_feed_behind" in summary, (
+        f"the failure must NAME the polluter, not its successor:\n{output}")
+    assert "left 1 degraded change feed(s) behind" in output, (
+        "the teardown must say what was left and by whom, from a sample taken "
+        f"BEFORE the clear:\n{output}")
+    assert "test_clean_degrades_then_clears_in_a_finally" not in summary, (
+        "a test that clears in a `finally` must not be failed by the fixture "
+        f"(it is the successor, not the polluter):\n{output}")
+    assert "2 passed" in output and "1 error" in output, (
+        "exactly the polluter is attributed; measured summary: "
+        f"{[ln for ln in output.splitlines() if 'passed' in ln][-1:]}")
 
 
 def test_a_leaked_degradation_is_attributed_to_the_test_that_left_it():
