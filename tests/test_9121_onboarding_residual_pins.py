@@ -33,12 +33,13 @@ so each assertion has a way to fail:
   exists to see) and `state._run(...)` (the honest fix, which would leave the
   note describing a gap that no longer exists);
 * the day one of those sites is DECLARED — the honest fix, `#9157` —
-  `test_no_eager_init_site_declares_itself_yet` turns RED *when the declaration
-  is a `with` in the same function*, so the note, the guard's opener inventory
-  and this file have to move together instead of drifting back to a universal
-  ("every onboarding write is declared") that the escape disproves. The
+  `test_no_escape3_function_opens_a_declaration_anywhere_yet` turns RED *when
+  the declaration is a `with` in the same function*, so the note, the guard's
+  opener inventory and this file have to move together instead of drifting back
+  to a universal ("every onboarding write is declared") that the escape
+  disproves. The
   `_run` route opens its scope in another file and is caught by the linkage
-  pin above;
+  pin below;
 * the fact that the detector is *capable* of firing is not argued, it is
   executed: `test_the_declaration_detector_can_fail` runs it over a synthetic
   declaration **for every recorded opener** and requires a hit, and
@@ -71,6 +72,7 @@ from __future__ import annotations
 
 import ast
 import textwrap
+from functools import cache
 from pathlib import Path
 
 from tortoise.onboarding import state as _os
@@ -198,6 +200,7 @@ def _assert_site_count(region: str, template: str, what: str) -> None:
     )
 
 
+@cache
 def _parse(rel: str) -> tuple[ast.Module, dict[ast.AST, ast.AST]]:
     tree = ast.parse((_REPO / rel).read_text(encoding="utf-8"))
     parents = {
@@ -496,7 +499,16 @@ def _eager_init_sites() -> dict[tuple[str, str], int]:
 
 def _declaring_functions(tree: ast.Module,
                          parents: dict[ast.AST, ast.AST]) -> set[str]:
-    """Enclosing functions of a `with` that opens a §17.1 declaration."""
+    """Enclosing functions of a `with` that opens a §17.1 declaration.
+
+    ⚠️ Deliberately FUNCTION-granular, not statement-granular: a `with` anywhere
+    inside an escape-(3) function is worth a human look, because that function
+    IS the site. The cost is a FALSE RED when an unrelated `with` is added
+    nearby — accepted, and the failure message names both causes so a lane is
+    never told it closed #9157 when it did not. Statement-level resolution
+    (walk the `With` body for the issued statement name, as `_statement_sinks`
+    does) is the fix if that turns out to hurt more than it helps.
+    """
     out: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, (ast.With, ast.AsyncWith)):
@@ -796,14 +808,21 @@ def test_the_escape3_sites_are_the_mint_sites_that_use_eager_init():
     )
 
 
-def test_no_eager_init_site_declares_itself_yet():
+def test_no_escape3_function_opens_a_declaration_anywhere_yet():
     """THE COUPLING: today no escape-(3) function opens a §17.1 declaration.
 
-    This is the assertion the deleted runtime probe only *claimed* to make. It
-    turns RED the day `#9157` lands by putting a `with` over ANY scope opener
-    (`_DECLARATION_PRIMITIVES`) into `sdk.py` / `hosted_api.py` around one of
-    the five sites — which is precisely when the note in `onboarding/state.py`,
-    the opener inventory in `projection/__init__.py` and this file must change
+    WHAT THIS MEASURES IS COARSER THAN ITS NAME USED TO SUGGEST, on purpose: it
+    reds on a declaration-scope `with` ANYWHERE inside an escape-(3) function
+    (`sdk.py` / `hosted_api.py`), not only around one of the five
+    `eager_init_query()` sites. Those functions ARE the sites, so a scope
+    appearing in one is worth a human look either way — but the two possible
+    causes are different, and the failure message names both rather than
+    assuming the interesting one.
+
+    It still turns RED the day `#9157` lands: putting a `with` over any scope
+    opener (`_DECLARATION_PRIMITIVES`) into one of those functions around one of
+    the five sites is precisely when the note in `onboarding/state.py`, the
+    opener inventory in `projection/__init__.py` and this file must change
     together.
 
     ⚠️ What this does NOT see: the honest fix may instead route the statement
@@ -825,11 +844,16 @@ def test_no_eager_init_site_declares_itself_yet():
     }
     escaped = {rel: names for rel, names in escaped.items() if names}
     assert not escaped, (
-        "an escape-(3) site now DECLARES itself — the residual (#9157) is being "
-        f"closed: {escaped}. Update, in the same change: the note in "
-        "`tortoise/onboarding/state.py`, the opener inventory in "
-        "`tortoise/projection/__init__.py`, and this pin — otherwise the "
-        "docstrings keep describing a gap that no longer exists"
+        "a §17.1 declaration scope now appears INSIDE an escape-(3) function: "
+        f"{escaped}. TWO possible causes, check which before acting. "
+        "(a) #9157 is being closed — then update, in the same change: the note "
+        "in `tortoise/onboarding/state.py`, the opener inventory in "
+        "`tortoise/projection/__init__.py`, and this pin, otherwise the "
+        "docstrings keep describing a gap that no longer exists. "
+        "(b) an UNRELATED `with` was added in that function — this pin is "
+        "function-granular on purpose and cannot tell the two apart; move the "
+        "scope out of the escape-(3) function, or tighten this pin to "
+        "statement level."
     )
 
 
@@ -852,7 +876,7 @@ def test_the_opener_inventory_is_pinned_so_a_new_lane_moves_this_file():
     and `onboarding/state.py` is the likeliest home for the `#9157` fix. Those
     are caught by `test_the_detector_population_is_pinned_by_content` (whose
     population is derived over all of `tortoise/`) and by
-    `test_no_eager_init_site_declares_itself_yet` (a site that starts declaring
+    `test_no_escape3_function_opens_a_declaration_anywhere_yet` (a site that starts declaring
     itself) — not here. This pin's job is the BULLET LIST a reader is told is
     exhaustive, so it moves when the list gains an entry defined in the module
     that list lives in.
@@ -917,7 +941,8 @@ def test_the_detector_population_is_pinned_by_content():
     assert derived == expected, (
         "the detector population changed: derived "
         f"{sorted(derived)} vs recorded {sorted(expected)}. This population is "
-        "what makes `test_no_eager_init_site_declares_itself_yet` able to see a "
+        "what makes `test_no_escape3_function_opens_a_declaration_anywhere_yet` "
+        "able to see a "
         "site declared through ANY opener — narrowing it re-opens the hole "
         "(#9157)"
     )
@@ -926,7 +951,7 @@ def test_the_detector_population_is_pinned_by_content():
 def test_the_declaration_detector_can_fail():
     """The instrument check: `_declaring_functions` must SEE every declaration.
 
-    Without this, `test_no_eager_init_site_declares_itself_yet` would also pass
+    Without this, `test_no_escape3_function_opens_a_declaration_anywhere_yet` would also pass
     if the detector were broken (a renamed helper, a `with` form it stopped
     matching) — an instrument that cannot fail is not evidence. It is run over
     EACH recorded opener: an earlier revision exercised only
