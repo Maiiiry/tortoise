@@ -983,11 +983,12 @@ def _report_unproven_seal(key: str, path: Path) -> None:
 def _read_regular_file(path: Path) -> bytes | None:
     """The file's bytes, or ``None`` if it is not a REGULAR file.
 
-    ``O_NONBLOCK`` is load-bearing, not tidiness: both callers run inside the
-    append's critical section (the per-path THREAD lock, always held; the
-    ``flock`` is conditional — see `_lock_exclusive` — so it is the thread lock,
-    not the ``flock``, that keeps this from racing a peer in this process), and
-    a FIFO — or any other special file someone left at the cache path — would
+    ``O_NONBLOCK`` is load-bearing, not tidiness: its one caller
+    (`_read_position_cache`) runs inside the journal's critical section (from
+    ``append``, and from ``position()``) — the per-path THREAD lock, always held;
+    the ``flock`` is conditional (see `_lock_exclusive`), so it is the thread
+    lock, not the ``flock``, that keeps this from racing a peer in this process.
+    A FIFO — or any other special file someone left at the cache path — would
     BLOCK the open or the read there, parking every appender to that journal in
     every process with nothing distinguishing it from a wedged peer. Non-blocking plus an
     ``S_ISREG`` check makes a special file a cache MISS instead: the cache is an
@@ -1683,8 +1684,15 @@ class EventLog:
         between the ``exists`` check and the open is re-created empty, which is
         the answer ``0`` for the file that then exists; and it writes the
         position cache through — but only when it holds the cross-process lock
-        AND the journal still holds the state it counted (in the degraded window,
-        or when the journal moved under the count, it leaves the cache alone).
+        AND the journal still holds the state it counted. Two DIFFERENT "the
+        journal moved under the count" cases have two different outcomes, and
+        neither one writes a cache entry: a PEER appended during the count
+        (including in the degraded window, where the lock proves nothing) makes
+        the state re-read differ, so the count is returned and the cache is left
+        alone; and a RESTORE that replaced the journal's inode during the count
+        raises (``:raises OSError:`` below), because the number counted belongs
+        to the file the path has since left and there is no count to give for
+        the one it now names. Neither case caches anything.
 
         Unlike :meth:`append` it RECOUNTS even while the journal's sidecar is in
         its ``_POSITION_CACHE_DEAD`` window: the append path declines that cost
@@ -1695,10 +1703,14 @@ class EventLog:
 
         :raises OSError: the journal exists but could not be opened, stat'ed or
             read (a read-only journal raises here — this method needs the
-            write fd for its lock), so there is no count to give. It raises
-            rather than answering ``0``, which is a fact about an EMPTY journal
-            and would be the same silence this method's ordinal exists to
-            remove.
+            write fd for its lock), **or** the path stopped naming the journal
+            whose count was taken (a restore or a rotation inside the count, so
+            the number the count produced is another file's) — in either case
+            there is no count to give. It raises rather than answering ``0``,
+            which is a fact about an EMPTY journal and would be the same
+            silence this method's ordinal exists to remove; and rather than
+            returning the number of a journal the path has left, which once
+            cached would be a fabricated count no later recount could correct.
         """
         if not self.path.exists():
             return 0

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import errno
 import gc
+import inspect
 import json
 import logging
 import os
@@ -1101,6 +1102,56 @@ def test_position_refuses_a_count_taken_on_a_journal_that_was_replaced(
     assert [r["n"] for r in read_for_replay(EventLog(path))] == ["restored"]
     assert EventLog(path).append({"n": "after"}) == 2
     assert before != path.read_bytes()
+
+
+def _doc_paragraph(doc: str, needle: str, *, starts: bool = False) -> str:
+    """The blank-line-delimited paragraph of *doc* that contains *needle*.
+
+    Whitespace-collapsed, so a wrapped sentence can be asserted by content and
+    a reflow of the prose does not break the test. With *starts*, the paragraph
+    must BEGIN with the needle — needed for `:raises OSError:`, which the
+    narrative also cites by name.
+    """
+    for para in doc.split("\n\n"):
+        text = " ".join(para.split())
+        if (text.startswith(needle) if starts else needle in text):
+            return text
+    raise AssertionError(f"no paragraph of the docstring starts with "
+                         f"{needle!r}" if starts else
+                         f"no paragraph of the docstring contains {needle!r}")
+
+
+def test_the_documented_raise_set_names_the_replaced_journal_case():
+    """The third raise condition this branch added is in the PUBLISHED contract.
+
+    `:raises OSError:` is what a caller reads, not the inline comment beside the
+    `_path_identity` check. The replaced-during-count case is none of "could not
+    be opened, stat'ed or read" — the journal WAS all three; a DIFFERENT file is
+    at the path now — so without a clause naming it the docstring cannot derive
+    the raise the code performs. Same class as the two prose defects this PR
+    fixed under its own rule ("prose the code does not support").
+
+    The narrative is pinned too, because the two "the journal moved under the
+    count" inputs now have two different answers: a peer appended → the count is
+    returned with the cache left alone; the path stopped naming the counted
+    journal → `OSError`. Collapsing them back into "it leaves the cache alone"
+    is the stale sentence this test exists to catch.
+    """
+    doc = inspect.getdoc(EventLog.position) or ""
+
+    clause = _doc_paragraph(doc, ":raises OSError:", starts=True)
+    assert "stopped naming" in clause, (
+        "the published raise set does not name the replaced-journal case: "
+        f"{clause!r}")
+    assert "count was taken" in clause, clause
+    assert "restore" in clause or "rotation" in clause, clause
+
+    narrative = _doc_paragraph(doc, "position cache through")
+    assert "peer" in narrative.lower(), (
+        "the cache narrative no longer names the peer-append outcome, so the "
+        f"two outcomes read as one: {narrative!r}")
+    assert "restore" in narrative.lower(), narrative
+    assert "raise" in narrative.lower(), narrative
 
 
 def test_position_recounts_and_clears_a_dead_mark(
