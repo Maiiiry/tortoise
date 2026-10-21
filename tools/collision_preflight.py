@@ -1011,6 +1011,15 @@ class Surface:
     # as DATA beside the note (not parsed back out of the note's prose), so the
     # note and the remedy cannot disagree about whether a cure exists.
     truncation_widenable: bool = True
+    # Whether this surface failed on a BUDGET EXHAUSTION the tool MEASURED, as
+    # DATA beside the note (#9423 review round 10, P3). `_incomplete_remedy`
+    # used to re-parse the note's prose for the signature — and the note embeds
+    # the gh error line only after `_one_line(..., limit=600)`, whose truncation
+    # keeps the FIRST 600 chars: a verbose stderr with the signature past that
+    # point lost it, and the report then prescribed "fix gh auth/network" for a
+    # cause the same run had already established. A surface that WAS rescued from
+    # an exhaustion knows the cause without reading a note, so it says so here.
+    budget_exhausted: bool = False
     # Whether this surface's hits and failures can affect the VERDICT.
     # `advisory` surfaces are still queried, still reported, and still HIT —
     # they simply cannot block a dispatch and cannot force INCOMPLETE (#5251).
@@ -5526,16 +5535,19 @@ def run_preflight(
                 # absence of the key is UNMEASURED, not "closes nothing". This is
                 # the honest half of #9402: recovering the enumeration must not
                 # be mistaken for having proved the negative.
-                # ⛔ THE REFUSED READ GOES FIRST, NOT LAST (#9423 review round 9,
-                # P3). `rest_cause` is the GraphQL error line, and it is what
-                # `_incomplete_remedy` classifies (`_is_budget_exhaustion(s.note)`)
-                # to decide whether the remedy says "budget" or the generic
-                # "fix gh auth/network". The note is truncated at ONE point
-                # (`_one_line(..., limit=...)`), so a signature near the END can
-                # be cut off by verbose gh stderr — and the report then
-                # prescribes a cure for a cause it had just measured. Leading
-                # with the cause means truncation can only ever remove prose
-                # that carries no signature.
+                # ⛔ THE CAUSE IS RECORDED AS DATA, NOT LEFT TO PROSE PARSING
+                # (#9423 review round 10, P3). This branch runs ONLY because
+                # `_is_budget_exhaustion` matched the GraphQL failure, so the
+                # surface's cause is KNOWN here. `_incomplete_remedy` re-reading
+                # the note was the fragile half: the note embeds the gh error via
+                # `_one_line(..., limit=_REFUSED_READ_NOTE_LIMIT)`, which keeps
+                # the FIRST 600 chars, so a verbose stderr could push the
+                # signature out of the note entirely and the report would again
+                # prescribe "fix gh auth/network" for a spent budget. (An earlier
+                # round moved the cause to the front of the NOTE and claimed that
+                # fixed it — the review correctly showed it did not, because the
+                # cut is applied to `rest_cause`, not to the note.)
+                surface.budget_exhausted = True
                 surface.incomplete(
                     f"closing-references-unmeasured: refused read — {rest_cause} "
                     "— the open-PR list was then answered over REST; "
@@ -5888,12 +5900,14 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
     """
     both = [
         s for s in incomplete
-        if s.truncated and _is_budget_exhaustion(s.note or "")
+        if s.truncated
+        and (s.budget_exhausted or _is_budget_exhaustion(s.note or ""))
     ]
     both_ids = {id(s) for s in both}
     exhausted = [
         s for s in incomplete
-        if id(s) not in both_ids and _is_budget_exhaustion(s.note or "")
+        if id(s) not in both_ids
+        and (s.budget_exhausted or _is_budget_exhaustion(s.note or ""))
     ]
     truncated = [
         s for s in incomplete if id(s) not in both_ids and s.truncated

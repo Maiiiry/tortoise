@@ -256,6 +256,16 @@ case "$1 $2" in
       echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
       exit 1
     fi
+    # #9423 review round 10 (P3): a VERBOSE exhaustion whose SIGNATURE falls past
+    # the point where the surface note truncates the gh error (`_one_line(...,
+    # limit=...)` keeps the FIRST N chars). The remedy must still name the budget
+    # — that is the whole #9402 defect — so this seam is what pins the cause as
+    # DATA on the surface rather than a substring of a cut note.
+    if [ "${state:-open}" = "open" ] && [ "${GH_STUB_PR_LIST_VERBOSE_EXHAUSTION:-0}" = "1" ]; then
+      printf '%0.schatter-' $(seq 1 120) >&2
+      echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
+      exit 1
+    fi
     # #9423 review (P1): the SAME exhaustion behind a LONGER stderr. `gh` emits
     # transport chatter before the GraphQL error on a verbose/retrying run, and
     # the tool one-lines that stderr into its message — so a fixed display cut
@@ -5566,6 +5576,29 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("a TARGET the tool cannot resolve (issue assignee/holder", out)
         self.assertIn("re-authenticating cannot change it", out)
         self.assertIn("and PART is:", out)
+
+    def test_a_verbose_exhaustion_still_yields_the_budget_remedy(self):
+        # ⛔ THE REMEDY MUST NOT DEPEND ON A SIGNATURE SURVIVING TRUNCATION
+        # (#9423 review round 10, P3). The surface note embeds the gh error line
+        # after `_one_line(..., limit=...)`, which keeps the FIRST N characters —
+        # so a verbose stderr can push "API rate limit already exceeded" out of
+        # the note entirely. `_incomplete_remedy` re-parsing that note then told
+        # the reader to re-authenticate and rebuild the fleet board for a budget
+        # exhaustion THIS RUN had already established — the exact #9402 defect
+        # surviving at whatever the cut happens to be.
+        #
+        # The fix is structural: the rescue records `Surface.budget_exhausted`
+        # because it only runs when the predicate matched, so no prose has to
+        # survive. This fixture makes the signature fall past the cut: 120 chunks
+        # of "chatter-" (~960 chars) precede it.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_PR_LIST_VERBOSE_EXHAUSTION": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("closing-references-unmeasured", out)
+        self.assertIn("GRAPHQL BUDGET EXHAUSTION", out)
+        self.assertNotIn("fix gh auth/network", out)
 
     def test_the_landed_summary_does_not_deny_the_read_it_reports(self):
         # #9423 review round 9 (P3): the LANDED branch has its OWN `ALSO
