@@ -3127,6 +3127,35 @@ def _rest_pr_wire_reason(element: object, index: int, where: str) -> str | None:
             "would be read as a live PR instead of being refused, and `state` "
             "is what decides whether a hit is terminal (NOT clean)"
         )
+    # ⛔ `title` / `body` ARE TYPED HERE TOO, AND FOR THE SAME REASON AS `state`
+    # (#9423 review round 6, P3). The projection writes
+    # `element.get("title") or ""` / `element.get("body") or ""`, so a FALSY
+    # non-string wire value (`0`, `false`, `[]`, `{}`, and `title: null`) was
+    # laundered into `""` BEFORE `_require_pr_dicts`' `isinstance(..., str)` loop
+    # could see it — the "non-string title/body is a REFUSAL" contract therefore
+    # held for TRUTHY non-strings only, i.e. on one of the two transports. Not a
+    # verdict-level fail-open (title/body only ever ADD hits, and the rescued
+    # surface is forced INCOMPLETE regardless), but it is the identical
+    # laundering that `state` was just fixed for, and a contract that applies to
+    # half of one transport's values is how the reads start disagreeing.
+    #
+    # `body` is the ONE key where `null` is a real wire VALUE (a PR with no
+    # description), so it is accepted and only a non-string, non-null body is
+    # refused. A `null` title is refused: GitHub never sends one.
+    if not isinstance(element.get("title"), str):
+        return (
+            f"{where} returned an element with a non-string 'title' at index "
+            f"{index} ({type(element.get('title')).__name__}) — coercing it to "
+            "'' would silently drop the title test on a BLOCKING surface "
+            "(NOT clean)"
+        )
+    if element.get("body") is not None and not isinstance(element.get("body"), str):
+        return (
+            f"{where} returned an element with a non-string 'body' at index "
+            f"{index} ({type(element.get('body')).__name__}) — coercing it to "
+            "'' would silently drop the body's closing-reference test on a "
+            "BLOCKING surface (NOT clean)"
+        )
     head = element.get("head")
     if not isinstance(head, dict):
         return (

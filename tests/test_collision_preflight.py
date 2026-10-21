@@ -5558,6 +5558,30 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("re-authenticating cannot change it", out)
         self.assertIn("and PART is:", out)
 
+    def test_falsy_non_string_rest_title_and_body_are_refused_not_laundered(self):
+        # #9423 review round 6 (P3): the projection writes `title or ""` /
+        # `body or ""`, so a FALSY non-string wire value was laundered into the
+        # empty string before `_require_pr_dicts`' type loop could see it — the
+        # "non-string title/body is a REFUSAL" contract held for TRUTHY
+        # non-strings only. `null` is legal for `body` (a PR with no
+        # description) and illegal for `title`.
+        for key, bad in (("title", 0), ("title", None), ("body", False),
+                         ("body", [])):
+            with self.subTest(field=key, value=bad):
+                self.gh_fixtures(open_prs=[{
+                    "number": 9414, "title": "chore: unrelated wording", "body": "",
+                    "headRefName": "chore/9999-other", "state": "open",
+                }])
+                raw = json.loads((self.gh_dir / "open_prs_rest.json").read_text())
+                raw[0][key] = bad
+                (self.gh_dir / "open_prs_rest.json").write_text(json.dumps(raw))
+                rc, out = self.run_tool(
+                    env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+                self.assertEqual(rc, 2, out)
+                self.assertIn("VERDICT: INCOMPLETE", out)
+                self.assertNotIn("VERDICT: CLEAN", out)
+                self.assertIn(f"non-string '{key}' at index 0", out)
+
     def test_a_rest_open_pr_element_with_a_non_string_state_is_refused(self):
         # #9423 review (P3): the projection coerces `state`
         # (`str(...).upper()`), which made `_require_pr_dicts`' non-string refusal
