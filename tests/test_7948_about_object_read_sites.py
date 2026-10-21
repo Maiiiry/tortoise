@@ -241,6 +241,23 @@ WHAT THIS PINS
    to 19 rows over 22 doors (measured at this head). The
    inputs are the TABLE's twenty-two doors, not the 99-tool registry, so adding a tool
    does not move them — which is what makes them pinnable without churn.
+23. `test_the_gate_walk_comment_pins_no_wall_clock_figure` +
+   `test_the_gate_walk_comment_arm_reds_on_the_text_it_replaced` — the `#9506` arms,
+   and the only ones here about this instrument's OWN prose rather than §13's. The
+   gate-walk comment in `_about_call_time_census.py` carried a duration a re-verifier
+   cannot settle — `measured 10.36 s of the control's 10.85 s` on the merge base, and
+   `~2.6 s of ~17 s` on an intermediate head of the branch — neither with the framing
+   that produced it (whole arm? control step? `--durations=0`? which box?), the
+   defect class three earlier rounds removed from that file. The rule is stated once
+   as `_unframed_durations()`: a duration is a claim, and it is allowed only when the
+   comment also carries the framing that produced it. ⚠️ The first version of the
+   guard keyed on the self-denial PHRASE instead (`no (magnitude|wall-clock)` AND a
+   duration), which was **green on the merge base** — the text the PR exists to
+   replace names no denial — and would go green again on any rewording of the denial,
+   so it retired itself on the next prose edit. The predicate no longer reads the
+   denial at all, and the second arm is its non-vacuity: the merge-base string and
+   the intermediate string RED, a duration carrying its framing stays GREEN, and a
+   duration with only "one box" for company (hardware is not framing) REDs.
 
 ⚠️ **What this deliberately does NOT claim.** The LITERAL census is a LOWER
 BOUND: it sees a relationship pattern naming the edge, so a reader that
@@ -265,8 +282,11 @@ from __future__ import annotations
 
 import ast
 import functools
+import inspect
 import re
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
@@ -3558,7 +3578,7 @@ def test_the_ungated_walk_reuses_the_gated_derivations():
     is run over a truncated module set, so an inline copy records NOTHING and reds.
     """
     census = _call_time_census()
-    sources = census._sources()
+    sources = census._universe()
     assert len(sources) > 2, "the package has too few modules to run this arm"
     subset = dict(sorted(sources.items())[:2])
 
@@ -3567,7 +3587,7 @@ def test_the_ungated_walk_reuses_the_gated_derivations():
         "_empty_pattern_sites_in": set(),
         "_call_time_sites_in": set(),
     }
-    originals = {name: getattr(census, name) for name in (*recorded, "_sources")}
+    originals = {name: getattr(census, name) for name in (*recorded, "_universe")}
 
     def _recording(name: str, real):
         def wrapper(file):
@@ -3579,7 +3599,7 @@ def test_the_ungated_walk_reuses_the_gated_derivations():
     patched: dict[str, object] = {
         name: _recording(name, getattr(census, name)) for name in recorded
     }
-    patched["_sources"] = lambda: subset
+    patched["_universe"] = lambda: subset
     try:
         for name, value in patched.items():
             setattr(census, name, value)
@@ -3664,3 +3684,269 @@ def test_a_module_constant_is_attributed_to_its_consumer():
         f"derived {sorted(derived)} — either the fallback is unreachable again (the "
         "line the review flagged) or the rule now attributes an unattributable read"
     )
+
+
+def _gate_walk_comment() -> str:
+    """The `#` lines of `_narrow_gate_walk_sites` — the comment `#9506` is about."""
+    census = _call_time_census()
+    source = inspect.getsource(census._narrow_gate_walk_sites)
+    return "\n".join(
+        line.strip() for line in source.splitlines() if line.lstrip().startswith("#")
+    )
+
+
+#: A duration, as a comment pins one (`10.36 s`, `~2.6 s`, `850 ms`).
+_DURATION = re.compile(r"\d+(?:\.\d+)?\s?(?:ms|s)\b")
+
+#: What makes a pinned duration SETTLEABLE — the framing that produced it.
+#: Each entry names the measurement a re-verifier must reproduce to check the
+#: number; "one box" deliberately is NOT here, because hardware is the condition
+#: a number is taken under, not the measurement it was taken OF.
+_DURATION_FRAMING = (
+    "--durations",
+    "whole arm",
+    "control step",
+    "in-suite",
+)
+
+
+def _unframed_durations(comment: str) -> list[str]:
+    """Durations `comment` pins WITHOUT the framing that produced them (`#9506`).
+
+    ⚠️ **This predicate is the fix to a FAIL-OPEN guard, not a rewording of one.**
+    The first version of the arm red on the co-occurrence of a self-denial phrase
+    (`no magnitude` / `no wall-clock`) AND a duration. That made it **green on the
+    merge base** — `git show origin/main:tests/_about_call_time_census.py` carried
+    *"re-reading `_sources()` and rebuilding the same 29 `_File`s measured 10.36 s
+    of the control's 10.85 s for byte-identical output"*, which says no denial at
+    all, so there was nothing for the guard to fire on: the arm passed on precisely
+    the text this PR deletes, and would pass again if that figure were re-introduced.
+    It was also fail-open on REWORDING — turning "No magnitude is pinned" into "No
+    timing figure is named" silently retired it.
+
+    So the rule now reads the CLAIM rather than a phrase about it: a duration is a
+    fact asserted about a measurement, and it is acceptable only when the comment
+    also states the framing that produced it. This reds on the merge-base text and
+    on the intermediate `~2.6 s of ~17 s` sentence alike, and no rewording can
+    retire it because it never reads the denial.
+
+    Coarse in one documented direction: the framing marker is matched over the whole
+    comment, not per number, so a comment that carries its framing may also mention
+    a second figure. That is the harmless direction — it can only stay GREEN where
+    the framing IS stated, which is the state the reviewer asked to keep allowed.
+    """
+    found = _DURATION.findall(comment)
+    if any(marker in comment for marker in _DURATION_FRAMING):
+        return []
+    return found
+
+
+def test_the_gate_walk_comment_pins_no_wall_clock_figure():
+    """A pinned duration must carry the framing that produced it (`#9506`).
+
+    ⚠️ **The `#9506` defect was a claim a re-verifier cannot settle.** The
+    refactor's comment read *"No magnitude is stated on purpose: the redundant
+    rebuild is a fraction of this arm (a re-verifier measured ~2.6 s of ~17 s on one
+    box)"* — an assertion that no magnitude is stated, immediately followed by one,
+    on the exact axis the change exists to fix — and its merge-base predecessor read
+    *"measured 10.36 s of the control's 10.85 s"*, a ratio that reproduces under no
+    framing the reviewer constructed (the redundant rebuild is ~2.6 s of a ~17 s
+    arm; the arm's dominant cost is the 242-module ungated walk, not the control).
+    Either way the framing (whole arm? control step? which box?) was absent, so a
+    re-verifier running the control step alone measures something else and cannot
+    tell which reading was meant.
+
+    Both directions, so the arm is not a style rule: a duration WITH its framing is
+    allowed (the reviewer's alternative fix), but a duration without it is red. The
+    predicate is `_unframed_durations`; its non-vacuity — that it reds on the text
+    this PR replaced — is its own arm below, because a guard that is green on the
+    pre-fix code guards nothing (the defect the round-5 review found here).
+    """
+    comment = _gate_walk_comment()
+    assert comment, (
+        "`_narrow_gate_walk_sites` carries no `#` comment any more, so this arm "
+        "asserts nothing — the mechanism it states was the whole point of the change"
+    )
+    assert not _unframed_durations(comment), (
+        "the gate-walk comment pins a duration without the framing that produced it "
+        f"({_unframed_durations(comment)}) — a claim a re-verifier cannot settle. "
+        "Drop the figure, or state it with the framing that produced it (whole arm / "
+        "control step / `--durations=0` / in-suite). Note that \"on one box\" is not "
+        "framing: it is the condition, not the measurement."
+    )
+
+
+def test_the_gate_walk_comment_arm_reds_on_the_text_it_replaced():
+    """Non-vacuity for `_unframed_durations`, on the MERGE BASE — not an
+    intermediate commit of this branch (`#9506`).
+
+    ⚠️ **The round-5 review found the first guard green on `origin/main`.** It red
+    only on `says_none AND duration`, and the base text says no denial, so the arm
+    passed on the very text this PR exists to delete. This arm feeds the same
+    three states through the same predicate the guard uses — the base string, the
+    intermediate string, and a framed duration — so "the guard reds on what it
+    replaced" is executed rather than asserted in a docstring, the shape this file
+    already uses elsewhere ("mutation applied, all arms re-run").
+    """
+    merge_base = (
+        "# `_literal_files()` is already parsed and cached; re-reading `_sources()` "
+        "and\n# rebuilding the same 29 `_File`s measured 10.36 s of the control's "
+        "10.85 s for\n# byte-identical output."
+    )
+    intermediate = (
+        "# ... only object identity changes. No magnitude is stated on purpose: the\n"
+        "# redundant rebuild is a fraction of this arm (a re-verifier measured "
+        "~2.6 s of\n# ~17 s on one box), and a wall-clock number pinned into a "
+        "comment is the\n# claim that rots."
+    )
+    assert _unframed_durations(merge_base) == ["10.36 s", "10.85 s"], (
+        "the predicate must red on the MERGE BASE text (`measured 10.36 s of the "
+        "control's 10.85 s`) — that is the figure this PR removes, so an arm that "
+        "passes on it is vacuous: it would let the identical figure be re-introduced"
+    )
+    assert _unframed_durations(intermediate), (
+        "the predicate must red on the intermediate `~2.6 s of ~17 s` sentence, "
+        "which is the state the earlier round called \"pre-fix\" — it is a commit on "
+        "this branch, never on main"
+    )
+    assert not _unframed_durations(
+        "# the arm measured 14.4 s whole arm, --durations=0, one box"
+    ), (
+        "a duration that carries its framing must stay allowed (the reviewer's "
+        "alternative fix) — otherwise this is a style rule that would red on a "
+        "settleable figure"
+    )
+    assert not _unframed_durations(_gate_walk_comment()), (
+        "the live comment must be green under the same predicate the two arms above "
+        "use — this is the arm the guard asserts, restated so a divergence between "
+        "the predicate and its non-vacuity arm cannot go unnoticed"
+    )
+
+
+def _pin_universe_to_disk(census, on_disk: set[Path]) -> None:
+    """The completeness pin's BODY — factored out so its FLOOR is pinnable too.
+
+    ⚠️ The floor is not decoration. Both set differences below are vacuously EMPTY
+    when `on_disk` is empty, so an enumeration that resolves to nothing (the package
+    moved or renamed, `TORTISE` mis-resolved, a packaging change) would let this arm
+    report green having asserted nothing — the exact defect
+    `docs/architecture/STORAGE-ARCHITECTURE-CHANGELOG.md` records for the carrier arm
+    ("it could report green having asserted nothing … It now counts the pairs it
+    examined"). For the one arm whose purpose is "the universe is complete", silence
+    on an empty universe is the failure it exists to prevent, so it reds here with its
+    own diagnosis. The sibling arms in this file carry the same shape
+    (`assert len(sources) > 2`, `assert len(census._sources()) > len(census._files())`).
+    """
+    assert len(on_disk) > 2, (
+        f"the package enumeration found {len(on_disk)} module(s) under "
+        f"{census.TORTISE} — this arm cannot assert completeness against an empty "
+        "disk set, so it reds here instead of passing vacuously"
+    )
+
+    for name in ("_universe", "_sources"):
+        observed = set(getattr(census, name)())
+        hidden = sorted(
+            str(path.relative_to(census.TORTISE)) for path in on_disk - observed
+        )
+        assert not hidden, (
+            f"`{name}()` omits {len(hidden)} module(s) that exist on disk, so every "
+            f"derivation silently stops covering them: {hidden[:5]}"
+        )
+        assert not (observed - on_disk), (
+            f"`{name}()` names paths that do not exist — the universe was built from "
+            "something other than this package"
+        )
+
+
+def test_the_census_universe_is_every_module_on_disk():
+    """The UNIVERSE must be every module under `tortoise/`, not a filtered subset.
+
+    ⚠️ This is the arm the `#9501` review earned, and it is about the gate one function
+    UPSTREAM of `_files()`. The file gate is interrogated from an ungated walk, but a
+    universe that silently drops a module removes its reader from every derivation
+    while every other arm stays green — measured: filtering one module out of the old
+    single source left all 29 arms green while §13's row 22
+    (`navigation.py::_hop_query`) stopped being derived.
+
+    Both halves are pinned against the DISK, not against each other: `_universe()` is
+    the disk enumeration, and `_sources()` is the set the derivations consume. If
+    either is narrowed, one of the two assertions reds — and the floor in
+    `_pin_universe_to_disk` means an EMPTY enumeration reds too, instead of passing
+    having asserted nothing. The mutation arms below make BOTH halves executable, one
+    per name: the floor arm reaches only the floor, so it cannot stand in for them.
+    """
+    census = _call_time_census()
+    _pin_universe_to_disk(census, {path for path in census.TORTISE.rglob("*.py")})
+
+
+def test_the_universe_pin_reds_on_an_empty_disk_set():
+    """The FLOOR: an enumeration that resolves to NOTHING must red, not pass.
+
+    Without the floor both of the pin's set differences are empty on an empty
+    `on_disk`, so the arm reports green having asserted nothing. Constructing that
+    state directly is the only way to prove the floor is load-bearing rather than
+    decorative: a `TORTISE` that resolves to nothing is exactly what a package move,
+    rename or packaging change produces, and it must red with its own diagnosis.
+    """
+    census = _call_time_census()
+    with pytest.raises(AssertionError, match="cannot assert completeness"):
+        _pin_universe_to_disk(census, set())
+
+
+def test_the_universe_pin_reds_when_a_module_is_dropped():
+    """Mutation: narrowing `_universe()` must RED — the pin is not vacuous.
+
+    This is the measurement the `#9504`/`#9501` review established by hand and the PR
+    body states in prose ("`_universe()` drops one module → RED — the universe pin").
+    Made executable here.
+
+    ⚠️ `_call_time_census()` is `@functools.cache`d, so every arm in this file shares
+    ONE module object — the patch below is process-wide and MUST be reverted, or an
+    arm that runs after this one reads a universe with a module missing (measured: 241
+    of 242, and the completeness arm reds on `migrate_db.py`). The `try/finally`
+    restore is the file's own convention (the reuse pin above does the same with its
+    `originals` snapshot), not belt-and-braces.
+    """
+    census = _call_time_census()
+    on_disk = {path for path in census.TORTISE.rglob("*.py")}
+    full = census._universe()
+    dropped = sorted(full)[len(full) // 2]
+    original = census._universe
+    try:
+        census._universe = lambda: {k: v for k, v in full.items() if k != dropped}
+        with pytest.raises(
+            AssertionError, match=re.escape(str(dropped.relative_to(census.TORTISE)))
+        ):
+            _pin_universe_to_disk(census, on_disk)
+    finally:
+        census._universe = original
+
+
+def test_the_universe_pin_reds_when_the_derivation_universe_is_dropped():
+    """Mutation: narrowing `_sources()` must RED — the OTHER half of the same pin.
+
+    `_universe()` and `_sources()` are two names for one contract: the disk
+    enumeration and the set the DERIVATIONS consume. Narrowing the second is the
+    `#9501` defect itself (a filter arriving on the gated side), and it is the arm the
+    PR body records by hand ("`_sources()` drops one module → RED — the universe
+    pin"). Executable here: `_sources()` is normally `@lru_cache(maxsize=1)`-warm from
+    earlier arms, so the patch replaces the module ATTRIBUTE — the only place the pin
+    can observe a narrowed derivation universe — and `_universe()` is left intact, so
+    the `_sources` half is the one that must speak.
+
+    The patch is reverted in `finally`: `_call_time_census()` is shared process-wide.
+    """
+    census = _call_time_census()
+    on_disk = {path for path in census.TORTISE.rglob("*.py")}
+    full = census._sources()
+    dropped = sorted(full)[len(full) // 3]
+    original = census._sources
+    try:
+        census._sources = lambda: {k: v for k, v in full.items() if k != dropped}
+        with pytest.raises(
+            AssertionError,
+            match=r"`_sources\(\)` omits 1 module\(s\)",
+        ):
+            _pin_universe_to_disk(census, on_disk)
+    finally:
+        census._sources = original
