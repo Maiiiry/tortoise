@@ -143,6 +143,10 @@ _COUNT_WORDS = {0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
 #: A `module::function` site name, as the four records spell it.
 _SITE_NAME_IN_NOTE = re.compile(r"(tortoise/[\w/]+\.py)::(\w+)")
 
+#: The same, spelled by BASENAME — how the plan doc and the ledger table do it
+#: (`sdk.py::org_create`, `hosted_api.py::register_user`).
+_SITE_BASENAME_IN_RECORD = re.compile(r"`(\w+\.py)::(\w+)`")
+
 
 # ── record slices: pin the RECORD, not the module that carries it ──────────
 def _record(*, path: str, start: str, end: str) -> str:
@@ -601,24 +605,34 @@ def _openers_in(
     return found
 
 
-def _projection_openers() -> set[str]:
+def _projection_openers(tree: ast.Module | None = None) -> set[str]:
     """The opener NAMES `tortoise/projection/__init__.py` defines (the inventory).
 
     NAMES here, unlike the detector population above, because the bullet list a
     reader is shown is a list of names.
 
-    ⛔ The justification is NOT "this module has no duplicate function names" —
-    it has ten, nested and same-scope (`_replay_seq` at two lines, `query`,
-    `wrapper`, `__init__` …; measured, #9150 review cycle 11, P2). It is that
-    every OPENER is a module-level `def` and no opener NAME is defined twice at
-    module level, which
+    ⛔ `tree` exists for the INSTRUMENT CHECK (#9150 review cycle 15, P2). The
+    derivation was itself unpinned: replacing this body with a literal of today's
+    four names left the suite green, after which
+    `test_the_opener_inventory_is_pinned_so_a_new_lane_moves_this_file` — whose
+    docstring promises "derived, then compared" — could no longer fire on a new
+    opener in the inventory module. With the module injectable,
+    `test_the_opener_inventory_is_derived_not_hand_listed` feeds a synthetic tree
+    carrying an added opener and requires it to appear.
+
+    ⛔ The name-keying justification is NOT "this module has no duplicate function
+    names" — it has ten, nested and same-scope (`_replay_seq` at two lines,
+    `query`, `wrapper`, `__init__` …; measured, #9150 review cycle 11, P2). It is
+    that every OPENER is a module-level `def` and no opener NAME is defined twice
+    at module level, which
     `test_no_opener_name_is_defined_twice_in_the_inventory_module` pins —
     otherwise a second function sharing an opener's name would be invisible here
     (a set of names has no second slot), the same defect cycle 5 fixed for the
     wide population by keying it on identity.
     """
-    return {name for _rel, name in
-            _openers_under(_REPO / "tortoise" / "projection" / "__init__.py")}
+    rel = "tortoise/projection/__init__.py"
+    module = tree if tree is not None else _parse(rel)[0]
+    return {name for _rel, name in _openers_in({rel: module})}
 
 
 #: The primitives that can authorize a cache write, from two places: every opener
@@ -1082,6 +1096,20 @@ def test_the_rebinding_rule_covers_every_binding_form():
             with contextlib.nullcontext(val.g) as graph:
                 graph.query(_init_q, params=_init_p)
         """,
+        # The ASYNC forms (#9150 review cycle 15, P2): `ast.AsyncFor` and
+        # `ast.AsyncWith` are separate node types, and while only the sync cases
+        # existed each async arm could be deleted with the suite green — leaving
+        # the detector blind on `async for graph in …` / `async with … as graph:`,
+        # which matters at this head because 3 of the 5 escape-(3) sites live in
+        # `async def` bodies.
+        "async_for": """
+            async for graph in _aiter(val.g):
+                graph.query(_init_q, params=_init_p)
+        """,
+        "async_with_as": """
+            async with _acm(val.g) as graph:
+                graph.query(_init_q, params=_init_p)
+        """,
         "walrus": """
             if (graph := val.g):
                 graph.query(_init_q, params=_init_p)
@@ -1120,15 +1148,19 @@ def test_the_rebinding_rule_covers_every_binding_form():
         """,
     }
     for form, tail in cases.items():
+        # `async for` / `async with` only parse inside a coroutine, and their node
+        # types differ, so the case name decides the `def` keyword.
+        prefix = "async def" if form.startswith("async_") else "def"
         source = (
-            "def site(proj, val, _init_q, _init_p):\n"
+            f"{prefix} site(proj, val, _init_q, _init_p):\n"
             "    graph = proj.db.select_graph('g')\n"
             + textwrap.indent(textwrap.dedent(tail), "    ")
         )
         tree = ast.parse(source)
         func = next(
             node for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "site"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "site"
         )
         handles = _escape_handle_names(func)
         offenders = _not_on_the_escape_handle(
@@ -1317,6 +1349,46 @@ def _duplicated_module_level_names(
         for name, lines in _module_level_defs(tree).items()
         if name in names and len(lines) > 1
     }
+
+
+def test_the_opener_inventory_is_derived_not_hand_listed():
+    """The inventory's derivation must SEE a new opener — proof of firing.
+
+    ⛔ `_projection_openers()`'s body was unpinned (#9150 review cycle 15, P2):
+    replacing it with a literal of today's four names left 21/21 green, after
+    which `test_the_opener_inventory_is_pinned_so_a_new_lane_moves_this_file` —
+    "derived, then compared" — could no longer fire on the shape #9123 and #9195
+    both used. Measured: with the literal in place AND a real
+    `_future_lane_write_scope` opener added above `_live_write_scope`, only the
+    DETECTOR pin red; the inventory pin passed.
+
+    Synthetic module, injected through `_projection_openers(tree=…)`, because the
+    real one is read from disk.
+    """
+    module = ast.parse(textwrap.dedent(
+        """
+        def _live_write_scope(reason: str = "live"):
+            return _cache_write_authorized(reason)
+
+        def _future_lane_write_scope(reason: str = "future"):
+            return _cache_write_authorized(reason)
+
+        def _not_an_opener(proj, cypher):
+            with _live_write_scope(cypher):
+                return proj.db.select_graph("g").query(cypher)
+        """
+    ))
+    derived = _projection_openers(module)
+    assert derived == {"_live_write_scope", "_future_lane_write_scope"}, (
+        "the opener inventory derivation does not pick up a NEW opener in the "
+        "inventory module — if this body is a literal of today's four names, the "
+        "inventory pin can never fire on the next lane that declares there, "
+        f"which is the whole point of pinning it: {sorted(derived)}"
+    )
+    assert _projection_openers(None) == _projection_openers(), (
+        "the injected-module path and the on-disk path disagree, so this "
+        "instrument check is not measuring the production derivation"
+    )
 
 
 def test_no_opener_name_is_defined_twice_in_the_inventory_module():
@@ -1524,6 +1596,31 @@ def test_the_declaration_detector_can_fail():
             "declaration — its `_named` filter is the only thing that makes it "
             "more precise than 'any `with`', and without it the coupling pin "
             "cries wolf with a message that blames the residual (#9157)"
+        )
+
+    # ⛔ And the ASYNC spelling (#9150 review cycle 15, P2): `ast.AsyncWith` is a
+    # separate node type, and while only a sync `with` was fed here the async arm
+    # could be deleted green — after which `async with <opener>(...)` in an
+    # escape-(3) function was invisible to the coupling pin. That is the shape the
+    # likely #9157 fix takes: 3 of the 5 sites are `async def` bodies.
+    for primitive in _DECLARATION_PRIMITIVES:
+        tree = ast.parse(textwrap.dedent(
+            f"""
+            async def org_create(proj, cypher):
+                async with {primitive}(cypher):
+                    return proj.db.select_graph("g").query(cypher)
+            """
+        ))
+        parents = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+        }
+        assert _declaring_functions(tree, parents) == {"org_create"}, (
+            "the declaration detector no longer recognises an ASYNC `with` "
+            f"(`async with {primitive}(...)`) — a residual closed by an async "
+            "scope would leave every pin green while the note still said the "
+            "sites were undeclared (#9157)"
         )
 
 
@@ -2021,6 +2118,78 @@ def test_a_diff_to_the_note_itself_selects_this_file():
     )
 
 
+def test_the_storage_ledger_declares_every_lane_the_tree_has():
+    """The §17.1 ledger's NUMERAL and its ROWS must agree — the drift that landed.
+
+    ⛔ Measured at the head this pin was written for (#9150 review cycle 15, P2):
+    `docs/architecture/STORAGE-ARCHITECTURE.md` said the carve-out "has FOUR
+    named lanes" and "is FOUR declared classes", and its table had four rows —
+    while `tortoise/projection/edges.py::_structural_edge_write_scope` declares a
+    FIFTH (`structural-edge.derived`, `#9195`, landed 2026-10-19) that appeared
+    nowhere in the record. The paragraph itself says "a new lane belongs here in
+    the PR that declares it", and this file quotes that preamble as the reason an
+    auditor trusts the table — so a reader auditing §17.1 for second writers was
+    told the inventory was complete one lane short.
+
+    Content-anchored on purpose: a recorded row set in the test means a lane
+    added to the tree reds here (with the doc updated in the same change), which
+    is the pin the numeral never had.
+    """
+    rel = "docs/architecture/STORAGE-ARCHITECTURE.md"
+    lines = (_REPO / rel).read_text(encoding="utf-8").splitlines()
+    lo = next(i for i, ln in enumerate(lines)
+              if ln.startswith("**⚠️ A PERMANENT CARVE-OUT IS DECLARED"))
+    hi = next(i for i, ln in enumerate(lines)
+              if ln.startswith("What all ") and "share, and what none" in ln)
+    preamble = " ".join(lines[lo:hi])
+    rows = [
+        ln for ln in lines[lo:hi]
+        if ln.startswith("| ") and not set(ln) <= set("| -")
+    ]
+    # header + separator are not lanes
+    rows = rows[1:]
+
+    recorded = {
+        "graph-metadata": "tests/test_9079_ep_epoch_declared.py",
+        "onboarding metadata": "tests/test_9079_onboarding_declared_lane.py",
+        "webhook delivery store": "tests/test_9233_webhook_declared_lane.py",
+        "pre-wipe restore": "tests/test_9210_rebuild_declares_restore.py",
+        # #9195's lane — the row this pin exists because of.
+        "structural-edge.derived": "tests/test_9079_edge_lane_declared.py",
+    }
+    derived = {
+        row.split("|")[1].strip(): row for row in rows
+    }
+    assert set(derived) == set(recorded), (
+        "the §17.1 ledger's lane rows changed: "
+        f"missing {sorted(set(recorded) - set(derived))}, "
+        f"unrecorded {sorted(set(derived) - set(recorded))}. A lane is DECLARED in "
+        "the tree before it is listed here (or the reverse) — either way this "
+        "table is what a reader auditing §17.1 for second writers trusts, so it "
+        "must list them all (#9157, #9195)"
+    )
+
+    n = len(derived)
+    word = _COUNT_WORDS.get(n)
+    assert word is not None, f"the ledger now has {n} lanes — extend `_COUNT_WORDS`"
+    for phrase in (f"has {word.upper()} named lanes",
+                   f"it is {word.upper()} declared classes"):
+        assert phrase.lower() in preamble.lower(), (
+            f"the ledger preamble no longer says {phrase!r} while the table has "
+            f"{n} rows — a numeral that disagrees with its own table is how this "
+            "said FOUR for a five-lane carve-out (#9150 review cycle 15, P2)"
+        )
+
+    for lane, pin in recorded.items():
+        assert (_REPO / pin).is_file(), (
+            f"the ledger's {lane!r} row points at a pin that does not exist: {pin}"
+        )
+        assert pin in derived[lane], (
+            f"the ledger's {lane!r} row no longer names its pin {pin} — a row "
+            "whose pin moved is a row nothing holds to the code"
+        )
+
+
 def test_the_plan_doc_and_the_storage_ledger_carry_the_residual():
     """The TWO remaining records must name the residual — they had no pin.
 
@@ -2075,6 +2244,30 @@ def test_the_plan_doc_and_the_storage_ledger_carry_the_residual():
                 "five escape-(3) sites disprove (#9157)"
             )
         _assert_site_count(flat, template, f"{what} (`{rel}`)")
+
+    # ⛔ BOTH DIRECTIONS of the per-site NAME list, for the record that SPELLS the
+    # names (#9150 review cycle 15, P2). `tortoise/onboarding/state.py`'s note is
+    # pinned both ways; the plan doc was pinned neither way, so a fabricated or
+    # stale function name read as coverage with every assertion green. The ledger
+    # row instead names the CLASS and the count, so it is covered by the count pin
+    # and by `test_the_storage_ledger_declares_every_lane_the_tree_has`.
+    plan = _record(
+        path="docs/plans/2026-10-14-7951-atomic-write-outbox.md",
+        start="**STILL OPEN: the ",
+        end="**LANDED SO FAR: the `delete_point` DOOR",
+    )
+    named = {(Path(m_rel).name, m_func)
+             for m_rel, m_func in _SITE_NAME_IN_NOTE.findall(plan)}
+    named |= set(_SITE_BASENAME_IN_RECORD.findall(plan))
+    expected_names = {(Path(rel).name, func) for rel, func in _ESCAPE3_CALL_SITES}
+    assert named == expected_names, (
+        "the increment-4 tracker (`docs/plans/2026-10-14-7951-atomic-write-outbox.md`) "
+        f"disagrees with the AST inventory about WHICH sites the residual holds: "
+        f"names not in the code {sorted(named - expected_names)}, sites it does not "
+        f"name {sorted(expected_names - named)}. A name that is not a site reads as "
+        "coverage the residual does not have, and a site the record omits reads as "
+        "closed — the same class the `state.py` note is pinned both ways for (#9157)"
+    )
 
 
 def test_the_inventory_cites_the_issue_that_owns_the_journalling_increment():
