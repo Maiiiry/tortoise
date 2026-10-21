@@ -23,14 +23,17 @@ sites, and the ingestion path reaches one of them by default:
   3. `projection/entities._fold_entity_linked_reason` — the REPLAY fold
      re-SETs it, i.e. the property is journaled and reproduced (`live == rebuild`).
 
-Four further shipped paths RE-MATERIALIZE the same attribute set by property
-MAP — `SET r += $props` / `SET r = $p` — over a predicate allowlist that
-includes `aboutObject`, so they reproduce `confidence` and add no new name:
-`cache_projection.relation_statement` (the record-layer projection; the
-`public.relation` row carries `confidence`), `projection._rebuild_all_replay`
-and `sdk.supersede_point` (rebuilding/copying it from the journal or the
-superseded point), and `hosted_backup.restore_graph` (`SET r = $p` over the
-dump's stored edge properties).
+Four further shipped paths RE-MATERIALIZE the edge, and one of them adds a
+SECOND name, so the earlier "exactly one name" reading was one form short:
+`cache_projection.relation_statement` (the record-layer projection) writes the
+record row's whole property set by property MAP over a predicate allowlist that
+includes `aboutObject`, and it also stamps `idx` — `public.relation.idx`, the
+parallel-edge ordinal — as an INLINE pattern property, unconditionally;
+`projection._rebuild_all_replay` and `sdk.supersede_point` re-materialize the
+journal's / the superseded point's attributes, and
+`hosted_backup.restore_graph` the dump's (`SET r = $p`). The measured set is
+therefore `confidence` (originated) plus `idx` (re-materialized): one semantic
+attribute and one identity coordinate, not one property name.
 
 ROOT CAUSE OF THE FALSE CLAIM — the method, not the measurement
 ---------------------------------------------------------------
@@ -65,10 +68,12 @@ WHAT IS PINNED
 --------------
 1. `test_the_absolute_property_free_sentences_do_not_reappear` — the retracted
    sentences are matched MARKER-INSENSITIVELY (`*`, backticks, whitespace) against
-   the live documents. Each entry records the document it was measured in on the
-   pre-fix tree; the first version of this file claimed all of them were live
-   pre-fix and one was not (its literal was unbolded while the document bolds
-   it), so the claim is now per entry — and leg 7 machine-checks that no entry is
+   the live documents. Each entry records its own provenance — the pre-fix
+   document it was measured in, or `RETRACTED_INTRODUCED_HERE` for wording this
+   PR itself wrote and withdrew; the first version of this file claimed all of
+   them were live pre-fix and one was not (its literal was unbolded while the
+   document bolds it), so the claim is now per entry — and leg 7 machine-checks
+   that no entry is
    a dead pin by requiring it to be findable, marker-insensitively, in the
    changelog that quotes it.
 2. `test_the_corrected_passages_name_the_property_bearing_class` — the
@@ -78,12 +83,13 @@ WHAT IS PINNED
    file-wide membership test cannot red on one section's silent deletion
    (`#8639` review, the `test_entity_attachment_brief_claims.py` precedent).
 3. `test_the_code_still_agrees_with_the_corrected_evidence` — each recorded
-   writer still writes `confidence` onto an `about*` edge. If that code is
-   removed, the document has re-rotted in the other direction and this reds
-   instead of the doc quietly lying again.
+   writer still writes what the documents claim it writes (`confidence` for the
+   originating three; the map/inline forms for the re-materializing four,
+   `idx` included). If that code is removed, the document has re-rotted in the
+   other direction and this reds instead of the doc quietly lying again.
 4. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
-   every relationship-variable property write inside a function that builds an
-   `about*` edge — named (`SET r.<prop>`), map-assigned (`SET r += $props` /
+   every property write on an `about*` relationship pattern (named variable or
+   anonymous) — named (`SET r.<prop>`), map-assigned (`SET r += $props` /
    `SET r = $p`), or an inline pattern map (`[r:aboutObject {idx:$idx}]`, which
    assigns with no `SET` clause at all) — must be one of the recorded writers.
    ⚠️ **The bound on that promise, stated rather than assumed:** an `about*`
@@ -93,11 +99,12 @@ WHAT IS PINNED
    derives its predicate from a vocabulary named NOWHERE in that list is still
    invisible — so adding a predicate vocabulary, or a new way of naming one, is
    a change to `_ABOUT_VOCAB` / `_module_in_scope`, not just a change to the
-   code. What IS machine-checked is that the three shipped forms are all read
-   (`test_the_census_reads_the_three_write_forms`) and that the allowlist path
-   is not skipped by the file walk (`test_the_census_reads_a_writer_that_never_
-   says_about`); the remaining gap is a vocabulary list, and a list cannot be
-   checked for a token nobody has written yet.
+   code. What IS machine-checked is that the inline form is read, including the
+   anonymous pattern (`test_the_census_reads_the_inline_pattern_map_form`) and
+   that the allowlist path is not skipped by the file walk
+   (`test_the_census_reads_a_writer_that_never_says_about`); the remaining gap is
+   a vocabulary list, and a list cannot be checked for a token nobody has
+   written yet.
 5. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
    the binder, **or stops being the fall-through branch** of the
@@ -107,8 +114,11 @@ WHAT IS PINNED
    a reader learns that a §11.1/§13 claim moved.
 7. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
    — every RETRACTED literal is findable in the changelog that quotes it, or is
-   declared pre-fix-only. A pin that cannot match the pre-fix text protects
-   nothing, and that is not a hypothesis: it shipped.
+   declared pre-fix-only or introduced-and-retracted inside this PR
+   (`RETRACTED_INTRODUCED_HERE`: two absolutes were written by an earlier
+   revision of THIS PR, so claiming a pre-fix presence for them would be the
+   same unmeasured provenance this file exists to stop). A pin that cannot match
+   the pre-fix text protects nothing, and that is not a hypothesis: it shipped.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
