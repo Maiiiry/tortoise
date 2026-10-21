@@ -1448,7 +1448,7 @@ the sibling arms already guard (`assert census`, `assert pins`, `assert _EXCLUDE
 
 **A third copy of the count was left stale — in the prior art this PR cites.** B2.7 of
 `REVIEW-CONSOLIDATED-2026-09-23.md` closed with *"⇒ the customer-callable count is four, not two"* while
-§13 and §13.8 state SEVENTEEN, and nothing read that file. The durable form is a POINTER, not a fourth
+§13 and §13.8 stated SEVENTEEN at that pass, and nothing read that file. The durable form is a POINTER, not a fourth
 number, so the row now marks its figure superseded and sends the reader to §13's table — and
 `test_the_prior_art_points_at_the_table_instead_of_restating_the_count` keeps the pointer there, because
 a restated count is a copy that rots on the next pass.

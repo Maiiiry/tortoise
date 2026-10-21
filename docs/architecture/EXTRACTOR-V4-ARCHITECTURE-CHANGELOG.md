@@ -683,16 +683,10 @@ design-language pass (#8542) established and `tests/test_extractor_v4_citation_r
 path — `recall_state` alone reads the edge on four code paths, three of them through an `about*`
 alternation CONSTANT — and a later pass added three readers that no module-level census could see: an
 all-edge walk in `navigation.py` behind two further MCP tools, the supersede dry run in `mcp_server.py`,
-and the replay delete-leg in `projection/__init__.py`. The document now states only the resulting fact
+and the replay delete-leg in `projection/__init__.py`. The document stated only the resulting fact at that pass
 (**TEN customer-callable read sites, behind EIGHT distinct doors**); the authoritative enumeration is
 `STORAGE-ARCHITECTURE.md` §13's table, resolved against the code by
 `tests/test_7948_about_object_read_sites.py`.
-
-**Two citations in §13.8 were also re-pointed, and this is the rot class the citation guard cannot see:**
-`create_about_edge` (`projection/edges.py:344` → `:1447`) and, in `STORAGE-ARCHITECTURE.md` §13,
-`_connect_issue_objects` (`sdk.py:20154`) — both numbers named something else entirely at HEAD. §13's
-citations are now symbol-keyed (`projection/edges.py::_EdgeHandlers.create_about_edge`,
-`sdk.py::TortoiseSDK._connect_issue_objects`), matching §13's own statement that it carries no line numbers.
 
 **And the guard that forbids this shape had a false PASS, now closed.** Its date arm was pinned to the
 space-separated form (`CORRECTED 20xx-`), so the parenthesized stamp above — the form this document's own
@@ -700,7 +694,7 @@ corrections actually take — read as clean. The separator now accepts a short n
 instrument's own both-directions test carries the parenthesized form as a `must_flag` fixture.
 
 **Two citations in §13.8/§13 named something else at HEAD, and were re-pointed:**
-`create_about_edge` (`projection/edges.py:344` → `:1447`, its `def`) and, in `STORAGE-ARCHITECTURE.md`
+`create_about_edge` (`projection/edges.py:344` → its `def`, at `:1458`) and, in `STORAGE-ARCHITECTURE.md`
 §13, `_connect_issue_objects` (`sdk.py:20154` → the symbol, `sdk.py::TortoiseSDK._connect_issue_objects`).
 §13's prose now states no line numbers at all, matching its own sentence that it carries none; the
 sibling `tests/test_extractor_v4_citation_rot.py` asserts every remaining quoted-symbol citation resolves.
@@ -766,11 +760,14 @@ pattern it stayed green).
 **sixteen** distinct door identifiers; the folding rule was applied inconsistently (graph-ordered `search` and
 `tortoise_fts_query` folded into one door, the three `dry_run` delete tools left as three); and the sentence
 justifying it — *"TWELVE sites behind those twelve doors, because `recall_state` alone reads the edge on FOUR
-code paths"* — requires doors to be FEWER than sites while asserting they are equal. Both documents now state
-SIXTEEN, the rule is stated (*a door is one independently callable entry point — an MCP tool, a public SDK
-method, or a served REST route — counted once per site that reaches it*), and
-`test_the_stated_door_count_matches_the_table` derives the total and the per-kind breakdown (nine MCP tools,
-five SDK methods, two REST routes) from the reach cells and asserts it in BOTH documents. Measured before the
+code paths"* — requires doors to be FEWER than sites while asserting they are equal. At that pass both documents stated
+SIXTEEN, the rule was stated (*a door is one independently callable entry point — an MCP tool, a public SDK
+method, or a served REST route — counted once per site that reaches it* — ⚠️ a rule since RETRACTED: it yields
+cell occurrences, not distinct doors), and `test_the_stated_door_count_matches_the_table` derived the total and
+the per-kind breakdown (then nine MCP tools, five SDK methods, two REST routes) from the reach cells and
+asserted it in BOTH documents. ⚠️ These figures are SUPERSEDED — the census now carries THIRTY-SEVEN rows /
+NINETEEN customer-callable sites / TWENTY-TWO doors, and the present counts live in §13.8 and §13 of the two
+design documents. Measured before the
 fix: rewriting the figure to `four` here, or `TEN` in the sibling, left all ten tests green.
 
 ## §13.8 question 2 — the count moves to SEVENTEEN sites / TWENTY doors, because the ALL-EDGE class was still a hand pass (2026-10-21, `#7948`)
@@ -823,8 +820,8 @@ the remaining untyped walks, and deleting a constraint reds
 `test_every_stated_exclusion_is_still_true` while leaving the site unowned in
 `test_no_untyped_walk_lacks_a_row_or_a_stated_exclusion`. **Nothing in this class is out by silence any more.**
 
-**Counts.** §13, §13's blast-radius sentence, §13.6 and §13.8 now state THIRTY-THREE read sites, SEVENTEEN
-customer-callable, TWENTY doors — ten MCP tools, six SDK methods and four REST routes (`POST /v1/backups` and
+**Counts.** §13, §13's blast-radius sentence, §13.6 and §13.8 stated, AT THAT PASS, THIRTY-THREE read sites, SEVENTEEN
+customer-callable, TWENTY doors — ten MCP tools, six SDK methods and four REST routes. ⚠️ **SUPERSEDED** — the table carries THIRTY-SEVEN / NINETEEN / TWENTY-TWO today; §13 is the authority, so do not re-read these as current. (`POST /v1/backups` and
 `POST /v1/backups/restore` are new; `backfill_v25` / `tortoise_backfill_v25` are new) — every figure derived
 from the reach cells by the guard, never hand-counted. §13.8's enumeration names all seventeen, and
 `test_the_extractor_document_agrees_on_the_count` holds it there in both directions. The ruling is unchanged:

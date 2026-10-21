@@ -2282,12 +2282,12 @@ def _route_table() -> dict[tuple[str, str], frozenset[str]]:
 #: note above: this is a BOUND, not a proof.
 #:
 #: ⚠️ **Three, and the tighter number is what makes the arm discriminate.** A
-#: uniform budget of 5 was measured to accept **44.7 % of the 340
+#: uniform budget of 5 was measured to accept **16.5 % of the 418
 #: (row, table-door) pairs** — three substitutions that keep a REAL tool in a
 #: cell were green under it (rows 22/24's reach cells swapped, rows 28/30's REST
 #: doors swapped, and row 28's verb changed). A uniform 3 accepts **15.6 %**, and
 #: all three of those red; the shipped predicate, with the two exceptions below,
-#: accepts 63/340 = **18.5 %**. Every one of the 29 true attributions is within 3
+#: accepts 69/418 = **16.5 %**. Every one of the 31 true attributions is within 3
 #: hops except the two named in `_DISTANCE_EXCEPTIONS`.
 _DOOR_REACH_HOPS = 3
 
@@ -2513,10 +2513,10 @@ def test_the_door_attribution_refuses_a_door_that_reaches_another_reader():
 #: Re-derived 2026-10-21 when rows 34-37 landed: 63 -> 69. The added
 #: pairs are NEW rows with their own doors (`TortoiseSDK.traverse`,
 #: `TortoiseSDK.ingest`), not a looser relation — no existing row's accepted set
-#: grew, and the worst row is unchanged, which is what distinguishes this from
+#: grew, and no existing row gained a door, which is what distinguishes this from
 #: the tripwire's failure mode.
 _ACCEPTED_PAIRS_AT_THIS_HEAD = 69
-#: 15 -> 16 on 2026-10-21: the TABLE's door set grew by the two SDK doors the new
+#: 15 -> 17 on 2026-10-21: the TABLE's door set grew by the two SDK doors the new
 #: call-time rows name, and `_hop_query` (an all-edge walk) legitimately reaches
 #: more of a larger set. It is the same relation over a larger population, not a
 #: looser predicate — no door was added to any row's own reach cell.
@@ -2974,7 +2974,9 @@ def test_every_carrier_constant_a_row_reads_through_still_names_the_edge():
 #: reason here instead of an IndexError.
 _13_8_ENUMERATION = (
     "sites are customer-callable",
-    "Two more are default-ON on the ingestion path",
+    # ⚠️ the marker follows the sentence that ACTUALLY starts the tail — it was re-worded to
+    # "Outside this nineteen, ..." to stop a re-verifier counting those five inside the nineteen
+    "Outside this nineteen, two are default-ON on the ingestion path",
 )
 
 #: `` `token` `` — the unit §13.8 names a reader (or a door) with.
@@ -3281,6 +3283,19 @@ def _call_time_census():
     return module
 
 
+#: The DERIVED side of the same fact: the resolver attributes a read to the innermost
+#: `def` or to the function that executes a query constant, while the table names the
+#: symbol a re-verifier should open. Each entry is grounded — `test_the_derived_aliases_
+#: are_grounded` asserts both halves exist in the module — so an alias cannot become a
+#: way of naming nothing.
+_DERIVED_ALIASES: dict[str, str] = {
+    # nested defs: the row names the port that CALLS them
+    "assembly.py::alias_objects": "assembly.py::docker_resolver_port",
+    "assembly.py::spine_rows": "assembly.py::docker_walker_port",
+    # one consumer of two query constants: the row names the constants
+    "subgraph.py::_collect_raw": "subgraph.py::_CYPHER_ABOUT",
+}
+
 #: A row may key on a module-level query CONSTANT where the derivation attributes the
 #: read to the function that EXECUTES it — both are true, and the row names the thing a
 #: re-verifier can find. Each alias says which consumer runs the constant, so the
@@ -3315,6 +3330,47 @@ def _declared_keys() -> set[str]:
         keys.add(_SITE_ALIASES.get(key, ""))
     return {k for k in keys if k}
 
+
+
+def test_every_named_census_site_owns_a_row():
+    """The named census's FORWARD direction — the half that was missing.
+
+    ⚠️ **`link_entity` was pinned only by a prose numeral.** Its `aboutObject` is a
+    PARAMETER DEFAULT (`edge_type: str = "aboutObject"`), not a literal in a read
+    clause, so the literal census cannot see it and the call-time class does not own
+    it either (the resolver resolves the default) — it landed in the named census,
+    which was consumed only as a permissive whitelist. Measured: deleting row 34 AND
+    writing `THIRTY-SIX` for `THIRTY-SEVEN` left all 26 arms green, i.e. one of the
+    four rows this change exists to restore was enforced by a single word. The
+    control — the same deletion for a literal reader (`belief_timeline`) — reds.
+
+    A register is only as good as its completeness direction, so this arm requires
+    every site the named census derives to own a row, an alias, or a register entry.
+    """
+    census = _call_time_census()
+    derived = _derived(census._census())
+    assert derived, (
+        "the named census derived nothing — the resolver stopped resolving "
+        "parameter defaults and loop variables, which is what makes it the only "
+        "route to a reader like `link_entity`"
+    )
+    declared = _declared_keys()
+    registered = _register_keys(census.CALL_TIME_REL) | _register_keys(census.EMPTY_PATTERN)
+    # ⚠️ Keep the DICT: the failure message indexes it, so rebinding the name to a
+    # set made the diagnostic raise `TypeError: 'set' object is not subscriptable`
+    # on exactly the path it exists for (a reviewer's mutation found it).
+    derived = {
+        _DERIVED_ALIASES.get(key, key): lines for key, lines in derived.items()
+    }
+    unowned = sorted(set(derived) - declared - registered)
+    assert not unowned, (
+        "the resolver sees these sites reading the `aboutObject` edge through a "
+        "value it had to RESOLVE (a parameter default, a loop variable, a dict "
+        "lookup), and §13 neither names them nor declares them out of scope:\n"
+        + "\n".join(f"  - {key} — lines {derived[key]}" for key in unowned)
+        + "\nAdd the row, or an alias in `_SITE_ALIASES` when a row names the "
+        "CONSTANT (or the enclosing function) the site consumes."
+    )
 
 def test_the_call_time_shape_is_derived_and_declared():
     """A type slot holding an EXPRESSION must be a row or a stated exclusion.
@@ -3416,4 +3472,69 @@ def test_the_bracket_less_spelling_is_inside_the_walk():
     assert not census._BARE_TRAVERSAL.search("MATCH (n)-[r]->(m)"), (
         "the bracket-less detector also matches the bracketed spelling, so it is "
         "not measuring the shape it claims"
+    )
+
+def test_the_derived_aliases_are_grounded():
+    """Every alias names two symbols that EXIST, so it cannot excuse nothing.
+
+    An alias table is a hole in a census if its entries are unchecked — the exact
+    shape `_NON_LITERAL`'s deleted carrier fallback had. Both halves are resolved
+    from the module's AST: the derived symbol, and the row symbol it stands for.
+    """
+    for derived_key, declared_key in sorted(_DERIVED_ALIASES.items()):
+        for key in (derived_key, declared_key):
+            module, _, symbol = key.partition("::")
+            tree = _module_tree(_module_path(module))
+            assert (
+                _span(tree, symbol) is not None
+                or symbol in _module_path(module).read_text(encoding="utf-8")
+            ), f"`{key}` does not exist at HEAD — the alias is stale"
+
+def test_the_file_filter_un_sees_nothing():
+    r"""The file gate must admit every module a walk derives a site in.
+
+    ⚠️ **A narrowed gate is the quietest failure this instrument can have:** the
+    walks still work, every arm still passes, and the reader they no longer reach
+    simply stops being covered.
+
+    ⚠️ **The CONTROL is the load-bearing half, and an earlier version of this arm did
+    not have it.** Its per-class loop is fed modules the gate EXCLUDES, and the gate
+    excludes only modules that fail every walk predicate — so those sets are empty by
+    construction and the loop proves nothing on its own. What gives it teeth is running
+    the SAME measurement through the NARROW gate (`_literal_files()`, the one predicate
+    the gate started from): that must find sites, or the measurement cannot see a
+    narrowing at all and this arm is a PASS about nothing.
+    """
+    census = _call_time_census()
+    labels = ("named census", "empty-pattern class", "call-time class")
+
+    skipped = census._excluded_walk_sites()
+    assert len(census._sources()) > len(census._files()), (
+        "the gate admits every module, so there is no excluded module to measure and "
+        "this arm passes vacuously — either the gate was widened to `True` or the "
+        "package shrank to the gated set"
+    )
+    problems = [
+        f"{label}: {len(found)} site(s) exist under `tortoise/` in a module the gate "
+        f"SKIPPED: {sorted({f'{Path(rel).name}::{sym}' for rel, sym in found})[:5]}"
+        for label, found in zip(labels, skipped, strict=True)
+        if found
+    ]
+    assert not problems, (
+        "the module gate is narrower than the walks it feeds, so readers outside it "
+        "are silently uncovered:\n  " + "\n  ".join(problems)
+    )
+
+    # CONTROL — the same measurement, through the NARROW gate, must DISAGREE.
+    narrow = census._excluded_walk_sites(use_narrow_gate=True)
+    assert any(narrow), (
+        "the narrow gate hides no site from any walk, so this measurement cannot "
+        "detect a narrowing — the control has gone blind and the arm above is a "
+        "PASS about nothing"
+    )
+    assert {file.path for file in census._literal_files()} < {
+        file.path for file in census._files()
+    }, (
+        "`_literal_files()` is no longer a strict subset of `_files()`, so the control "
+        "is not measuring the widening it claims"
     )

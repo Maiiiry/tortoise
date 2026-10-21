@@ -86,39 +86,14 @@ _UNKNOWN = ""
 #: A backticked token in §13's `site` column that can be a symbol.
 _SYMBOL = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*(?:\(\))?\Z")
 
-#: Floor for the empty-pattern class walk, so the class arm cannot pass by
-#: deriving nothing. The exact size is asserted by the class arm, never here: a
-#: floor is not a count, and a numeral restated in a comment is the claim class
-#: this file exists to stop being unread
-#: (`test_the_file_states_no_count_it_does_not_measure`).
-_MIN_EMPTY_PATTERN = 5
-
-#: Floor arms: deliberately BELOW the census the TABLE declares, so a legitimate
-#: contraction — a row deleted together with its reader — is not a reason to red,
-#: and so a broken parser cannot pass by finding nothing. A floor is not a count,
-#: and pinning it at the table's own figure would turn that contraction into a
-#: failure whose message says "the parser broke". This comment states the
-#: PROPERTY and restates no numeral: the exact counts are asserted against the
-#: table by `test_the_prose_counts_match_the_table`, one arm down, and a copy of
-#: them here is what `test_the_file_states_no_count_it_does_not_measure` bans.
-_MIN_SITES = 10
-_MIN_ROWS = 10
-#: `FOUR` was the floor when this arm was written, i.e. the count BEFORE the
-#: fifth correction. Kept at that historical value so a *contraction* of the
-#: prose is visible even before the exact-count arm below reads the numeral
-#: itself; that arm — `test_the_prose_counts_match_the_table` — is the only place
-#: the current customer-callable count may appear, so this comment stops at the
-#: property rather than quoting the table's figure.
-_MIN_CUSTOMER_CALLABLE = 4
-
-#: Floor for the call-time class walk, for the same reason as
-#: `_MIN_EMPTY_PATTERN`: the shape detector breaking is a failure, a legitimate
-#: contraction is not. No numeral here — the class arm measures the size.
-_MIN_CALL_TIME = 4
-
+#: ⚠️ The FLOORS of the retired guard's arms (`_MIN_SITES`, `_MIN_ROWS`,
+#: `_MIN_CUSTOMER_CALLABLE`, `_MIN_CALL_TIME`, `_MIN_EMPTY_PATTERN`) are NOT here: a floor
+#: was that guard's own guard-rail, its arms live in the guard that owns the table, and a
+#: constant defined here would be a number nothing reads — the claim class this census
+#: exists to stop being unread.
 #: The empty-pattern readers that are NOT an `aboutObject` read for a referent,
 #: declared by name with the reason, so a NEW member of the class cannot appear
-#: silently: `test_the_empty_pattern_class_is_declared` derives the class from
+#: silently: `test_the_empty_pattern_class_is_derived_and_declared` derives the class from
 #: the pattern's shape and requires every member to be either a §13 row or an
 #: entry here. Each entry is `(filename, symbol, why it is not an about read)`.
 EMPTY_PATTERN: tuple[tuple[str, str, str], ...] = (
@@ -927,6 +902,40 @@ def _empty_pattern_sites() -> dict[tuple[str, str], tuple[int, ...]]:
                 sites.setdefault((file.rel, symbol), []).append(line)
     return {key: tuple(sorted(value)) for key, value in sites.items()}
 
+
+
+def _excluded_walk_sites(use_narrow_gate: bool = False) -> tuple[set[tuple[str, str]], ...]:
+    """The three derivations restricted to modules the FILE GATE excludes.
+
+    The gate in front of the walks must be a SUPERSET of what they would find: one
+    predicate too narrow un-sees a reader silently — every arm stays green while the
+    census stops covering it, which is this census's own defect class one layer down.
+
+    ⚠️ **Measured from the WHOLE-PACKAGE walks, not re-derived per file.** An earlier
+    version called a per-file helper that does not exist (`_empty_pattern_sites_in`)
+    exactly when a module satisfied the both-classes predicate — unreachable while the
+    gate excludes only modules failing both, so it read as green and would have raised
+    `NameError` the moment the gate widened, which is the one change this function
+    exists to police. The walks are cached; re-filtering their output by module is both
+    correct and cheaper than a second derivation.
+
+    `use_narrow_gate` swaps in `_literal_files()` — the single predicate the gate
+    started from — so the caller can show that a NARROWER gate is visible to this
+    measurement rather than merely asserting that it would be.
+    """
+    gate = {
+        file.path
+        for file in (_literal_files() if use_narrow_gate else _files())
+    }
+    excluded = {
+        str(path.relative_to(ROOT))
+        for path in _sources()
+        if path not in gate
+    }
+    named = {key for key in _census() if key[0] in excluded}
+    empty = {key for key in _empty_pattern_sites() if key[0] in excluded}
+    call_time = {key for key in _call_time_sites() if key[0] in excluded}
+    return named, empty, call_time
 
 def _call_time_sites_in(file: _File) -> set[tuple[str, int]]:
     """`_call_time_sites()` restricted to one (usually synthetic) module.
