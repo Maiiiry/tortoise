@@ -2077,9 +2077,14 @@ def _calibration_read_offenders(functions, readers=_CALIBRATION_READERS,
     """The per-row checks of the note, over `functions` (name -> def node).
 
     Extracted so the synthetic non-vacuity tests can run the SAME code on a
-    hand-built function instead of asserting against a copy of it. `writers` is
-    the set of names the census proves write; `None` means "ask the census",
-    which is what the real pin does.
+    hand-built function instead of asserting against a copy of it.
+
+    `writers` is `_census_writer_names()` — "write **OR** not-proven-read", NOT
+    "the names the census proves a write": 45 of its 83 entries are functions
+    the census could not settle, so the offender message this set drives may not
+    claim the census PROVES a write (see that function's docstring for the full
+    polarity, and `test_the_census_writer_set_states_its_own_polarity` for the
+    pin). `None` means "ask the census", which is what the real pin does.
     """
     writers = _census_writer_names() if writers is None else writers
     offenders: list[str] = []
@@ -2953,6 +2958,34 @@ def test_a_proven_read_is_subtracted_only_for_its_own_module():
         "a proven read registered for `sdk.py` ITSELF was not subtracted, so "
         "the register's whole purpose is gone — a correct row reds on the "
         "census's silence again")
+
+
+def test_the_offenders_helper_docstring_states_the_real_polarity():
+    """NON-VACUITY for the `writers` parameter's own docstring (review P2).
+
+    `_census_writer_names`'s polarity was corrected to "write **OR**
+    not-proven-read" (45 of 83 entries are functions the census could not
+    settle), and the offender message was corrected with it — but the parameter
+    DOCSTRING eleven lines below still said "the set of names the census proves
+    write", i.e. the narrower, false thing. No pin covered prose, so the
+    overtuned sentence could sit beside the corrected one indefinitely and tell
+    every reader of the helper the wrong contract.
+
+    Red on the pre-fix text: it contained the literal "proves write".
+    """
+    doc = " ".join((_calibration_read_offenders.__doc__ or "").split())
+    assert doc, "`_calibration_read_offenders` lost its docstring"
+    assert "proves write" not in doc, (
+        "the `writers` docstring claims the census PROVES a write again — the "
+        "real polarity is 'write OR not-proven-read' (45 of 83 entries are "
+        f"unproven), so the parameter's stated contract is false (doc={doc!r})")
+    assert "not-proven-read" in doc, (
+        "the `writers` docstring no longer states the 'write OR "
+        "not-proven-read' polarity it receives from `_census_writer_names` "
+        f"(doc={doc!r})")
+    assert "`None`" in doc, (
+        "the `writers` docstring no longer documents the `None` default, which "
+        f"is what the real pin passes (doc={doc!r})")
 
 
 def test_the_calibration_reader_list_is_bound_to_the_rows_it_guards():
