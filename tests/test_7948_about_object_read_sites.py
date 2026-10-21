@@ -3716,7 +3716,8 @@ def test_the_census_universe_is_every_module_on_disk():
     the disk enumeration, and `_sources()` is the set the derivations consume. If
     either is narrowed, one of the two assertions reds — and the floor in
     `_pin_universe_to_disk` means an EMPTY enumeration reds too, instead of passing
-    having asserted nothing (the two mutation arms below make both halves executable).
+    having asserted nothing. The mutation arms below make BOTH halves executable, one
+    per name: the floor arm reaches only the floor, so it cannot stand in for them.
     """
     census = _call_time_census()
     _pin_universe_to_disk(census, {path for path in census.TORTISE.rglob("*.py")})
@@ -3741,17 +3742,55 @@ def test_the_universe_pin_reds_when_a_module_is_dropped():
 
     This is the measurement the `#9504`/`#9501` review established by hand and the PR
     body states in prose ("`_universe()` drops one module → RED — the universe pin").
-    Made executable here. `_call_time_census()` imports a FRESH module object per call,
-    so replacing `_universe` on this instance cannot leak through its `lru_cache` into
-    any other arm — and `_sources()` delegates to the module-global `_universe`, so
-    both names lose the module together and the `_universe` half is what must speak.
+    Made executable here.
+
+    ⚠️ `_call_time_census()` is `@functools.cache`d, so every arm in this file shares
+    ONE module object — the patch below is process-wide and MUST be reverted, or an
+    arm that runs after this one reads a universe with a module missing (measured: 241
+    of 242, and the completeness arm reds on `migrate_db.py`). The `try/finally`
+    restore is the file's own convention (the reuse pin above does the same with its
+    `originals` snapshot), not belt-and-braces.
     """
     census = _call_time_census()
     on_disk = {path for path in census.TORTISE.rglob("*.py")}
     full = census._universe()
     dropped = sorted(full)[len(full) // 2]
-    census._universe = lambda: {k: v for k, v in full.items() if k != dropped}
-    with pytest.raises(
-        AssertionError, match=re.escape(str(dropped.relative_to(census.TORTISE)))
-    ):
-        _pin_universe_to_disk(census, on_disk)
+    original = census._universe
+    try:
+        census._universe = lambda: {k: v for k, v in full.items() if k != dropped}
+        with pytest.raises(
+            AssertionError, match=re.escape(str(dropped.relative_to(census.TORTISE)))
+        ):
+            _pin_universe_to_disk(census, on_disk)
+    finally:
+        census._universe = original
+
+
+def test_the_universe_pin_reds_when_the_derivation_universe_is_dropped():
+    """Mutation: narrowing `_sources()` must RED — the OTHER half of the same pin.
+
+    `_universe()` and `_sources()` are two names for one contract: the disk
+    enumeration and the set the DERIVATIONS consume. Narrowing the second is the
+    `#9501` defect itself (a filter arriving on the gated side), and it is the arm the
+    PR body records by hand ("`_sources()` drops one module → RED — the universe
+    pin"). Executable here: `_sources()` is normally `@lru_cache(maxsize=1)`-warm from
+    earlier arms, so the patch replaces the module ATTRIBUTE — the only place the pin
+    can observe a narrowed derivation universe — and `_universe()` is left intact, so
+    the `_sources` half is the one that must speak.
+
+    The patch is reverted in `finally`: `_call_time_census()` is shared process-wide.
+    """
+    census = _call_time_census()
+    on_disk = {path for path in census.TORTISE.rglob("*.py")}
+    full = census._sources()
+    dropped = sorted(full)[len(full) // 3]
+    original = census._sources
+    try:
+        census._sources = lambda: {k: v for k, v in full.items() if k != dropped}
+        with pytest.raises(
+            AssertionError,
+            match=r"`_sources\(\)` omits 1 module\(s\)",
+        ):
+            _pin_universe_to_disk(census, on_disk)
+    finally:
+        census._sources = original
