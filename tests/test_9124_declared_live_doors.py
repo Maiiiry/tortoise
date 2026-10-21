@@ -1285,6 +1285,62 @@ _SCALAR_COERCIONS = frozenset(
     {"int", "float", "bool", "len", "abs", "round", "hash"})
 
 
+#: Literal containers: a value whose ENTIRE content is a constant expression.
+_LITERAL_CONTAINERS = (ast.Dict, ast.List, ast.Tuple, ast.Set)
+
+
+def _is_literal_value(node) -> bool:
+    """True when everything `node` can evaluate to is a CONSTANT.
+
+    Read by the non-NAME callee arm to decide the one benign case: a method
+    called ON a literal (`", ".join(...)`) or on a name whose every binding is
+    a literal container (`_CYPHER_CHAR_LITERAL.get(ch)` — a dict literal) can
+    only return text this walk has ALREADY collected, so it carries no blind
+    spot. A call on anything else — `b = _make(); b.suffix()` — returns text
+    from a body this walk never read, and is REPORTED.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, _LITERAL_CONTAINERS):
+        children = list(node.values if isinstance(node, ast.Dict) else node.elts)
+        if isinstance(node, ast.Dict):
+            children += [key for key in node.keys if key is not None]
+        return all(_is_literal_value(child) for child in children)
+    return False
+
+
+def _non_name_callee_is_benign(callee, bindings, params, module) -> bool:
+    """Benign cases for a call whose `func` is not a NAME.
+
+    Three, all measured — a blanket report reds the real pin:
+
+    * the receiver is a LITERAL, or a name whose every binding is a literal
+      container: `", ".join(_CALIBRATION_EVIDENCE_KINDS)` and
+      `_CYPHER_CHAR_LITERAL.get(ch)` are the two shapes the two pinned rows
+      assemble their statements with, and each value they return is drawn from
+      text this walk already read;
+    * the receiver is a PARAMETER: the `params` arm owns that decision (a
+      followed callee's parameter was walked at the call site; otherwise the
+      parameter is already reported) — `_live_only` does exactly
+      `clause.split(" AND ")` on the real tree;
+    * the callee is itself an ATTRIBUTE of a parameter (`self._suffix()`), where
+      the receiver NAME is already reported by the bare-name arm.
+    """
+    if not isinstance(callee, ast.Attribute):
+        return False  # Subscript / Lambda / … — nothing benign is known
+    receiver = callee.value
+    if isinstance(receiver, ast.Name) and receiver.id in params:
+        return True
+    if _is_literal_value(receiver):
+        return True
+    if not isinstance(receiver, ast.Name):
+        return False
+    values = list(bindings.get(receiver.id, ()))
+    if module is not None:
+        values += list(_module_bindings(module).get(receiver.id, ()))
+    return bool(values) and all(_is_literal_value(value) for value in values)
+
+
 def _fragments_of(expr, bindings, params, module, path, followed, unread,
                   depth: int = 0, visited=None,
                   params_are_inspected: bool = False) -> list[str]:
@@ -1296,8 +1352,11 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
 
     Anything that cannot be resolved is added to `unread` rather than skipped —
     the census's own polarity (a fragment that cannot be shown read-only is not
-    called read-only), so a blind spot cannot be inherited silently. Parameters
-    are the exception: they carry bind data and integers — but only when their
+    called read-only), so a blind spot cannot be inherited silently. A callee
+    need not be a NAME: an `Attribute`/`Subscript`/`Lambda` callee cannot be
+    resolved at all, so it is reported too (`_non_name_callee_is_benign` names
+    the three benign shapes). Parameters are the exception: they carry bind data
+    and integers — but only when their
     VALUE was already walked, which is true for a FOLLOWED CALLEE (its argument
     was inspected in the caller's expression) and NOT true for the top-level
     function: there the parameter is a value this walk never sees, so a directly
@@ -1377,15 +1436,37 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
                         default, callee_bindings, _params_of(callee),
                         callee_module, callee_path, followed, unread, depth + 1,
                         visited, params_are_inspected=True))
-            elif callee is None and sub.func.id not in _BUILTIN_NAMES:
+            elif callee is None and (
+                    sub.func.id not in _BUILTIN_NAMES
+                    or sub.func.id in bindings
+                    or (module is not None
+                        and sub.func.id in _module_bindings(module))):
                 # ⛔ REPORTED, never skipped — this is the polarity the
                 # docstring above states, and the asymmetry that made it a
                 # hole: an unknown NAME reds the pin below
                 # (`else: unread.add(sub.id)`), an unknown CALL did not, so a
                 # write introduced in a helper's return was invisible AND
-                # unannounced. A builtin is the one benign case (`int`, `len`),
-                # and it is the same test the bare-name arm uses.
+                # unannounced. A builtin is the one benign case (`int`, `len`)
+                # — and only when NOTHING HERE BINDS IT, the same two-table
+                # test the bare-name and scalar-coercion arms make:
+                # `next = _parts` / `format = _suffix_builder` makes the name
+                # a user callable, `_resolve_callee` does not follow an alias,
+                # and the builtin exemption then blessed a call whose body this
+                # walk never read (measured GREEN over a write in `_parts`).
                 unread.add(f"{sub.func.id}()")
+            continue
+        if isinstance(sub, ast.Call):
+            # A callee that is NOT a NAME: `Attribute` (`b.suffix()`),
+            # `Subscript` (`handlers[i]()`), `Lambda`. The NAME arm above cannot
+            # resolve it and the bare-name branch below skips it, so before this
+            # arm it contributed NEITHER a fragment NOR an `unread` entry — the
+            # defect closed for NAME callees at `aec5d1e0e`, left one branch
+            # over (measured GREEN: `b = _make(); query += f"{b.suffix()}"`).
+            # Not rescued by the receiver: when the receiver RESOLVES nothing
+            # else reports it.
+            if not _non_name_callee_is_benign(
+                    sub.func, bindings, params, module):
+                unread.add(f"{ast.unparse(sub.func)}()")
             continue
         if not isinstance(sub, ast.Name) or id(sub) in call_names:
             # A callee NAME is handled above; naming it again here would report
@@ -1564,17 +1645,40 @@ def test_the_symbol_pin_reads_the_comment_not_the_rows():
         '}\n')
     note = _comments_in(rows_only)
     assert note == "", f"the block has no comments, yet {note!r} was read"
-    assert [name for name, _s in _CALIBRATION_READERS if name not in note], (
-        "the symbol pin is satisfied by the SET ROWS alone — deleting the "
-        "#9063 note would leave it green, which is the failure it exists to "
-        "prevent")
-    # …and the note, once present, IS what satisfies it.
+    # ⛔ THE PIN'S OWN PREDICATE, not `name not in note`: after the line above
+    # established `note == ""` that test is `True` unconditionally, so it could
+    # not fail — and it held identically with the positive half reverted to the
+    # pre-fix `name in _unresolved_block_source()`, the very defect this test
+    # claims to hold. Spending the predicate on a comment-free block leaves both
+    # names MISSING, which is what makes deleting the note red.
+    def _missing(block_source: str) -> list[str]:
+        """The pin's own `missing` computation, over any block source."""
+        note_lines = _comments_in(block_source).splitlines()
+        return [name for name, shape in _CALIBRATION_READERS
+                if not any(name in line and shape in line
+                           for line in note_lines)]
+
+    def _missing(block_source: str) -> list[str]:
+        """The pin's own `missing` computation, over any block source."""
+        note_lines = _comments_in(block_source).splitlines()
+        return [name for name, shape in _CALIBRATION_READERS
+                if not any(name in line and shape in line
+                           for line in note_lines)]
+
+    assert _missing(rows_only) == [name for name, _shape in _CALIBRATION_READERS], (
+        "the symbol pin would stay green with the #9063 note deleted — its "
+        "positive half is reading the block's SET ROWS, not the comments")
+    # …and the note, once present in the shape the pin requires (ONE comment
+    # line carrying the name AND its read shape), satisfies it.
     with_note = rows_only.replace(
         "_UNRESOLVED = {",
-        "# `calibrate_summary` and `_uncalibrated_ep_participants` are reads.\n"
+        "#   `calibrate_summary` — `MATCH … OPTIONAL MATCH … RETURN` (a read)\n"
+        "#   `_uncalibrated_ep_participants` — `MATCH … RETURN n.id` (a read)\n"
         "_UNRESOLVED = {")
-    assert not [name for name, _s in _CALIBRATION_READERS
-                if name not in _comments_in(with_note)]
+    assert _missing(with_note) == [], (
+        "the pin does not even accept a note written in its own required "
+        f"shape, so the assertion above proves nothing (comments: "
+        f"{_comments_in(with_note)!r})")
 
 
 def _census_writer_names() -> frozenset[str]:
@@ -1994,6 +2098,112 @@ def test_an_unresolvable_callee_is_reported_not_dropped():
     assert not _offenders_for(benign), (
         "a genuine builtin call was reported as unread, so `int(...)` would "
         "red every pinned row")
+
+
+def test_a_shadowed_builtin_CALLEE_is_reported_not_blessed():
+    """NON-VACUITY for the builtin half of the callee arm (review P2).
+
+    The arm exempted every builtin-SHAPED name from `unread` without consulting
+    the binding tables — while the bare-name arm and the scalar-coercion arm a
+    few lines up both refuse to bless such a name unless it is UNBOUND. So
+    `next = _parts` / `format = _suffix_builder` (or an alias import) made the
+    name a user callable, `_resolve_callee` did not follow it, the name matched
+    `_BUILTIN_NAMES`, nothing was reported, and the callee's `return` text was
+    never walked: `query += f"{next()}"` came back CLEAN over a write in
+    `_parts`. Measured: `[]` before this fix, both halves.
+    """
+    module_level = (
+        'def _parts():\n'
+        '    return " SET n.poked = 1"\n'
+        'next = _parts\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id "\n'
+        '        query += f"{next()}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(module_level, with_module=True)
+    assert any("could not be read out" in offender for offender in offenders), (
+        "a MODULE binding that shadows a builtin was called as a function and "
+        "the call was blessed as the builtin, so its return text — a write, "
+        f"here — was never read nor reported (offenders={offenders})")
+
+    local = (
+        'def _parts():\n'
+        '    return " SET n.poked = 1"\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        parts = _parts\n'
+        '        query = "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id "\n'
+        '        query += f"{format(parts())}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(local, with_module=True)
+    assert any("could not be read out" in offender for offender in offenders), (
+        "a LOCAL binding of a builtin-shaped name was blessed as the builtin, "
+        f"so its call was neither followed nor reported (offenders={offenders})")
+
+
+def test_an_attribute_callee_on_a_resolved_value_is_reported():
+    """NON-VACUITY for the NON-NAME callee arm of `_fragments_of` (review P2).
+
+    An `ast.Call` whose `func` is an `Attribute` matched neither the NAME arm
+    nor the bare-name arm, so it contributed neither a fragment nor an `unread`
+    entry — the defect closed for NAME callees at `aec5d1e0e`, one branch over.
+    It is not rescued by the receiver: when the receiver RESOLVES (a local bound
+    to a call, a module binding) nothing else reports it. Measured: `[]` over
+    `b = _make(); query += f"{b.suffix()}"`.
+
+    The benign half is load-bearing, not decoration: a blanket report reds the
+    two real rows, which assemble their statements with `", ".join(...)` and
+    `_CYPHER_CHAR_LITERAL.get(ch)`, and `_live_only` does `clause.split(…)` on a
+    followed callee's parameter.
+    """
+    via_local = (
+        'def _make():\n'
+        '    return object()\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id "\n'
+        '        b = _make()\n'
+        '        query += f"{b.suffix()}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(via_local, with_module=True)
+    assert any("could not be read out" in offender for offender in offenders), (
+        "a method call on a resolved local was dropped in silence, so a write "
+        f"returned by it is invisible AND unannounced (offenders={offenders})")
+
+    via_module = (
+        'def _make():\n'
+        '    return object()\n'
+        'BUILDER = _make()\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id "\n'
+        '        query += f"{BUILDER.suffix()}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(via_module, with_module=True)
+    assert any("could not be read out" in offender for offender in offenders), (
+        "a method call on a MODULE binding was dropped in silence — the same "
+        f"fail-open one hop out (offenders={offenders})")
+
+    # The three measured benign shapes, each kept benign on purpose.
+    benign = (
+        "KINDS = ('statement', 'observation')\n"
+        "CHARS = {'q': 'x'}\n"
+        "def _live_only(clause):\n"
+        "    return ' AND '.join(clause.split(' AND '))\n"
+        "class Door:\n"
+        "    def reading(self, proj):\n"
+        '        query = "MATCH (n:Point) WHERE n.id IN $ids "\n'
+        "        query += f\"RETURN n.id {' - '.join(KINDS)} {CHARS.get('q')} \"\n"
+        '        query += f"{_live_only(\'a AND b\')}"\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(benign, with_module=True)
+    assert not offenders, (
+        "a method call on a LITERAL, on a name bound only to a literal "
+        "container, or on a followed callee's parameter was reported — those "
+        "are the shapes the two pinned rows assemble their statements with "
+        f"(`, `.join / dict `.get` / `_live_only`'s `clause.split`): "
+        f"{offenders}")
 
 
 def test_the_params_set_matches_the_census_for_a_positional_only_parameter():
