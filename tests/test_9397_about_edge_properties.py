@@ -49,20 +49,26 @@ absence. That is why this file checks the *writer census*, not another grep.
 
 THE SAME BLINDNESS, ONE LEVEL DOWN (review cycle on this file's first version)
 -----------------------------------------------------------------------------
-A census that reads only `SET r.<prop>` repeats the error: three forms write a
-property onto an edge, and a census must read all three — the named form
-`SET r.<prop>`, the property MAP (`SET r += $props` / `SET r = $p`), and the
-INLINE pattern map (`[r:aboutObject {idx:$idx}]`), which has no `SET` clause at
-all. Four shipped sites use the map/inline forms on an allowlisted
-`aboutObject` predicate (listed above). An interpolated predicate counts as
-about-bearing when its writer takes it from the shared about / predicate
-vocabulary — including the allowlist itself (`validate_rel_type`,
+A census that reads only `SET r.<prop>` repeats the error: the property-MAP
+form `SET r += $props` / `SET r = $p` is structurally invisible to it, and four
+shipped sites already use that form on an allowlisted `aboutObject` predicate
+(listed above). So the census reads ALL THREE write forms, and an interpolated
+predicate counts as about-bearing when its writer takes it from the shared about
+/ predicate vocabulary — including the allowlist itself (`validate_rel_type`,
 `KNOWN_REL_TYPES`, `_sanitize_label`), because "validated against the whole
 allowlist, which contains `aboutObject`" is exactly how a map-form writer
 names its edge without writing `aboutObject` anywhere. For the same reason the
 census has NO file-level `about` prefilter: that module never spells the word,
 so eligibility is decided by CONTENT (AST), not by a literal — the prefilter
 shipped, and it dropped precisely the writer the widening exists for.
+
+⚠️ THAT is a heuristic, and the promise it supports is bounded by it: the census
+cannot see a writer whose predicate comes from a vocabulary named nowhere in
+`_ABOUT_VOCAB` (or whose module `_module_in_scope` skips). The two forms that
+ARE provably read — the allowlist path and the inline pattern map — are pinned
+by synthetic probes; the residual gap is a list of names, and a list cannot be
+checked for a token nobody has written yet. Adding a predicate vocabulary is a
+change to `_ABOUT_VOCAB`, not only to the code that uses it.
 
 WHAT IS PINNED
 --------------
@@ -81,18 +87,27 @@ WHAT IS PINNED
    file-wide membership test cannot red on one section's silent deletion
    (`#8639` review, the `test_entity_attachment_brief_claims.py` precedent).
 3. `test_the_code_still_agrees_with_the_corrected_evidence` — each recorded
-   writer still writes the form it is recorded as (`confidence` named, or the
-   MAP / INLINE form) onto an `about*` edge. If that code is removed, the
-   document has re-rotted in the other direction and this reds instead of the
-   doc quietly lying again.
-4. `test_the_named_and_map_form_writer_populations_are_disjoint` — one site is
-   not recorded twice, and the map-form population has not silently shrunk.
-5. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
-   every property write on an `about*` relationship variable, in ANY of the
-   three forms, must be one of the recorded writers. A NEW writer that names
-   its edge literally, or takes the predicate from the shared allowlist,
-   cannot appear unrecorded.
-6. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
+   writer still writes `confidence` onto an `about*` edge. If that code is
+   removed, the document has re-rotted in the other direction and this reds
+   instead of the doc quietly lying again.
+4. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
+   every relationship-variable property write inside a function that builds an
+   `about*` edge — named (`SET r.<prop>`), map-assigned (`SET r += $props` /
+   `SET r = $p`), or an inline pattern map (`[r:aboutObject {idx:$idx}]`, which
+   assigns with no `SET` clause at all) — must be one of the recorded writers.
+   ⚠️ **The bound on that promise, stated rather than assumed:** an `about*`
+   edge is recognised by an `about*` LITERAL, or by an INTERPOLATED predicate in
+   a function whose body names one of the `_ABOUT_VOCAB` vocabularies (and, at
+   the file-walk level, in a module `_module_in_scope` admits). A writer that
+   derives its predicate from a vocabulary named NOWHERE in that list is still
+   invisible — so adding a predicate vocabulary, or a new way of naming one, is
+   a change to `_ABOUT_VOCAB` / `_module_in_scope`, not just a change to the
+   code. What IS machine-checked is that the three shipped forms are all read
+   (`test_the_census_reads_the_three_write_forms`) and that the allowlist path
+   is not skipped by the file walk (`test_the_census_reads_a_writer_that_never_
+   says_about`); the remaining gap is a vocabulary list, and a list cannot be
+   checked for a token nobody has written yet.
+5. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
    the binder, **or stops being the fall-through branch** of the
    `TORTOISE_SESSION_EXTRACTOR == "m2"` selection, that sentence becomes false
@@ -173,6 +188,14 @@ RETRACTED: dict[str, tuple[str, str]] = {
         "the entity links stay bare",
         "STORAGE-ARCHITECTURE.md",
     ),
+    "the corrected claim's own 'exactly one name' absolute": (
+        "The property set is exactly one name — `confidence`",
+        "STORAGE-ARCHITECTURE.md",
+    ),
+    "§13.8 q2's 'never a second property name'": (
+        "never a second property name",
+        "EXTRACTOR-V4-ARCHITECTURE.md",
+    ),
     "the decision ledger's reason is property-freedom": (
         "Cheap because edges are **property-free**",
         "EXTRACTOR-V4-ARCHITECTURE-CHANGELOG.md",
@@ -201,6 +224,8 @@ RETRACTED_QUOTED_IN: dict[str, Path] = {
         STORAGE_CHANGELOG
     ),
     "§11.3's prose says the links stay bare": STORAGE_CHANGELOG,
+    "the corrected claim's own 'exactly one name' absolute": STORAGE_CHANGELOG,
+    "§13.8 q2's 'never a second property name'": STORAGE_CHANGELOG,
 }
 
 #: The one retracted sentence this correction REWROTE rather than quoted, so no
@@ -230,13 +255,15 @@ RECORDED_WRITERS: dict[tuple[str, str], tuple[str, ...]] = {
 }
 
 #: The RE-MATERIALIZING writers: they carry the edge's whole attribute set by
-#: property MAP over an allowlisted predicate (which includes `aboutObject`), so
-#: the census must see them or the "exactly one property name" claim is defended
-#: only against the form that happens to be in use today. Every one of these
-#: reproduces `confidence` from the record row, the journal event or the dump —
-#: none adds a second property name — so they are recorded as the MAP form, not
-#: as a property. `_SET_MAP` cannot read names, and inventing one would be the
-#: same guess this file exists to stop.
+#: property MAP over an allowlisted predicate (which includes `aboutObject`).
+#: They are recorded as the MAP form because a map assignment's NAMES are
+#: schema-driven and unreadable statically — `_SET_MAP` cannot read them, and
+#: inventing one would be the same guess this file exists to stop. ⚠️ One of
+#: them ALSO writes a name in the INLINE pattern-map form
+#: (`cache_projection.relation_statement` stamps `{idx:$idx}`,
+#: `cache_projection.py:717`), and that `idx` is read by the census's inline
+#: rule — so the documents' set is `confidence` (originated) plus `idx`
+#: (re-materialized), not one name.
 MAP_WRITERS: dict[tuple[str, str], tuple[str, ...]] = {
     ("tortoise/cache_projection.py", "relation_statement"): (
         "MERGE (src)-[r:{rel.rel_type} {{idx:$idx}}]->(tgt) SET r += $props",
@@ -254,22 +281,11 @@ MAP_WRITERS: dict[tuple[str, str], tuple[str, ...]] = {
     ),
 }
 
-#: The one recorded writer that puts an extra NAME on the edge inside the
-#: relationship pattern itself: `relation_statement` writes `idx` — the
-#: `public.relation.idx` parallel-edge ordinal — as `[r:{rel_type} {idx:$idx}]`,
-#: unconditionally, on every edge it materializes. Recorded as a FORM, not as a
-#: property: it is the edge's identity coordinate, not a semantic attribute, and
-#: the corrected documents say so (§11.1, §13, §13.8 q2). The MAP row above is
-#: the same site; this row is what makes the INLINE half of the write measured
-#: rather than incidental.
-INLINE_FORM_WRITERS: dict[tuple[str, str], tuple[str, ...]] = {
-    ("tortoise/cache_projection.py", "relation_statement"): (
-        'MERGE (src)-[r:{rel.rel_type} {{idx:$idx}}]->(tgt) SET r += $props',
-    ),
-}
-
-#: The one semantic attribute the originating writers put on an about edge.
+#: The property. One ORIGINATED name; `idx` is the second recorded name, written
+#: by the record-layer projection as an INLINE pattern map (see `INLINE_FORM`).
 PROPERTY = "confidence"
+#: The second name, and the form that writes it.
+SECOND_PROPERTY = "idx"
 
 #: Sentinel for an edge write whose property NAMES cannot be read statically:
 #: a property-MAP assignment (`SET r += $props`) carries whichever columns the
@@ -293,6 +309,17 @@ _SET_ON = re.compile(r"SET\s+(\w+)\.(\w+)\s*=")
 #: `aboutObject {` grep this PR exists to correct — a census that cannot match
 #: it reports a measured absence. Four shipped sites already use this form.
 _SET_MAP = re.compile(r"SET\s+(\w+)\s*(\+=|=)\s*(\$|\{)")
+#: The THIRD form: a property written by an INLINE pattern map —
+#: `MERGE (s)-[r:aboutObject {idx:$idx}]->(t)`. Its NAMES are statically readable
+#: (unlike `SET r += $props`), and it appears in NO `SET` clause (unlike
+#: `SET r.<prop>`), so both rules above were blind to it while
+#: `cache_projection.relation_statement` shipped it on every edge it
+#: materializes — including an allowlisted `aboutObject` one. Found by the
+#: third review cycle: the first census missed the MAP form, the second missed
+#: this, and each time the census's own blindness was the defect.
+INLINE_FORM = "<inline-map>"
+_INLINE_BRACE = re.compile(r"\{([^{}]*)\}")
+_INLINE_NAME = re.compile(r"(\w+)\s*:")
 #: A relationship pattern, captured as (variable, relationship-token).
 _PATTERN = re.compile(r"\[(\w+):([^\]]{0,120})\]")
 _ABOUT_REL = re.compile(
@@ -375,78 +402,95 @@ def _qualified(tree: ast.Module):
     yield from walk(tree)
 
 
-def _census_source(module: str, text: str) -> dict[tuple[str, str], set[str]]:
-    """The census, over ONE module's source text.
-
-    Split out so `test_the_census_sees_every_write_form_it_claims` can run it
-    on SYNTHETIC writers. A coverage claim exercised only against today's tree
-    cannot show that a new writer REDS — and twice in this file's life the form
-    the tree happened to use was the only form the census could see.
-    """
+def _writers_in_module(
+    module: str, text: str
+) -> dict[tuple[str, str], set[str]]:
+    """The census over ONE module's source. Split out so a SYNTHETIC module can be
+    put through it: the two fail-open forms found in review (the inline pattern
+    map, and a writer that names its predicate from the allowlist instead of
+    spelling `about`) are only pinned non-vacuously by feeding this function a
+    module that uses them — no shipped file has to exist for the rule to be
+    proved live."""
     found: dict[tuple[str, str], set[str]] = {}
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:  # pragma: no cover — a broken module fails elsewhere
-        return found
-    lines = text.splitlines()
-    for qualname, node in _qualified(tree):
-        body = _own_body(node, lines)
-        about_vars: set[str] = set()
-        inline_vars: set[str] = set()
-        interpolated = "{" in body and any(
-            vocab in body for vocab in _ABOUT_VOCAB
-        )
-        for var, rel in _PATTERN.findall(body):
-            if _ABOUT_REL.search(rel) or ("{" in rel and interpolated):
-                about_vars.add(var)
-                # A property written INSIDE the pattern is a MAP (`{name:value}`),
-                # never a bare interpolated predicate (`{rel}`, no colon).
-                if ":" in rel:
-                    inline_vars.add(var)
-        if not about_vars:
-            continue
-        key = (module, qualname.split(".")[-1])
-        for var, prop in _SET_ON.findall(body):
-            if var in about_vars:
-                found.setdefault(key, set()).add(prop)
-        # The property-MAP form: `SET r += $props` / `SET r = $p` writes an
-        # edge's whole attribute set and is invisible to `_SET_ON`. Recorded as
-        # the FORM (`MAP_FORM`), because the names are schema-driven and
-        # unreadable statically — see `MAP_WRITERS`.
-        if any(var in about_vars for var, _op, _rhs in _SET_MAP.findall(body)):
-            found.setdefault(key, set()).add(MAP_FORM)
-        # The INLINE form: a property in the pattern itself, with no `SET`.
-        if inline_vars & about_vars:
-            found.setdefault(key, set()).add(INLINE_FORM)
+    if True:  # one flat body, so the file/rglob caller below stays a loop
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:  # pragma: no cover — a broken module fails elsewhere
+            return found
+        lines = text.splitlines()
+        for qualname, node in _qualified(tree):
+            body = _own_body(node, lines)
+            about_vars: set[str] = set()
+            inline: dict[str, set[str]] = {}
+            interpolated = "{" in body and any(
+                vocab in body for vocab in _ABOUT_VOCAB
+            )
+            for var, rel in _PATTERN.findall(body):
+                if _ABOUT_REL.search(rel) or ("{" in rel and interpolated):
+                    about_vars.add(var)
+                    # An inline pattern map (`{idx:$idx}`) is a property write
+                    # whose NAME is right there — read it rather than assume.
+                    for brace in _INLINE_BRACE.findall(rel):
+                        inline.setdefault(var, set()).update(
+                            _INLINE_NAME.findall(brace)
+                        )
+            if not about_vars:
+                continue
+            for var, names in inline.items():
+                # A brace with no `name: value` pair contributes nothing: record
+                # no empty set, which would report a writer for writing nothing.
+                if var in about_vars and names:
+                    found.setdefault(
+                        (module, qualname.split(".")[-1]), set()
+                    ).update(names)
+            for var, prop in _SET_ON.findall(body):
+                if var in about_vars:
+                    found.setdefault(
+                        (module, qualname.split(".")[-1]), set()
+                    ).add(prop)
+            # The property-MAP form (review finding on this file's first
+            # version): `SET r += $props` / `SET r = $p` writes an edge's whole
+            # attribute set and is invisible to `_SET_ON`. Recorded as the FORM
+            # (`MAP_FORM`), because the names are schema-driven and unreadable
+            # statically — see `MAP_WRITERS`.
+            if any(var in about_vars for var, _op, _rhs in _SET_MAP.findall(body)):
+                found.setdefault(
+                    (module, qualname.split(".")[-1]), set()
+                ).add(MAP_FORM)
     return found
 
 
-def _about_edge_property_writers(
-    root: Path | None = None,
-) -> dict[tuple[str, str], set[str]]:
+def _module_in_scope(text: str) -> bool:
+    """Can this module NAME an about predicate — by spelling one, or by taking it
+    from the shared predicate vocabulary a map-form writer uses INSTEAD of
+    spelling it (`validate_rel_type` / `KNOWN_REL_TYPES` / `_sanitize_label`)?
+
+    The prefilter used to be the literal word "about", which is exactly the word
+    `_ABOUT_VOCAB`'s own justification says such a writer does NOT contain — so
+    the vocabulary widening never reached the files it exists for (third review
+    cycle; measured: a map-form module with no "about" anywhere was skipped).
+    Its own leg pins both halves, because a prefilter is a fail-open by
+    construction: anything it skips is reported as a measured absence.
+    """
+    return "about" in text or any(v in text for v in _ABOUT_VOCAB)
+
+
+def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
     """{(module, symbol): {property, …}} for every property-bearing about-edge write.
 
-    `root` defaults to the real package; a test passes a temporary directory to
-    exercise the WALK itself (the file-level prefilter the census first had was
-    in this loop, not in `_census_source`, so a per-source test cannot cover it).
+    BOUND: an edge counts as `about*` by an `about*` literal in the relationship
+    token, or by INTERPOLATION in a function body that names one of
+    `_ABOUT_VOCAB` (and, above that, in a module `_module_in_scope` admits). A
+    writer that names its predicate some other way is invisible here — the
+    promise is "nothing NEW appears unrecorded among the forms and vocabularies
+    we read", never "nothing can appear".
     """
-    root = PKG if root is None else root
     found: dict[tuple[str, str], set[str]] = {}
-    # EVERY module is parsed. The `if "about" not in text: continue` prefilter
-    # this function first had dropped exactly the writer the widened
-    # `_ABOUT_VOCAB` exists for — one that takes its predicate from the shared
-    # allowlist and never spells `aboutObject` (review finding), so eligibility
-    # was decided by a literal word the design says will be absent. Measured
-    # cost of parsing the whole package: ~1.6 s, against a guard that could not
-    # see the module it was meant to guard.
-    for path in sorted(root.rglob("*.py")):
+    for path in sorted(PKG.rglob("*.py")):
         text = path.read_text(encoding="utf-8", errors="replace")
-        try:
-            module = path.relative_to(ROOT).as_posix()
-        except ValueError:  # a temporary probe tree
-            module = path.name
-        for key, props in _census_source(module, text).items():
-            found.setdefault(key, set()).update(props)
+        if not _module_in_scope(text):
+            continue
+        found.update(_writers_in_module(path.relative_to(ROOT).as_posix(), text))
     return found
 
 
@@ -554,14 +598,16 @@ def test_the_corrected_passages_name_the_property_bearing_class():
             "'property-free' is replaced by a named, bounded exception, not by "
             "silence"
         )
-        # The record-layer projection writes ONE further name — `idx`, the
-        # parallel-edge ordinal — so a section claiming a one-name property set
-        # must say which one it is excluding, or the claim is false against a
-        # writer this file records (`INLINE_FORM_WRITERS`).
-        assert "idx" in section, (
-            f"{label} does not name the `idx` ordinal the record-layer "
-            "projection writes inline (`[r:aboutObject {idx:$idx}]`) — the "
-            "measured property set then contradicts a recorded writer"
+        # The SECOND recorded name, and the third write form: `confidence` alone
+        # is the ORIGINATED set. A record-projected about edge also carries `idx`
+        # (`cache_projection.relation_statement`, an inline pattern map), so a
+        # section naming only `confidence` re-asserts an absolute the code
+        # disproves — the exact defect this PR exists to correct.
+        assert f"`{SECOND_PROPERTY}`" in section, (
+            f"{label} no longer names `{SECOND_PROPERTY}` — the record-layer "
+            "projection stamps it inline on an allowlisted `aboutObject` edge "
+            "(`cache_projection.py:717`), so the measured set is `confidence` "
+            "(originated) plus `idx` (re-materialized), not one name"
         )
     # The surviving true half must stay stated: the GENERIC writer sets nothing.
     storage = docs["STORAGE"]
@@ -735,10 +781,23 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
         "`SET r = $p`) at all — `_SET_MAP` or the widened `_ABOUT_VOCAB` was "
         "changed, and the map-form half of the population is unmeasured again"
     )
-    assert any(INLINE_FORM in props for props in writers.values()), (
-        "the census sees no INLINE pattern-map write "
-        "(`[r:aboutObject {idx:$idx}]`) at all — the third form is unmeasured "
-        "again, and `relation_statement`'s `idx` is invisible"
+    #: The THIRD form. `cache_projection.relation_statement` stamps `idx` in an
+    #: inline pattern map; if the census stops reading it, this population goes
+    #: back to claiming an about edge carries one name — the version of this
+    #: guard that missed four shipped writers, one form further along.
+    assert writers[("tortoise/cache_projection.py", "relation_statement")] >= {
+        SECOND_PROPERTY,
+        MAP_FORM,
+    }, (
+        "the census no longer reports `idx` (the INLINE pattern-map form) on "
+        "the record-layer projection — `MERGE (src)-[r:{rel.rel_type} "
+        "{idx:$idx}]->(tgt) SET r += $props` (`cache_projection.py:717`) "
+        "writes a SECOND property name on an allowlisted `aboutObject` edge, "
+        "which is why the documents state `confidence` + `idx`"
+    )
+    assert any(SECOND_PROPERTY in props for props in writers.values()), (
+        "no writer in the population is seen writing `idx` — the inline-map "
+        "rule has stopped measuring anything"
     )
     unrecorded = sorted(
         f"{module}::{symbol} SETs {sorted(props)}"
@@ -755,7 +814,58 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
     )
 
 
-# ── 6. the reach claim the corrected text makes ────────────────────────────
+# ── 4b. the two forms the census was fail-open on (synthetic probes) ───────
+
+
+def test_the_census_reads_the_inline_pattern_map_form():
+    """A property stamped INSIDE the pattern (`-[r:aboutObject {c:$v}]->`) is a
+    write; a census that only reads `SET` clauses reports it as a measured
+    absence — the blindness this file exists to stop, one form along. Probed on
+    a synthetic module so the rule is proved live without a shipped writer's
+    cooperation, and so a regression reds here rather than in production."""
+    probe = (
+        "def link(g, s, t, c):\n"
+        "    g.query('MERGE (s)-[r:aboutObject {confidence:$c}]->(t)', "
+        "params={'c': c})\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", probe)
+    assert found == {("tortoise/probe.py", "link"): {"confidence"}}, (
+        "the census does not read the INLINE pattern-map form — a property "
+        f"written there is invisible again (found {found!r})"
+    )
+
+
+def test_the_census_reads_a_writer_that_never_says_about():
+    """The module prefilter was the literal word "about" — which is exactly what
+    `_ABOUT_VOCAB`'s justification says an allowlist-driven map writer does NOT
+    contain, so the widened vocabulary never reached those files. The probe
+    names no about predicate at all: it takes it from `validate_rel_type`, the
+    allowlist that contains every `about*` type (`security.py:85`)."""
+    probe = (
+        "from tortoise.security import validate_rel_type\n"
+        "def project_edge(g, rel_type, props):\n"
+        "    validate_rel_type(rel_type)\n"
+        "    g.query(f'MERGE (s)-[r:{rel_type}]->(t) SET r += $props', "
+        "params={'props': props})\n"
+    )
+    assert "about" not in probe
+    assert _module_in_scope(probe), (
+        "the module prefilter still requires the literal word 'about', so the "
+        "allowlist-driven map writer is skipped by the FILE WALK even though "
+        "the census rule would see it"
+    )
+    assert not _module_in_scope("x = 1\n"), (
+        "the prefilter admits every module — it no longer narrows anything, so "
+        "an unrelated module's writes would count as about-edge writers"
+    )
+    found = _writers_in_module("tortoise/probe.py", probe)
+    assert found == {("tortoise/probe.py", "project_edge"): {MAP_FORM}}, (
+        "the census does not read a map-form writer whose predicate comes from "
+        f"the allowlist instead of the word 'about' (found {found!r})"
+    )
+
+
+# ── 5. the reach claim the corrected text makes ────────────────────────────
 
 
 def test_the_default_ingestion_path_reaches_the_binder():
