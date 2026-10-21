@@ -337,9 +337,16 @@ STORAGE_CHANGELOG = (
 #: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against.
 #: The reading MOVES with this file and is re-measured at every revision, never
 #: carried forward — a count in this prose is a claim the code outgrows
-#: silently, which is exactly how this defect kept returning. Re-measure it
-#: (substitute the four pre-fix documents from `PRE_FIX_REV`, run the file, read
-#: the split) instead of trusting any number written here. "Was live pre-fix" is a claim about HISTORY, so it is
+#: silently, which is exactly how this defect kept returning — the same sentence
+#: went stale at one leg total, was corrected to a new total that was itself
+#: stale, and a concurrent lane's re-measurement was out of date the moment two
+#: more legs landed. That is why no total appears here.
+#: TO RE-MEASURE: swap ALL FOUR live documents this guard reads for their
+#: `01b5486ec` versions, run the file, read the split. A PARTIAL swap measures
+#: something else — `STORAGE-ARCHITECTURE.md` alone gives a different reading
+#: because the extractor and changelog legs then still read corrected text —
+#: so the swap, not the number, is the durable instruction.
+#: "Was live pre-fix" is a claim about HISTORY, so it is
 #: checked against history instead of restated: an entry in
 #: `RETRACTED_INTRODUCED_HERE` must be ABSENT here, every other entry PRESENT.
 #: ⛔ NOT derived from `git merge-base HEAD origin/main`: the moment this lands
@@ -641,7 +648,7 @@ _ABOUT_REL = re.compile(
 #: restorer's `_sanitize_label` belong here for the map-form writers: they do
 #: not name `aboutObject` at the write site at all — they take the predicate
 #: from the allowlist that contains it (or from the dump, sanitized). Verified
-#: against the tree: adding them raises the census from 3 rows to exactly 7 ROWS —
+#: against the tree: adding them raises the census from 5 rows to exactly 7 ROWS (the two rows they add are the map-form writers) —
 #: the 5 recorded writers (3 named-form + 2 map-form) plus the 2 declared false
 #: positives, which are rows the census sees and does not count as writers.
 _ABOUT_VOCAB: tuple[str, ...] = (
