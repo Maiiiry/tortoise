@@ -6346,8 +6346,20 @@ def format_report(
                 "may also be forced by a non-holder hit above."
             )
         if incomplete:
+            # ⛔ "COULD NOT BE QUERIED" IS FALSE FOR A REST-RESCUED SURFACE
+            # (#9423 review round 8, P3). The rescue (#9402) ENUMERATES the open-PR
+            # list and runs the title/head-ref/number tests over it; only the
+            # GraphQL-computed closing-reference test is unmeasured. The summary
+            # line said "open PRs could not be queried" directly beneath a
+            # blocking hit that `open PRs` HAD produced, while the surface's own
+            # note said "N PR(s) WERE read". A summary that contradicts the row
+            # above it is the "report misdescribes what it measured" class this
+            # PR exists to close, so the verb is now precise: PARTIAL reads are
+            # "could not be FULLY queried", which is true for all three causes
+            # (unmeasured test, truncated cap, unread surface).
             lines.append(
-                f"  ALSO INCOMPLETE: {len(incomplete)} surface(s) could not be queried "
+                f"  ALSO INCOMPLETE: {len(incomplete)} surface(s) could not be FULLY "
+                f"queried "
                 f"({', '.join(s.name for s in incomplete)}) — "
                 f"{_incomplete_remedy(incomplete)}"
             )
@@ -6355,7 +6367,7 @@ def format_report(
     if incomplete:
         lines.append(
             f"VERDICT: INCOMPLETE (exit {EXIT_INCOMPLETE}) — {len(incomplete)} surface(s) "
-            f"could not be queried ({', '.join(s.name for s in incomplete)}); "
+            f"could not be FULLY queried ({', '.join(s.name for s in incomplete)}); "
             f"this is NOT clean for #{issue} in {slug} — "
             f"{_incomplete_remedy(incomplete)}"
         )

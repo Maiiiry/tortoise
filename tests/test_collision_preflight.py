@@ -5567,6 +5567,27 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("re-authenticating cannot change it", out)
         self.assertIn("and PART is:", out)
 
+    def test_the_summary_does_not_say_a_partially_read_surface_was_unqueryable(self):
+        # #9423 review round 8 (P3): with the list rescued over REST, the open-PR
+        # surface DID answer — only the computed closing-reference test is
+        # unmeasured. The summary used to say "could not be queried (open PRs)"
+        # directly beneath a hit `open PRs` had produced, contradicting both the
+        # surface note ("N PR(s) WERE read") and the remedy. The verb is now
+        # "could not be FULLY queried", which is true for all three incomplete
+        # causes and does not deny the read that happened.
+        self.gh_fixtures(open_prs=[{
+            "number": 9416, "title": f"fix(dispatch): names the issue ({ISSUE})",
+            "body": "", "headRefName": "feat/9999-other", "state": "open",
+        }])
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertIn("could not be FULLY queried", out)
+        # The false absolute is gone from BOTH summary lines.
+        self.assertNotIn("surface(s) could not be queried", out)
+        # …while the read itself is still reported as evidence.
+        self.assertIn("1 PR(s) WERE read", out)
+
     def test_a_null_rest_body_is_accepted_and_the_enumeration_still_runs(self):
         # #9423 review round 7 (P3): `body: null` is the REAL REST shape for a PR
         # with no description, and it is the COMMON production shape. The wire
