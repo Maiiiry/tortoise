@@ -61,8 +61,17 @@ neither the live nor the replay lane:
   `reestablish_watermark`) and raises `first_seq`, so a parked subscriber gets
   the truthful 410 instead of `[]` forever. A declared truncation with a cursor
   contract, not corruption.
-* `_replay_write_scope` for `reestablish_watermark`, which only ever runs as part
-  of a wipe+replay: the value it writes came FROM the journal's own rebuild.
+* the watermark in `reestablish_watermark`, whose lane is stated by its CALLER
+  and opened HERE, at the handle: `rebuild_all` puts back the value it CAPTURED
+  before the wipe and names that leg (`pre-wipe-restore: …`, `#9210`), while
+  the journal engine `rebuild()` — which ALSO puts back a captured value, taken
+  by `capture_watermark` before its own wipe — keeps the engine's method-wide
+  `"replay"` and is a DEFERRED instance of the same defect, left to `#9213`
+  rather than claimed truthful (it was claimed to "re-derive" the value from
+  the journal, which the code refutes; see the helper's docstring). The
+  declaration has to live at the write because an inner scope SHADOWS an outer
+  one (`_cache_write_authorized` is a `ContextVar`), so a `with` at the call
+  site could not state the lane at all.
 
 ⚠️ The declarations are NOT a licence for the swallow: `append_event` and
 `_refresh_first_seq` still catch bare `Exception` (a store failure must never
@@ -73,6 +82,7 @@ guarded handle (#9124 part 2), not a declaration.
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -123,7 +133,7 @@ _DEGRADED: dict[tuple[str, str], dict[str, Any]] = {}
 #: NOT `asyncio.to_thread`, whose shared default executor is the #3060
 #: starvation path the repo avoids — so the `:GraphEvent` emit leg executes on a
 #: graph-pool worker, while `degraded_graphs()` is called from the `async def`
-#: `/health` route ON the loop (`_health_payload` → `_change_feed_health`). `sorted(_DEGRADED.items())` materialises a list
+#: health route ON the loop (`hosted_api.health()` → `_change_feed_health`). `sorted(_DEGRADED.items())` materialises a list
 #: while a peer thread may insert, which raises ``RuntimeError: dictionary
 #: changed size during iteration`` — and `/health` swallows that, so it would
 #: answer ``change_feed.degraded: false`` at the exact moment a second feed went
@@ -134,6 +144,7 @@ _DEGRADED: dict[tuple[str, str], dict[str, Any]] = {}
 _DEGRADED_LOCK = threading.Lock()
 
 
+@functools.cache
 def _canonical_path(path: str) -> str:
     """ONE store, ONE key — however its path is spelled.
 
@@ -145,6 +156,20 @@ def _canonical_path(path: str) -> str:
     identity, the same normalisation `projection._prewipe_db_path_identity` and
     `fallback_snapshot.snapshot_key` apply (`realpath(abspath(expanduser()))`,
     which is what makes macOS's `/tmp` -> `/private/tmp` compare EQUAL).
+
+    ⛔ MEMOISED per raw spelling, and the memo is part of the fix, not an
+    optimisation. The normalisation reads MUTABLE ambient state — the process
+    cwd (`abspath`) and the symlinks along the path (`realpath`) — while both
+    the WRITER (`record_degraded` -> `_graph_key`) and the READER
+    (`degraded()` -> `_graph_key`) re-derive the key on every call. Re-deriving
+    would let a recorded loss become un-findable by the very poll it must
+    refuse: `chdir` after a relative `_path` was recorded, or a repointed
+    symlinked parent, moves the key out from under the state, `degraded()`
+    answers `None`, and `poll_events` returns `[]` over the lost event — the
+    silence this module exists to break, reintroduced by the fix for a
+    different one. Pinning the resolution for the process lifetime makes a
+    projection's identity stable, which is what the raw-string key was, and
+    takes the per-poll `realpath` syscalls off the `poll_events` path.
 
     `:memory:` is left ALONE deliberately: it names no file, `abspath` would
     fold the caller's cwd into the key, and two cwds would then be two keys for
@@ -214,9 +239,11 @@ def record_degraded(proj, stage: str, event_type: str, event_id: str | None,
 
     ``stage``/``event_type``/``error`` describe the MOST RECENT failure, and the
     FIRST one is kept beside them as ``first_stage``/``first_error``: a graph can
-    fail twice for different reasons (`append-unverified` then `append`), and the
-    first is often the only provable one, so overwriting it would discard the
-    diagnosis a reader needs. Both are recorded rather than one being chosen.
+    fail twice for different reasons (`append` then `append-unverified`), and the
+    first is often the only provable one — the order matters, because
+    ``append-unverified`` is by definition the stage that could NOT be proven —
+    so overwriting it would discard the diagnosis a reader needs. Both are
+    recorded rather than one being chosen.
 
     Called from BOTH swallows (`TortoiseSDK._emit_event` and `append_event`) so
     the two cannot record different diagnoses for the same failure, and so a
@@ -279,6 +306,10 @@ def degraded_graphs() -> list[dict[str, Any]]:
             "first_stage": state["first_stage"],
             "lost": state["lost"],
             "error": state["error"],
+            # Both diagnoses, for the same reason `degraded()` carries both: a
+            # reporter that forwarded only the CURRENT stage would still hide
+            # the first, often only provable, one (#9208 review).
+            "first_error": state["first_error"],
         }
         for (store, _graph), state in sorted(snapshot)
     ]
@@ -537,8 +568,30 @@ def capture_watermark(proj) -> dict | None:
     return {"last_seq": value}
 
 
-def reestablish_watermark(proj, carried_last_seq: int | None) -> int | None:
+def reestablish_watermark(proj, carried_last_seq: int | None, *,
+                          restore_reason: str | None = None) -> int | None:
     """Re-establish ``:GraphEventMeta`` after a wipe+replay (#4653).
+
+    ``restore_reason`` states which lane the carried value came from, and it is
+    the CALLER's to state because this helper has two callers with unlike
+    authorization: `FalkorProjection.rebuild_all` puts back a value it CAPTURED
+    from this graph immediately before the wipe, so it names its restore leg
+    (``pre-wipe-restore: :GraphEventMeta watermark (#4653)``, #9210) — the replay
+    lane's contract ("this content came FROM the record") is FALSE for it. The
+    journal engine `rebuild()` puts back a captured value TOO — it calls
+    `capture_watermark` before its own wipe and hands the result here — so the
+    same contract is false for it as well; it keeps the default and therefore
+    keeps this module's landed declaration (#9224) as a DEFERRED instance of
+    that defect, disclosed here and left to `#9213`, NOT because the value
+    comes from the replayed log (it does not: the carry is a pre-wipe read of
+    the live counter). ⚠️ A blanket restore reason is not the honest fix for
+    that caller either: `last_seq` is `max(carried, max(:GraphEvent.seq))`, so
+    the stored value can be the REPLAYED seq when it is higher — the two
+    sources have to be split before one lane can describe the write. The lane
+    is opened at the write below, never at the call site: the
+    scope is a `ContextVar`, so an inner declaration shadows an outer one, and a
+    `with` around the call would be silently discarded — the exact way the
+    watermark went on declaring `"replay"` while restoring captured state.
 
     The ``last_seq`` monotonicity guard is ``hosted_backup._restore_event_meta``'s
     (#3902): ``last_seq = max(carried, max(:GraphEvent.seq))`` — whatever the
@@ -650,11 +703,20 @@ def reestablish_watermark(proj, carried_last_seq: int | None) -> int | None:
     # `first_seq` is raised, never lowered (see the docstring), and its `CASE`
     # reads the PRE-clause value — Cypher evaluates a SET clause against the
     # state before it.
-    # §17.1 (#9124): this write only ever runs as part of a wipe+replay — the
-    # value it re-establishes came FROM the rebuild of the journal — so it
-    # declares the REPLAY lane rather than arriving at the handle undeclared.
-    from .projection import _replay_write_scope
-    with _replay_write_scope():
+    # §17.1 (#9124, #9210, #9224): this write never arrives at the handle
+    # undeclared, but WHICH lane it declares is the caller's to state — this
+    # lane's own named restore leg when `rebuild_all` is putting back the value
+    # it captured before the wipe (#9210), the engine's replay lane for
+    # `rebuild()`, which restores a captured counter as well but keeps the
+    # `"replay"` default as a DEFERRED #9213 item (not because its value is
+    # journal-derived — see the docstring; a blanket restore reason would be
+    # false for the `max(carried, max(:GraphEvent.seq))` leg).
+    # `_cache_write_authorized` is the same single-writer ContextVar
+    # every scope uses, so an undeclared caller still fails closed on `None`;
+    # the lane is opened here because an inner scope shadows an outer one, so a
+    # `with` at the call site could never be the declaration.
+    from .projection import _cache_write_authorized
+    with _cache_write_authorized(restore_reason or "replay"):
         rows = proj.g.query(
             "MERGE (m:GraphEventMeta) "
             "ON CREATE SET m.last_seq = $last, m.first_seq = $first "

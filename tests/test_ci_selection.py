@@ -2322,6 +2322,40 @@ def test_9078_guard_runs_on_a_main_only_diff():
     assert "test_9078_record_written_by_production_path.py" in r["test_files"], r
 
 
+def test_9192_guard_runs_on_the_diff_that_can_break_it():
+    # #9192 review P1: `tests/test_9192_tenant_armed_by_request.py` is the PR's
+    # own proof that a multi-tenant process cannot name its tenant from env. Its
+    # REGISTRATION closed `--integrity` (the required `manifest-integrity` job),
+    # but a registration is not a SELECTION pin: a guard that is registered and
+    # never selected on the diff that can break it certifies nothing (#9196/#9231).
+    #
+    # It is DUAL-registered for the #9078 reason because the two halves of the
+    # fix live under two different selectors. `tortoise/record_writer.py` (the
+    # resolver: `record_tenant` / `single_tenant_declared`) matches no
+    # SOURCE_PATTERN and falls through to `core`; `tortoise/mcp_auth.py`
+    # (`OrgResolutionMiddleware`, the per-request installer) is an EXACT `api`
+    # match, and a named-surface match REPLACES the `core` fallback (`core` is
+    # added only in the `if not found:` branch; `CORE_ALSO` does not list it).
+    #
+    # Measured before the registration: `select(["tortoise/record_writer.py"])`
+    # -> surfaces=['core'] with the file ABSENT (603 files), and
+    # `select(["tortoise/mcp_auth.py"])` -> surfaces=['api'] with it ABSENT (288
+    # files).
+    #
+    # Mutation check: deleting the `core` arm fails the first pair of asserts,
+    # deleting the `api` arm fails the second — neither can be dropped believing
+    # the other covers it.
+    core_sel = _sel(["tortoise/record_writer.py"])
+    assert core_sel["full"] is False, core_sel
+    assert "core" in core_sel["surfaces"], core_sel
+    assert "test_9192_tenant_armed_by_request.py" in core_sel["test_files"], core_sel
+
+    api_sel = _sel(["tortoise/mcp_auth.py"])
+    assert api_sel["full"] is False, api_sel
+    assert api_sel["surfaces"] == ["api"], api_sel
+    assert "test_9192_tenant_armed_by_request.py" in api_sel["test_files"], api_sel
+
+
 def test_source_currency_tool_change_selects_core_not_tier1():
     # #5581: tools/source_currency.py owns tests/test_source_currency_5581.py
     # (`core`) — the §4.6 aggregate, the sourced disclosure, and the flag-gated
@@ -6573,6 +6607,46 @@ def test_write_path_measurement_source_edit_selects_eval():
         assert "test_extractor_v2.py" in selected, (
             "the core-registered importer of tests.eval.write_path.runner must "
             f"still run on {changed}; selected {sorted(selected)}")
+
+
+def test_ask_sealed_corpus_source_edit_selects_eval():
+    """#9097: editing the sealed benchmark's sources must run its pinning tests.
+
+    ``corpus.py`` (the hash scope, the manifest verification and the SEALED
+    loaders) and ``generate_corpus.py`` (the sealed-gold renderer) live under
+    ``tests/eval/ask/`` and are not named ``test_*.py``, so before the
+    ``tests/eval/ask/`` SOURCE_PATTERNS entry a change to them matched no
+    pattern and fell to the ``tests/`` to ``core`` fallback — where neither
+    ``eval/ask/test_ask_corpus.py`` nor ``test_measure_ask_distilled.py`` is
+    registered. The corpus hash scope or a gold-only-edit check could then be
+    rewritten with every gate green, and the published exit-bar verdict would
+    rest on an unpinned instrument.
+
+    Watched RED before the entry existed (surfaces == ['core'], neither pin in
+    test_files), GREEN after.
+    """
+    cases = (
+        # the hash scope / manifest gate / sealed loaders
+        "tests/eval/ask/corpus.py",
+        # the renderer whose output the pre-registered corpus hash covers
+        "tests/eval/ask/generate_corpus.py",
+        # a hand-edited sealed gold — the silent re-key scenario
+        "tests/eval/ask/gold/ask01_residence.gold.json",
+    )
+    for changed in cases:
+        r = _sel([changed])
+        assert r["full"] is False
+        assert "eval" in r["surfaces"], (
+            "a sealed-ask-corpus source edit (" + changed + ") must select the "
+            "eval surface that owns its pinning tests; got "
+            + str(r["surfaces"]))
+        selected = set(r["test_files"]) | set(r["slow_selected"])
+        assert "eval/ask/test_ask_corpus.py" in selected, (
+            "the corpus contract tests must run on " + changed + "; selected "
+            + str(sorted(selected)))
+        assert "test_measure_ask_distilled.py" in selected, (
+            "the exit-bar tests must run on " + changed + "; selected "
+            + str(sorted(selected)))
 
 
 def test_tortoise_api_change_selects_api_and_core():
