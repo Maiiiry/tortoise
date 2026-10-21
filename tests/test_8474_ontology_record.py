@@ -231,7 +231,12 @@ def test_the_companion_documents_describe_the_row_that_exists() -> None:
         "the retention doc's §4.6 explanation must name the mechanism actually in "
         "force: the row links this document, which is what exempts the line"
     )
-    assert "R1" in flat and "§4.6" in flat, (
+    # Pin the MECHANISM paragraph, not `flat`: `flat` unions every passage that
+    # mentions `docs/ONTOLOGY.md`, and the implementation-constant table further
+    # down contains both `R1` and `§4.6` — deleting this paragraph's own mentions
+    # left the arm green (mutation-measured 2026-10-21).
+    mechanism = next(p for p in passages if "links this document" in p)
+    assert "R1" in mechanism and "§4.6" in mechanism, (
         "…and it must name the `R1` ruling the row carries, for the §4.6 row"
     )
 

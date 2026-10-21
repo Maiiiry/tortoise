@@ -901,13 +901,31 @@ def _model_version(text: str) -> tuple[int, ...]:
 _BLOCK_VERSION_RE = re.compile(r">\s*\*\*Changelog v(\d+\.\d+)")
 
 
+def _first_block_header(changelog: str, start: int = 0) -> re.Match:
+    """The first block header at/after `start`, found by the SAME pattern the
+    parser uses. Never a literal `> **Changelog v3.`: that hardcoded the major
+    digit, so a legitimately recorded MAJOR release (v4.0 with its own block)
+    was located nowhere and reported as "a model version bump landed with no
+    record of what changed" — the opposite of what the tree said."""
+    match = _BLOCK_VERSION_RE.search(changelog, start)
+    assert match, "no `> **Changelog v<N>.<M>` block header in the changelog"
+    return match
+
+
+def _last_block_header_before(changelog: str, limit: int) -> re.Match:
+    """The LAST block header starting before `limit` — the block a §4.8 bullet
+    sits under."""
+    found = _first_block_header(changelog)
+    for match in _BLOCK_VERSION_RE.finditer(changelog):
+        if match.start() >= limit:
+            break
+        found = match
+    return found
+
+
 def _newest_changelog_version(changelog: str) -> str:
     """The version of the NEWEST block — the changelog is newest-first."""
-    at = changelog.index("> **Changelog v3.")
-    line = changelog[at:changelog.index("\n", at)]
-    match = _BLOCK_VERSION_RE.match(line)
-    assert match, f"unparseable newest changelog header: {line!r}"
-    return match.group(1)
+    return _first_block_header(changelog).group(1)
 
 
 def _assert_declared_version_is_recorded(ontology: str, changelog: str) -> None:
@@ -979,10 +997,9 @@ def test_section_4_8_changelog_entry_sits_under_its_own_version_block() -> None:
     changelog = ONTOLOGY_CHANGELOG.read_text(encoding="utf-8")
     ontology = ONTOLOGY.read_text(encoding="utf-8")
     bullet_at = changelog.index("§4.8 (added by #3554")
-    header = changelog.rindex("> **Changelog v3.", 0, bullet_at)
-    header_line = changelog[header:changelog.index("\n", header)]
-    block_version = _BLOCK_VERSION_RE.match(header_line)
-    assert block_version, f"unparseable changelog header: {header_line!r}"
+    block_match = _last_block_header_before(changelog, bullet_at)
+    block_version = block_match
+    header_line = changelog[block_match.start():changelog.index("\n", block_match.start())]
     # The version the model document declares about itself (frontmatter title).
     declared = re.search(r'^title: "Tortoise — Canonical Ontology v(\d+\.\d+)"',
                          ontology, re.M)
@@ -996,7 +1013,7 @@ def test_section_4_8_changelog_entry_sits_under_its_own_version_block() -> None:
     # The RELATION: the block carrying the bullet is the release §4.8 landed in.
     bullet_line = changelog[bullet_at:changelog.index("\n", bullet_at)]
     landing = re.search(r"§4\.8 \(added by #3554, (\d{4}-\d{2}-\d{2})\)", bullet_line)
-    block_date = re.search(r"\*\*Changelog v3\.\d+ \((\d{4}-\d{2}-\d{2})", header_line)
+    block_date = re.search(r"\*\*Changelog v\d+\.\d+ \((\d{4}-\d{2}-\d{2})", header_line)
     assert landing and block_date, (
         f"both dates must be readable: bullet={bullet_line!r} header={header_line!r}")
     assert landing.group(1) == block_date.group(1), (
@@ -1036,16 +1053,14 @@ def test_a_model_version_bump_with_no_changelog_block_fails() -> None:
     # The arm the third rewrite left in place cannot see the regression: §4.8's
     # block is v3.29 and stays there, so `block <= declared` holds for any bump.
     bullet_at = changelog.index("§4.8 (added by #3554")
-    header = changelog.rindex("> **Changelog v3.", 0, bullet_at)
-    block_version = _BLOCK_VERSION_RE.match(changelog[header:changelog.index("\n", header)])
-    assert block_version, "§4.8's block header must be readable"
+    block_version = _last_block_header_before(changelog, bullet_at)
     assert _model_version(block_version.group(1)) <= _model_version(bumped_version), (
         "this test's premise is that the §4.8-only bound accepts a bump with no record")
 
     with pytest.raises(AssertionError, match="no record of what changed"):
         _assert_declared_version_is_recorded(bumped, changelog)
 
-    newest_at = changelog.index("> **Changelog v3.")
+    newest_at = _first_block_header(changelog).start()
     recorded = (changelog[:newest_at]
                 + f"> **Changelog v{bumped_version} (2199-01-01 — issue #0 — synthetic):**\n>\n"
                 + changelog[newest_at:])

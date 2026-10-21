@@ -66,11 +66,14 @@ aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 > header says so. The row had drifted into a status report — and a lane reading it as specification would take
 > "no reader supplies one today" for a rule. Owner ruling, 2026-10-21.
 >
-> ⚠️ **Scoped to this row.** The ruling has NOT been applied section-wide: three other §4.6 rows still carry build
-> status (`validFrom`'s "tracked on #3644 … no such path exists yet (#3590 S2)" and two version-record notes, "no
-> `:Source` reader exists yet" / "**What remains open**"). Widening the approved span was not this change's to make
-> — `ONTOLOGY.md` line 39 requires the owner's approval of the *exact* changes — so they are tracked at **#9497**,
-> with the guard question (a section-wide negative arm needs an allow-list for authority citations) recorded there.
+> ⚠️ **Scoped to this row.** The ruling has NOT been applied section-wide. **Four further §4.6 table rows** still
+> carry the same class this entry removes — `expiredAt` ("**Still unwritten**: no `:Source` removal path exists"),
+> `format` ("in `_SOURCE_HANDLED` since D10"), `provenance_spans` ("written by the capture path, slice 5+") and
+> `is_episodic` ("**planned for** the capture path, slice 5+") — as do `validFrom` ("tracked on **#3644** … no such
+> path exists yet (#3590 S2)") and two version-record notes below the table ("no `:Source` reader exists yet" /
+> "**What remains open**"). Widening the approved span was not this change's to make — `ONTOLOGY.md` line 39 requires
+> the owner's approval of the *exact* changes — so all seven sites are tracked at **#9497**, with the guard question
+> (a section-wide negative arm needs an allow-list for authority citations) recorded there.
 >
 > **Nothing is lost.** The two open gaps the removed text described remain tracked at **#8740** (no reader
 > supplies an observation yet) and **#8739** (the `:Source` read bag still serves a stored condition verbatim).
