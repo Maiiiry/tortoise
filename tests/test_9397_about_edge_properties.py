@@ -13,18 +13,24 @@ The owner's 2026-09-23 ruling on stored-vs-derived (`#7948`) rests on a
   * and the same fact in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 q2 and the
     decision row at `EXTRACTOR-V4-ARCHITECTURE-CHANGELOG.md`.
 
-At HEAD an `about*` edge carries `confidence`, ORIGINATED by **three** shipped
-sites, and the ingestion path reaches one of them by default:
+At HEAD an `about*` edge carries `confidence`, and TWO shipped sites ORIGINATE
+it — write it FIRST — while a third writes the same property in the same NAMED
+form but REPRODUCES it on replay, so the causal and the write-form axes are not
+the same axis (round 10 of the changelog records the confusion this caused).
+The ingestion path reaches one of the originators by default:
 
   1. `session_link.link_entity` — `MERGE (s)-[r:{edge_type}]->(t)
-     SET r.confidence=$conf` (`edge_type` defaults to `aboutObject`);
+     SET r.confidence=$conf` (`edge_type` defaults to `aboutObject`); ORIGINATES.
   2. `subject_binding.bind_point_subjects` — `SET r.confidence=$conf` on an
-     already-present about edge; the `object` slot role binds via `aboutObject`;
+     already-present about edge; the `object` slot role binds via `aboutObject`.
+     ORIGINATES, and the `_extract_session_v2` ingestion path reaches it.
   3. `projection/entities._fold_entity_linked_reason` — the REPLAY fold
      re-SETs it, i.e. the property is journaled and reproduced (`live == rebuild`).
+     RE-MATERIALIZES — it does not originate anything.
 
-TWO further shipped paths RE-MATERIALIZE the edge, and one of them adds a
-SECOND name, so the earlier "exactly one name" reading was one form short:
+THREE shipped paths therefore RE-MATERIALIZE (the replay fold above, and the two
+below), and one of the two below adds a SECOND name, so the earlier "exactly
+one name" reading was one form short:
 `cache_projection.relation_statement` (the record-layer projection) writes the
 record row's whole property set by property MAP over a predicate allowlist that
 includes `aboutObject`, and it also stamps `idx` — `public.relation.idx`, the
@@ -32,8 +38,10 @@ parallel-edge ordinal — as an INLINE pattern property, unconditionally; and
 `hosted_backup.restore_graph` the dump's (`SET r = $p`). The measured set is
 therefore `confidence` (originated) plus `idx` (re-materialized): one semantic
 attribute and one identity coordinate, not one property name. **The measured
-population is 3 originating + 2 re-materializing = 5 writers the census can
-SEE — and it is blind to a sixth SHIPPED site, which the count must not hide:**
+population is 5 writers the census can SEE — 3 in the NAMED form (`SET
+r.<prop>`) and 2 by property MAP, which is the axis the census reads; on the
+CAUSAL axis those same 5 split 2 ORIGINATING + 3 RE-MATERIALIZING — and it is
+blind to a sixth SHIPPED site, which the count must not hide:**
 `session_source_migration._move_in` moves an edge by
 `MERGE ({src})-[r2:`{rel}`]->(new) ON CREATE SET r2 = properties(r)`, i.e. it
 copies the WHOLE property map, and `rel` is handed to it from
@@ -156,7 +164,10 @@ WHAT IS PINNED (one entry per test, in file order)
    silent revert reds here. The assertions are SECTION-scoped (§11.1, §13,
    §13.8 q2), not file-wide: the literals appear in more than one section, so a
    file-wide membership test cannot red on one section's silent deletion
-   (`#8639` review, the `test_entity_attachment_brief_claims.py` precedent).
+   (`#8639` review, the `test_entity_attachment_brief_claims.py` precedent). It
+   also rejects an unmeasured population SHARE (`most entity links`, `for most
+   links`, `bulk of the rows` …) and the retracted FORM COUNT on the originated
+   set — both were live and green in the `#9403` head (`#9403` review, P1/P2).
 3. `test_the_corrected_passages_carry_no_bare_edges_line_citation` — the
    rewritten passages cite the generic writer by SYMBOL, not by a bare
    `projection/edges.py:<n>`: a line number is only true of the revision it was
@@ -267,6 +278,19 @@ WHAT IS PINNED (one entry per test, in file order)
 21. `test_the_correction_ledger_numbers_each_round_once` — the ledger's round
    numbering is unique (it is the ledger's only index), and the fourth round's
    false record of §13's citation does not come back.
+22. `test_the_writer_classification_separates_the_causal_axis_from_the_write_form`
+   — the documents counted 5 writers as `3 originating + 2 re-materializing`,
+   and that composition is false: `projection/entities._fold_entity_linked_reason`
+   reproduces on REPLAY what the journal already carried, which is the documents'
+   own definition of RE-MATERIALIZING. The census can only see the WRITE FORM
+   (3 named + 2 map), which is why the wrong number read plausibly; the causal
+   split is 2 + 3, and the legs red if the fold is filed as an originator again
+   (`#9403` review, P2).
+23. `test_the_correction_changelog_qualifies_its_line_citations` — the entry's
+   own round-5 rule (`at HEAD` on every number that is not true at the pin) is
+   applied to the paragraph that MAKES the citations: three of them survived
+   bare, and one (`security.py:85`) is false at the declared pin `c79ba1cf2`
+   (`#9403` review, P2).
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -312,10 +336,10 @@ STORAGE_CHANGELOG = (
 #: the last `main` commit before this correction's own documentation edits
 #: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against.
 #: The reading MOVES with this file and is re-measured at every revision, never
-#: carried forward: 4 failed / 6 passed when it had 10 legs, 6 failed / 8 passed
-#: when it had 16, and **9 failed / 10 passed of the 19 legs at this revision**
-#: (the two `#9403`-review legs — §11.4 rule 1 and the ledger KEEP row — red on
-#: the pre-fix documents too, as does the detector-wording leg). "Was live pre-fix" is a claim about HISTORY, so it is
+#: carried forward — a count in this prose is a claim the code outgrows
+#: silently, which is exactly how this defect kept returning. Re-measure it
+#: (substitute the four pre-fix documents from `PRE_FIX_REV`, run the file, read
+#: the split) instead of trusting any number written here. "Was live pre-fix" is a claim about HISTORY, so it is
 #: checked against history instead of restated: an entry in
 #: `RETRACTED_INTRODUCED_HERE` must be ABSENT here, every other entry PRESENT.
 #: ⛔ NOT derived from `git merge-base HEAD origin/main`: the moment this lands
@@ -1090,6 +1114,51 @@ def test_the_corrected_passages_name_the_property_bearing_class():
             "the documented property set then covers only `SET r.<prop>` "
             "writers, which is the blindness this file exists to stop"
         )
+    # The UNMEASURED SHARE, in whatever spelling (`#9403` review, P1). §11.1 says
+    # in as many words that *"Which SHARE of the rows is bare is not measured
+    # here"*, and the same PR's corrected §13 / §13.8 q2 then said *"most entity
+    # links are two ids"* and *"The structural door stays open **for most links**"*
+    # — a population-share claim nothing measured, contradicting the paragraph
+    # that withdraws it. Measured GREEN while all three were live. Share words
+    # appear elsewhere in both documents for other claims, so the pin is
+    # BAREness-specific rather than a word ban.
+    share_claims = (
+        "most entity links",
+        "most links",
+        "mostly stays open",
+        "bulk of the rows",
+        "most of the rows",
+        "majority of the rows",
+    )
+    for label, start, end, which in CORRECTED_SECTIONS:
+        section = _flat(_section(docs[which], start, end))
+        found = [claim for claim in share_claims if _flat(claim) in section]
+        assert not found, (
+            f"{label} states an unmeasured population SHARE {found} — the row's "
+            "shape is measured (an UNBOUND link is two ids), what SHARE of the "
+            "rows is unbound is not, and §11.1 says so; scope the claim to the "
+            "row shape or measure the share"
+        )
+    # The FORM COUNT on the originated set (`#9403` review, P2). §13 said the
+    # ORIGINATED set is "written in two forms" and then listed three writers
+    # that all use the NAMED form — the map form belongs to the RE-MATERIALIZING
+    # class in the next sentence. Same defect the retraction pins in §11.1
+    # (*"Two forms write to an edge, and both are in scope"*), left standing in
+    # §13 and pinned by nothing (measured GREEN).
+    form_counts = ("written in two forms", "it is written in two forms")
+    storage_13 = _flat(
+        next(
+            _section(docs[w], s, e) for lab, s, e, w in CORRECTED_SECTIONS
+            if lab.endswith("§13")
+        )
+    )
+    survivors = [literal for literal in form_counts if _flat(literal) in storage_13]
+    assert not survivors, (
+        f"§13 reintroduces the retracted FORM COUNT {survivors} for the "
+        "originated set — every originating writer uses the NAMED form "
+        "`SET r.<prop>`; the property MAP belongs to the re-materializing "
+        "class, which the next sentence already enumerates"
+    )
 
 
 #: The pre-fix spelling of §13's `create_about_edge` citation, kept as a
@@ -1282,6 +1351,13 @@ def test_the_cheapness_rule_states_the_measured_set_and_records_the_tension():
         "bare rows",
         "carry no properties",
         "property free",
+        # `#9403` review, P1: the round-9 fix replaced `bare rows` with *"bare
+        # apart from the projection's `idx` ordinal"* — the SAME population
+        # absolute in a spelling no entry above could see, while the sentence
+        # ten lines below it records that a BOUND link carries `confidence`.
+        # Measured GREEN with the clause live. Scope the clause to the row's
+        # shape, and pin the spelling.
+        "bare apart from",
     )
     survivors = [
         literal for literal in population_absolutes
@@ -1325,6 +1401,8 @@ def test_the_ledger_keep_row_names_both_recorded_properties():
         f"found {len(rows)} lines matching {LEDGER_KEEP_ROW!r}"
     )
     row = rows[0]
+    # The row's "reason" CELL — column 4 of the table row, split on the pipe.
+    cell = row.split("|")[4]
     for prop in (PROPERTY, SECOND_PROPERTY):
         assert f"`{prop}`" in row, (
             f"the ledger's KEEP row does not name `{prop}` — the measured set "
@@ -1370,6 +1448,22 @@ def test_the_ledger_keep_row_names_both_recorded_properties():
         "— the row is the reason a reader takes the layer to be cheap, so a "
         "closed count there is the same defect the correction exists to stop"
     )
+    # The row must also RENDER: it carried 2 opening and 3 closing parentheses
+    # and an odd (11) count of `**` markers at the `#9403` head, so the emphasis
+    # span broke and a stray `)` appeared mid-sentence — in the row this leg's
+    # own docstring calls "the reason a reader takes the layer to be cheap"
+    # (`#9403` review, P2). Substring assertions cannot see that, and neither
+    # can markdownlint: MD-emphasis checks do not run inside a table cell.
+    assert cell.count("(") == cell.count(")"), (
+        f"the ledger's KEEP row has unbalanced parentheses "
+        f"({cell.count('(')} open, {cell.count(')')} close) — a table cell "
+        "renders that as a stray bracket mid-sentence"
+    )
+    assert cell.count("**") % 2 == 0, (
+        f"the ledger's KEEP row has an ODD number of `**` markers "
+        f"({cell.count('**')}), so one emphasis span is unclosed and the rest "
+        "of the cell renders bold or literal"
+    )
 
 
 # ── 3. the code must still agree with the corrected evidence ───────────────
@@ -1408,6 +1502,163 @@ def test_the_code_still_agrees_with_the_corrected_evidence():
     )
 
 
+def _unqualified_line_citations(text: str) -> list[str]:
+    """Every `path.py:<n>` / `path.sql:<n>` citation in `text` that carries no
+    revision qualifier (`at HEAD`, `at the pin`, `at the pinned revision`)
+    within a short following window.
+
+    Same rule as `_unqualified_edges_line_citations` below, generalised to every
+    module rather than `projection/edges.py`: the `#9397` changelog entry uses a
+    BARE line number as shorthand for "current", and the entry itself records
+    that this exact convention was wrong three times (`cache_projection.py:717`).
+    """
+    cite = re.compile(r"`[\w./-]+\.(?:py|sql):\d+`")
+    qualifier = re.compile(r"at HEAD|at the pin\b|at the pinned revision", re.I)
+    out: list[str] = []
+    matches = list(cite.finditer(text))
+    for i, m in enumerate(matches):
+        # The window STOPS at the next citation. Measured: a neighbour's
+        # `— at HEAD` inside a flat 120-character window qualified a bare
+        # citation beside it, so removing `(at HEAD)` from `security.py:85`
+        # while the next clause carried one stayed GREEN (vacuous pin).
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        if qualifier.search(text[m.end() : end]):
+            continue
+        out.append(m.group(0))
+    return out
+
+
+def test_the_writer_classification_separates_the_causal_axis_from_the_write_form():
+    """The documents counted 5 writers as *"3 originating + 2 re-materializing"*,
+    and that composition is FALSE (`#9403` review, P2):
+
+    `projection/entities._fold_entity_linked_reason` re-writes on REPLAY what the
+    journal's `EntityLinked` record already carried — the documents' own
+    definition of RE-MATERIALIZING, and the class they put
+    `cache_projection.relation_statement` and `hosted_backup.restore_graph` in.
+    The same PR's §13.8 q2 calls it *"reproduced by … the replay fold"* while
+    §11.1 and §13 filed it under ORIGINATING, so the total (5) was right and its
+    composition was wrong — two live documents disagreeing about the same site.
+
+    The axes are separate, which is why the number read plausibly: the census
+    can only see the WRITE FORM (named `SET r.<prop>` vs property MAP), and that
+    split really is 3 + 2. The CAUSAL split is 2 originating + 3
+    re-materializing. Nothing pinned either, so both readings stayed green.
+    """
+    storage = _doc(STORAGE)
+    section_13 = _flat(
+        _section(
+            storage,
+            "## 13. Filed from this document",
+            "## 14. What this document does not decide",
+        )
+    )
+    # The DESIGN doc may not state the wrong composition. The CHANGELOG is
+    # deliberately exempt from the absence half: it is where the history is
+    # RECORDED, and it quotes the old composition verbatim while saying it was
+    # corrected — a substring ban there would forbid recording the fix, which is
+    # the defect leg 6's own comment warns about ("the BARE word `property
+    # free` is deliberately absent … so a word-level test would red on the note
+    # that RECORDS the retraction"). The changelog is held to the POSITIVE half.
+    assert _flat("3 originating + 2 re-materializing") not in section_13, (
+        "STORAGE-ARCHITECTURE.md §13 files the replay fold as an ORIGINATING "
+        "writer — `_fold_entity_linked_reason` re-writes on replay what the "
+        "journal already carried, which is this document's own definition of "
+        "RE-MATERIALIZING; the causal split is 2 + 3"
+    )
+    assert _flat("2 originating + 3 re-materializing") in _flat(
+        _doc(STORAGE_CHANGELOG)
+    ), (
+        "STORAGE-ARCHITECTURE-CHANGELOG.md no longer states the corrected "
+        "causal composition (2 originating + 3 re-materializing) — the ledger "
+        "is where the count's current form is recorded, so a ledger still "
+        "carrying only the wrong composition is the history a reader mistakes "
+        "for the claim"
+    )
+    # The correct split must be STATED, not merely absent: an absence-only pin
+    # is satisfied by deleting the classification altogether.
+    assert (
+        _flat("2 ORIGINATING") in section_13
+        and _flat("3 RE-MATERIALIZING") in section_13
+    ), (
+        "§13 no longer states the causal split (2 originating + 3 "
+        "re-materializing) — the measured population's composition is a claim, "
+        "and deleting it leaves the number a reader cannot check"
+    )
+    # And the write-FORM split is the axis the census actually reads, so it must
+    # survive alongside it — a single number cannot carry both.
+    assert "NAMED form" in section_13 and "property MAP" in section_13, (
+        "§13 conflates the causal split with the write-form split — the census "
+        "reads the FORM (named `SET r.<prop>` vs property MAP), and that is the "
+        "axis its 3 + 2 belongs to"
+    )
+    # §11.1 must not file the fold as one of the writers that ORIGINATE the
+    # property, and must say what it actually does.
+    section_111 = _flat(
+        _section(
+            storage,
+            "### 11.1 Why the connections are not the cost problem",
+            "### 11.2 What actually costs money",
+        )
+    )
+    assert "_fold_entity_linked_reason" in section_111, (
+        "§11.1 no longer names the replay fold, so the third write site is "
+        "silently dropped from the evidence base"
+    )
+    assert (
+        _flat("RE-MATERIALIZES") in section_111
+        or _flat("RE-MATERIALIZING") in section_111
+    ), (
+        "§11.1 lists `_fold_entity_linked_reason` without classifying it as a "
+        "RE-MATERIALIZER — the pre-fix wording introduced it as one of 'the "
+        "*originating* writers', which is the misclassification this leg pins"
+    )
+
+
+def test_the_correction_changelog_qualifies_its_line_citations():
+    """The `#9397` entry's own rule is that a `file:line` citation is qualified
+    when the number is not true at the document's declared pin — the rule it
+    used to fix three `cache_projection.py:717` citations (`#9403` review, P2).
+
+    Three citations of the same class survived UNQUALIFIED in that same entry,
+    and one of them is false at the pin both live documents declare
+    (`c79ba1cf2`): bare `security.py:85` lands on `"INFORMED_BY", "PRODUCES"`
+    there, the about allowlist being at `:77-78`, and `record_projection.py` and
+    the `record_epistemic` migration do not exist at that commit at all — so
+    those two numbers cannot be pinned to it either. This is the `edges.py:344`
+    failure mode (a plausible-looking number that lands on something else), which
+    is why the guard already bans it in the DESIGN docs.
+
+    A citation is qualified when `at HEAD` / `at the pin` / `at the pinned
+    revision` follows it within a short window.
+    """
+    entry = _doc(STORAGE_CHANGELOG)
+    # Scoped to the paragraph that MAKES these citations (round 2), not to the
+    # whole entry: the entry quotes historical citations verbatim while
+    # narrating their repair, so a file-wide rule would red on its own record.
+    paragraph = _section(
+        entry,
+        "**Second review-cycle correction",
+        "**Third review-cycle correction",
+    )
+    # The rule must be able to MATCH the pre-fix spelling, or it protects nothing
+    # (the `STALE_CITATION_PROBE` lesson): `security.py:85` was bare.
+    probe = "(`security.py:85`), on a relation row the projection builds"
+    assert _unqualified_line_citations(probe) == ["`security.py:85`"], (
+        "the citation rule no longer matches the pre-fix spelling "
+        "`security.py:85`, so it cannot red on a re-introduction"
+    )
+    unqualified = _unqualified_line_citations(paragraph)
+    assert not unqualified, (
+        "the `#9397` changelog entry cites a line number with no revision "
+        "qualifier:\n  "
+        + "\n  ".join(unqualified)
+        + "\n\nThe entry's own round-5 correction added `at HEAD` to three "
+        "`cache_projection.py:717` citations for exactly this reason: a bare "
+        "number reads as current and lands somewhere else at the pin."
+    )
+
+
 def test_the_named_and_map_form_writer_populations_are_disjoint():
     #: A row in both dicts would mean one site is recorded twice, and the
     #: `MAP_FORM` sentinel would then be asserted against a named-form row (or
@@ -1420,8 +1671,9 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
     )
     assert len(MAP_WRITERS) >= 2, (
         "the map-form population shrank below the two shipped sites the "
-        "documents now record (3 originating + 2 re-materializing = 5; two "
-        "further census hits are declared false positives) — if a writer was "
+        "documents now record (5 writers the census sees: 3 named-form + 2 "
+        "map-form, i.e. 2 originating + 3 re-materializing; two further "
+        "census hits are declared false positives) — if a writer was "
         "genuinely removed, re-derive the documents' count with it"
     )
     #: A site cannot be both a real writer and a declared false positive.
@@ -2063,6 +2315,32 @@ def test_the_guard_states_its_own_execution_and_probe_coverage_honestly():
     assert "two forms" not in section_header, (
         "the 4b section header is back to counting two forms, but the section "
         "holds probes for THREE write forms"
+    )
+
+    # A LEG COUNT in the guard's own prose (`#9403` review, P2). The
+    # `PRE_FIX_REV` comment said "**9 failed / 10 passed of the 19 legs at this
+    # revision**" while the file collected 21 and the pre-fix run split 10/11 —
+    # the same "a count in prose is a claim the code outgrows silently" failure
+    # the round-8 correction declares eliminated, one paragraph above it. The
+    # measured reading is re-derived at every revision (`PRE_FIX_REV` says how),
+    # so the provenance comment must not carry a number at all.
+    #
+    # Scanned over the HEADER BLOCK (everything before the first `def`), not
+    # `__doc__`: the stale count lived in a `#:` comment, which `__doc__` does
+    # not carry, and not over the whole source either — a leg's docstring may
+    # quote a PAST measurement ("left all 16 legs green") or this leg's own
+    # message, and a file-wide scan would match itself.
+    header_block = src[: src.find("\ndef ")]
+    assert header_block, "the header block could not be located — this check measures nothing"
+    numeric_leg_counts = re.findall(
+        r"\b(?:of the )?\d+ legs\b|\b\d+ (?:failed|passed) / \d+ (?:failed|passed)\b",
+        header_block,
+    )
+    assert not numeric_leg_counts, (
+        "the module header states a numeric leg count "
+        f"{numeric_leg_counts} — the split moves with every leg added or "
+        "removed, so it is an unmeasured claim in the PROSE of a guard whose "
+        "subject is unmeasured claims; state how to re-measure it instead"
     )
 
 
