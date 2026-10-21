@@ -310,6 +310,42 @@ def test_a_keyless_capture_stamps_its_stub_with_the_capture_instant(prov, monkey
         f"clock read: ingestedAt={ingested_at!r} capturedAt={captured_at!r}")
 
 
+def test_the_extracting_lane_stamps_its_stub_with_the_capture_instant(prov):
+    """#8501 corrected the ``ingestedAt`` note inside
+    ``_materialize_session_source``: on the capture path the field is now the
+    CAPTURE's own instant, not a later clock read. The lane where the old
+    premise lived is THIS one — a capture that DOES mint Points, whose stub
+    used to be minted by ``_link_source`` during extraction, so ``ingestedAt``
+    was that writer's ``_now_iso()`` while ``capturedAt`` (and the
+    ``SourceCreated`` record) carried the capture instant. The rebuild pin
+    (``test_the_stub_the_early_materialization_mints_survives_a_rebuild``)
+    compares live vs rebuilt but cannot say WHICH instant either holds; this
+    one pins the value, which is what the corrected note claims.
+
+    FAILS ON THE PRE-FIX CODE: the two stamps then come from two different
+    clock reads (the capture's and the extraction's), so they are not equal.
+    FAILS IF the early mint stops carrying ``now=`` (a fresh ``_now_iso()``
+    stamp again) or if the materialization moves back below extraction."""
+    sdk, _events = prov
+    res = sdk.capture_session(CONV)
+    assert res["ok"] is True, res
+    # PRE-CONDITION: this is the lane that extracts, i.e. the one where the
+    # stub used to be minted by `_link_source` after the capture began.
+    assert res["extracted"] >= 1, (
+        f"guard: this test is about the EXTRACTING lane, got {res['extracted']}"
+    )
+
+    rows = sdk._get_proj().g.query(
+        "MATCH (s:Source {url:$u}) RETURN s.capturedAt, s.ingestedAt",
+        params={"u": f"session:{res['session_id']}"}).result_set
+    assert rows and rows[0][0] and rows[0][1], f"no stamps on the Source: {rows!r}"
+    captured_at, ingested_at = rows[0]
+    assert ingested_at == captured_at, (
+        "the session Source's ingest instant is not the capture's own — the "
+        "stub was minted from a later clock read: "
+        f"capturedAt={captured_at!r} ingestedAt={ingested_at!r}")
+
+
 def test_a_keyless_capture_lands_the_full_stub_shape(prov, monkeypatch):
     """A capture that extracts NOTHING never reaches ``_link_source``, so before
     #8501 its session ``:Source`` was created by ``_materialize_session_source``'s

@@ -11899,7 +11899,9 @@ class TortoiseSDK:
         #   * `_stub_completion=True` — THIS RECORD COMPLETES A STUB, IT DOES NOT
         #     CREATE A SOURCE (`_upsert_source` reads it as `$stub_completion`).
         #     It suppresses the ON CREATE arm's three CREATOR-ONLY defaults, which
-        #     the live node never has (the M2 `_link_source` stub created it):
+        #     the live node never has — the stub mint never sets them, whether it
+        #     was `_link_source` (any non-capture path) or the `_mint_source_stub`
+        #     call above (the capture path since #8501):
         #     `id`, `version=1` and `externalId=''`. Without it a `rebuild_all` —
         #     which folds `SourceCreated` in pass 1b, BEFORE pass 2 mints the stub
         #     — recovered a session `:Source` carrying a version ordinal this
@@ -11918,15 +11920,39 @@ class TortoiseSDK:
         #   * `updatedAt` carries the instant the write stamped, so the fold's
         #     stub-completion arm reproduces it instead of the replay clock.
         #
-        # ⚠️ `ingestedAt` is emitted too, but it is a KNOWN RESIDUAL and is not
-        # claimed as faithful: the stub this write completes is created by the
-        # M2 `_link_source` projection write, whose `ingestedAt` is minted from
-        # the clock at ITS write, and `_upsert_source`'s ON MATCH arm has no
-        # `ingestedAt` clause at all (only ON CREATE reads the recorded value).
-        # So a rebuilt session Source keeps a replay-clock ingest stamp. That
-        # is the same unjournaled-writer class one writer upstream, not
-        # something this record can fix; the recorded value is emitted anyway so
-        # the ON CREATE path (no stub) is faithful.
+        #   * `ingestedAt` is emitted and IS faithful on the capture path
+        #     (#8501 corrected this note; it used to call the field a KNOWN
+        #     RESIDUAL on a premise this change removed). The stub this write
+        #     completes is now minted BY THIS DOOR — `_mint_source_stub(...
+        #     now=now)` above — so its `ingestedAt` is the CAPTURE's instant, not
+        #     a fresh clock at a later write; this record carries that same
+        #     `now`, and `_upsert_source`'s ON CREATE arm reads the RECORDED
+        #     value (`coalesce($ingestedAt, $now)`, the #5024 rule) instead of
+        #     the replay clock. So live == rebuilt for the field, which is what
+        #     `test_the_stub_the_early_materialization_mints_survives_a_rebuild`
+        #     asserts (`s.ingestedAt` compared after a destructive
+        #     `rebuild_all()`), and
+        #     `test_a_keyless_capture_stamps_its_stub_with_the_capture_instant`
+        #     pins the value on the no-Point lane, and
+        #     `test_the_extracting_lane_stamps_its_stub_with_the_capture_instant`
+        #     pins it on the lane that extracts.
+        #
+        #     The residual it used to describe is still REACHABLE — the
+        #     boundary is the stub's CREATOR, not the path. The field above is
+        #     faithful exactly where this door's own mint CREATED the node.
+        #     Whenever a `session:<id>` stub ALREADY EXISTS when this door runs,
+        #     the mint's ON MATCH arm leaves that earlier writer's `ingestedAt`
+        #     in place while the record carries the capture's instant, and
+        #     `_upsert_source`'s ON MATCH arm has no `ingestedAt` clause at all
+        #     (only ON CREATE reads the recorded value) — so a rebuild folds the
+        #     recorded instant onto a live node still holding the earlier one.
+        #     That earlier writer is any door that minted the ref first (a
+        #     `create_point` carrying a `session_id` → `_link_source`, the
+        #     hosted commit path's `create_source`, the #4125 reconciler) plus
+        #     every node written before #8501 or by a legacy writer. This record
+        #     cannot correct that — the instant was never journaled by the
+        #     writer that chose it — but it is no longer the capture path's
+        #     DEFAULT shape: a fresh capture now mints as it materializes.
 
     # ── Update / Delete consolidation (epic #888 W2, PR #912) ─────────
     # One update()/delete() for Points AND entities. The legacy methods
