@@ -93,7 +93,8 @@ def _render_kind_semantics(vocab: dict, ns: str, kinds: list[str]) -> str:
 #
 # ⛔ `CORE_OBJECT_KINDS` is DERIVED from the canonical set — never a fourth hand-typed copy.
 # Measured before this change it still carried `document` (retired as an `objectKind` by D10 — a
-# document is a `:Source`, ONTOLOGY §4.4) and `concept` (retired by #2727), while OMITTING five
+# document is a `:Source`, ONTOLOGY §4.4) and `concept` (never a §5 objectKind — removed from
+# the extractor's core brief by T12/#1272, which maps it to `core:other`), while OMITTING five
 # kinds §5 declares (`Problem`, `strategy`, `plan`, `goal`, `target`).
 # ⚠ HONESTY ABOUT ITS REACH (#2786 review): no PRODUCTION path renders this constant — the
 # prompt's kind menu is `CORE_SEMANTICS` below, rendered into `core_lines`; its only in-repo
@@ -182,7 +183,7 @@ THE CLAIM GATE (iteration 6 — the corrected discriminator): glue = talk ABOUT 
 
 ## Entity axis (what entities are mentioned) — CLOSED vocab WITH semantics (criteria v1 §2)
 Type every entity mention against the kind SEMANTICS below — never name-matching, never minted kinds. Prefer the MOST SPECIFIC kind; near-miss (⚠) → the closest kind WITH the flag and the confusable sibling named; no fit or low confidence → core:other EXPLICITLY + a pack-proposal note (never forced nearest-kind).
-CONFUSABLE GUARD: product-strategy:architecture is for the DESIGN/STRUCTURE of a solution ("the four-node chain architecture") — NOT for abstract models ("the state-centric model" → core:other: §5 declares NO `concept` object kind — #2727 retired it — so an abstract model with no fitting kind is the EXPLICIT other bucket), NOT for implementation details ("Object MERGE key", "rate bucket" → dev:code or core:other), NOT for work items ("quota fix" → dev:issue is wrong — it is a work item → core:WorkItem).
+CONFUSABLE GUARD: product-strategy:architecture is for the DESIGN/STRUCTURE of a solution ("the four-node chain architecture") — NOT for abstract models ("the state-centric model" → core:other: §5 declares NO `concept` object kind, so an abstract model with no fitting kind is the EXPLICIT other bucket), NOT for implementation details ("Object MERGE key", "rate bucket" → dev:code or core:other), NOT for work items ("quota fix" → dev:issue is wrong — it is a work item → core:WorkItem).
 
 CORE:
 {core_lines}

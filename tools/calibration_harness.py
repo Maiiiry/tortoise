@@ -197,7 +197,8 @@ EVK = {"decision", "occurrence", "deployment", "review", "extraction",
 # ⛔ The `core:` half is DERIVED from the one canonical object-kind set (#2786), never a
 # hand-typed copy. A stale member here does not merely fail to catch drift, it ABSORBS it:
 # `metrics()` counts an entity whose kind is NOT in VOCAB as `minted`, so while the retired
-# `core:document` (D10) and `core:concept` (#2727) sat in this set an extractor emitting them
+# `core:document` (D10) and `core:concept` (never a §5 objectKind; removed by T12/#1272) sat in
+# this set an extractor emitting them
 # was scored as in-vocabulary. Guarded by
 # `tests/test_kind_vocabulary_consistency.py`
 # ::test_calibration_harness_core_vocabulary_is_the_canonical_set.
