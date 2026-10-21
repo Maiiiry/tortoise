@@ -114,8 +114,11 @@ absence. That is why this file checks the *writer census*, not another grep.
 THE SAME BLINDNESS, ONE LEVEL DOWN (review cycle on this file's first version)
 -----------------------------------------------------------------------------
 A census that reads only `SET r.<prop>` repeats the error: the property-MAP
-form `SET r += $props` / `SET r = $p` is structurally invisible to it, and four
+form `SET r += $props` / `SET r = $p` is structurally invisible to it, and two
 shipped sites already use that form on an allowlisted `aboutObject` predicate
+(`cache_projection.relation_statement`, `hosted_backup.restore_graph`), and two
+further census hits are DECLARED FALSE POSITIVES (their map `SET` names no
+`about*` predicate — pinned by test 9)
 (listed above). So the census reads all three write forms **where `_PATTERN`
 recognises the spelling** (the gap list above names the spellings it does not),
 and an interpolated
@@ -147,7 +150,7 @@ WHAT IS PINNED (one entry per test, in file order)
    the live documents. Each entry records its own provenance — the pre-fix
    document it was measured in, or `RETRACTED_INTRODUCED_HERE` for wording this
    PR itself wrote and withdrew. Which class an entry is in is MEASURED against
-   the pre-fix revision by test 14, because a label nothing compares against the
+   the pre-fix revision by test 18, because a label nothing compares against the
    text is the same unmeasured claim one level up.
 2. `test_the_corrected_passages_name_the_property_bearing_class` — the
    corrected passages must POSITIVELY name the writers and the property, so a
@@ -265,7 +268,7 @@ that the rule keeps stating the measured set and keeps carrying the tension
 record, test 5). Line numbers are not
 asserted — the SYMBOL is authoritative, per the documents' own rule.
 
-Static, stdlib-only, with ONE exception: test 14 shells out to `git show` to
+Static, stdlib-only, with ONE exception: test 18 shells out to `git show` to
 measure a provenance claim about history, and skips when the revision is
 unreachable. No DB, no graph, no network.
 """
@@ -306,7 +309,7 @@ STORAGE_CHANGELOG = (
 #: this comment claimed `fetch-depth: 0` and was false for the only job that
 #: matters (`python-ci.yml:631`; the one `fetch-depth: 0` is the `changes` job at
 #: `:224`). The rev is made reachable by `_ensure_commit`, which fetches the
-#: `main` ref at a bounded depth; leg 8 then SKIPS rather than passes on a
+#: `main` ref at a bounded depth; leg 18 then SKIPS rather than passes on a
 #: history it genuinely could not read, and the skip message says so.
 PRE_FIX_REV = "01b5486ec"
 
@@ -319,7 +322,7 @@ PRE_FIX_REV = "01b5486ec"
 #: retracted INSIDE this PR (see `RETRACTED_INTRODUCED_HERE`) — their `home` is
 #: still the document the claim belongs to, and `_provenance` keeps the message
 #: from claiming a pre-fix presence that never existed. Which class an entry is
-#: in is MEASURED against `PRE_FIX_REV` by leg 8, not taken on trust: the
+#: in is MEASURED against `PRE_FIX_REV` by leg 18, not taken on trust: the
 #: `§11.1` method entry was filed as pre-fix-live and is not (measured absent
 #: at `01b5486ec`), which made leg 1's diagnostic print a false pre-fix claim.
 RETRACTED: dict[str, tuple[str, str]] = {
@@ -899,7 +902,7 @@ def _provenance(label: str, home: str) -> str:
     by THIS PR's own earlier revision and withdrawn by a later one. Printing "was
     live pre-fix" for them would put an unmeasured claim in the diagnostic of
     the guard whose whole subject is unmeasured claims — which is exactly what
-    happened to the `§11.1` method entry before leg 8 measured the split.
+    happened to the `§11.1` method entry before leg 18 measured the split.
     """
     if label in RETRACTED_INTRODUCED_HERE:
         return (
