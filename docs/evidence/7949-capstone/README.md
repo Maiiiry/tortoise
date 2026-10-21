@@ -131,10 +131,13 @@ claims below are STALE, which is what the capstone run is built on:
    runner is now this probe rather than nothing.
 3. **⚠️ CORRECTED — a single entry point CAN drive all eight steps.** The body asks this
    as an open question. It resolves YES: `TortoiseSDK.capture_session` →
-   `sdk._extract_session_v2` (`sdk.py:10422`; called at `:9439`) →
+   `sdk._extract_session_v2` (`sdk.py:10772`; called at `:9782`) →
    `extractor_v2.extract_session_v2` (`extractor_v2.py:7634`), which calls, in one pass
-   (line numbers re-derived at `027c8c1ab` — the symbol is authoritative and the line is a
-   convenience, which is how the pin's earlier numbers went stale here):
+   (line numbers re-derived at `7523ad934`, the merge-up of `origin/main` whose five
+   `sdk.py` commits — `a0ddce4ea`, `77660fe5b`, `01b5486ec`, `2dacb87f5`, `ae66ccdc4` —
+   moved the def and its call site 350 and 343 lines down under the previous cites; the
+   symbol is authoritative and the line is a convenience, which is how the pin's earlier
+   numbers went stale here):
 
    | step | call site | witness the probe reads | on the receipt? |
    |---|---|---|---|
