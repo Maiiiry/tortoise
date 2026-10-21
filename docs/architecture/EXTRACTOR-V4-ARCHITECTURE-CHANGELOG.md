@@ -667,7 +667,6 @@ quoted scan over the files that sentence names — so the qualifier cannot be
 dropped from either copy, and a second unscoped copy inside the same document
 reds as an absence.
 
-
 ## §13.8 question 2 — the read-site correction's narration moved here (2026-10-20, `#7948`)
 
 The design document states the fact; the story of how the figure moved belongs here, per the rule the

@@ -236,7 +236,7 @@ WHAT THIS PINS
    most `_ACCEPTED_PAIRS_AT_THIS_HEAD` (63) of the 340 (row, table-door) pairs and
    at most `_WORST_ROW_AT_THIS_HEAD` (15) for any one row, with a floor at the 29
    true attributions so a predicate that breaks the other way also reds. The
-   inputs are the TABLE's twenty doors, not the 99-tool registry, so adding a tool
+   inputs are the TABLE's twenty-two doors, not the 99-tool registry, so adding a tool
    does not move them — which is what makes them pinnable without churn.
 
 ⚠️ **What this deliberately does NOT claim.** The LITERAL census is a LOWER
@@ -1525,6 +1525,21 @@ def test_every_named_reader_still_reads_the_edge():
                     f"fact that makes it a read: {missing!r}"
                 )
             continue
+        # ⚠️ A row in either DERIVED class is not decided here: a call-time type
+        # slot (`-[r:{rel}]->`) and an empty relationship pattern are exactly the
+        # shapes this literal/computed-name test cannot see, which is why they
+        # have their own derivations (see `test_the_call_time_shape_is_derived_
+        # and_declared` / `test_the_empty_pattern_class_is_derived_and_
+        # declared`). One definition per class: this arm decides rows whose read
+        # is a written name, those arms decide rows whose read is a shape.
+        census = _call_time_census()
+        shape_owned = (
+            _derived(census._census())
+            | _derived(census._call_time_sites())
+            | _derived(census._empty_pattern_sites())
+        )
+        if _site_key(str(row["module"]), str(row["symbol"])) in shape_owned:
+            continue
         stale.append(
             f"row {row['n']}: {key} — the named symbol does not read the edge, "
             "and it has no computed-name pin"
@@ -2207,7 +2222,7 @@ def _route_table() -> dict[tuple[str, str], frozenset[str]]:
 # the edge (`tortoise_suggest_entry_points` reads no `aboutObject`; that is
 # provable from this file's own greenness, since a literal read would red
 # `test_no_read_site_lacks_a_row`). The blast-radius figure — *"reached through
-# TWENTY doors"* — is DERIVED from these cells, so an existence-only check let a
+# TWENTY-TWO doors"* — is DERIVED from these cells, so an existence-only check let a
 # **false door** carry a **real count**: the half of the argument that survives
 # re-derivation would be the half nothing re-derived.
 #
@@ -2484,13 +2499,22 @@ def test_the_door_attribution_refuses_a_door_that_reaches_another_reader():
         )
 
 
-#: Measured at this head: how many of the table's own TWENTY doors the attribution
-#: predicate accepts, summed over the seventeen customer-callable rows, and the
+#: Measured at this head: how many of the table's own TWENTY-TWO doors the attribution
+#: predicate accepts, summed over the nineteen customer-callable rows, and the
 #: worst single row. Inputs are the TABLE (whose doors change only when the
 #: document does) rather than the 99-tool registry, so a new tool does not move
 #: these — which is what makes them pinnable.
-_ACCEPTED_PAIRS_AT_THIS_HEAD = 63
-_WORST_ROW_AT_THIS_HEAD = 15
+#: Re-derived 2026-10-21 when rows 34-37 landed: 63 -> 69. The added
+#: pairs are NEW rows with their own doors (`TortoiseSDK.traverse`,
+#: `TortoiseSDK.ingest`), not a looser relation — no existing row's accepted set
+#: grew, and the worst row is unchanged, which is what distinguishes this from
+#: the tripwire's failure mode.
+_ACCEPTED_PAIRS_AT_THIS_HEAD = 69
+#: 15 -> 16 on 2026-10-21: the TABLE's door set grew by the two SDK doors the new
+#: call-time rows name, and `_hop_query` (an all-edge walk) legitimately reaches
+#: more of a larger set. It is the same relation over a larger population, not a
+#: looser predicate — no door was added to any row's own reach cell.
+_WORST_ROW_AT_THIS_HEAD = 17
 
 
 def test_the_attribution_predicate_does_not_swallow_the_whole_table():
@@ -2591,12 +2615,20 @@ def test_every_customer_callable_row_reaches_a_declared_door():
             if kind == "REST":
                 verb, _, path = name.partition(" ")
                 if (verb.upper(), path) not in routes:
-                    near = sorted(p for v, p in routes if v == verb.upper() and p == path)
+                    # The PATH may well exist under another verb — that is a different
+                    # door, and saying which verb it carries is what tells a reader
+                    # whether the row is stale or the route was renamed.
+                    other_verb = sorted(v for v, p in routes if p == path)
+                    hint = (
+                        f" — the path exists, but under {'/'.join(other_verb)}"
+                        if other_verb
+                        else " — no route carries that path under any verb"
+                    )
                     broken.append(
                         f"{label} — REST `{name}` is not a route: no "
                         f"`@app.{verb.lower()}({path!r})` decorator exists anywhere under "
                         "tortoise/ (the VERB is checked, not just the path — a sibling "
-                        "route on the same path is a different door)"
+                        f"route on the same path is a different door){hint}"
                     )
                     continue
             # ⚠️ EXISTENCE IS NOT ATTRIBUTION — see the note above this section.
@@ -2638,7 +2670,12 @@ _STATED_DOOR_COUNT = re.compile(r"\b([A-Z]+(?:-[A-Z]+)?|\d+) (?:distinct )?doors
 #: Case-INSENSITIVE, for the one place the figure is stated inside a sentence
 #: (`... across twelve doors`): the residue that survived the first fix was
 #: lower-case and the capital-only pattern above could not see it.
-_ANY_DOOR_COUNT = re.compile(r"\b([A-Za-z]+|\d+) (?:distinct )?doors?\b", re.I)
+#: ⚠️ The compound form must be in the pattern, or a HYPHENATED figure is read as
+#: its last word: `TWENTY-TWO doors` matched `TWO doors` and yielded 2, which is a
+#: guard defect that only shows up once a count crosses twenty (it did, when the
+#: table grew to 22 doors). `_STATED_DOOR_COUNT` always carried the hyphen form;
+#: this capital-insensitive twin did not.
+_ANY_DOOR_COUNT = re.compile(r"\b([A-Z]+(?:-[A-Z]+)?|\d+) (?:distinct )?doors?\b", re.I)
 
 
 def _blast_radius_door_count(document: str) -> int | None:
@@ -2681,9 +2718,23 @@ def _stated_door_counts(section: str) -> set[int]:
 
 
 def _spelled(value: int) -> str:
+    """The document's spelling of a count — `NINETEEN`, `TWENTY-TWO`, `THIRTY-SEVEN`.
+
+    ⚠️ The counts are spoken in the document as COMPOUND words, and the first cut
+    of this helper knew only the tens, so raising the count past 29 redded with
+    *"22 has no spelled form this guard knows"* — a guard failure about the
+    guard. The compound form is now generated from `_TENS` + `_NUMBER_WORDS`
+    (the same tables `_words` reads back), which is what made the gap possible.
+    """
     for word, number in _NUMBER_WORDS.items():
         if number == value:
             return word
+    for tens_word, tens_value in _TENS.items():
+        units = value - tens_value
+        if 0 < units < 10:
+            for word, number in _NUMBER_WORDS.items():
+                if number == units:
+                    return f"{tens_word}-{word}"
     raise AssertionError(f"{value} has no spelled form this guard knows")
 
 
@@ -2712,12 +2763,12 @@ def test_the_stated_door_count_matches_the_table():
 
     So the rule is now STATED in both documents — *a door is one independently
     callable entry point: an MCP tool, a public SDK method, or a served REST
-    route; counted ONCE however many of the seventeen sites reach it* — and both
+    route; counted ONCE however many of the nineteen sites reach it* — and both
     documents' stated total, and the per-kind breakdown, are asserted against the
     table. ⚠️ **The first cut of that rule said "counted once per site that
     reaches it", which does not produce the figure it certifies**: applied
-    literally it yields the CELL-OCCURRENCE total (29), not the distinct door
-    total (20), and a reader following it cannot reproduce either number. The
+    literally it yields the CELL-OCCURRENCE total (31), not the distinct door
+    total (22), and a reader following it cannot reproduce either number. The
     cell-occurrence total is therefore STATED as well (§13's blast-radius
     sentence) and asserted here, so the folding rule is checkable in both
     directions instead of being prose that happens to agree with a constant.
@@ -2761,8 +2812,14 @@ def test_the_stated_door_count_matches_the_table():
             ("sdk", "SDK methods"),
             ("rest", "REST routes"),
         )
-        if not any(
-            f"{_spelled(kinds.get(kind, 0))} {noun}".lower() in tail for tail in tails
+        # ⚠️ EVERY sentence that states the total must carry the breakdown — not
+        # just one of them. `any(...)` over `tails` let a corrected sentence at
+        # the headline vouch for a stale one a few lines below (measured: the
+        # blast-radius sentence still said "six SDK methods" and "the seventeen
+        # sites" while the headline was right, and the suite stayed green).
+        if any(
+            f"{_spelled(kinds.get(kind, 0))} {noun}".lower() not in tail
+            for tail in tails
         )
     ]
     assert not missing, (
@@ -3174,4 +3231,181 @@ def test_section_13_pins_every_count_to_a_ref():
         "files out by the time the branch merged. Quote the sha or the date it "
         "was measured at, or state the command and let the reader measure it:\n  - "
         + "\n  - ".join(f"line {line}: {frag!r}" for line, frag in unpinned)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The two classes this guard does NOT re-derive: a relationship type supplied at
+# CALL TIME, and an EMPTY relationship pattern in either legal spelling.
+#
+# ⚠️ **They are derived — just not here.** `#9398` landed those two derivations
+# as the tests of its own table, pinned to that table's prose (a row count and a
+# `<from> → <to> sites` change chain). The table was re-keyed onto
+# `module.py::symbol` and the narration moved to the changelog, so the pins could
+# not survive the merge — but the derivations are the part that mattered: a
+# reader that writes its type as an expression (`-[r:{rel}]->`) or omits the type
+# altogether (`-[r]->`, `(n)--()`) is invisible to every name-based scan, which is
+# the exact blind spot §13 exists to close. They now live in
+# `tests/_about_call_time_census.py` (moved verbatim from that guard) and are
+# consumed here, so there is ONE derivation and the pins stay with the table.
+#
+# Both registers are checked in BOTH directions, which is what makes the class
+# fail-closed rather than declared: a derived site must be a row or a register
+# entry (a NEW reader of the shape cannot ship green), and a register entry must
+# still derive (a stale entry cannot hide the next reader).
+# ---------------------------------------------------------------------------
+
+@functools.cache
+def _call_time_census():
+    """The `#9398` derivation module, imported by path (it is not a test module)."""
+    import importlib.util
+
+    path = Path(__file__).with_name("_about_call_time_census.py")
+    assert path.exists(), (
+        f"{path.name} carries the call-time and empty-pattern derivations and is "
+        "missing — without it those two classes are unguarded, which is the "
+        "regression this arm exists to prevent"
+    )
+    spec = importlib.util.spec_from_file_location("_about_call_time_census", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+#: A row may key on a module-level query CONSTANT where the derivation attributes the
+#: read to the function that EXECUTES it — both are true, and the row names the thing a
+#: re-verifier can find. Each alias says which consumer runs the constant, so the
+#: pairing is a stated fact rather than a fuzzy match.
+_SITE_ALIASES: dict[str, str] = {
+    "definite_description_backfill.py::CENSUS_QUERY": "definite_description_backfill.py::census_rows",
+}
+
+
+def _site_key(rel: str, symbol: str) -> str:
+    """`file.py::Last` — the table keys on `module.py::Symbol`, the derivation on the
+    bare name, so both sides are normalised to the LAST dotted component."""
+    return f"{Path(rel).name}::{symbol.rsplit('.', 1)[-1]}"
+
+
+def _derived(keys: dict[tuple[str, str], tuple[int, ...]]) -> dict[str, tuple[int, ...]]:
+    """`module.py::symbol` → the lines, from the support module's `(file, symbol)` keys."""
+    return {_site_key(rel, symbol): tuple(lines) for (rel, symbol), lines in keys.items()}
+
+
+def _register_keys(entries) -> set[str]:
+    return {_site_key(rel, symbol) for rel, symbol, _why in entries}
+
+
+def _declared_keys() -> set[str]:
+    """The rows' keys, plus each alias's target so a constant-keyed row matches."""
+    keys: set[str] = set()
+    for row in _rows():
+        key = _site_key("x/" + str(row["module"]), str(row["symbol"]))
+        keys.add(key)
+        keys.add(_SITE_ALIASES.get(key, key))
+        keys.add(_SITE_ALIASES.get(key, ""))
+    return {k for k in keys if k}
+
+
+def test_the_call_time_shape_is_derived_and_declared():
+    """A type slot holding an EXPRESSION must be a row or a stated exclusion.
+
+    ⚠️ **This is the class no literal scan can see, and it is not hypothetical:**
+    `TortoiseSDK.traverse` fills the type from a CALLER ARGUMENT (gated only by
+    `validate_rel_type` over `KNOWN_REL_TYPES`, which carries the about* family)
+    and `TortoiseSDK.ingest` fills it from the bundle's `relation`, allowlisted
+    against `_VALID_EDGE_PREDICATES`. Both are customer doors. A table that
+    enumerated only literal spellings dropped them while still claiming its count
+    was the whole argument.
+    """
+    census = _call_time_census()
+    derived = _derived(census._call_time_sites())
+    assert derived, (
+        "the call-time derivation found no site at all — it resolves the type slot "
+        "through loop variables, `for rel in CONSTANT` loops and parameter "
+        "defaults, so an empty result means the resolver stopped working and the "
+        "class is unguarded again"
+    )
+    declared = _declared_keys()
+    registered = _register_keys(census.CALL_TIME_REL)
+    unowned = sorted(set(derived) - declared - registered)
+    assert not unowned, (
+        "these sites read the edge through a relationship type supplied at CALL "
+        "TIME, and §13 neither names them nor declares them out of scope:\n"
+        + "\n".join(f"  - {key} — lines {derived[key]}" for key in unowned)
+        + "\nAdd a row with the symbol, or a `CALL_TIME_REL` entry in "
+        "`tests/_about_call_time_census.py` stating the code fact that keeps "
+        f"`aboutObject` off that slot ({len(derived)} derived, "
+        f"{len(registered)} registered, {len(declared)} rows)"
+    )
+
+
+def test_no_call_time_entry_outlives_its_site():
+    """The reverse direction: a register entry that no longer derives is stale.
+
+    A one-way check is the fail-open half — an entry kept after the code changed
+    would excuse a site that no longer exists AND keep the class silently
+    smaller than it is.
+    """
+    census = _call_time_census()
+    derived = set(_derived(census._call_time_sites()))
+    stale = sorted(_register_keys(census.CALL_TIME_REL) - derived)
+    assert not stale, (
+        "`CALL_TIME_REL` still declares these sites, and the derivation no longer "
+        f"finds them: {stale} — the entry excuses a read that is not there and "
+        "must be deleted, or the resolver has regressed"
+    )
+
+
+def test_the_empty_pattern_class_is_derived_and_declared():
+    """A traversal that names NO type must be a row or a stated exclusion.
+
+    ⚠️ **Both legal spellings are derived** — the bracketed `-[r]->` and the
+    bracket-less `(n)--()`. The bracket-less one was outside the walk once, and a
+    live member sat undeclared while the document claimed the class was complete
+    (`domain_validators.validate_chain_integrity`'s `AND NOT (n)--()`, the
+    `orphaned_draft` degree check).
+    """
+    census = _call_time_census()
+    derived = _derived(census._empty_pattern_sites())
+    assert derived, "the empty-pattern derivation found no site at all"
+    declared = _declared_keys()
+    registered = _register_keys(census.EMPTY_PATTERN)
+    unowned = sorted(set(derived) - declared - registered)
+    assert not unowned, (
+        "these sites walk EVERY relationship type (no type is written, in either "
+        "spelling) and §13 neither names them nor declares them out of scope:\n"
+        + "\n".join(f"  - {key} — lines {derived[key]}" for key in unowned)
+        + "\nAdd a row, or an `EMPTY_PATTERN` entry stating the code fact that "
+        f"bounds the walk ({len(derived)} derived, {len(registered)} registered)"
+    )
+
+
+def test_no_empty_pattern_entry_outlives_its_site():
+    """The reverse direction for the empty-pattern register."""
+    census = _call_time_census()
+    derived = set(_derived(census._empty_pattern_sites()))
+    stale = sorted(_register_keys(census.EMPTY_PATTERN) - derived)
+    assert not stale, (
+        "`EMPTY_PATTERN` still declares these sites, and the derivation no longer "
+        f"finds them: {stale} — delete the entry, or the resolver has regressed"
+    )
+
+
+def test_the_bracket_less_spelling_is_inside_the_walk():
+    """The bracket-less traversal is the half that was invisible; pin the detector.
+
+    ⚠️ A regex that only finds `[…]` reproduces the original defect exactly, and
+    it looks correct in review — so the shape is asserted on a synthetic string
+    rather than inferred from the corpus, which happens to contain one member.
+    """
+    census = _call_time_census()
+    assert census._BARE_TRAVERSAL.search("MATCH (n) WHERE NOT (n)--() RETURN n"), (
+        "the bracket-less traversal `(n)--()` is not recognised — every reader "
+        "written in that spelling is invisible again"
+    )
+    assert not census._BARE_TRAVERSAL.search("MATCH (n)-[r]->(m)"), (
+        "the bracket-less detector also matches the bracketed spelling, so it is "
+        "not measuring the shape it claims"
     )

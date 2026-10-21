@@ -1411,7 +1411,6 @@ that measures the table. **Measured.** Restoring the two pre-fix comments reds
 sample inside that arm, so the shapes cannot silently fall out of coverage. Counts are unchanged —
 **twenty-six sites, twenty-two rows, nine customer-callable rows (twelve sites)**.
 
-
 ## §13's derived class now covers the FRAGMENT half, and three claims in the guard became executable (2026-10-21, `#7948`)
 
 Review cycle 5 found four defects, all inside the guard that makes §13 executable rather than anything
@@ -1454,22 +1453,41 @@ number, so the row now marks its figure superseded and sends the reader to §13'
 `test_the_prior_art_points_at_the_table_instead_of_restating_the_count` keeps the pointer there, because
 a restated count is a copy that rots on the next pass.
 
-## The §13 census becomes the SUPERSET one — and the first guard retires (`#9400`, 2026-10-21)
+## Two censuses of the same table merge — and the first one's DERIVATION survives it (`#9400`, 2026-10-21)
 
-Two branches made the same table executable inside the same hour. `#9398` landed
-`tests/test_7948_about_edge_read_sites.py`, whose table covers **26 sites across 22 rows, 9
-customer-callable, 12 door-reaching**. `#9400` carries the wider pass: **33 sites, 17
-customer-callable, across 20 doors**, deriving the all-edge class the name-based census cannot
-see (`SubgraphExpander._neighbors`, `navigation._hop_query`), the carrier-constant readers
-(`ABOUT_EDGE_TYPES` / `_ABOUT_TYPES`), and the call-time doors whose relationship type is an
-expression rather than a literal. Its symbol set is a **strict superset** — every symbol the
-landed table names is named here, and 36 more — so the two are not alternatives to reconcile but
-one census replacing an earlier, narrower one.
+Two branches made §13 executable inside the same hour. `#9398` landed
+`tests/test_7948_about_edge_read_sites.py`, whose table covered **26 sites across 22 rows, 9
+customer-callable, 12 door-reaching**. `#9400` is the wider pass: the merged table now carries
+**37 rows, 19 customer-callable, across 22 distinct doors** — it derives the all-edge class a
+name-based census cannot see (`SubgraphExpander._neighbors`, `navigation._hop_query`, the backup
+dump and the counts that verify and settle it, the org export, the delete blast-radius preview,
+the v2.5 backfill), and the carrier-constant readers (`ABOUT_EDGE_TYPES`, `TortoiseSDK._ABOUT_TYPES`).
 
-They cannot both stay: each parses §13 in its own row shape (`module.py **symbol**` vs
-`module.py::Symbol`), so the landed guard reads a table it can no longer find and reddens 14
-legs. **The narrower guard is retired and `tests/test_7948_about_object_read_sites.py` keeps the
-table.** Its name appears nowhere else in this file — a guard name in prose is a citation, and a
+⚠️ **The first resolution called it a straight supersession, and that was WRONG — it was a
+measurement artefact, not a finding.** The claim "every symbol the landed table names is named
+here, plus 36 more" came from comparing two different row spellings (`module.py **symbol**` vs
+`module.py::Symbol`): the regex matched only one of them, so the other table looked almost empty.
+Measured properly, the wider pass had **dropped four rows** the narrower one carried —
+`sdk.py::TortoiseSDK.traverse` and `sdk.py::TortoiseSDK.ingest` (both customer-callable
+CALL-TIME doors) and `session_link.py::link_entity` / `subject_binding.py::bind_point_subjects`
+(both write-path readers whose relationship type is an expression). A name-and-literal census
+cannot see any of the four; that is exactly why the narrower guard derived them from the resolved
+SHAPE. They are **rows 34–37** now, so the table is a superset **by measurement** rather than by
+assertion, and the "36" is gone: 37 rows against 26 is ELEVEN more.
+
+**The narrower guard retires as a FILE, not as a capability.** The two cannot coexist — each
+parses §13 in its own row shape, so the landed guard reads a table it can no longer find and
+reddens 10 of its 25 legs. What it *derived*, though, is the part that mattered: the call-time
+class (a type slot holding an expression, which no literal scan sees) and both legal spellings of
+an empty relationship pattern (the bracketed `-[r]->` and the bracket-less `(n)--()`, the second of
+which once left a live member undeclared). Those derivations moved, verbatim, into
+`tests/_about_call_time_census.py`; `tests/test_7948_about_object_read_sites.py` consumes them and
+pins both directions — every derived site must own a row or a stated exclusion, and every
+exclusion must still derive. The prose pins that came with the old file (its own row count, its
+`<from> → <to> sites` change chain) could not survive the restructure; they are the narration this
+document no longer keeps, and the changelog is where it lives.
+
+The old guard's name now appears nowhere in this file: a guard name in prose is a citation, and a
 citation to a deleted file is rot of the same kind the guards exist to prevent — so the mention
 above is the retirement record itself, not a citation of a live guard.
 

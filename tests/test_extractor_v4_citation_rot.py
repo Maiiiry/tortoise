@@ -493,9 +493,15 @@ _SYMBOL = r"[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?"
 #: `projection/entities.py`).
 _CITED_FILE = r"[A-Za-z0-9_./-]+\.py"
 #: `sym` (`file.py:NNN`) — the symbol immediately precedes its citation.
-_SYM_THEN_CITATION = re.compile(rf"`({_SYMBOL})`\s*\(`?({_CITED_FILE}):(\d+)")
+#: ⚠️ The line number is OPTIONAL here, and it is the form the document
+#: PREFERS: a symbol-keyed citation (`sym` (`file.py`)) survives a code move,
+#: while a line number rots on the next insertion. Requiring `:NNN` (an earlier
+#: state of this guard) silently stopped checking every symbol-only citation —
+#: `kind_classifier.classify_items` (`kind_classifier.py`) matched nothing at
+#: all, so a citation of a symbol that no longer exists passed.
+_SYM_THEN_CITATION = re.compile(rf"`({_SYMBOL})`\s*\(`?({_CITED_FILE})(?::(\d+))?")
 #: `file.py:NNN` (`sym`) — the citation immediately precedes its symbol.
-_CITATION_THEN_SYM = re.compile(rf"`?({_CITED_FILE}):(\d+)`?\s*\(`({_SYMBOL})`")
+_CITATION_THEN_SYM = re.compile(rf"`?({_CITED_FILE})(?::(\d+))?`?\s*\(`({_SYMBOL})`")
 
 
 def _citations_in(text: str) -> list[tuple[int, str, str, int]]:
@@ -503,11 +509,21 @@ def _citations_in(text: str) -> list[tuple[int, str, str, int]]:
     found: list[tuple[int, str, str, int]] = []
     for match in _SYM_THEN_CITATION.finditer(text):
         found.append(
-            (match.start(), match.group(1), match.group(2), int(match.group(3)))
+            (
+                match.start(),
+                match.group(1),
+                match.group(2),
+                int(match.group(3)) if match.group(3) else 0,
+            )
         )
     for match in _CITATION_THEN_SYM.finditer(text):
         found.append(
-            (match.start(), match.group(3), match.group(1), int(match.group(2)))
+            (
+                match.start(),
+                match.group(3),
+                match.group(1),
+                int(match.group(2)) if match.group(2) else 0,
+            )
         )
     return found
 
@@ -529,13 +545,14 @@ def test_every_quoted_symbol_citation_resolves_at_head():
     count assertion reds, so the guard cannot quietly become vacuous.
     """
     citations = _quoted_symbol_citations()
-    assert len(citations) >= 6, (
+    assert len(citations) >= 9, (
         f"only {len(citations)} quoted-symbol citations found — the document's "
         "citation shape changed (or the extractor broke) and this guard would "
-        "otherwise pass vacuously. The floor was 10 until #7948 symbol-keyed "
-        "§13.8's eleven `file.py:NNNN` citations (this form no longer matches "
-        "them); the six that remain are the rest of the document's, and they "
-        "are what this guard pins."
+        "otherwise pass vacuously. NINE is the measured count at this head, and "
+        "it counts BOTH the line-numbered and the symbol-only forms: the floor "
+        "was 6 while the symbol-only form was excluded from the patterns, which "
+        "was the regression that let `kind_classifier.classify_items` "
+        "(`kind_classifier.py`) rot unread."
     )
 
     unresolved = []
