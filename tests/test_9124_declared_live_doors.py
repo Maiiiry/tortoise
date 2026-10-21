@@ -1096,22 +1096,36 @@ _CALIBRATION_READERS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _unresolved_block_source() -> str:
-    """The source of the `_UNRESOLVED` set literal, comments included.
+def _unresolved_block_span(source: str) -> str:
+    """The source of the ONE module-level `_UNRESOLVED` set literal.
 
-    Sliced from THIS file by the AST's own line numbers, so the span cannot
-    silently shrink to a fragment that happens to pass.
+    Sliced by the AST's own line numbers, so the span cannot silently shrink to
+    a fragment that happens to pass.
+
+    ⛔ EXACTLY ONE assignment, asserted rather than assumed (review P3): the
+    first version looped and `return`ed on the first match, so a SECOND
+    `_UNRESOLVED = {…}` later in the module — the one that is live at runtime,
+    because it rebinds the name — left both pins validating the DEAD first
+    literal while the governing block went unverified, silently. Counting the
+    matches makes a rebinding red instead of skipped.
     """
-    source = Path(__file__).read_text()
     lines = source.splitlines()
-    for node in ast.parse(source).body:
-        if (isinstance(node, ast.Assign)
-                and any(getattr(t, "id", None) == "_UNRESOLVED"
-                        for t in node.targets)):
-            return "\n".join(lines[node.lineno - 1:node.end_lineno])
-    raise AssertionError(
-        "`_UNRESOLVED` is not a module-level assignment any more — this pin "
-        "reads its source to check the hand-check note, so move the pin with it")
+    matches = [
+        node for node in ast.parse(source).body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", None) == "_UNRESOLVED" for t in node.targets)]
+    assert len(matches) == 1, (
+        f"`_UNRESOLVED` is assigned {len(matches)} times at module level — a "
+        "second assignment REBINDS the name, so these pins would check the "
+        "dead first literal while the live block went unverified. Keep one "
+        "assignment (or move the pins with the rebinding)")
+    node = matches[0]
+    return "\n".join(lines[node.lineno - 1:node.end_lineno])
+
+
+def _unresolved_block_source() -> str:
+    """The `_UNRESOLVED` block of THIS file, comments included."""
+    return _unresolved_block_span(Path(__file__).read_text())
 
 
 def _comments_in(block_source: str) -> str:
@@ -1134,6 +1148,27 @@ def _comments_in(block_source: str) -> str:
         if token.type == tokenize.COMMENT:
             comments.append(token.string.lstrip("#"))
     return "\n".join(comments)
+
+
+def _missing_citations(block_source: str) -> list[str]:
+    """The `_CALIBRATION_READERS` rows this block's COMMENT text does not cite.
+
+    ⛔ THE PIN'S OWN PREDICATE, and it lives HERE — module level, one definition
+    (review P2). It used to be spelled out inside the pin, while the non-vacuity
+    test defined its own byte-identical copy: the test therefore observed
+    nothing the pin computed and stayed green when the pin's positive half was
+    reverted to the pre-fix `name in block`, i.e. it could not fail on the
+    regression it claims to hold. Both now drive this function, so reverting
+    `_comments_in` to the raw block reds the pin AND the test.
+
+    Returns one entry per row whose name AND read shape are not on a single
+    comment line — the citation must be one line, because a name mentioned
+    somewhere and a shape mentioned elsewhere does not let a reader re-verify
+    the note.
+    """
+    note_lines = _comments_in(block_source).splitlines()
+    return [name for name, shape in _CALIBRATION_READERS
+            if not any(name in line and shape in line for line in note_lines)]
 
 
 def _string_constants(node) -> list[str]:
@@ -1428,6 +1463,13 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
       of which 230 were repeats of a literal it had already seen, where the
       guard collects 77 — and, because it is no longer the thing keeping the
       walk finite, 10 fragments that the old ceiling cut are now inspected.
+      ⛔ BOTH id-keyed containers RETAIN the node they key on (`visited` the
+      expression, `followed` the callee). `_resolve_callee` re-parses its target
+      on every resolution, so a bare `set[int]` keyed on a node from a throwaway
+      module could have its `id` recycled: the guard then skipped a node it had
+      never walked — neither followed nor reported, the silent blind spot this
+      docstring forbids. `test_the_fragment_walk_retains_the_nodes_it_keys_on`
+      pins that.
     * `_FRAGMENT_DEPTH_CAP` — a backstop for a binding CYCLE, and it REPORTS.
       It used to `return fragments` in silence: past six hops a write held in a
       variable was neither inspected nor added to `unread`, so the pin stayed
@@ -1444,9 +1486,14 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
             f"{ast.dump(expr)[:60]}>")
         return fragments
     seen = visited.setdefault(id(expr), [])
-    if any(scope is bindings for scope in seen):
+    if any(scope is bindings for _retained, scope in seen):
         return []  # already inspected in this exact scope; nothing new to add
-    seen.append(bindings)  # RETAINED, so this `id` cannot be recycled under us
+    # ⛔ THE EXPRESSION IS RETAINED WITH THE SCOPE (review P2). Appending only
+    # `bindings` pinned the SCOPE dict, never the key: `expr` (a parse-tree node
+    # from `_resolve_callee`'s throwaway module) could be freed and its `id`
+    # recycled, which made the guard above fire for a DIFFERENT expression — and
+    # the walk then returned `[]`, neither inspected nor reported.
+    seen.append((expr, bindings))
     call_names = {id(node.func) for node in ast.walk(expr)
                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
     # A parameter passed to an UNshadowed scalar coercion cannot carry statement
@@ -1470,7 +1517,14 @@ def _fragments_of(expr, bindings, params, module, path, followed, unread,
             callee, callee_module, callee_path = _resolve_callee(
                 sub.func.id, module, path)
             if callee is not None and id(callee) not in followed:
-                followed.add(id(callee))
+                # ⛔ KEYED BY id, RETAINING THE CALLEE — the same shape as
+                # `_MODULE_BINDINGS_CACHE`. A bare `set[int]` kept no reference
+                # to `callee`, and `_resolve_callee` re-parses its target on
+                # every resolution, so a later `ast.parse` could land on the
+                # freed address: the guard then skipped a callee it had never
+                # followed — neither followed nor reported, the silent blind
+                # spot this walk's docstring forbids.
+                followed[id(callee)] = callee
                 callee_bindings = _local_bindings(ast.walk(callee))
                 for returned in _function_returns(callee):
                     fragments.extend(_fragments_of(
@@ -1593,7 +1647,7 @@ def _assembled_statement_fragments(func, call: ast.Call,
         return [], set()
     unread: set[str] = set()
     fragments = _fragments_of(statement, _local_bindings(ast.walk(func)),
-                              _params_of(func), module, path, set(), unread)
+                              _params_of(func), module, path, {}, unread)
     return fragments, unread
 
 
@@ -1721,10 +1775,7 @@ def test_the_unresolved_hand_check_cites_symbols_not_line_numbers():
         "function by NAME — the symbol is authoritative, the number is not:"
         f"\n  {block}")
     note = _comments_in(block)
-    note_lines = note.splitlines()
-    missing = [
-        name for name, shape in _CALIBRATION_READERS
-        if not any(name in line and shape in line for line in note_lines)]
+    missing = _missing_citations(block)
     assert not missing, (
         "the note no longer cites the function(s) it is the hand-check FOR, "
         f"with the read shape it claims ({missing}) — the citation must be ONE "
@@ -1746,6 +1797,13 @@ def test_the_symbol_pin_reads_the_comment_not_the_rows():
     hand: two declared rows, no comment. Under the fix `_comments_in` sees no
     names and the pin would red; under the old `name in block` both names are
     "present" and it would stay green.
+
+    ⛔ It drives `_missing_citations` — the PIN'S OWN PREDICATE, the function
+    the pin calls — not a copy of it (review P2). The earlier version carried a
+    private `_missing()` (twice, the first definition dead), so the test could
+    not observe the pin at all and stayed green with the pin's positive half
+    reverted to `name in block`. Now reverting `_missing_citations`'s
+    `_comments_in(...)` call to the raw block reds this test.
     """
     rows_only = (
         '_UNRESOLVED = {\n'
@@ -1754,29 +1812,34 @@ def test_the_symbol_pin_reads_the_comment_not_the_rows():
         '}\n')
     note = _comments_in(rows_only)
     assert note == "", f"the block has no comments, yet {note!r} was read"
-    # ⛔ THE PIN'S OWN PREDICATE, not `name not in note`: after the line above
-    # established `note == ""` that test is `True` unconditionally, so it could
-    # not fail — and it held identically with the positive half reverted to the
-    # pre-fix `name in _unresolved_block_source()`, the very defect this test
-    # claims to hold. Spending the predicate on a comment-free block leaves both
-    # names MISSING, which is what makes deleting the note red.
-    def _missing(block_source: str) -> list[str]:
-        """The pin's own `missing` computation, over any block source."""
-        note_lines = _comments_in(block_source).splitlines()
-        return [name for name, shape in _CALIBRATION_READERS
-                if not any(name in line and shape in line
-                           for line in note_lines)]
-
-    def _missing(block_source: str) -> list[str]:
-        """The pin's own `missing` computation, over any block source."""
-        note_lines = _comments_in(block_source).splitlines()
-        return [name for name, shape in _CALIBRATION_READERS
-                if not any(name in line and shape in line
-                           for line in note_lines)]
-
-    assert _missing(rows_only) == [name for name, _shape in _CALIBRATION_READERS], (
+    # The names ARE in the raw block, on the set rows — so the assertions below
+    # discriminate on WHERE the pin reads, not on whether the text exists at
+    # all. A predicate that skimmed the raw block (`name in block`, the pre-fix
+    # shape) would find both and stay green over a note-less block.
+    assert all(name in rows_only for name, _shape in _CALIBRATION_READERS), (
+        "this case is only meaningful while the block's rows carry both names")
+    # ⛔ THE PIN'S OWN PREDICATE (`_missing_citations`, the function the pin
+    # calls), not `name not in note`: after the line above established
+    # `note == ""` that test is `True` unconditionally, so it could not fail —
+    # and it held identically with the positive half reverted. Spending the
+    # predicate on a comment-free block leaves both names MISSING, which is what
+    # makes deleting the note red.
+    assert _missing_citations(rows_only) == [
+        name for name, _shape in _CALIBRATION_READERS], (
         "the symbol pin would stay green with the #9063 note deleted — its "
         "positive half is reading the block's SET ROWS, not the comments")
+    # …and a name+shape pair sitting in a ROW (a string element, not a comment)
+    # must NOT satisfy it: that is the difference between reading COMMENTS and
+    # reading the block's raw text, which `_comments_in` exists to make.
+    shapes_in_rows = (
+        '_UNRESOLVED = {\n'
+        '    "calibrate_summary OPTIONAL MATCH",\n'
+        '    "_uncalibrated_ep_participants RETURN n.id",\n'
+        '}\n')
+    assert _missing_citations(shapes_in_rows) == [
+        name for name, _shape in _CALIBRATION_READERS], (
+        "a name+shape pair in a SET ROW satisfied the pin — its positive half "
+        "is reading the block's raw text, not its comments")
     # …and the note, once present in the shape the pin requires (ONE comment
     # line carrying the name AND its read shape), satisfies it.
     with_note = rows_only.replace(
@@ -1784,10 +1847,32 @@ def test_the_symbol_pin_reads_the_comment_not_the_rows():
         "#   `calibrate_summary` — `MATCH … OPTIONAL MATCH … RETURN` (a read)\n"
         "#   `_uncalibrated_ep_participants` — `MATCH … RETURN n.id` (a read)\n"
         "_UNRESOLVED = {")
-    assert _missing(with_note) == [], (
+    assert _missing_citations(with_note) == [], (
         "the pin does not even accept a note written in its own required "
         f"shape, so the assertion above proves nothing (comments: "
         f"{_comments_in(with_note)!r})")
+
+
+def test_a_second_unresolved_assignment_reds_the_pin():
+    """NON-VACUITY for the ONE-assignment guard in `_unresolved_block_span`.
+
+    The span used to `return` on the first module-level `_UNRESOLVED = {…}`, so
+    a SECOND assignment — which REBINDS the name, and is therefore the block
+    that governs at runtime — left both pins validating the DEAD first literal,
+    silently. Pre-fix this case returns the first span and the assertion below
+    never fires; with the fix it reds.
+    """
+    one = (
+        '_UNRESOLVED = {\n'
+        '    "a",\n'
+        '}\n')
+    assert "a" in _unresolved_block_span(one), (
+        "the span helper does not even find a single assignment")
+    with pytest.raises(AssertionError, match="assigned 2 times"):
+        _unresolved_block_span(one + "\n_UNRESOLVED = {\n    'b',\n}\n")
+    # A rebinding that the OLD loop would have skipped rather than reded.
+    with pytest.raises(AssertionError, match="assigned 0 times"):
+        _unresolved_block_span("_UNRESOLVED: set[str] = {'a'}\n")
 
 
 def _census_writer_names() -> frozenset[str]:
@@ -2061,6 +2146,62 @@ def test_the_fragment_walk_follows_a_name_past_six_hops():
         "a write reached through 12 name hops produced no offender, so the "
         "depth ceiling silently dropped it — the pin stays green over a "
         f"writing row (offenders={offenders})")
+
+
+def test_the_fragment_walk_retains_the_nodes_it_keys_on():
+    """NON-VACUITY for the identity guards in `_fragments_of` (review P2).
+
+    Both guards are keyed on `id(node)`, and keying on an id is only safe when
+    the entry RETAINS the node (`_MODULE_BINDINGS_CACHE` was fixed that way; its
+    `test_the_module_bindings_cache_retains_its_module` holds it). Here
+    `followed` was a bare `set[int]` and `visited` appended only the SCOPE dict,
+    so a freed node's `id` could be recycled and the guard then fired for a
+    DIFFERENT node: the walk returned `[]` for an expression it never inspected,
+    neither followed nor reported. `_resolve_callee` re-parses on every
+    resolution, which is exactly how such a node becomes unreachable while its
+    id stays a live key.
+
+    Pre-fix this reds deterministically: a `set` of ints has no `.items()`, and
+    a `visited` entry is a bare dict, not a `(expr, scope)` pair.
+    """
+    source = (
+        "def _parts():\n"
+        '    return " SET n.poked = 1"\n'
+        "\n"
+        "def reading(proj):\n"
+        '    query = f"MATCH (n:Point) RETURN n.id {_parts()}"\n'
+        "    return proj.g.query(query).result_set\n")
+    tree = ast.parse(source)
+    reading = next(node for node in tree.body
+                   if isinstance(node, ast.FunctionDef)
+                   and node.name == "reading")
+    bindings = _local_bindings(reading)
+    assert "query" in bindings, "the synthetic reader binds no statement"
+    followed: dict = {}
+    visited: dict = {}
+    _fragments_of(bindings["query"][0], bindings, _params_of(reading),
+                  tree, Path("synthetic_sdk.py"), followed, set(),
+                  visited=visited)
+    assert followed, (
+        "the walk followed no NAME callee, so this case proves nothing about "
+        "the `followed` guard")
+    for key, callee in followed.items():
+        assert id(callee) == key, (
+            "a `followed` entry is keyed by an id but does not retain the "
+            "callee, so a recycled id makes the guard skip a callee it never "
+            "followed — neither followed nor reported")
+        assert isinstance(callee, (ast.FunctionDef, ast.AsyncFunctionDef)), (
+            f"the retained value is not the callee ({callee!r})")
+    assert visited, (
+        "the walk recorded no `visited` entry, so this case proves nothing "
+        "about that guard")
+    for key, seen in visited.items():
+        for expr, _scope in seen:
+            assert id(expr) == key, (
+                "a `visited` entry does NOT retain the expression it is "
+                "keyed by (it kept the scope dict instead), so a recycled id "
+                "can fire the guard for a different expression and the walk "
+                "returns [] without inspecting or reporting it")
 
 
 def test_the_fragment_walk_fails_closed_at_the_depth_cap():
