@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -47,9 +48,12 @@ NOW = 1_800_000_000
 
 class FakeStore:
     """In-memory stand-in for the graph. `create` NEVER overwrites an existing id and hands
-    the caller back the EXISTING content — verified behaviour of `create_point` against a
-    live FalkorDB (a second create with the same id returns the first point, content and
-    all), and the reason the read-back is the authority rather than the write's exit code."""
+    the caller back the EXISTING content — the behaviour the SHIPPED store has because it
+    writes `MERGE … ON CREATE SET` (one contender's `ON CREATE` runs, the loser's statement
+    matches the existing node). It is deliberately NOT the behaviour of `create_point`:
+    measured on a live FalkorDB, two `create_point` calls with the same id left TWO `:Point`
+    nodes, which is exactly why the store does not use it (evidence README §3). The read-back
+    is the authority rather than the write's exit code either way."""
 
     def __init__(self) -> None:
         self.points: dict[str, str] = {}
@@ -307,10 +311,14 @@ def test_expired_claim_is_reclaimed_and_the_epoch_fences():
 
 
 def test_reclaim_through_a_store_without_a_fence_is_refused_not_blindly_written():
-    """Review of #9487 (P1): the shipped `SDKClaimStore` cannot express "set only if the epoch
-    is still E" — `update_point` is a blind write — so the interleaving A.replace → A.read →
-    B.replace → B.read lets both boxes report `acquired`. A store without the fence must make
-    `acquire` REFUSE (rc 2), never fall back to the blind write that reintroduces it."""
+    """Review of #9487 (P1): a store that cannot express "set only if the epoch is still E"
+    lets the interleaving A.replace → A.read → B.replace → B.read report `acquired` twice, so
+    `acquire` must REFUSE (rc 2) rather than fall back to a blind write that reintroduces it.
+
+    `SDKClaimStore` DOES express the fence — `MATCH … WHERE n.claim_epoch = $expected SET …`,
+    which touches 0 rows when a peer moved it — so this pins the capability CHECK, not a
+    limitation of the shipped store (the earlier docstring said the shipped store could not
+    express it; review of #9487 noted it was stale)."""
 
     class BlindStore(FakeStore):
         replace_if_epoch = None
@@ -426,6 +434,33 @@ def test_forced_release_by_a_non_holder_records_the_reason_in_the_claim():
         store=FakeStore(),
     )
     assert rc == wc.EXIT_USAGE
+
+
+def test_forced_release_keeps_the_reason_verbatim_even_with_a_bracket():
+    """The audit reason lives inside the bracketed `[released: …]` marker, so an unescaped `]`
+    closed it early — and the old fix (`reason.replace("]", ")")`) silently REWROTE the
+    operator's words (`a]b` became `a)b`) in the one field that records WHY a claim was taken
+    from its holder (review of #9487 nit). Escaping keeps the text and the fence."""
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    reason = "holder crashed [see run 42] — closing bracket ] inside"
+    out = wc.release(
+        store,
+        "daniel-ospina/tortoise",
+        "issue-5052",
+        owner="cell-9:999",
+        force=True,
+        reason=reason,
+        now=NOW + 5,
+    )
+    assert out.rc == 0, out.reason
+    stored = wc._parse(store.points[wc.claim_id("daniel-ospina/tortoise", "issue-5052")])
+    # the operator's words survive, character for character (escape aside):
+    assert reason.replace("]", "\\]") in stored.purpose
+    assert ")" not in stored.purpose.split("[released:", 1)[1].split("]", 1)[0].replace("(", "").replace("[", "")
+    # the marker still opens once and the audit actor survives
+    assert stored.purpose.count("[released:") == 1
+    assert "forced by cell-9:999" in stored.purpose
 
 
 def test_reentrant_acquire_is_already_held_rather_than_held_by_a_peer():
@@ -565,11 +600,95 @@ def test_negative_capacity_fields_are_a_usage_error(flag):
     assert rc == wc.EXIT_USAGE
 
 
+def test_a_malformed_invocation_is_rc3_never_the_retryable_rc2():
+    """⛔ `argparse` exits **2** from `error()` — the code this tool reserves for "the store
+    could not answer", which a controller RETRIES. Every parse failure used to return it: a
+    missing `--repo` (required on all three verbs), a bad `--kind` choice, and
+    `--allow-box-local` written BEFORE the subcommand (registered on the subcommand's parent).
+    A retry of a command that can never succeed is the same defect the `status --repo` /
+    `--ttl 0` fixes closed on the validated path (review of #9487 P2)."""
+    for argv in (
+        # `--repo` omitted: required on `acquire`, `status` and `release`.
+        ["acquire", "--issue", "5052", "--session", "cell-t1"],
+        ["status", "--issue", "5052"],
+        ["release", "--issue", "5052", "--session", "cell-t1"],
+        # a `choices` violation
+        ["acquire", "--repo", "o/r", "--issue", "5052", "--session", "s", "--kind", "bogus"],
+        # `--allow-box-local` belongs to the SUBCOMMAND, not the root parser
+        ["--allow-box-local", "acquire", "--repo", "o/r", "--issue", "5052", "--session", "s"],
+        # an unknown verb
+        ["claim", "--repo", "o/r"],
+    ):
+        rc = wc.main(argv, store=FakeStore())
+        assert rc == wc.EXIT_USAGE, argv
+        assert rc != wc.EXIT_UNANSWERABLE, argv
+
+
+def test_help_is_still_rc0_not_the_usage_error():
+    """The parse-failure remap must not turn `--help` (argparse exits 0) into rc 3."""
+    assert wc.main(["--help"]) == wc.EXIT_OK
+    assert wc.main(["acquire", "--help"]) == wc.EXIT_OK
+
+
 def test_check_survives_an_injected_store_without_a_target_method(monkeypatch):
     """`check` called the injected store's `target()` unconditionally; the test seam has none."""
     monkeypatch.setattr(wc, "_require_store_configured", lambda *a, **k: "docker://example.invalid/g")
     rc = wc.main(["check"], store=FakeStore())
     assert rc == 0
+
+
+def test_check_refuses_a_box_local_target_instead_of_printing_ok(monkeypatch, capsys):
+    """⛔ `check` is what a dispatch flow GATES on ("rc 2 = no"), and it used to print
+    `ok: claim store reachable (docker://***@127.0.0.1:16379/…)` on STDOUT and exit **0** for
+    a target `acquire`/`status`/`release` all refuse — the disqualification was only a stderr
+    `WARNING`. That is the one-variable-away repeat of the failure this tool exists to
+    prevent: the claim lands locally, reads `free` on every peer, and the preflight said go
+    (review of #9487 P2). The verdict is now the siblings' verdict."""
+
+    class BoxLocalStore(FakeStore):
+        def require_shared(self):
+            return (
+                "the claim store target is BOX-LOCAL (127.0.0.1) — a claim written there reads "
+                "as acquired here and free on every peer"
+            )
+
+        def target(self):
+            return "docker://***@127.0.0.1:16379/tortoise_test_matrix"
+
+    monkeypatch.setattr(wc, "_require_store_configured", lambda *a, **k: "docker://127.0.0.1:16379/tm")
+    rc = wc.main(["check"], store=BoxLocalStore())
+    err = capsys.readouterr()
+    assert rc == wc.EXIT_UNANSWERABLE and rc != wc.EXIT_OK
+    assert "ok:" not in err.out, "a box-local target must not be announced as ok on stdout"
+    assert "BOX-LOCAL" in err.err
+
+    # ...and the acknowledgement flag still lets a single-box trial proceed.
+    rc = wc.main(["check", "--allow-box-local"], store=FakeStore())
+    assert rc == wc.EXIT_OK
+
+
+def test_check_json_carries_the_target_and_the_verdict(monkeypatch, capsys):
+    """`--json` was accepted (it rides the shared parent parser) and silently IGNORED by
+    `check`, so a controller parsing the other three verbs got prose here (review of #9487
+    nit). It now emits one object, on the refusal too."""
+
+    class BoxLocalStore(FakeStore):
+        def require_shared(self):
+            return "the claim store target is BOX-LOCAL (127.0.0.1)"
+
+        def target(self):
+            return "docker://***@127.0.0.1:16379/tm"
+
+    monkeypatch.setattr(wc, "_require_store_configured", lambda *a, **k: "docker://127.0.0.1:16379/tm")
+
+    assert wc.main(["check", "--json"], store=FakeStore()) == wc.EXIT_OK
+    ok = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert ok == {"status": "ok", "reachable": True, "target": "unknown target"}
+
+    assert wc.main(["check", "--json"], store=BoxLocalStore()) == wc.EXIT_UNANSWERABLE
+    refused = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert refused["status"] == "REFUSED" and refused["reachable"] is False
+    assert "BOX-LOCAL" in refused["reason"]
 
 
 def test_read_back_that_differs_from_our_write_is_held_not_acquired():
@@ -642,6 +761,31 @@ def test_status_free_is_a_real_answer_and_unanswerable_is_not():
     assert unknown.rc == 2 and unknown.status == "REFUSED"
 
 
+def test_status_rc_reports_that_it_answered_not_that_the_unit_is_free():
+    """`status` is the verb whose job is "who holds this?", so its rc is the ANSWER's
+    deliverability: `free`, `expired` and `held` are all rc 0 and the JSON `status` field says
+    which. That is the OPPOSITE polarity to `claims.sh`'s status verb, which exits 1 when the
+    unit is UNHELD (`scripts/orchestrator-harness/claims.sh::_claim_status_at`) — so the
+    difference is named in the module's CALLER CONTRACT instead of leaving a silent gap
+    (review of #9487). Pinned here so a later "align it with claims.sh" change has to break
+    this test and read the reason."""
+    store = FakeStore()
+    free = wc.status(store, "daniel-ospina/tortoise", "issue-5052", now=NOW)
+    assert (free.rc, free.status) == (0, "free")
+
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    held = wc.status(store, "daniel-ospina/tortoise", "issue-5052", now=NOW)
+    assert (held.rc, held.status) == (0, "held")
+    assert held.owner == "cell-1:100"
+
+    expired = wc.status(store, "daniel-ospina/tortoise", "issue-5052", now=NOW + 4000)
+    assert (expired.rc, expired.status) == (0, "expired")
+
+    # the branchable exit code for "a live holder exists" is `acquire`'s (and release's):
+    blocked = wc.acquire(store, _record(owner="cell-4:200"), now=NOW + 10)
+    assert (blocked.rc, blocked.status) == (wc.EXIT_HELD, "held")
+
+
 # ── the content line is the identity ───────────────────────────────────────────────
 
 
@@ -674,7 +818,19 @@ def test_json_outcome_carries_the_decision_a_controller_logs():
     assert payload["lease_until"] == NOW + 3600
 
 
-# ── the shipped store, end to end ─────────────────────────────────────────────────
+# ── the shipped store, end to end ───────────────────────────────────────────────────
+#
+# ⛔ EVERY live leg keys on a PER-RUN claim key. A fixed key (`issue-999999` and friends) made
+# two concurrent runs of this file — this box runs many lanes against one container by design
+# (#5084) — read and fence each other's records: the second run's `replace_if_epoch(…,
+# expected_epoch=1)` lost to a peer that had already bumped the epoch, so the assertions
+# below went red for a reason that had nothing to do with the code under test (review of
+# #9487). Each leg deletes its own node in `finally`, so the per-run key leaves no residue.
+
+
+def _probe_key() -> str:
+    return f"issue-{uuid.uuid4().hex[:12]}"
+
 
 
 @pytest.mark.skipif(
@@ -689,7 +845,7 @@ def test_live_sdk_store_acquire_status_release():
     exercised. `allow_box_local`: the lane's own container is loopback by design.
     """
     store = wc.SDKClaimStore(allow_box_local=True)
-    key = "issue-999999"
+    key = _probe_key()
     repo = "daniel-ospina/tortoise"
     cid = wc.claim_id(repo, key)
     record = wc.ClaimRecord(
@@ -764,7 +920,7 @@ def test_live_fence_admits_exactly_one_of_two_contenders():
     deleting `WHERE n.claim_epoch = $expected` left the whole suite green, and two contenders
     observing the same expired epoch then BOTH won."""
     store = wc.SDKClaimStore(allow_box_local=True)
-    repo, key = "daniel-ospina/tortoise", "issue-999998"
+    repo, key = "daniel-ospina/tortoise", _probe_key()
     cid = wc.claim_id(repo, key)
     try:
         base = wc.ClaimRecord(
@@ -800,7 +956,7 @@ def test_live_legacy_duplicate_nodes_read_as_one_claim_and_are_refused_on_write(
     used `create_point`, which does not enforce uniqueness — measured: 2 nodes). Reads must
     answer with one claim, and a write must REFUSE rather than pick one."""
     store = wc.SDKClaimStore(allow_box_local=True)
-    repo, key = "daniel-ospina/tortoise", "issue-999997"
+    repo, key = "daniel-ospina/tortoise", _probe_key()
     cid = wc.claim_id(repo, key)
     old = wc.ClaimRecord(
         repo=repo, key=key, owner="pytest:old", lease_until=NOW + 60, epoch=1, claimed_at=NOW

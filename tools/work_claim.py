@@ -79,12 +79,23 @@ this". An unset store is therefore refused before any query is attempted.
 
 CALLER CONTRACT (drop-in vocabulary with `claims.sh`, so a caller needs no new branch)
 ------------------------------------------------------------------------------------
-    rc 0  acquired (or reclaimed an EXPIRED claim, or a release/status that succeeded)
+    rc 0  acquired (or reclaimed an EXPIRED claim, or a release that succeeded, or a
+          `status` that ANSWERED — including `status: held`, see below)
     rc 1  held by a LIVE claim (or a release refused: not the caller's / epoch moved)
     rc 2  the store could not answer — REFUSE the dispatch, do not proceed blind
     rc 3  the INVOCATION was malformed (no number where one is required, `--force` without
-          `--reason`). Deliberately distinct from rc 2: a controller retries an unanswerable
-          store, and a retry of a malformed command can never succeed.
+          `--reason`, an unparseable argument list). Deliberately distinct from rc 2: a
+          controller retries an unanswerable store, and a retry of a malformed command can
+          never succeed.
+
+⚠️ `status` ANSWERS, so its rc is the answer's deliverability, not the claim's liveness:
+`free`, `expired` and `held` are all rc 0 (the JSON `status` field carries which, and
+`--json` is how a controller branches). `claims.sh`'s own status verb is the OPPOSITE
+polarity — rc 1 when UNHELD, rc 0 when held (`scripts/orchestrator-harness/claims.sh`,
+`_claim_status_at`) — so a caller porting from it must branch on `acquire`/`release` rc
+(the same in both tools) or on the status FIELD, never on `status`'s exit code. Naming it
+here is what makes the table usable; a silent difference is what made it a finding
+(review of #9487).
 
 `--json` emits one object with `status`, `owner`, `lease_until`, `epoch`, `reason` so a
 controller can log the measured reason instead of guessing.
@@ -107,7 +118,9 @@ USAGE
     tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1
     tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 \
         --session cell-t9 --force --reason "holder crashed, lease expired 2h ago"
-    tools/work_claim.py check            # is the store reachable? prints the target; rc 2 = no
+    tools/work_claim.py check            # is the store reachable AND shared? prints the
+                                         # target; rc 2 = no (a box-local target is rc 2
+                                         # unless --allow-box-local acknowledges a trial)
 
 STORE
 -----
@@ -121,10 +134,11 @@ free — the duplicate-dispatch failure, reported as a success.
 ⚠️ The guard validates that a store is CONFIGURED, not that it is SHARED. A loopback URI
 (`docker://…@127.0.0.1:16379/…`) is exactly as invisible to a peer as the embedded file, and
 every cell's own graph looks like that (see the evidence README §1). So EVERY verb that
-consults the store — `acquire`, `status`, `release` — refuses a loopback target unless
-`--allow-box-local` acknowledges a single-box trial (`status` included: its `free` is what a
-controller dispatches on). `check` prints the target with the password REDACTED and warns
-when it is box-local.
+consults the store — `acquire`, `status`, `release`, and `check` (which a dispatch flow
+gates on) — refuses a loopback target unless `--allow-box-local` acknowledges a single-box
+trial (`status` included: its `free` is what a controller dispatches on). `check` prints the
+target with the password REDACTED, and returns rc 2 — not a WARNING on stderr — when that
+target is box-local.
 
 There is deliberately no default: see the fail-closed note.
 """
@@ -177,6 +191,19 @@ EXIT_UNANSWERABLE = 2
 # number used to reach `normalise_key(0)` → rc 2, which a controller reads as "the store is
 # unanswerable" and retries forever; the invocation was wrong and nothing was unreachable.
 EXIT_USAGE = 3
+
+
+def _audit_text(value: str) -> str:
+    """Keep a caller-supplied audit reason verbatim INSIDE the bracketed `[released: …]`
+    marker that `release --force` writes into the claim's purpose.
+
+    The marker is fenced by `[` and `]`, so an unescaped `]` in the reason used to close it
+    early — and the old fix for that (`reason.replace("]", ")")`) silently rewrote the
+    operator's words, `a]b` becoming `a)b`, in the one field that exists to record WHY a
+    claim was taken from its holder (review of #9487 nit). Escaping keeps the text readable
+    and the fence unambiguous.
+    """
+    return value.replace("\\", "\\\\").replace("]", "\\]")
 
 
 class StoreUnanswerable(RuntimeError):
@@ -918,7 +945,7 @@ def release(
     tomb.lease_until = now
     if force:
         actor = f" (forced by {owner}" + (f" from session {session}" if session else "") + ")"
-        tomb.purpose = (tomb.purpose + " [released:" + reason.replace("]", ")") + "]" + actor).strip()
+        tomb.purpose = (tomb.purpose + " [released:" + _audit_text(reason) + "]" + actor).strip()
     else:
         tomb.purpose = (tomb.purpose + " [released]").strip()
     # The write is conditional on the epoch we OBSERVED, so it cannot erase a peer's newer
@@ -1173,30 +1200,60 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
 
     sub.add_parser("check", parents=[common], help="is the store reachable? rc 2 = no")
 
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        # ⛔ `argparse` exits **2** from `error()` — the code this tool reserves for "the
+        # store could not answer", i.e. RETRY the dispatch. Every parse failure went through
+        # it: a missing `--repo` (required on all three verbs), a bad `--kind` choice, or
+        # `--allow-box-local` written BEFORE the subcommand (it is registered on the
+        # subcommand's parent). A controller retrying a command that can never succeed is
+        # the same defect the `status --repo` / `--ttl 0` fixes closed for the validated
+        # path; this closes it on the parse path, so a malformed invocation is ALWAYS
+        # EXIT_USAGE (review of #9487 P2).
+        code = exc.code if isinstance(exc.code, int) else EXIT_USAGE
+        if code == 0:  # `--help`: argparse already printed the help we asked for
+            return EXIT_OK
+        return EXIT_USAGE
     args.json = getattr(args, "json", False)
 
     if args.cmd == "check":
+        def _refuse(reason: str) -> int:
+            if args.json:
+                print(json.dumps({"status": "REFUSED", "reachable": False, "reason": reason}, sort_keys=True))
+            print(f"REFUSED: {reason}", file=sys.stderr)
+            return EXIT_UNANSWERABLE
+
         try:
             _require_store_configured()
             if store is None:
                 store = SDKClaimStore(allow_box_local=getattr(args, "allow_box_local", False))
+            # ⛔ Reachable is NOT shared, and this verb is what a dispatch flow GATES on
+            # ("`check` … rc 2 = no", the USAGE block and the evidence README §6). A target
+            # every sibling refuses — `acquire`/`status`/`release` all rc 2 on a loopback
+            # graph — used to print `ok: claim store reachable` and exit 0 here, with the
+            # disqualification only as a stderr WARNING: the one-variable-away repeat of the
+            # local-write-reported-as-success failure this tool exists to prevent (review of
+            # #9487 P2). So the verdict is the siblings' verdict — rc 2 unless
+            # `--allow-box-local` acknowledges a single-box trial — and rc 0 cannot coexist
+            # with a target the tool will refuse to write.
+            shared = getattr(store, "require_shared", None)
+            refusal = shared() if shared is not None else None
+            if refusal:
+                return _refuse(refusal)
             # A definite read, not a write: `check` must be safe to run on any box at any
             # time, and an empty answer still proves the store answered.
             store.read(claim_id("probe", "probe"))
         except StoreUnanswerable as exc:
-            print(f"REFUSED: {exc}", file=sys.stderr)
-            return EXIT_UNANSWERABLE
+            return _refuse(str(exc))
         except Exception as exc:
-            print(f"REFUSED: claim store unanswerable ({type(exc).__name__}: {exc})", file=sys.stderr)
-            return EXIT_UNANSWERABLE
+            return _refuse(f"claim store unanswerable ({type(exc).__name__}: {exc})")
         where = getattr(store, "target", None)
-        print(f"ok: claim store reachable ({where() if where else 'unknown target'})")
-        # Reachable is not the same as SHARED. Say so here, where a human reads it — the
-        # dispatch path refuses a box-local target outright (see `require_shared`).
-        shared = getattr(store, "require_shared", None)
-        if shared is not None and shared():
-            print(f"WARNING: {shared()}", file=sys.stderr)
+        target = where() if where else "unknown target"
+        if args.json:
+            print(json.dumps({"status": "ok", "reachable": True, "target": target}, sort_keys=True))
+        else:
+            print(f"ok: claim store reachable ({target})")
         return EXIT_OK
 
     # `status --repo` with NO number is the repo-wide listing, not a malformed single-key

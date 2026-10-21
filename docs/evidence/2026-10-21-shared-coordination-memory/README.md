@@ -99,21 +99,32 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
   an **8 GB PRO FalkorDB Cloud** instance already on the bill at $350/month (~1.9% of that line), and the
   Fly app it fronts is already running for the product. Upgrading a *plan* is a product decision about
   our own internal tenant; it is not new infrastructure.
-- **What is missing to use hosted today** (measured, not assumed): **a credential.** `.mcp.json`'s
-  `tortoise` entry declares `https://api.premiselabs.co/mcp/` with **no `Authorization` header**, and
-  neither `TORTOISE_API_KEY` nor `TORTOISE_API_URL` is set in a cell environment — so every cell writes
-  to its own box-local graph (`:16379`, `docker://`) or to nothing. Second, a plan **≥ solo**, because
-  the map alone is past free's cap. **Nothing else**: the pilot's SDK calls (`create_point`, `get_point`,
-  `update_point`, `query`) are identical on hosted — the endpoint is the only difference.
-- **So the cost to close is one key and $9–25/month — and it does not pass through Postgres.** The claim
-  slice needs Point create/read/update only; the relational record store (`#7879`) is not on this path.
-  That is the measured answer to "are we waiting on the migration": **no, there is nothing to wait for.**
+- **What is missing to use hosted today** (measured, not assumed): **a credential AND a hosted write
+  path for this slice.** The credential half is real: `.mcp.json`'s `tortoise` entry declares
+  `https://api.premiselabs.co/mcp/` with **no `Authorization` header**, and neither `TORTOISE_API_KEY`
+  nor `TORTOISE_API_URL` is set in a cell environment — so every cell writes to its own box-local graph
+  (`:16379`, `docker://`) or to nothing.
+- **The claim tool is NOT a drop-in on hosted, and this README said it was.** `SDKClaimStore` writes
+  through `sdk._get_proj().g.query(<raw Cypher>)` — the bolt/docker projection handle — because the CAS
+  and the fence are Cypher statements (§3). The hosted surface is MCP/HTTP, where a graph handle does
+  not exist, so the `create_point`/`get_point`/`update_point`/`query` SDK calls this paragraph used to
+  cite are **not** what the pilot calls, and swapping the endpoint would not move it. The tool says so
+  itself: `TORTOISE_API_URL` is explicitly REFUSED as proof of a store because it "has **no hosted
+  client**" (module STORE section, and `_require_store_configured`), and a dispatch against a target it
+  cannot write must refuse rather than land box-locally. So the honest answer to "what is missing" is
+  **a credential, a plan ≥ solo, and a hosted store/transport for the claim slice** — the last one is
+  work (a client + a write path with an atomic equivalent of `MERGE`-on-id), not a config flag.
+- **So the money is $9–25/month and it does not pass through Postgres.** The claim slice needs Point
+  create/read/update only; the relational record store (`#7879`) is not on this path. That is the
+  measured answer to "are we waiting on the migration": **no** — but the hosted migration of THIS slice
+  is a small, separate build (above), not a key swap, and the pilot's comparable economics hold whether
+  the graph is self-hosted `bolt://` (already running) or hosted.
 
 ## 3. The pilot — one slice, the claim, in the graph
 
-`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (40 fake-store tests + 3 live tests, 43
-collected), contract `rc 0/1/2` identical to `claims.sh` so a caller needs no new branch (`rc 3` is a
-malformed invocation).
+`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (46 fake-store tests + 3 live tests, 49
+collected), contract `rc 0/1/2/3` identical to `claims.sh` for `acquire`/`release` so a caller needs no
+new branch (`rc 3` is a malformed invocation; `status`'s rc reports that it ANSWERED — see §3.1).
 
 **What it stores.** One `:Point` per held unit, id = `sha256(repo, key)` rendered as the SDK's ULID shape —
 **deterministic, and never containing a box** (`claims.sh`'s own recorded lesson: *"a KEY CONTAINING THE
@@ -130,14 +141,19 @@ Every write is therefore ONE atomic statement —
 
 ```cypher
 MERGE (n:Point {id:$id}) ON CREATE SET n += $props, n.content=$content, n.__cas=$token
-RETURN count(n) AS c, n.content AS content, n.__cas = $token AS won
+RETURN count(n) AS c, collect(n.content) AS contents, collect(n.__cas = $token) AS wins
 ```
 
 with a token unique to the call: `MERGE` applies its `ON CREATE` exactly once, so only one
 contender can create the id; the loser's statement matches the existing node and returns the
-winner's content. `won` reports whose create ran, which the store uses as a consistency check —
-the verdict is the content comparison, because a contender writing a byte-identical record is
-the same identity, not a second holder.
+winner's content. **Every returned value is an aggregate on purpose**: a bare `n.content`
+alongside `count(n)` GROUPS BY that column, so a legacy graph holding two nodes for one id
+returns one row per duplicate with `c = 1` — the duplicate guard never fires, which is how an
+earlier form of this statement (quoted here until review of #9487) silently disabled itself
+(measured). The aggregates make `count(n)` report the real node count and give `contents`/`wins`
+one row regardless of duplicates. `wins` reports whose create ran, which the store uses as a
+consistency check — the verdict is the content comparison, because a contender writing a
+byte-identical record is the same identity, not a second holder.
 State changes are `MATCH … WHERE n.claim_epoch = $expected SET …`, which touches 0 rows when a peer moved
 the epoch — that is the fence, in the store, not in the caller.
 
@@ -161,7 +177,7 @@ the epoch — that is the fence, in the store, not in the caller.
 `rc 2` is a **refusal**, and the controller must not dispatch:
 
 ```text
-$ env -u TORTOISE_DB_URI tools/work_claim.py acquire --repo … --issue 5052 --session cell-t1
+$ env -u TORTOISE_DB_URI uv run python tools/work_claim.py acquire --repo … --issue 5052 --session cell-t1
 REFUSED: no claim store configured: set TORTOISE_DB_URI (the shared graph). An unset store is
 refused rather than answered from a default target — an empty read from the wrong graph looks
 exactly like 'nobody holds this' (#7871).
@@ -178,6 +194,19 @@ falls back to the box's EMBEDDED file. `check` printed `ok: claim store reachabl
 while the claim landed locally: acquired here, free on every peer, which is the duplicate-dispatch
 failure reported as a success. The guard now names the API URL explicitly and refuses it, and
 `check` prints the resolved target (`ok: claim store reachable (docker://…)`).
+
+⛔ **`check` returns its siblings' verdict**: a box-local target is **rc 2 with the refusal**
+(the same answer `acquire`/`status`/`release` give) unless `--allow-box-local` acknowledges a
+single-box trial — before that it printed `ok: …` on stdout and exited 0 with the
+disqualification only as a stderr `WARNING`, which is a dispatch preflight saying "go" for the
+exact store shape the tool refuses (review of #9487 P2). `check --json` emits the same verdict as
+one object.
+
+`status` ANSWERS, so its exit code is the answer's deliverability, not the claim's liveness —
+`free`, `expired` and `held` are all rc 0 and the JSON `status` field says which. `claims.sh`'s own
+status verb is the opposite polarity (rc 1 when UNHELD); the branchable "a live holder exists" code
+is `acquire`'s/`release`'s rc 1. The difference is stated in the module's CALLER CONTRACT rather
+than left for a caller to discover.
 
 Every shape of "I cannot answer" is rc 2, and each one names its cause: an **unset** store (refused
 *before* any query — the SDK would otherwise answer from a default target, which is #7871's measured
@@ -238,14 +267,14 @@ stores all of them.
 ```bash
 # the per-claim volume probe (private lane graph, so no peer's target is touched)
 uri="$(uv run python tools/test_lane.py uri)" && eval "$uri"
-uv run pytest tests/test_work_claim.py -q            # 43 passed (3 live legs skip without a URI; 40 pass hermetically)
+uv run pytest tests/test_work_claim.py -q            # 46 passed at this head (3 live legs skip without a URI)
 
 # `--allow-box-local`: this lane's container is loopback BY DESIGN. EVERY verb that reads or
 # writes the store (`acquire`, `status`, `release`) refuses a loopback target otherwise,
-# because a claim there is invisible to every peer (see §3).
-tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 --allow-box-local \
+# because a claim there is invisible to every peer (see §3). `check` refuses it too (rc 2).
+uv run python tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 --allow-box-local \
     --session cell-t1 --branch feat/x --purpose "pilot" --host cell-t1 --ncpu 8 --lpc 372 --lanes 3
-tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json --allow-box-local
-tools/work_claim.py status --repo daniel-ospina/tortoise --json --allow-box-local   # repo-wide
-tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1 --allow-box-local
+uv run python tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json --allow-box-local
+uv run python tools/work_claim.py status --repo daniel-ospina/tortoise --json --allow-box-local   # repo-wide
+uv run python tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1 --allow-box-local
 ```
