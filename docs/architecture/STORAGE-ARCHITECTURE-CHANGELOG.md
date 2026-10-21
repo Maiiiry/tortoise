@@ -694,6 +694,31 @@ that was itself a heading cannot collide with this file's own outline.
 
 ---
 
+## §13 — the `aboutObject` headline claim is SCOPED to the files it measured (`#9399`)
+
+The removed sentence and why it went. §13's evidence for the KEEP ruling opened
+with an unqualified claim about *"the primary search path"*, but the command it
+quotes as proof measures exactly three modules — and `tortoise/ranking.py`, which
+holds both product ranking read paths and therefore the reads behind the default
+recall door (`tortoise_recall` → `sdk_method="recall_state"`), is not one of them.
+
+**Removed (verbatim):**
+
+> **The primary search path does NOT read it.** `rg -n 'aboutObject'
+> tortoise/retrieval.py tortoise/search_engine.py tortoise/session_reinjection.py`
+> → **exit 1, zero matches**, case-insensitive. **Hindsight's premise holds for
+> this path.**
+
+The measurement was never wrong; the **scope** was unstated, so the sentence read
+as a whole-product claim and a reader checking only the quoted command concluded
+the opposite of what the section rules on. The design document now states the
+lane the three files bound and names the module and the door outside it;
+`tests/test_9399_search_path_claim_scope.py` holds it there by parsing the file
+list OUT of the sentence and re-running the scan over it, so widening the list or
+reverting the qualification reds.
+
+---
+
 ### 2026-10-20 — `#9397`: §11.1 and §13 said the `aboutObject` edge carries **no** property — it carries `confidence`
 
 **What was recorded.** §11.1 (*"Our `aboutObject` links are **property-free** … a full-repo search for a property-bearing edge finds **none**"*) and §13 (*"**no** `aboutObject` edge carries **any property** … we lose nothing semantically by deriving later"*), plus the same fact in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 question 2 and in this ledger's `aboutObject` decision row. ⚠️ **The retraction had to reach §11.1's estimate footnote and §11.3 too**, which stated it in a third wording a reader reaches twenty lines below the correction: the cost footnote rested on *"from the measured property-free finding"*, §11.3's table called the rows *"**property-free rows**"*, and §11.3's prose said *"the entity links stay bare"*. A correction that fixes one wording and leaves three is how the same absolute gets re-derived.
