@@ -656,3 +656,90 @@ def test_live_sdk_store_acquire_status_release():
         # The suite's own residue: best-effort, and never a test failure.
         with contextlib.suppress(Exception):
             store._rows("MATCH (n:Point {id:$id}) DETACH DELETE n", id=cid)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TORTOISE_DB_URI"),
+    reason="needs a live graph (TORTOISE_DB_URI) — the fake-store tests cover the CAS logic",
+)
+def test_live_fence_admits_exactly_one_of_two_contenders():
+    """The fence is the STATEMENT, so it must be pinned against the real graph and not only
+    against `FakeStore` (which implements the fence itself). Mutation-measured in review:
+    deleting `WHERE n.claim_epoch = $expected` left the whole suite green, and two contenders
+    observing the same expired epoch then BOTH won."""
+    store = wc.SDKClaimStore(allow_box_local=True)
+    repo, key = "daniel-ospina/tortoise", "issue-999998"
+    cid = wc.claim_id(repo, key)
+    try:
+        base = wc.ClaimRecord(
+            repo=repo, key=key, owner="pytest:1", lease_until=NOW + 3600, claimed_at=NOW
+        )
+        assert wc.acquire(store, base).rc == 0
+
+        a = wc.ClaimRecord(
+            repo=repo, key=key, owner="pytest:a", lease_until=NOW + 7200, epoch=2, claimed_at=NOW
+        )
+        b = wc.ClaimRecord(
+            repo=repo, key=key, owner="pytest:b", lease_until=NOW + 7200, epoch=2, claimed_at=NOW
+        )
+        # Both believed the stored epoch was 1 and both try to write epoch 2.
+        first = store.replace_if_epoch(cid, a, expected_epoch=1)
+        second = store.replace_if_epoch(cid, b, expected_epoch=1)
+        assert first is not None, "the first contender must win"
+        assert second is None, "the second contender must lose — the epoch moved"
+        stored = wc._parse(store.read(cid) or "")
+        assert stored.owner == "pytest:a"
+        assert stored.epoch == 2
+    finally:
+        with contextlib.suppress(Exception):
+            store._rows("MATCH (n:Point {id:$id}) DETACH DELETE n", id=cid)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("TORTOISE_DB_URI"),
+    reason="needs a live graph (TORTOISE_DB_URI) — the fake-store tests cover the CAS logic",
+)
+def test_live_legacy_duplicate_nodes_read_as_one_claim_and_are_refused_on_write():
+    """A graph written by the pre-MERGE version can hold two nodes for one id (that version
+    used `create_point`, which does not enforce uniqueness — measured: 2 nodes). Reads must
+    answer with one claim, and a write must REFUSE rather than pick one."""
+    store = wc.SDKClaimStore(allow_box_local=True)
+    repo, key = "daniel-ospina/tortoise", "issue-999997"
+    cid = wc.claim_id(repo, key)
+    old = wc.ClaimRecord(
+        repo=repo, key=key, owner="pytest:old", lease_until=NOW + 60, epoch=1, claimed_at=NOW
+    )
+    new = wc.ClaimRecord(
+        repo=repo, key=key, owner="pytest:new", lease_until=NOW + 3600, epoch=2, claimed_at=NOW
+    )
+    try:
+        for rec in (old, new):  # two nodes, one id — exactly the legacy shape
+            store._rows(
+                "CREATE (n:Point {id:$id, pointKind:$kind, repo:$repo, claim_epoch:$epoch, "
+                "content:$content})",
+                id=cid,
+                kind=wc.CLAIM_KIND,
+                repo=repo,
+                epoch=rec.epoch,
+                content=rec.content(),
+            )
+        assert wc._parse(store.read(cid) or "").owner == "pytest:new"
+        listed = [r for r in store.query_repo(repo) if r["key"] == key]
+        assert len(listed) == 1, listed
+        assert listed[0]["epoch"] == 2
+        with pytest.raises(wc.StoreUnanswerable) as excinfo:
+            store.create(cid, old)
+        assert "2 nodes" in str(excinfo.value)
+    finally:
+        with contextlib.suppress(Exception):
+            store._rows("MATCH (n:Point {id:$id}) DETACH DELETE n", id=cid)
+
+
+def test_ttl_zero_is_a_usage_error_not_an_instantly_expired_claim():
+    """`--ttl 0` produced a claim that was already expired yet reported `acquired` rc 0, so a
+    peer reclaimed it at once and also reported `acquired` — a double grant from one flag."""
+    rc = wc.main(
+        ["acquire", "--repo", "o/r", "--issue", "5052", "--session", "cell-t1", "--ttl", "0"],
+        store=FakeStore(),
+    )
+    assert rc == wc.EXIT_USAGE

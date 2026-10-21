@@ -467,7 +467,8 @@ class SDKClaimStore:
         rows = self._rows(
             "MERGE (n:Point {id:$id}) "
             "ON CREATE SET n += $props, n.content = $content, n.__cas = $token "
-            "RETURN count(n) AS c, n.content AS content, n.__cas = $token AS won",
+            "RETURN count(n) AS c, collect(n.content) AS contents, "
+            "collect(n.__cas = $token) AS wins",
             id=cid,
             props=props,
             content=record.content(),
@@ -475,12 +476,17 @@ class SDKClaimStore:
         )
         if not rows:
             raise StoreUnanswerable("the claim store returned no row for the claim write")
-        found, content, _won = rows[0][0], rows[0][1], rows[0][2]
+        # EVERY returned value is an aggregate on purpose: a bare `n.content` alongside
+        # `count(n)` groups BY that column, so a legacy graph holding two nodes for one id
+        # returned one row per duplicate with `c = 1` and the duplicate guard never fired
+        # (measured in review of #9487 P3).
+        found = int(rows[0][0] or 0)
+        contents = rows[0][1] or []
         if found != 1:
             raise StoreUnanswerable(
                 f"the claim store holds {found} nodes for id {cid} — refusing to pick one"
             )
-        return content or ""
+        return (contents[0] if contents else "") or ""
 
     def replace(self, cid: str, record: ClaimRecord) -> str:
         """Release: conditional on the epoch the caller OBSERVED, so a release cannot
@@ -603,7 +609,7 @@ def acquire(
     cid = claim_id(record.repo, record.key)
     record.claimed_at = record.claimed_at or now
     record.lease_until = record.lease_until or (now + DEFAULT_TTL)
-    record.host = record.host or (hostname or os.environ.get("HOSTNAME") or "")
+    record.host = record.host or _host_name()
 
     # Is this a store a PEER can read? (review of #9487 P2.) The env guard above can only prove
     # that a URI is set: the README's own inventory records that every cell writes to its own
@@ -747,7 +753,11 @@ def acquire(
     reclaim = ClaimRecord(**{**record.__dict__})
     reclaim.epoch = epoch + 1
     reclaim.claimed_at = now
-    reclaim.lease_until = now + DEFAULT_TTL
+    # The requested window, not a constant: `--ttl` is the caller's statement of how long the
+    # unit is theirs, and a reclaim that silently swapped in DEFAULT_TTL would give the next
+    # holder a different lease than it asked for (review of #9487 P2).
+    ttl = record.lease_until - now if record.lease_until > now else DEFAULT_TTL
+    reclaim.lease_until = now + ttl
     mine = reclaim.content()
     fenced = getattr(store, "replace_if_epoch", None)
     if fenced is None:
@@ -843,6 +853,16 @@ def release(
     """
     now = _now() if now is None else now
     cid = claim_id(repo, key)
+    shared = getattr(store, "require_shared", None)
+    if shared is not None:
+        refusal = shared()
+        if refusal:
+            return Outcome(
+                rc=EXIT_UNANSWERABLE,
+                status="REFUSED",
+                reason=f"release refused: {refusal}",
+                claim_id=cid,
+            )
     try:
         existing = store.read(cid) or ""
     except StoreUnanswerable as exc:
@@ -906,6 +926,8 @@ def release(
         status="released",
         reason=f"released {key} (held by {owner})",
         owner=owner,
+        lease_until=tomb.lease_until,
+        epoch=tomb.epoch,
         claim_id=cid,
         record=tomb,
     )
@@ -913,8 +935,17 @@ def release(
 
 def status(store: ClaimStore, repo: str, key: str | None, *, now: int | None = None) -> Outcome:
     """Who holds this right now. A reachable store with no claim is a real answer (rc 0 with
-    `status=free`), and is never confused with an unanswerable one (rc 2)."""
+    `status=free`), and is never confused with an unanswerable one (rc 2).
+
+    A box-local store is refused here too: `free` from a graph no peer can read is the same
+    defect as an empty read from the wrong graph, and `status` is what a controller dispatches
+    on (review of #9487 P3)."""
     now = _now() if now is None else now
+    shared = getattr(store, "require_shared", None)
+    if shared is not None:
+        refusal = shared()
+        if refusal:
+            return Outcome(rc=EXIT_UNANSWERABLE, status="REFUSED", reason=f"refused: {refusal}")
     if key:
         cid = claim_id(repo, key)
         try:
@@ -1032,6 +1063,13 @@ def _parse(content: str) -> ClaimRecord:
     )
 
 
+def _host_name() -> str:
+    """This box's name — one resolver, so the owner token and the stored `host` field can
+    never disagree (review of #9487 P3: the token used `socket.gethostname()` and the record
+    kept the HOSTNAME-only fallback, so under cron/systemd the stored host was empty)."""
+    return os.environ.get("HOSTNAME") or socket.gethostname() or "box"
+
+
 def _owner_token(session: str = "", pid: int | None = None) -> str:
     """The caller's identity, STABLE across processes.
 
@@ -1044,7 +1082,7 @@ def _owner_token(session: str = "", pid: int | None = None) -> str:
     The lease (not `kill -0`) is still what expires a claim: a session id is a name, not a
     liveness proof.
     """
-    host = os.environ.get("HOSTNAME") or socket.gethostname() or "box"
+    host = _host_name()
     if session:
         return f"{host}:{session}"
     pid = os.getpid() if pid is None else pid
@@ -1148,6 +1186,11 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
         for name in ("issue", "pr"):
             if getattr(args, name, None) == 0:
                 raise ValueError(f"--{name} must be a positive number (omit it for a listing)")
+        # `--ttl 0` used to mint a claim that was ALREADY expired and report `acquired` rc 0;
+        # a peer then reclaimed it at once and ALSO reported `acquired` — the double grant the
+        # fence exists to prevent, reachable from one flag (review of #9487 P2).
+        if args.cmd == "acquire" and int(getattr(args, "ttl", 0)) <= 0:
+            raise ValueError("--ttl must be a positive number of seconds")
         number = int(getattr(args, "pr", None) or 0) or int(getattr(args, "issue", None) or 0)
         kind = "pr" if int(getattr(args, "pr", None) or 0) else args.kind
         key = None if args.cmd == "status" and number == 0 else normalise_key(kind, number)

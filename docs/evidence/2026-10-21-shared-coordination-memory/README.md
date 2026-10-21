@@ -66,10 +66,11 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 | Fleet map graph, as a hosted tenant would hold it | **21,065 nodes** — 10,374 `:Point`, **10,583 `:GraphEvent`**, 60 `:Source`, 1 `:Event` | `docs/evidence/7983-cost-magnitudes/graph-content-census.json` (2026-10-17, live self-hosted map at `:16379`) |
 | Resident size of that map | **35 MB graph memory**, **0.1499 GB** at the measured 1,672 B/resident node | same census; `STORAGE-ARCHITECTURE.md` §17.4.6 |
 | **Charged** nodes of that map | **≈10,435** (Points + Object/Subject/Event; the `GraphEvent` journal is **not** charged) | `tortoise/quota.py` (the `points` counter IS the pricing `max_graph_nodes` cap) |
-| **One claim**, measured on a private lane graph today (`docker://:@127.0.0.1:16393`) | **+2 nodes per claim** (1 `:Point` + 1 `:GraphEvent` journal entry); **+5 MB for 3,000 claims** (incl. 2 MB of index) ⇒ **≈1,748 B resident/claim**; **10.7 ms per create** (3,000 creates in 32.0 s) | this lane's probe, `GRAPH.MEMORY USAGE` + `MATCH (n) RETURN count(n)` |
+| **One claim**, measured on a private lane graph today (`docker://:@127.0.0.1:16393`) | **+2 nodes per claim on the `create_point` path** (1 `:Point` + 1 `:GraphEvent` journal entry); **+5 MB for 3,000 claims** (incl. 2 MB of index) ⇒ **≈1,748 B resident/claim**; **10.7 ms per create** (3,000 creates in 32.0 s) | this lane's probe, `GRAPH.MEMORY USAGE` + `MATCH (n) RETURN count(n)` |
+| **One claim on the SHIPPED write path** (re-measured in review, since the tool no longer uses `create_point` — it needs an atomic `MERGE`, see §3) | **+1 node** (`:Point`) per claim; `create_point` on the same graph adds **4** (`:Point`, `:GraphEvent`, `EpMeta`, `GraphEventMeta`) | `MATCH (n) RETURN count(n)` and label deltas before/after `SDKClaimStore.create` vs `sdk.create_point` |
 | Chargeable nodes per claim | **1** (the journal entry is not counted; the Point is) | `tortoise/quota.py` |
 | **Writes per day** — lane dispatches ≈ PR creation | **63–118/day** across the two repos: `tortoise` 39/81/52/28 PRs on 10-18…10-21, `agent-infra` 27/37/27/11/18 | `gh pr list --state all` on each repo, run today |
-| **Claims per month** | **≈3,000** (100/day × 30) ⇒ **3,000 chargeable nodes**, **6,000 resident nodes**, **≈5 MB**, **≈6,000 write ops** (create + release) | derived from the two rows above |
+| **Claims per month** | **≈3,000** (100/day × 30) ⇒ **3,000 chargeable nodes**, **3,000 resident nodes** (the shipped MERGE path), **≈3 MB**, **≈6,000 write ops** (create + release) | derived from the two rows above |
 | **Reads per dispatch pass** | **13** candidates (`candidates.txt`), i.e. ~13 `status` reads per pass; 360 passes/day/box ⇒ **≈4,680 reads/day/box** | `$HOME/orchestrator/candidates.txt`, the 240 s cycle |
 
 ### 2.2 The price (every number sourced)
@@ -155,12 +156,16 @@ the epoch — that is the fence, in the store, not in the caller.
 `rc 2` is a **refusal**, and the controller must not dispatch:
 
 ```text
-$ env -u TORTOISE_DB_URI tools/work_claim.py acquire --repo … --issue 5052
+$ env -u TORTOISE_DB_URI tools/work_claim.py acquire --repo … --issue 5052 --session cell-t1
 REFUSED: no claim store configured: set TORTOISE_DB_URI (the shared graph). An unset store is
 refused rather than answered from a default target — an empty read from the wrong graph looks
 exactly like 'nobody holds this' (#7871).
 rc=2
 ```
+
+(Order matters: `acquire` checks its OWN identity first, because a claim whose owner no later
+process can reproduce could never be released. Omit `--session` and you get rc 3 with
+`usage: acquire needs --session …`, not this refusal.)
 
 ⛔ **`TORTOISE_API_URL` is NOT proof of a store** (review of this branch, measured). Accepting it
 armed the guard and then let `TortoiseSDK()` ignore it — the SDK reads only `TORTOISE_DB_URI` and
@@ -228,8 +233,7 @@ stores all of them.
 ```bash
 # the per-claim volume probe (private lane graph, so no peer's target is touched)
 uri="$(uv run python tools/test_lane.py uri)" && eval "$uri"
-export TORTOISE_DB_URI="$uri"
-uv run pytest tests/test_work_claim.py -q            # 33 passed (1 live test skips without a URI)
+uv run pytest tests/test_work_claim.py -q            # 36 passed (3 live legs skip without a URI; 33 pass hermetically)
 
 # `--allow-box-local`: this lane's container is loopback BY DESIGN. Dispatch refuses a loopback
 # store otherwise, because a claim there is invisible to every peer (see §3).
