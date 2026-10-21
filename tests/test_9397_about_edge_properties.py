@@ -23,17 +23,25 @@ sites, and the ingestion path reaches one of them by default:
   3. `projection/entities._fold_entity_linked_reason` — the REPLAY fold
      re-SETs it, i.e. the property is journaled and reproduced (`live == rebuild`).
 
-Four further shipped paths RE-MATERIALIZE the edge, and one of them adds a
+THREE further shipped paths RE-MATERIALIZE the edge, and one of them adds a
 SECOND name, so the earlier "exactly one name" reading was one form short:
 `cache_projection.relation_statement` (the record-layer projection) writes the
 record row's whole property set by property MAP over a predicate allowlist that
 includes `aboutObject`, and it also stamps `idx` — `public.relation.idx`, the
 parallel-edge ordinal — as an INLINE pattern property, unconditionally;
-`projection._rebuild_all_replay` and `sdk.supersede_point` re-materialize the
-journal's / the superseded point's attributes, and
+`projection._rebuild_all_replay` re-materializes the journal's attributes, and
 `hosted_backup.restore_graph` the dump's (`SET r = $p`). The measured set is
 therefore `confidence` (originated) plus `idx` (re-materialized): one semantic
 attribute and one identity coordinate, not one property name.
+
+`sdk.supersede_point` — which an earlier revision of this file also recorded as
+a re-materializer — is NOT one. Its `SET r += $attrs` is on the 2a-DIRECT leg,
+whose rows are discovered by `MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t)`,
+so `rtype` is provably `IMPL|NAND`; the about edge is transferred by a separate
+BARE `MERGE (new)-[:{rel}]->(t)` with no `SET`. On an about edge it writes no
+property — it DROPS `confidence` (filed as `#9417`). The census's whole-function
+variable union cannot tell the two legs apart, so the row is declared a FALSE
+POSITIVE in `NOT_AN_ABOUT_WRITER` rather than counted as a re-materialization.
 
 ROOT CAUSE OF THE FALSE CLAIM — the method, not the measurement
 ---------------------------------------------------------------
@@ -287,12 +295,24 @@ MAP_WRITERS: dict[tuple[str, str], tuple[str, ...]] = {
         'SET r += $attrs',
         '("direction", "confidence", "weight", "label",',
     ),
-    ("tortoise/sdk.py", "supersede_point"): (
-        'SET r += $attrs',
-        'if k in ("direction", "confidence", "weight",',
-    ),
     ("tortoise/hosted_backup.py", "restore_graph"): (
         'CREATE (a)-[r:{safe_type}]->(b) SET r = $p',
+    ),
+}
+
+#: Census rows that are FALSE POSITIVES of the whole-function variable union: the
+#: function writes through `r`, but on a DIFFERENT relationship type than the
+#: about edge it also transfers. They are recorded here, not in `MAP_WRITERS`,
+#: because a row there asserts a re-materialization that does not happen — the
+#: false-POSITIVE version of this PR's own defect (an instrument that cannot
+#: tell which edge the `SET` lands on).
+NOT_AN_ABOUT_WRITER: dict[tuple[str, str], str] = {
+    ("tortoise/sdk.py", "supersede_point"): (
+        "the `SET r += $attrs` is on the 2a-DIRECT leg, whose rows come from "
+        "`MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t)` (rtype is provably "
+        "IMPL|NAND); the about edge is transferred by a separate BARE "
+        "`MERGE (new)-[:{rel}]->(t)` with no SET — so this writer carries NO "
+        "property on an about edge (it drops `confidence`; #9417)"
     ),
 }
 
@@ -311,6 +331,12 @@ SECOND_PROPERTY = "idx"
 MAP_FORM = "<map:$props>"
 
 _SET_ON = re.compile(r"SET\s+(\w+)\.(\w+)\s*=")
+#: A COMMA-CONTINUED assignment in the same SET clause —
+#: `SET r.confidence=$c, r.weight=$w`. `_SET_ON` reads only the first one, so a
+#: second property name written this way would be a measured absence in the very
+#: guard that claims the property set is bounded (the tree already uses the form
+#: on non-about edges, e.g. `hosted_api.py`, `ep.py`).
+_SET_ON_MORE = re.compile(r",\s*(\w+)\.(\w+)\s*=")
 #: Property-MAP assignment on a relationship variable: `SET r += $props`,
 #: `SET r = $p`. Structurally invisible to `_SET_ON`, and — like the
 #: `aboutObject {` grep this PR exists to correct — a census that cannot match
@@ -327,6 +353,26 @@ _SET_MAP = re.compile(r"SET\s+(\w+)\s*(\+=|=)\s*(\$|\{)")
 INLINE_FORM = "<inline-map>"
 _INLINE_BRACE = re.compile(r"\{([^{}]*)\}")
 _INLINE_NAME = re.compile(r"(\w+)\s*:")
+
+#: The names each recorded row is allowed to report, EXACTLY. `test_no_unrecorded_
+#: property_bearing_about_edge_writer` rejects an extra name on a recorded
+#: writer, because a subset test on the writer KEY alone lets a new property
+#: appear under an already-recorded site while every "the measured set is
+#: `confidence` plus `idx`" sentence quietly becomes false.
+EXPECTED_NAMES: dict[tuple[str, str], frozenset[str]] = {
+    ("tortoise/session_link.py", "link_entity"): frozenset({PROPERTY}),
+    ("tortoise/subject_binding.py", "bind_point_subjects"): frozenset({PROPERTY}),
+    ("tortoise/projection/entities.py", "_fold_entity_linked_reason"): (
+        frozenset({PROPERTY})
+    ),
+    ("tortoise/cache_projection.py", "relation_statement"): (
+        frozenset({SECOND_PROPERTY, MAP_FORM})
+    ),
+    ("tortoise/projection/__init__.py", "_rebuild_all_replay"): (
+        frozenset({MAP_FORM})
+    ),
+    ("tortoise/hosted_backup.py", "restore_graph"): frozenset({MAP_FORM}),
+}
 #: A relationship pattern, captured as (variable, relationship-token). The
 #: variable may be EMPTY: `MERGE (s)-[:aboutObject {confidence:$c}]->(t)` is
 #: valid Cypher that names no variable, and `(\w+)` here made that writer
@@ -435,7 +481,17 @@ def _writers_in_module(
                 vocab in body for vocab in _ABOUT_VOCAB
             )
             for var, rel in _PATTERN.findall(body):
-                if _ABOUT_REL.search(rel) or ("{" in rel and interpolated):
+                # INTERPOLATION counts only for a NAMED variable. An
+                # anonymous pattern with an interpolated predicate is how the
+                # EP operators are written — `MERGE (op)-[:{rtype} {idx:$idx}]
+                # ->(new)` with `rtype` in {IMPL, NAND} — and admitting it made
+                # `idx` a census false positive in `_rebuild_all_replay` and
+                # `supersede_point`. An anonymous `about*` edge is still read:
+                # its predicate is a literal there
+                # (`-[:aboutObject {confidence:$c}]->`).
+                if _ABOUT_REL.search(rel) or (
+                    var and "{" in rel and interpolated
+                ):
                     about_vars.add(var)
                     # An inline pattern map (`{idx:$idx}`) is a property write
                     # whose NAME is right there — read it rather than assume.
@@ -452,7 +508,7 @@ def _writers_in_module(
                     found.setdefault(
                         (module, qualname.split(".")[-1]), set()
                     ).update(names)
-            for var, prop in _SET_ON.findall(body):
+            for var, prop in _SET_ON.findall(body) + _SET_ON_MORE.findall(body):
                 if var in about_vars:
                     found.setdefault(
                         (module, qualname.split(".")[-1]), set()
@@ -700,10 +756,28 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
         "so neither row pins what it claims:\n  "
         + "\n  ".join(f"{m}::{s}" for m, s in both)
     )
-    assert len(MAP_WRITERS) >= 4, (
-        "the map-form population shrank below the four shipped sites the "
-        "documents now record — if a writer was genuinely removed, re-derive "
-        "the documents' count with it"
+    assert len(MAP_WRITERS) >= 3, (
+        "the map-form population shrank below the three shipped sites the "
+        "documents now record (3 originating + 3 re-materializing = 6) — if a "
+        "writer was genuinely removed, re-derive the documents' count with it"
+    )
+    #: A site cannot be both a real writer and a declared false positive.
+    both_roles = sorted(set(NOT_AN_ABOUT_WRITER) & set(MAP_WRITERS))
+    assert not both_roles, (
+        "these sites are recorded as a map-form writer AND as a census false "
+        "positive, so one of the two rows is lying:\n  "
+        + "\n  ".join(f"{m}::{s}" for m, s in both_roles)
+    )
+    #: Every recorded row must DECLARE its name set, or a new name on that site
+    #: would slip past the subset test below.
+    undeclared = sorted(
+        f"{m}::{s}" for m, s in (*RECORDED_WRITERS, *MAP_WRITERS)
+        if (m, s) not in EXPECTED_NAMES
+    )
+    assert not undeclared, (
+        "these recorded writers have no EXPECTED_NAMES row, so a second "
+        "property name at that site would never be compared against the "
+        "documents' claim:\n  " + "\n  ".join(undeclared)
     )
 
 
@@ -746,11 +820,28 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
         "no writer in the population is seen writing `idx` — the inline-map "
         "rule has stopped measuring anything"
     )
+    #: NAMES, not just keys. A subset test on the writer key alone stays green
+    #: when a SECOND property is added at an already-recorded site — which is
+    #: exactly how "the measured set is `confidence` plus `idx`" would rot.
+    unexpected = sorted(
+        f"{module}::{symbol} SETs {sorted(props - EXPECTED_NAMES[(module, symbol)])}"
+        for (module, symbol), props in writers.items()
+        if (module, symbol) in EXPECTED_NAMES
+        and props - EXPECTED_NAMES[(module, symbol)]
+    )
+    assert not unexpected, (
+        "a recorded about-edge writer now writes a name the documents do not "
+        "record:\n  " + "\n  ".join(unexpected)
+        + "\nRe-derive the property set (STORAGE-ARCHITECTURE.md §11.1/§13) "
+        "and extend EXPECTED_NAMES; an unrecorded name invalidates the "
+        "ruling's cost-only bound."
+    )
     unrecorded = sorted(
         f"{module}::{symbol} SETs {sorted(props)}"
         for (module, symbol), props in writers.items()
         if (module, symbol) not in RECORDED_WRITERS
         and (module, symbol) not in MAP_WRITERS
+        and (module, symbol) not in NOT_AN_ABOUT_WRITER
     )
     assert not unrecorded, (
         "these functions put a property on an `about*` edge and are recorded "
