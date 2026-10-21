@@ -43,6 +43,13 @@ property — it DROPS `confidence` (filed as `#9417`). The census's whole-functi
 variable union cannot tell the two legs apart, so the row is declared a FALSE
 POSITIVE in `NOT_AN_ABOUT_WRITER` rather than counted as a re-materialization.
 
+⚠️ An EXEMPTION is a fail-open cell unless something compares against it, which
+is why this row is NOT exempt from the name-set comparison: it declares
+`EXPECTED_NAMES` like a recorded writer, and its premise (BARE about transfer,
+`SET` on the `IMPL|NAND` rows) is asserted against the STATEMENT it names — not
+against a function-wide text union, which is the very blindness the row exists
+to explain.
+
 ROOT CAUSE OF THE FALSE CLAIM — the method, not the measurement
 ---------------------------------------------------------------
 The evidence was gathered with a Cypher **property-MAP** pattern,
@@ -90,7 +97,10 @@ WHAT IS PINNED
    document bolds it), so the claim is now per entry — and leg 7 machine-checks
    that no entry is
    a dead pin by requiring it to be findable, marker-insensitively, in the
-   changelog that quotes it.
+   changelog that quotes it. Leg 8 then MEASURES the classification against
+   the pre-fix revision, because a label nothing compares against the text is
+   the same unmeasured claim one level up (the `§11.1` method entry sat under
+   pre-fix provenance that way, and nothing red).
 2. `test_the_corrected_passages_name_the_property_bearing_class` — the
    corrected passages must POSITIVELY name the writers and the property, so a
    silent revert reds here. The assertions are SECTION-scoped (§11.1, §13,
@@ -132,7 +142,7 @@ WHAT IS PINNED
 7. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
    — every RETRACTED literal is findable in the changelog that quotes it, or is
    declared pre-fix-only or introduced-and-retracted inside this PR
-   (`RETRACTED_INTRODUCED_HERE`: two absolutes were written by an earlier
+   (`RETRACTED_INTRODUCED_HERE`: three absolutes were written by an earlier
    revision of THIS PR, so claiming a pre-fix presence for them would be the
    same unmeasured provenance this file exists to stop). A pin that cannot match
    the pre-fix text protects nothing, and that is not a hypothesis: it shipped.
@@ -149,20 +159,33 @@ WHAT IS PINNED
    §11.1 correction, for a different link class (a record-projected `references`
    edge carries `idx` too). Scoped to the fact the paragraph establishes: those
    links carry **no `sourceVersion`**.
+10. `test_every_retracted_literal_declares_its_true_provenance` — the
+   CLASSIFICATION is measured, not merely declared: a literal listed in
+   `RETRACTED_INTRODUCED_HERE` must be ABSENT from the pre-fix revision
+   (`PRE_FIX_REV`) and every other entry PRESENT there. Without this the label
+   is an assertion about history that nothing compares against history — and
+   leg 1 then prints "was live pre-fix" for a sentence this PR wrote, in the
+   diagnostic of the guard whose whole subject is unmeasured provenance. Skips
+   (never passes silently) when the revision is unreachable.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
 (that is a design question, recorded, not resolved here). Line numbers are not
 asserted — the SYMBOL is authoritative, per the documents' own rule.
 
-Static, stdlib-only. No DB, no graph, no network.
+Static, stdlib-only, with ONE exception: leg 8 shells out to `git show` to
+measure a provenance claim about history, and skips when the revision is
+unreachable. No DB, no graph, no network.
 """
 
 from __future__ import annotations
 
 import ast
 import re
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 PKG = ROOT / "tortoise"
@@ -175,15 +198,30 @@ STORAGE_CHANGELOG = (
     ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE-CHANGELOG.md"
 )
 
+#: The revision the retracted literals' PRE-FIX provenance is measured against —
+#: the last `main` commit before this correction's own documentation edits
+#: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against
+#: (4 failed / 6 passed). "Was live pre-fix" is a claim about HISTORY, so it is
+#: checked against history instead of restated: an entry in
+#: `RETRACTED_INTRODUCED_HERE` must be ABSENT here, every other entry PRESENT.
+#: ⛔ NOT derived from `git merge-base HEAD origin/main`: the moment this lands
+#: the merge-base IS the corrected tree, and the measurement would invert. CI
+#: checks out with `fetch-depth: 0`, so the rev is reachable there; leg 8 skips
+#: rather than passes if it is not.
+PRE_FIX_REV = "01b5486ec"
+
 #: label → (retracted literal, the live document it was measured in on the
 #: PRE-FIX tree). The document is recorded per entry because it is a checkable
 #: claim, not decoration: the `§13.8 q2` row in this file's first version pinned
 #: an UNBOLDED literal where the document bolds it, so it matched nothing — a
 #: dead entry that would have passed on a verbatim revert. The literal is the
-#: document's own text, bold markers included. Two entries were introduced and
+#: document's own text, bold markers included. Three entries were introduced and
 #: retracted INSIDE this PR (see `RETRACTED_INTRODUCED_HERE`) — their `home` is
 #: still the document the claim belongs to, and `_provenance` keeps the message
-#: from claiming a pre-fix presence that never existed.
+#: from claiming a pre-fix presence that never existed. Which class an entry is
+#: in is MEASURED against `PRE_FIX_REV` by leg 8, not taken on trust: the
+#: `§11.1` method entry was filed as pre-fix-live and is not (measured absent
+#: at `01b5486ec`), which made leg 1's diagnostic print a false pre-fix claim.
 RETRACTED: dict[str, tuple[str, str]] = {
     "§11.1 calls the links property-free and reports a zero search": (
         "Our `aboutObject` links are **property-free**",
@@ -281,6 +319,12 @@ RETRACTED_PRE_FIX_ONLY: frozenset[str] = frozenset({
 RETRACTED_INTRODUCED_HERE: frozenset[str] = frozenset({
     "the corrected claim's own 'exactly one name' absolute",
     "§13.8 q2's 'never a second property name'",
+    # Measured: this literal is ABSENT from `01b5486ec`, i.e. it was written by
+    # an earlier revision of this PR and withdrawn by a later one (the
+    # changelog's "A **third** stale absolute survived in the same section").
+    # Filed as pre-fix-live until `#9403` review, which made the guard's own
+    # failure message claim a pre-fix presence that never existed.
+    "§11.1's method paragraph counted the write forms as two",
 })
 
 #: The writers the corrected passages must NAME, and the code shape that makes
@@ -394,6 +438,12 @@ EXPECTED_NAMES: dict[tuple[str, str], frozenset[str]] = {
         frozenset({MAP_FORM})
     ),
     ("tortoise/hosted_backup.py", "restore_graph"): frozenset({MAP_FORM}),
+    #: The declared FALSE POSITIVE is compared like any other row. It is in the
+    #: census (with `MAP_FORM`, from the IMPL|NAND `SET r += $attrs`), and an
+    #: exemption with no expected set is exactly where a new property would slip
+    #: past `unexpected` — the comparison is keyed on `EXPECTED_NAMES`, so the
+    #: row has to be HERE for the exemption to stay measured.
+    ("tortoise/sdk.py", "supersede_point"): frozenset({MAP_FORM}),
 }
 #: A relationship pattern, captured as (variable, relationship-token). The
 #: variable may be EMPTY: `MERGE (s)-[:aboutObject {confidence:$c}]->(t)` is
@@ -488,6 +538,55 @@ class UnparsableModule(Exception):
     manufactures a measured absence. The message names the module so the
     reader knows which file to fix, and the leg that raises it reds.
     """
+
+
+def _function_body(module: str, symbol: str) -> str:
+    """The source of `symbol` in `module`, nested definitions blanked out."""
+    text = (ROOT / module).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    for name, node in _qualified(ast.parse(text)):
+        if name.split(".")[-1] == symbol:
+            return _own_body(node, lines)
+    raise AssertionError(f"{module}::{symbol} no longer exists")
+
+
+def _query_call_containing(body: str, needle: str) -> str:
+    """The text of the one `.query(...)` CALL that carries `needle`.
+
+    SCOPED to the call, not the function or the module: a premise about WHICH
+    statement a property lands in cannot be checked against a function-wide text
+    union — that union is precisely the false positive `NOT_AN_ABOUT_WRITER`
+    declares — and a module-wide membership test is weaker still.
+    """
+    for match in re.finditer(r"\.query\(", body):
+        start = match.end() - 1  # at the '('
+        depth = 0
+        for i in range(start, len(body)):
+            char = body[i]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    call = body[start : i + 1]
+                    if needle in call:
+                        return call
+                    break
+    return ""
+
+
+def _git_show(rev: str, path: str) -> str | None:
+    """`git show <rev>:<path>`, or None where the history is unavailable."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"{rev}:{path}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return None
+    return done.stdout if done.returncode == 0 else None
 
 
 def _writers_in_module(
@@ -611,10 +710,11 @@ def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
 def _provenance(label: str, home: str) -> str:
     """The per-entry provenance a leg-1 failure prints.
 
-    Not every retracted literal was live pre-fix: two absolutes were written by
-    THIS PR's own earlier revision and withdrawn by a later one. Printing "was
+    Not every retracted literal was live pre-fix: three absolutes were written
+    by THIS PR's own earlier revision and withdrawn by a later one. Printing "was
     live pre-fix" for them would put an unmeasured claim in the diagnostic of
-    the guard whose whole subject is unmeasured claims.
+    the guard whose whole subject is unmeasured claims — which is exactly what
+    happened to the `§11.1` method entry before leg 8 measured the split.
     """
     if label in RETRACTED_INTRODUCED_HERE:
         return (
@@ -641,8 +741,13 @@ def test_the_absolute_property_free_sentences_do_not_reappear():
     #: checked — but only for ITS literal, because the same file legitimately
     #: quotes the retracted sentences inside this correction's entry.
     ledger = _doc(EXTRACTOR_CHANGELOG)
+    #: `name` is the LIVE document the sentence survived in — printed, because
+    #: `home` is the pre-fix document the entry was measured in, and a
+    #: STORAGE-home literal that re-rots inside the extractor doc would
+    #: otherwise report the wrong file in the diagnostic of a guard whose whole
+    #: subject is the accuracy of provenance statements.
     survivors = [
-        f"{label}: {sentence!r} ({_provenance(label, home)})"
+        f"{label}: {sentence!r} in {name} ({_provenance(label, home)})"
         for label, (sentence, home) in RETRACTED.items()
         for name, text in live.items()
         if _flat(sentence) in _flat(text)
@@ -937,13 +1042,57 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
     #: Every recorded row must DECLARE its name set, or a new name on that site
     #: would slip past the subset test below.
     undeclared = sorted(
-        f"{m}::{s}" for m, s in (*RECORDED_WRITERS, *MAP_WRITERS)
+        f"{m}::{s}" for m, s in (
+            *RECORDED_WRITERS, *MAP_WRITERS, *NOT_AN_ABOUT_WRITER
+        )
         if (m, s) not in EXPECTED_NAMES
     )
     assert not undeclared, (
         "these recorded writers have no EXPECTED_NAMES row, so a second "
         "property name at that site would never be compared against the "
         "documents' claim:\n  " + "\n  ".join(undeclared)
+    )
+
+
+def test_the_declared_false_positive_premise_holds_at_the_statement():
+    """`NOT_AN_ABOUT_WRITER` is an EXEMPTION, and an exemption nobody compares
+    against is a fail-open cell.
+
+    The recorded premise: `supersede_point`'s `SET r += $attrs` is on the
+    2a-DIRECT leg (`rtype` is `type(r)` of the `IMPL|NAND` rows), and its about
+    edge is transferred by a BARE `MERGE` — so on an about edge it writes
+    nothing and DROPS `confidence` (`#9417`). This asserts the premise at the
+    STATEMENT, which is where the property would land: a function-wide
+    membership test over `sdk.py` is satisfied by both literals while a `SET`
+    sits on the about transfer, and then §13 / §13.8 q2's "it drops
+    `confidence`" becomes false with every other leg green.
+    """
+    body = _function_body("tortoise/sdk.py", "supersede_point")
+    transfer = _query_call_containing(body, "MERGE (new)-[:{rel}]->(t)")
+    assert transfer, (
+        "`supersede_point` no longer transfers the about edge with a bare "
+        "`MERGE (new)-[:{rel}]->(t)` — re-derive NOT_AN_ABOUT_WRITER, and the "
+        "documents' '#9417 drops `confidence`' claim with it"
+    )
+    assert "SET" not in transfer, (
+        "the about-edge transfer in `supersede_point` now writes a property "
+        f"({transfer.strip()!r}), so that row is NOT a census false positive: "
+        "it carries that name on an `about*` edge, and the documents' 'on an "
+        "about edge it writes no property — it DROPS `confidence` (#9417)' is "
+        "now false. Re-derive the property set, move the row out of "
+        "NOT_AN_ABOUT_WRITER, and give it an EXPECTED_NAMES row naming it."
+    )
+    # The `SET` the census DOES see must land on a statement whose relationship
+    # patterns are all non-about — that asymmetry is the whole exemption.
+    setter = _query_call_containing(body, "SET r += $attrs")
+    assert setter, (
+        "`supersede_point` no longer carries the `SET r += $attrs` the census "
+        "row was derived from — the exemption now describes code that moved"
+    )
+    assert _ABOUT_REL.search(setter) is None, (
+        "the `SET r += $attrs` statement now names an `about*` predicate "
+        f"({setter.strip()!r}) — the property lands on an about edge, so the "
+        "exemption is stale"
     )
 
 
@@ -988,7 +1137,11 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
     )
     #: NAMES, not just keys. A subset test on the writer key alone stays green
     #: when a SECOND property is added at an already-recorded site — which is
-    #: exactly how "the measured set is `confidence` plus `idx`" would rot.
+    #: exactly how "the measured set is `confidence` plus `idx`" would rot. The
+    #: declared FALSE POSITIVE is in this comparison too (it has an
+    #: `EXPECTED_NAMES` row), because an exemption the name comparison skips is
+    #: a fail-open cell: a property added on that about edge would red nothing
+    #: while the documents assert the edge carries none.
     unexpected = sorted(
         f"{module}::{symbol} SETs {sorted(props - EXPECTED_NAMES[(module, symbol)])}"
         for (module, symbol), props in writers.items()
@@ -1000,7 +1153,9 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
         "record:\n  " + "\n  ".join(unexpected)
         + "\nRe-derive the property set (STORAGE-ARCHITECTURE.md §11.1/§13) "
         "and extend EXPECTED_NAMES; an unrecorded name invalidates the "
-        "ruling's cost-only bound."
+        "ruling's cost-only bound. If the site is NOT_AN_ABOUT_WRITER, a name "
+        "at it means the false positive has become a real writer — move it out "
+        "and re-derive the documents' 'it drops `confidence`' claim."
     )
     unrecorded = sorted(
         f"{module}::{symbol} SETs {sorted(props)}"
@@ -1180,6 +1335,54 @@ def test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live()
         "these retracted sentences are pinned but findable nowhere — a pin "
         "that cannot match the pre-fix text cannot red on a re-rot:\n  "
         + "\n  ".join(dead)
+    )
+
+
+def test_every_retracted_literal_declares_its_true_provenance():
+    """The provenance SPLIT itself, measured against the pre-fix revision.
+
+    Leg 7 proves every retracted literal can be found SOMEWHERE. It cannot
+    prove the entry's provenance is right, because it accepts the same changelog
+    for a pre-fix-live literal and for one this PR wrote and withdrew — so a
+    misclassified entry produced a leg-1 failure message claiming a pre-fix
+    presence that never existed (`§11.1`'s method paragraph, measured absent at
+    `01b5486ec`). That is the guard's own subject, one level up: a label that
+    nothing compares against the text it describes.
+    """
+    pre_fix: dict[str, str] = {}
+    for home in {home for _sentence, home in RETRACTED.values()}:
+        text = _git_show(PRE_FIX_REV, f"docs/architecture/{home}")
+        if text is None:
+            pytest.skip(
+                f"`git show {PRE_FIX_REV}:docs/architecture/{home}` is not "
+                "reachable in this checkout (shallow clone, no git, or the "
+                "rev was rewritten), so the pre-fix provenance cannot be "
+                "measured here — this leg only SKIPS, it never passes on a "
+                "history it could not read"
+            )
+        pre_fix[home] = _flat(text)
+    wrong: list[str] = []
+    for label, (sentence, home) in RETRACTED.items():
+        present = _flat(sentence) in pre_fix[home]
+        declared_introduced = label in RETRACTED_INTRODUCED_HERE
+        if present == declared_introduced:
+            kind = (
+                "introduced-and-retracted-inside-this-PR"
+                if declared_introduced
+                else "live-pre-fix"
+            )
+            state = "PRESENT" if present else "ABSENT"
+            wrong.append(
+                f"{label}: declared {kind} but the literal is {state} at "
+                f"{PRE_FIX_REV}:docs/architecture/{home}"
+            )
+    assert not wrong, (
+        "these retracted literals declare a provenance the pre-fix tree "
+        "disproves — leg 1's failure message would then assert a history that "
+        "never happened:\n  " + "\n  ".join(wrong)
+        + "\nAn entry belongs in RETRACTED_INTRODUCED_HERE iff it is ABSENT at "
+        f"{PRE_FIX_REV} (this PR wrote it and withdrew it); otherwise its "
+        "'was live pre-fix' claim stands."
     )
 
 
