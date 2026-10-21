@@ -814,8 +814,13 @@ def _site_symbol(node: ast.AST, file: _File) -> list[str]:
         # are identical with and without it and no site row resolves through the
         # `<module>` fallback — but the omission was silent: an annotated module
         # constant fell through to the consumer lookup with no name to look up.
-        # Broadening the input class is the cheap half; the fallback itself is still
-        # exercised by no fixture, which is recorded open rather than claimed fixed.
+        # Broadening the input class is the cheap half. The bare `<module>` fallback
+        # IS pinned synthetically — the sibling arm
+        # `test_a_module_constant_is_attributed_to_its_consumer` puts a root inside an
+        # `if` block, which reaches it — so what has no fixture is the OTHER
+        # unattributed shape, the `<module:NAME>` return below (a constant that is
+        # found but has no consumer). That shape is recorded open rather than claimed
+        # fixed.
         if isinstance(stmt, ast.AnnAssign):
             if (
                 stmt.value is not None

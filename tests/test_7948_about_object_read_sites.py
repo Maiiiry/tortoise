@@ -268,6 +268,8 @@ import functools
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 DOC = ROOT / "docs" / "architecture" / "STORAGE-ARCHITECTURE.md"
 PKG = ROOT / "tortoise"
@@ -3665,22 +3667,25 @@ def test_a_module_constant_is_attributed_to_its_consumer():
         "line the review flagged) or the rule now attributes an unattributable read"
     )
 
-def test_the_census_universe_is_every_module_on_disk():
-    """The UNIVERSE must be every module under `tortoise/`, not a filtered subset.
+def _pin_universe_to_disk(census, on_disk: set[Path]) -> None:
+    """The completeness pin's BODY — factored out so its FLOOR is pinnable too.
 
-    ⚠️ This is the arm the `#9501` review earned, and it is about the gate one function
-    UPSTREAM of `_files()`. The file gate is interrogated from an ungated walk, but a
-    universe that silently drops a module removes its reader from every derivation
-    while every other arm stays green — measured: filtering one module out of the old
-    single source left all 29 arms green while §13's row 22
-    (`navigation.py::_hop_query`) stopped being derived.
-
-    Both halves are pinned against the DISK, not against each other: `_universe()` is
-    the disk enumeration, and `_sources()` is the set the derivations consume. If
-    either is narrowed, one of the two assertions reds.
+    ⚠️ The floor is not decoration. Both set differences below are vacuously EMPTY
+    when `on_disk` is empty, so an enumeration that resolves to nothing (the package
+    moved or renamed, `TORTISE` mis-resolved, a packaging change) would let this arm
+    report green having asserted nothing — the exact defect
+    `docs/architecture/STORAGE-ARCHITECTURE-CHANGELOG.md` records for the carrier arm
+    ("it could report green having asserted nothing … It now counts the pairs it
+    examined"). For the one arm whose purpose is "the universe is complete", silence
+    on an empty universe is the failure it exists to prevent, so it reds here with its
+    own diagnosis. The sibling arms in this file carry the same shape
+    (`assert len(sources) > 2`, `assert len(census._sources()) > len(census._files())`).
     """
-    census = _call_time_census()
-    on_disk = {path for path in census.TORTISE.rglob("*.py")}
+    assert len(on_disk) > 2, (
+        f"the package enumeration found {len(on_disk)} module(s) under "
+        f"{census.TORTISE} — this arm cannot assert completeness against an empty "
+        "disk set, so it reds here instead of passing vacuously"
+    )
 
     for name in ("_universe", "_sources"):
         observed = set(getattr(census, name)())
@@ -3695,3 +3700,58 @@ def test_the_census_universe_is_every_module_on_disk():
             f"`{name}()` names paths that do not exist — the universe was built from "
             "something other than this package"
         )
+
+
+def test_the_census_universe_is_every_module_on_disk():
+    """The UNIVERSE must be every module under `tortoise/`, not a filtered subset.
+
+    ⚠️ This is the arm the `#9501` review earned, and it is about the gate one function
+    UPSTREAM of `_files()`. The file gate is interrogated from an ungated walk, but a
+    universe that silently drops a module removes its reader from every derivation
+    while every other arm stays green — measured: filtering one module out of the old
+    single source left all 29 arms green while §13's row 22
+    (`navigation.py::_hop_query`) stopped being derived.
+
+    Both halves are pinned against the DISK, not against each other: `_universe()` is
+    the disk enumeration, and `_sources()` is the set the derivations consume. If
+    either is narrowed, one of the two assertions reds — and the floor in
+    `_pin_universe_to_disk` means an EMPTY enumeration reds too, instead of passing
+    having asserted nothing (the two mutation arms below make both halves executable).
+    """
+    census = _call_time_census()
+    _pin_universe_to_disk(census, {path for path in census.TORTISE.rglob("*.py")})
+
+
+def test_the_universe_pin_reds_on_an_empty_disk_set():
+    """The FLOOR: an enumeration that resolves to NOTHING must red, not pass.
+
+    Without the floor both of the pin's set differences are empty on an empty
+    `on_disk`, so the arm reports green having asserted nothing. Constructing that
+    state directly is the only way to prove the floor is load-bearing rather than
+    decorative: a `TORTISE` that resolves to nothing is exactly what a package move,
+    rename or packaging change produces, and it must red with its own diagnosis.
+    """
+    census = _call_time_census()
+    with pytest.raises(AssertionError, match="cannot assert completeness"):
+        _pin_universe_to_disk(census, set())
+
+
+def test_the_universe_pin_reds_when_a_module_is_dropped():
+    """Mutation: narrowing `_universe()` must RED — the pin is not vacuous.
+
+    This is the measurement the `#9504`/`#9501` review established by hand and the PR
+    body states in prose ("`_universe()` drops one module → RED — the universe pin").
+    Made executable here. `_call_time_census()` imports a FRESH module object per call,
+    so replacing `_universe` on this instance cannot leak through its `lru_cache` into
+    any other arm — and `_sources()` delegates to the module-global `_universe`, so
+    both names lose the module together and the `_universe` half is what must speak.
+    """
+    census = _call_time_census()
+    on_disk = {path for path in census.TORTISE.rglob("*.py")}
+    full = census._universe()
+    dropped = sorted(full)[len(full) // 2]
+    census._universe = lambda: {k: v for k, v in full.items() if k != dropped}
+    with pytest.raises(
+        AssertionError, match=re.escape(str(dropped.relative_to(census.TORTISE)))
+    ):
+        _pin_universe_to_disk(census, on_disk)
