@@ -233,9 +233,12 @@ WHAT THIS PINS
    fragment census that existed for three cycles and was never CALLED.
 22. `test_the_attribution_predicate_does_not_swallow_the_whole_table` — (8)'s
    relation is a BOUND, so the RATE it accepts is pinned as its own number: at
-   most `_ACCEPTED_PAIRS_AT_THIS_HEAD` (63) of the 340 (row, table-door) pairs and
-   at most `_WORST_ROW_AT_THIS_HEAD` (15) for any one row, with a floor at the 29
-   true attributions so a predicate that breaks the other way also reds. The
+   most `_ACCEPTED_PAIRS_AT_THIS_HEAD` of the (row, table-door) pairs and at
+   most `_WORST_ROW_AT_THIS_HEAD` for any one row, with a floor at the cell
+   occurrences §13 states, so a predicate that breaks the other way also reds.
+   The counts live in those constants and in §13; restating them here is how this
+   paragraph came to cite 63 pairs of 340 with a floor of 29 after the table grew
+   to 19 rows over 22 doors (measured at this head). The
    inputs are the TABLE's twenty-two doors, not the 99-tool registry, so adding a tool
    does not move them — which is what makes them pinnable without churn.
 
@@ -2253,14 +2256,17 @@ def _route_table() -> dict[tuple[str, str], frozenset[str]]:
 #     alternative is a comment claiming more than the predicate proves.
 #   * **`_DOOR_REACH_HOPS` is a BOUND, and the number is a MEASUREMENT, not a
 #     guess — the first one was WRONG and a review caught it.** A uniform budget
-#     of 5 attributed all seventeen rows, so it looked safe; measured against
-#     substitutions that keep a REAL tool in the cell it accepted **44.7 % of the
-#     340 (row, table-door) pairs**, and three such substitutions stayed GREEN
-#     (rows 22/24's reach cells swapped, rows 28-31's backup doors swapped, and
-#     row 28's verb changed to the sibling `GET` that dumps nothing). At a uniform
-#     3 hops the same sweep accepts **15.6 %** and all three red; the SHIPPED
-#     predicate — those two exceptions included — accepts 63/340 = **18.5 %**, and
-#     that is the figure pinned by the arm below. Depth still trades both
+#     of 5 attributed every row of the table as it stood then, so it looked safe;
+#     measured against substitutions that keep a REAL tool in the cell it accepted
+#     it swallowed the largest share of the (row, table-door) pairs, and three such
+#     substitutions stayed GREEN (rows 22/24's reach cells swapped, rows 28-31's
+#     backup doors swapped, and row 28's verb changed to the sibling `GET` that
+#     dumps nothing). At a uniform 3 hops the same sweep accepts far less and all
+#     three red; the SHIPPED predicate — the exceptions in `_DISTANCE_EXCEPTIONS`
+#     included — accepts the rate the arm below pins (`_ACCEPTED_PAIRS_AT_THIS_HEAD`
+#     over the derived population), because a rate restated in prose is a count
+#     that rots: this sentence still read 63/340 = 18.5 % after the table grew.
+#     Depth still trades both
 #     ways — at 2 hops nine legitimate rows false-red — and the only two true
 #     attributions beyond 3 are named in `_DISTANCE_EXCEPTIONS` with the code fact
 #     that earns each. ⚠️ This is why the bound is pinned on BOTH sides: the
@@ -2564,9 +2570,10 @@ def test_the_attribution_predicate_does_not_swallow_the_whole_table():
     )
     # The tripwire must not be satisfied by a predicate that accepts NOTHING:
     # every true attribution is inside this set by construction.
-    assert total >= 29, (
-        f"only {total} pairs are accepted although §13's cells name 29 door "
-        "occurrences — the predicate has broken the other way"
+    assert total >= 31, (
+        f"only {total} pairs are accepted although §13's cells name 31 door "
+        "occurrences (the count the table arm pins) — the predicate has broken the "
+        "other way"
     )
 
 
@@ -2650,9 +2657,9 @@ def test_every_customer_callable_row_reaches_a_declared_door():
 
     # A predicate that silently stops resolving its entries turns this arm green
     # on an assertion it never made — so the floor is asserted, not assumed.
-    assert attributed >= 29, (
+    assert attributed >= 31, (
         f"only {attributed} door attributions were attempted, and §13's "
-        "customer-callable cells name 29 door OCCURRENCES — a lower floor let a dead "
+        "customer-callable cells name 31 door OCCURRENCES — a lower floor let a dead "
         "door KIND parser (all six SDK doors, say) pass this arm silently"
     )
     assert not broken, (
@@ -2832,7 +2839,8 @@ def test_the_stated_door_count_matches_the_table():
     )
     # The OTHER half of the same rule: "counted ONCE however many sites reach it"
     # is only checkable if the cell-occurrence total is stated too — `tortoise_recall`
-    # / `recall_state` alone land in five rows, so 20 distinct doors is 29 cells.
+    # / `recall_state` alone land in several rows, so the number of distinct doors and
+    # the number of CELLS differ, which is why the document must state both.
     occurrences = sum(len(rows) for rows in doors.values())
     stated_occurrences = {
         int(match.group(1))

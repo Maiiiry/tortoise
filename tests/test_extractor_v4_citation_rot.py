@@ -493,12 +493,14 @@ _SYMBOL = r"[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?"
 #: `projection/entities.py`).
 _CITED_FILE = r"[A-Za-z0-9_./-]+\.py"
 #: `sym` (`file.py:NNN`) — the symbol immediately precedes its citation.
-#: ⚠️ The line number is OPTIONAL here, and it is the form the document
-#: PREFERS: a symbol-keyed citation (`sym` (`file.py`)) survives a code move,
-#: while a line number rots on the next insertion. Requiring `:NNN` (an earlier
-#: state of this guard) silently stopped checking every symbol-only citation —
-#: `kind_classifier.classify_items` (`kind_classifier.py`) matched nothing at
-#: all, so a citation of a symbol that no longer exists passed.
+#: ⚠️ The line number is OPTIONAL here (and on `_CITATION_THEN_SYM` below), and
+#: the document PREFERS the symbol-keyed form: `sym` (`file.py`) survives a code
+#: move, while a line number rots on the next insertion. Requiring `:NNN` on the
+#: citation-then-symbol shape (an earlier state of THIS guard, changed in the same
+#: diff as the widened narration) silently stopped checking every symbol-only
+#: citation of that shape — `kind_classifier.classify_items`
+#: (`kind_classifier.py`) matched nothing at all, so a citation of a symbol that
+#: no longer exists passed.
 _SYM_THEN_CITATION = re.compile(rf"`({_SYMBOL})`\s*\(`?({_CITED_FILE})(?::(\d+))?")
 #: `file.py:NNN` (`sym`) — the citation immediately precedes its symbol.
 _CITATION_THEN_SYM = re.compile(rf"`?({_CITED_FILE})(?::(\d+))?`?\s*\(`({_SYMBOL})`")
