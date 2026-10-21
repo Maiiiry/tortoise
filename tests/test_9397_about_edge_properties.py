@@ -38,9 +38,10 @@ SEE — and it is blind to a sixth SHIPPED site, which the count must not hide:*
 `MERGE ({src})-[r2:`{rel}`]->(new) ON CREATE SET r2 = properties(r)`, i.e. it
 copies the WHOLE property map, and `rel` is handed to it from
 `MOVABLE_SOURCE_RELS` — which contains `aboutSource` and `aboutDocument`.
-**The bound is what the CODE enforces, and it is narrower than "spells the
-vocabulary": THREE escape shapes are uncovered, all measured against
-`_writers_in_module`:**
+**It is a DETECTOR, not a PROOF of absence — stated as that, never as a
+completeness claim, because every completeness claim written here has been
+falsified by a shape the next reviewer measured.** What it does not read, each
+measured against `_writers_in_module` rather than assumed:
 
 1. **A predicate handed in as a PARAMETER** — the vocabulary lives in the
    caller, so the body never names it (`_move_in`, above; measured: adding
@@ -49,19 +50,29 @@ vocabulary": THREE escape shapes are uncovered, all measured against
    `_PATTERN` (`\[(\w*):([^\]]{0,120})\]`) requires a TYPED relationship
    pattern, so an untyped `MATCH (s)-[r]->(t)` is `continue`d before any rule
    runs. Measured: `MATCH (s)-[r]->(t) WHERE type(r) = 'aboutObject'
-   SET r.confidence = $c` -> `{}`. This shape is already live style in the
-   tree (`sdk.py` / `analyze.py` use `WHERE type(r) = 'NAND'`).
+   SET r.confidence = $c` -> `{}`. Already live style in the tree (`sdk.py` /
+   `analyze.py` use `WHERE type(r) = 'NAND'`).
 3. **An fn-call RHS** (`SET r = properties(x)`) — `_SET_MAP` (`$|{`) cannot
    read it, **even when the about predicate IS spelled in a typed pattern**.
    Measured: `MATCH (s:Point)-[r:aboutObject]->(t) SET r = properties(x)` ->
    `{}`, while the same writer with `SET r = $p` is recorded (`<map:$props>`).
+4. **Spellings `_PATTERN` does not recognise** — whitespace before the
+   relationship-type colon (`[r :aboutObject]`), whitespace after `[`
+   (`[ r:aboutObject]`), and a `]` inside an inline map
+   (`{tags:["a"],confidence:$c}` truncates the `[^\]]{0,120}` span). Each
+   measured `{}` with a control recorded.
+5. **About-named predicates outside `_ABOUT_REL`'s enumerated seven** — the
+   guard's own comment claimed "an `about*` LITERAL", but `_ABOUT_REL` is
+   `about(Subject|Object|Event|Point|Document|Action|Source)`; an `aboutClaim`
+   edge measured `{}`.
+6. **Any writer outside `tortoise/`** — the walk is `PKG.rglob("*.py")` over the
+   package, while the retracted evidence came from a *full-repo* search;
+   `tools/longmem_eval/` and `graph-scripts/` hold `aboutObject`/`aboutSubject`
+   writes today (none currently property-bearing).
 
-**So the honest bound is: a property is seen only when the predicate sits in a
-TYPED relationship pattern (or is interpolated from a vocabulary listed in
-`_ABOUT_VOCAB`) AND the write is one of `SET var.<prop>`,
-`SET var (+=|=) $map/{…}`, or an inline pattern map. Parameter-passed
-predicates, untyped `WHERE type(r) = …` bindings and fn-call RHS forms are all
-outside the census** — `tests/test_9397_about_edge_properties.py` pins the two
+**So the honest statement is: the census is a regression tripwire over the
+shapes it enumerates, inside `tortoise/`.** A property it does not see is not
+evidence of absence, and this paragraph is the thing that says so. — `tests/test_9397_about_edge_properties.py` pins the two
 synthetic shapes so this bound cannot silently drift back to an absolute.
 
 `sdk.supersede_point` and `projection._rebuild_all_replay` — which earlier
@@ -186,7 +197,10 @@ WHAT IS PINNED (one entry per test, in file order)
    VANISH from the census (a row recorded for code nobody can find protects
    nothing).
    ⚠️ **The bound on that promise, stated rather than assumed:** an `about*`
-   edge is recognised by an `about*` LITERAL, or by an INTERPOLATED predicate in
+   edge is recognised by a literal in `_ABOUT_REL`'s enumerated set —
+   `about(Subject|Object|Event|Point|Document|Action|Source)`, NOT the
+   `about*` prefix as this comment originally claimed (an `aboutClaim` edge is
+   unseen; measured) — or by an INTERPOLATED predicate in
    a function whose body names one of the `_ABOUT_VOCAB` vocabularies (and, at
    the file-walk level, in a module `_module_in_scope` admits). A writer that
    derives its predicate from a vocabulary named NOWHERE in that list is still
@@ -197,25 +211,36 @@ WHAT IS PINNED (one entry per test, in file order)
    the census STOP rather than skip.
 11. `test_the_census_reads_the_inline_pattern_map_form` — synthetic probe for the
    inline pattern map, named and anonymous.
-12. `test_the_census_reads_a_writer_that_never_says_about` — synthetic probe for
+12. `test_the_census_bound_is_pinned_as_a_gap_not_an_absence` — the census's
+   DECLARED bound is pinned in prose and in code: the two escape shapes it
+   names are measured `{}` against `_writers_in_module` beside a control, so
+   the bound cannot drift back into an absence claim.
+13. `test_the_documents_state_the_bound_as_a_detector_not_a_proof` — the
+   completeness claim is WITHDRAWN, not reworded a fifth time: the detector
+   wording must be present in the guard's `__doc__` and at least twice in
+   `STORAGE-ARCHITECTURE.md`, and the retracted absolutes absent. Measured
+   without it, deleting the bound paragraphs or inserting a fresh absolute
+   left every leg green — a pin that is named for a bound and does not red on
+   its removal is not evidence.
+14. `test_the_census_reads_a_writer_that_never_says_about` — synthetic probe for
    the allowlist-driven writer whose module never spells `about`.
-13. `test_the_census_fails_closed_on_a_module_it_cannot_parse` — a module
+15. `test_the_census_fails_closed_on_a_module_it_cannot_parse` — a module
    `ast.parse` (or the strict UTF-8 decode) rejects STOPS the census and names
    the file, instead of returning `{}` and reporting every writer inside it as a
    measured absence — the same fail-open shape as the `rg 'aboutObject {'` zero.
-14. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
+16. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
    the binder, **or stops being the fall-through branch** of the
    `TORTOISE_SESSION_EXTRACTOR == "m2"` selection, that sentence becomes false
    while every other test stays green.
-15. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
+17. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
    — every RETRACTED literal is findable in the changelog that quotes it, or is
    declared pre-fix-only or introduced-and-retracted inside this PR
    (`RETRACTED_INTRODUCED_HERE`: three absolutes were written by an earlier
    revision of THIS PR, so claiming a pre-fix presence for them would be the
    same unmeasured provenance this file exists to stop). A pin that cannot match
    the pre-fix text protects nothing, and that is not a hypothesis: it shipped.
-16. `test_every_retracted_literal_declares_its_true_provenance` — the
+18. `test_every_retracted_literal_declares_its_true_provenance` — the
    CLASSIFICATION is measured, not merely declared: a literal listed in
    `RETRACTED_INTRODUCED_HERE` must be ABSENT from the pre-fix revision
    (`PRE_FIX_REV`) and every other entry PRESENT there. Without this the label
@@ -223,7 +248,7 @@ WHAT IS PINNED (one entry per test, in file order)
    leg 1 then prints "was live pre-fix" for a sentence this PR wrote, in the
    diagnostic of the guard whose whole subject is unmeasured provenance. Skips
    (never passes silently) when the revision is unreachable.
-17. `test_the_storage_changelog_records_the_correction` — the changelog is where
+19. `test_the_storage_changelog_records_the_correction` — the changelog is where
    a reader learns that a §11.1/§13 claim moved.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
@@ -263,9 +288,9 @@ STORAGE_CHANGELOG = (
 #: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against.
 #: The reading MOVES with this file and is re-measured at every revision, never
 #: carried forward: 4 failed / 6 passed when it had 10 legs, 6 failed / 8 passed
-#: when it had 16, and **8 failed / 10 passed of the 18 legs at this revision**
+#: when it had 16, and **9 failed / 10 passed of the 19 legs at this revision**
 #: (the two `#9403`-review legs — §11.4 rule 1 and the ledger KEEP row — red on
-#: the pre-fix documents too). "Was live pre-fix" is a claim about HISTORY, so it is
+#: the pre-fix documents too, as does the detector-wording leg). "Was live pre-fix" is a claim about HISTORY, so it is
 #: checked against history instead of restated: an entry in
 #: `RETRACTED_INTRODUCED_HERE` must be ABSENT here, every other entry PRESENT.
 #: ⛔ NOT derived from `git merge-base HEAD origin/main`: the moment this lands
@@ -1539,6 +1564,64 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "the control probe (a readable property-MAP write on a typed about "
         f"pattern) is no longer recorded — the census changed (found {found!r})"
     )
+    # Shape 3: the predicate is a PARAMETER (the `_move_in` shape) — the
+    # vocabulary is in the caller, so nothing in the body names it.
+    parameterised = (
+        "def move(g, rel, s, t):\n"
+        "    g.query(f'MERGE (s)-[r2:`{rel}`]->(t) ON CREATE SET "
+        "r2 = properties(s)')\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", parameterised)
+    assert found == {}, (
+        "the census now reads a PARAMETERISED predicate — a real widening; "
+        "update the documented gap list in the same change (found "
+        f"{found!r})"
+    )
+
+
+#: The sentence that states the census's epistemic status. The bound is stated
+#: as a DETECTOR rather than as a completeness claim, because every
+#: completeness claim written in this file was falsified by the next reviewer's
+#: measurement. The pin below exists so that drift is a RED, not a re-review:
+#: measured without it, deleting the bound paragraphs or inserting a fresh
+#: absolute left the suite green.
+_BOUND_MARKER = "DETECTOR, not a PROOF of absence"
+
+#: Absolutes this file used to assert and must never assert again.
+_RETRACTED_BOUND_ABSOLUTES = (
+    "all three are in scope",
+    "no writer that SPELLS an about vocabulary",
+)
+
+
+def test_the_documents_state_the_bound_as_a_detector_not_a_proof():
+    """The DOCUMENTS carry the non-exhaustive wording, and none of the
+    retracted absolutes comes back.
+
+    This leg exists because the probe test above pins the CENSUS and, on its
+    own, pinned nothing about the prose: measured, deleting the bound
+    paragraphs from §11.1/§13, or inserting a new absolute, left all 16 legs
+    green — so the changelog's claim that the probes keep the bound from
+    decaying was itself false.
+    """
+    assert _BOUND_MARKER in (__doc__ or ""), (
+        "this module's docstring no longer states the census as a DETECTOR "
+        "rather than a completeness claim"
+    )
+    storage = (ROOT / "docs/architecture/STORAGE-ARCHITECTURE.md").read_text(
+        encoding="utf-8"
+    )
+    flat = _flat(storage)
+    in_111 = flat.count(_BOUND_MARKER)
+    assert in_111 >= 2, (
+        "`docs/architecture/STORAGE-ARCHITECTURE.md` must state the detector "
+        f"bound in BOTH §11.1 and §13 (found {in_111} occurrence(s))"
+    )
+    for absolute in _RETRACTED_BOUND_ABSOLUTES:
+        assert absolute not in flat, (
+            f"a retracted completeness claim is back in "
+            f"`docs/architecture/STORAGE-ARCHITECTURE.md`: {absolute!r}"
+        )
 
 
 def test_the_census_reads_a_writer_that_never_says_about():
