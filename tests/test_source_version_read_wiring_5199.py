@@ -550,6 +550,82 @@ def test_provenance_chain_orders_object_references_by_id():
     )
 
 
+def test_identity_object_link_reads_unknown_never_current():
+    """#5199 — the READ-side twin of `test_identity_link_stays_property_free`.
+
+    Input: a source at 'h1'; an `:Object` linked through the app-facing writer
+    (`link_source_to_entity(..., 'Object')` — the identity/mention shape; the
+    raw `sourceObjectId` materialization in `projection/entities.py` writes the
+    same property-free edge by hand, and is pinned separately in
+    `tests/test_connector_sources.py`), then the source revised to 'h2'.
+
+    The approved scope (option A, 2026-09-25; `STORAGE-ARCHITECTURE.md` §9.6)
+    keeps identity/mention links PROPERTY-FREE — a connector Object's Source
+    `url` IS the artifact, so there is no version to compare. The honest answer
+    is therefore `unknown`, which is the state the issue's checklist calls
+    "degrade explicitly (not silently current)".
+
+    FAILS IF either:
+
+    * an absent note is rendered `current` — the false-current the note exists
+      to prevent, and the one direction §4.6 forbids (mutating
+      `currency_status`'s empty case to return `current` reds this test); or
+    * `Object` is added to `_DERIVATION_REFERENCES_LABELS` — the link then
+      carries 'h1', the revised source makes it `stale`, and this assertion
+      goes red on the very change that would reverse the ruling. Read this
+      docstring before "fixing" it.
+
+    The Object itself must survive untouched: `stale != wrong`, and this link
+    is not even version-scoped, so nothing here may delete or rewrite the
+    target.
+
+    Unique coverage: the only test that reads the **currency pair** of a
+    production-written identity link through `get_provenance_chain`. The edge's
+    existence is pinned elsewhere (`tests/test_references_edge.py`,
+    `tests/test_3998_raw_absent_state.py`), and its property-freeness by
+    `test_identity_link_stays_property_free` — what is pinned NOWHERE else is
+    that such a link READS `unknown` rather than `current`.
+    """
+    sdk = TortoiseSDK(_tmp("obj-read.db"))
+    try:
+        proj = _point_and_source(sdk, current="h1")
+        proj.g.query("CREATE (o:Object {id:'obj-1', name:'Widget', objectKind:'product'})")
+        sdk.link_source_to_entity("c.txt", "obj-1", "Object")  # identity: no note
+
+        # The source is revised AFTER the link was minted.
+        proj.g.query("MATCH (s:Source {url:'c.txt'}) SET s.contentHash='h2'")
+
+        rows = [r for r in sdk.get_provenance_chain("pt_1")
+                if (r.get("entity") or {}).get("id") == "obj-1"]
+        assert len(rows) == 1, f"the Object link must be reported; got {rows!r}"
+        row = rows[0]
+        # The premise itself: the source really did move AFTER the link was
+        # minted. Without this the setup could silently stop landing and the
+        # test would keep passing on an h1-vs-h1 graph while its message says
+        # "revised".
+        assert row["sourceCurrentVersion"] == "h2", (
+            f"the source revision must land; the source is at "
+            f"{row['sourceCurrentVersion']!r}"
+        )
+        assert row["linkRecordedVersion"] == "", (
+            "an identity/mention link records no version — got "
+            f"{row['linkRecordedVersion']!r}"
+        )
+        assert row["linkCurrency"] == "unknown", (
+            "an unversioned identity link must read `unknown`, never `current` "
+            f"(nor a speculative `stale`); got {row['linkCurrency']!r}"
+        )
+
+        alive = proj.g.query(
+            "MATCH (o:Object {id:'obj-1'}) RETURN count(o), o.name, o.objectKind"
+        ).result_set
+        assert alive == [[1, "Widget", "product"]], (
+            f"the Object must survive the source revision unchanged; got {alive!r}"
+        )
+    finally:
+        sdk.close()
+
+
 def test_provenance_chain_breaks_a_node_key_tie_by_the_note():
     """REGRESSION (#5199 review P3). Two `references` edges to the SAME target can
     carry different notes (a hand-built shape — the writers key a target by

@@ -434,6 +434,36 @@ class TestIdempotency:
 # GitHub entity path — Source → Object reference via explicit sourceObjectId
 # ═══════════════════════════════════════════════════════════════════════
 
+def _apply_entity_path_shape(proj) -> None:
+    """Apply the GitHub entity-path fold: `ObjectRegistered`, the poll-shaped
+    event, then the `{id}-created` event carrying `sourceObjectId` — the shape
+    that makes `_materialize_connector_source` mint
+    `(Source)-[:references]->(Object)`.
+
+    Shared by the tests below (edge existence, and #5199 property-freeness): the
+    payload is the github mapper's, so it drifts in ONE place rather than in
+    every test that reads the resulting graph.
+    """
+    # Object first (ingest() order: ObjectRegistered → Event → ...)
+    proj.apply({
+        "type": "ObjectRegistered",
+        "id": "github-issue-test/repo-42",
+        "name": "test/repo#42",
+        "object_kind": "pm:issue",
+        "title": "Fix login bug",
+        "url": GH_URL,
+        "createdAt": "2026-07-10T10:00:00Z",
+    })
+    # poll-shaped event + entity-path event (both fire in ingest())
+    proj.apply(gh_issue_event())
+    proj.apply(gh_issue_event(
+        eventId="github-issue-test/repo-42-created",
+        eventKind="pm:cardCreated",
+        object="github-issue-test/repo-42",
+        sourceObjectId="github-issue-test/repo-42",
+    ))
+
+
 class TestEntityPathObjectReference:
     def test_entity_path_wires_object_reference(self):
         """The github entity path emits a second Event (`{entity_id}-created`)
@@ -442,24 +472,7 @@ class TestEntityPathObjectReference:
         issue shape is pre-existing — do not enshrine a one-Event invariant)."""
         with fresh_sdk() as sdk:
             proj = sdk._get_proj()
-            # Object first (ingest() order: ObjectRegistered → Event → ...)
-            proj.apply({
-                "type": "ObjectRegistered",
-                "id": "github-issue-test/repo-42",
-                "name": "test/repo#42",
-                "object_kind": "pm:issue",
-                "title": "Fix login bug",
-                "url": GH_URL,
-                "createdAt": "2026-07-10T10:00:00Z",
-            })
-            # poll-shaped event + entity-path event (both fire in ingest())
-            proj.apply(gh_issue_event())
-            proj.apply(gh_issue_event(
-                eventId="github-issue-test/repo-42-created",
-                eventKind="pm:cardCreated",
-                object="github-issue-test/repo-42",
-                sourceObjectId="github-issue-test/repo-42",
-            ))
+            _apply_entity_path_shape(proj)
             # both Event nodes exist
             assert _count(proj, "Event") == 2
             # Source references BOTH events
@@ -473,6 +486,66 @@ class TestEntityPathObjectReference:
             assert _edge_count(proj, "Source", "url", GH_URL,
                                "references", "Object", "id",
                                "github-issue-test/repo-42") == 1
+
+    def test_entity_path_object_link_stays_property_free(self):
+        """#5199 — the identity/mention exclusion holds through BOTH in-repo
+        writers, not only the app-facing one.
+
+        `_materialize_connector_source` mints `(Source)-[:references]->(Object)`
+        with raw Cypher (`MERGE (s)-[:references]->(o)`), bypassing
+        `link_source_to_entity` — and therefore bypassing
+        `_DERIVATION_REFERENCES_LABELS` entirely. That is correct under the
+        approved scope: a connector Object's Source `url` IS the artifact, so
+        there is no version to compare. But nothing pinned it, so a
+        "complete the anchor for Object" change aimed at this writer would land
+        here unobserved.
+
+        The connector Source DOES carry a real `contentHash` (#5214), so this is
+        the strong form: a version was available to stamp, and must not have
+        been.
+
+        FAILS IF this raw writer writes ANY property on the identity link —
+        `<prop>` keys are asserted empty, not just `sourceVersion`, because
+        §9.6 keeps the whole form property-free: a `version`, a cached
+        `linkCurrency` or any other stamp breaks the same ruling. The
+        `sourceVersion` clause is named separately, for diagnosis.
+        """
+        with fresh_sdk() as sdk:
+            proj = sdk._get_proj()
+            _apply_entity_path_shape(proj)
+
+            # The premise: this Source has a version available to stamp.
+            hashes = proj.g.query(
+                "MATCH (s:Source {url: $u}) RETURN s.contentHash",
+                params={"u": GH_URL},
+            ).result_set
+            assert hashes and hashes[0][0], (
+                "the connector Source must carry a contentHash for this test to "
+                f"exercise the strong case; got {hashes!r}"
+            )
+
+            rows = proj.g.query(
+                "MATCH (:Source {url: $u})-[r:references]->"
+                "(:Object {id: $oid}) RETURN keys(r)",
+                params={"u": GH_URL, "oid": "github-issue-test/repo-42"},
+            ).result_set
+            assert len(rows) == 1, (
+                "the connector Object link must be MINTED — otherwise this test "
+                f"asserts nothing about its properties; got {rows!r}"
+            )
+            assert rows[0][0] == [], (
+                "an identity/mention link must stay property-free even though "
+                f"the Source has a version; got {rows[0][0]!r}"
+            )
+            stamps = proj.g.query(
+                "MATCH (:Source {url: $u})-[r:references]->"
+                "(:Object {id: $oid}) RETURN r.sourceVersion",
+                params={"u": GH_URL, "oid": "github-issue-test/repo-42"},
+            ).result_set
+            assert stamps == [[None]], (
+                "no version may be recorded on an identity link — the Source's "
+                f"url IS the artifact, so there is nothing to compare; got {stamps!r}"
+            )
 
     def test_event_object_never_used_as_object_key(self):
         """AC gate: event.object (a TITLE on poll paths) must never produce a
