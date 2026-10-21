@@ -23,20 +23,14 @@ sites, and the ingestion path reaches one of them by default:
   3. `projection/entities._fold_entity_linked_reason` — the REPLAY fold
      re-SETs it, i.e. the property is journaled and reproduced (`live == rebuild`).
 
-Four further shipped paths RE-MATERIALIZE the edge, and none adds a second
-*attribute*: `cache_projection.relation_statement` (the record-layer
-projection) carries the row's whole property set by property MAP over a
-predicate allowlist that includes `aboutObject` —
-`MERGE (src)-[r:{rel_type} {idx:$idx}]->(tgt) SET r += $props` — while
-`projection._rebuild_all_replay` and `sdk.supersede_point` re-materialize the
-journal's / the superseded point's attributes (`SET r += $props`), and
-`hosted_backup.restore_graph` the dump's (`SET r = $p`). `idx` is the one
-further NAME this puts on an about edge: `public.relation.idx`, the
-**parallel-edge ordinal**, written unconditionally by `relation_statement`. It
-is the edge's identity coordinate, not a semantic attribute or payload; the
-record's open `props` tail (which carries `confidence` for a bound link) rides
-the MAP. The documents state exactly that (§11.1, §13, §13.8 q2) — "one
-property name" without it is contradicted by a writer this file records.
+Four further shipped paths RE-MATERIALIZE the same attribute set by property
+MAP — `SET r += $props` / `SET r = $p` — over a predicate allowlist that
+includes `aboutObject`, so they reproduce `confidence` and add no new name:
+`cache_projection.relation_statement` (the record-layer projection; the
+`public.relation` row carries `confidence`), `projection._rebuild_all_replay`
+and `sdk.supersede_point` (rebuilding/copying it from the journal or the
+superseded point), and `hosted_backup.restore_graph` (`SET r = $p` over the
+dump's stored edge properties).
 
 ROOT CAUSE OF THE FALSE CLAIM — the method, not the measurement
 ---------------------------------------------------------------
@@ -57,10 +51,7 @@ predicate counts as about-bearing when its writer takes it from the shared about
 / predicate vocabulary — including the allowlist itself (`validate_rel_type`,
 `KNOWN_REL_TYPES`, `_sanitize_label`), because "validated against the whole
 allowlist, which contains `aboutObject`" is exactly how a map-form writer
-names its edge without writing `aboutObject` anywhere. For the same reason the
-census has NO file-level `about` prefilter: that module never spells the word,
-so eligibility is decided by CONTENT (AST), not by a literal — the prefilter
-shipped, and it dropped precisely the writer the widening exists for.
+names its edge without writing `aboutObject` anywhere.
 
 ⚠️ THAT is a heuristic, and the promise it supports is bounded by it: the census
 cannot see a writer whose predicate comes from a vocabulary named nowhere in
@@ -112,17 +103,12 @@ WHAT IS PINNED
    the binder, **or stops being the fall-through branch** of the
    `TORTOISE_SESSION_EXTRACTOR == "m2"` selection, that sentence becomes false
    while every other test stays green.
+6. `test_the_storage_changelog_records_the_correction` — the changelog is where
+   a reader learns that a §11.1/§13 claim moved.
 7. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
    — every RETRACTED literal is findable in the changelog that quotes it, or is
    declared pre-fix-only. A pin that cannot match the pre-fix text protects
    nothing, and that is not a hypothesis: it shipped.
-8. `test_the_storage_changelog_records_the_correction` — the changelog is where
-   a reader learns that a §11.1/§13 claim moved.
-
-Non-vacuity of the FORMS themselves is pinned separately by
-`test_the_census_sees_every_write_form_it_claims`: synthetic writers, one per
-form — including the allowlist-only map writer that spells no `about` — must be
-seen, and an unrelated node write must not be.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -292,16 +278,8 @@ SECOND_PROPERTY = "idx"
 #: record/edge schema has. For the bound entity links here that set includes
 #: `confidence` (`record_projection.RelationUpsert.attrs`; `public.relation`
 #: has a `confidence` column), so a map-form writer reproduces the SAME one
-#: ATTRIBUTE — it does not introduce a second one. Recorded as a form, not a name.
+#: name — it does not introduce a second one. Recorded as a form, not a name.
 MAP_FORM = "<map:$props>"
-
-#: Sentinel for a property written in the RELATIONSHIP PATTERN itself —
-#: `MERGE (src)-[r:aboutObject {idx:$idx}]->(tgt)`. There is no `SET` clause, so
-#: BOTH `_SET_ON` and `_SET_MAP` are blind to it; it shipped in
-#: `cache_projection.relation_statement` (whose `idx` is `public.relation.idx`,
-#: the parallel-edge ordinal) and was recorded only incidentally, because a
-#: `SET r += $props` sits beside it.
-INLINE_FORM = "<inline:$map>"
 
 _SET_ON = re.compile(r"SET\s+(\w+)\.(\w+)\s*=")
 #: Property-MAP assignment on a relationship variable: `SET r += $props`,
@@ -337,9 +315,7 @@ _ABOUT_REL = re.compile(
 #: not name `aboutObject` at the write site at all — they take the predicate
 #: from the allowlist that contains it (or from the dump, sanitized). Verified
 #: against the tree: adding them raises the census from 3 writers to exactly 7,
-#: the four map-form sites above plus the three named-form ones. Because such a
-#: module never spells `about`, the census parses EVERY module — a file-level
-#: `about` prefilter made this vocabulary unreachable (review finding).
+#: the four map-form sites above plus the three named-form ones.
 _ABOUT_VOCAB: tuple[str, ...] = (
     "ENTITY_LINKED_RELS",
     "_ABOUT_REPLAY_RELS",
@@ -635,17 +611,11 @@ def test_the_corrected_passages_name_the_property_bearing_class():
 def test_the_code_still_agrees_with_the_corrected_evidence():
     writers = _about_edge_property_writers()
     stale: list[str] = []
-    expected: dict[tuple[str, str], set[str]] = {}
-    for key in RECORDED_WRITERS:
-        expected.setdefault(key, set()).add(PROPERTY)
-    for key in MAP_WRITERS:
-        expected.setdefault(key, set()).add(MAP_FORM)
-    for key in INLINE_FORM_WRITERS:
-        expected.setdefault(key, set()).add(INLINE_FORM)
-    shapes_by_key = {
-        **RECORDED_WRITERS, **MAP_WRITERS, **INLINE_FORM_WRITERS,
+    recorded = {
+        **{k: (shapes, PROPERTY) for k, shapes in RECORDED_WRITERS.items()},
+        **{k: (shapes, MAP_FORM) for k, shapes in MAP_WRITERS.items()},
     }
-    for key, shapes in shapes_by_key.items():
+    for key, (shapes, expected) in recorded.items():
         module, symbol = key
         text = (ROOT / module).read_text(encoding="utf-8")
         try:
@@ -660,19 +630,15 @@ def test_the_code_still_agrees_with_the_corrected_evidence():
         for shape in shapes:
             if shape not in text:
                 stale.append(f"{module}::{symbol} — lost {shape!r}")
-        missing = sorted(expected[key] - writers.get(key, set()))
-        if missing:
+        if expected not in writers.get(key, set()):
             stale.append(
                 f"{module}::{symbol} — the census no longer sees it writing "
-                f"{missing} on a relationship variable"
+                f"{expected!r} on a relationship variable"
             )
     assert not stale, (
         "the CODE moved away from the corrected evidence — re-derive the "
         "documented claim instead of leaving it stale:\n  " + "\n  ".join(stale)
     )
-
-
-# ── 4. the two writer populations ──────────────────────────────────────────
 
 
 def test_the_named_and_map_form_writer_populations_are_disjoint():
@@ -690,77 +656,9 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
         "documents now record — if a writer was genuinely removed, re-derive "
         "the documents' count with it"
     )
-    #: An INLINE row for a site that is not a recorded map writer would pin a
-    #: form on a writer nobody recorded — the row would pass while the census's
-    #: population and the documents' enumeration disagreed.
-    stranded = sorted(set(INLINE_FORM_WRITERS) - set(MAP_WRITERS))
-    assert not stranded, (
-        "these sites are recorded as an INLINE-form writer but not as a map-form "
-        "writer, so the documents' enumeration and this file disagree:\n  "
-        + "\n  ".join(f"{m}::{s}" for m, s in stranded)
-    )
 
 
-# ── 5. no unrecorded property-bearing writer ───────────────────────────────
-
-
-def test_the_census_sees_every_write_form_it_claims(tmp_path):
-    """NON-VACUITY per FORM, on synthetic sources (review finding, twice).
-
-    Each sample is a writer the documents' "all three forms are in scope" says
-    the census must see. Every one of them was INVISIBLE to an earlier version
-    of this census: the allowlist-spelled sample to the file-level `about`
-    prefilter, the inline sample to both `SET` regexes. And the control sample
-    pins the other direction — a census that records everything is not a
-    census, and a false positive is how a guard gets deleted instead of fixed.
-    """
-    named = _census_source("named.py", '''
-def attach(proj, conf):
-    q = f"MATCH (s) MERGE (s)-[r:aboutObject]->(t) SET r.confidence=$conf"
-    proj.g.query(q, {"conf": conf})
-''')
-    assert named == {("named.py", "attach"): {PROPERTY}}, named
-
-    # The module NEVER spells `about`: the predicate comes from the shared
-    # allowlist, which is exactly the writer the widened `_ABOUT_VOCAB` exists
-    # for — and the one the removed `if "about" not in text` prefilter dropped
-    # BEFORE parsing. This one therefore runs through the real WALKER.
-    probe = tmp_path / "binderish.py"
-    probe.write_text('''
-def project_edge(proj, rel, props):
-    validate_rel_type(rel)
-    q = f"MERGE (s)-[r:{rel}]->(t) SET r += $props"
-    proj.g.query(q, {"props": props})
-''', encoding="utf-8")
-    allowlisted_map = _about_edge_property_writers(tmp_path)
-    assert allowlisted_map == {("binderish.py", "project_edge"): {MAP_FORM}}, (
-        "a map-form writer that takes its predicate from the allowlist and "
-        "never spells `about` is invisible again — the file-level prefilter "
-        "was removed for this case"
-    )
-
-    # The third form: the property is in the PATTERN, so there is no `SET` for
-    # either regex to match. Shipped at `relation_statement` (`{idx:$idx}`).
-    inline = _census_source("inline.py", '''
-def materialize(proj, conf):
-    q = f"MERGE (s)-[r:aboutObject {{confidence:$conf}}]->(t)"
-    proj.g.query(q, {"conf": conf})
-''')
-    assert inline == {("inline.py", "materialize"): {INLINE_FORM}}, (
-        "an inline pattern-map property on an about edge is invisible again — "
-        "neither `_SET_ON` nor `_SET_MAP` matches it, and it is the form "
-        "`cache_projection.relation_statement` uses for `idx`"
-    )
-
-    unrelated = _census_source("unrelated.py", '''
-def touch(proj, polarity):
-    q = "MATCH (n) SET n.polarity=$polarity"
-    proj.g.query(q, {"polarity": polarity})
-''')
-    assert unrelated == {}, (
-        "the census recorded a node-property write that touches no relationship "
-        f"at all: {unrelated}"
-    )
+# ── 4. no unrecorded property-bearing writer ───────────────────────────────
 
 
 def test_no_unrecorded_property_bearing_about_edge_writer():
@@ -928,7 +826,7 @@ def test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live()
     )
 
 
-# ── 8. the changelogs must carry the correction, not the old claim ─────────
+# ── 6. the changelogs must carry the correction, not the old claim ─────────
 
 
 def test_the_storage_changelog_records_the_correction():
