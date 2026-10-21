@@ -39,9 +39,18 @@ aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 > observation today (`#8740`, the tracked follow-up)"*; the `resolve_raw_availability(props, observed=…)` call
 > signature; the `:Source`-property read-bag sentence that named the residual `#8739` and a source file path; the
 > internal coverage list (`create_source`/`_upsert_source`, `_fold_source_versioned` → `_upsert_source`, the
-> `SourceCreated` replay); the module constant `raw_state.RAW_DELETION_MARKER_TTL` (now "the deletion-marker TTL",
-> with the value and its rationale kept); and a dangling `R1` citation that has no definition anywhere in the
-> repository.
+> `SourceCreated` replay); and the module constant `raw_state.RAW_DELETION_MARKER_TTL` (now "the deletion-marker
+> TTL", with the value and its rationale kept).
+>
+> **The row's retention authority is NAMED, not assumed.** Dropping the constant name removed the only thing on the
+> line that tied its 10-day bound to an authority, so the row now cites **R1** *with the document that defines it* —
+> `docs/retention-and-deletion.md`, whose `RAW_DELETION_MARKER_TTL` row is the **sole authority** for that guarantee
+> window — beside the existing `(R2)` citation of `docs/durability-posture.md`. `R1` is the owner ruling *restore
+> window ≠ retention window; no retention window on user **content***, stated in code at `tortoise/raw_state.py`, in
+> `docs/retention-and-deletion.md`, and in `docs/plans/2026-09-18-4179-retention-deletion.md`; it is a resolvable
+> citation, so it is **kept** — and it now resolves on sight instead of by lookup. (The constant NAME is build
+> detail and belongs here; the ruling it implements is model, and the companion doc cites `R1` for this very row —
+> a row that dropped it would leave that clause with no traceable basis.)
 >
 > **Why.** `ONTOLOGY.md` states the model we want; *whether something is built* is this file's job, and its own
 > header says so. The row had drifted into a status report — and a lane reading it as specification would take
@@ -54,7 +63,7 @@ aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 > caller-supplied and never persisted, a recorded act winning over any observation, a stored condition read
 > fail-closed as `unrecognised`, expiry authorising a journalled drop, and the property refused on the generic
 > entity surface.
-
+>
 > **Changelog v3.29 (2026-10-17 — issue #3554 — the canonical `:Session` capture-container is declared, and §4.1's `speaker` row is corrected):**
 >
 > **A new model section (§4.8), recorded in its OWN release.** The `:Session` capture container

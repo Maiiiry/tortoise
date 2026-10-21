@@ -893,8 +893,13 @@ def test_retrofit_verdicts_cite_documentation_homes_that_exist() -> None:
         assert "§ '#3554 amendment'" in where, name
 
 
+def _model_version(text: str) -> tuple[int, ...]:
+    """``"3.30"`` → ``(3, 30)`` — compare model versions numerically, not as text."""
+    return tuple(int(part) for part in text.split("."))
+
+
 def test_section_4_8_changelog_entry_sits_under_its_own_version_block() -> None:
-    """The §4.8 changelog bullet belongs to its own version/date/issue header.
+    """The §4.8 changelog bullet belongs to the release that carries it.
 
     Pre-fix the bullet was the FIRST item of the ``v3.23 (2026-10-10 —
     issues #7813 + #7853)`` block, making that header's date and issue
@@ -909,34 +914,49 @@ def test_section_4_8_changelog_entry_sits_under_its_own_version_block() -> None:
     header enumerated an issue that could not have landed in it — the same
     misattribution one block up, now pinned as correct by a hardcoded ``v3.24``.
 
-    So this asserts the RELATION, not the literal: the bullet sits under the
-    NEWEST block, and that block's version is the version the model document
-    itself declares. Pre-fix (both the original ``v3.23`` shape and the
-    ``v3.24`` one) this fails.
+    The second fix asserted "the bullet sits under the NEWEST block, and that
+    block's version is what the model document declares" — an OVER-CONSTRAINT:
+    it made ANY later model release red, though the model is meant to keep
+    evolving and the §4.8 bullet had not moved. A later release (v3.30, #8745,
+    a §4.6-only change) failed it, which is not the misattribution it was
+    reaching for. The relation it wanted is "the block carries the section's own
+    release", so that is what is pinned — from facts already in the text, with
+    no version literal: the bullet records its own landing date
+    (``§4.8 (added by #3554, 2026-10-17)``) and the header records the block's
+    date, so a bullet under ANY other block — older *or* newer — disagrees; and
+    the block's version may not be NEWER than the model document declares
+    itself. Pre-fix (the ``v3.23`` shape, the ``v3.24`` one, and a later block
+    that copies the bullet) each fails; a later block that leaves the bullet
+    alone (v3.30) does not.
     """
     changelog = ONTOLOGY_CHANGELOG.read_text(encoding="utf-8")
     ontology = ONTOLOGY.read_text(encoding="utf-8")
-    bullet = changelog.index("§4.8 (added by #3554")
-    header = changelog.rindex("> **Changelog v3.", 0, bullet)
+    bullet_at = changelog.index("§4.8 (added by #3554")
+    header = changelog.rindex("> **Changelog v3.", 0, bullet_at)
     header_line = changelog[header:changelog.index("\n", header)]
+    block_version = re.match(r">\s*\*\*Changelog v(\d+\.\d+)", header_line)
+    assert block_version, f"unparseable changelog header: {header_line!r}"
     # The version the model document declares about itself (frontmatter title).
     declared = re.search(r'^title: "Tortoise — Canonical Ontology v(\d+\.\d+)"',
                          ontology, re.M)
     assert declared, "docs/ONTOLOGY.md must declare its model version in frontmatter"
-    assert f"v{declared.group(1)}" in header_line, (
-        f"§4.8 is recorded under {header_line!r} but the model document declares "
-        f"v{declared.group(1)} — a new model section must be recorded in the "
-        "release that carries it, not an older one")
-    newest = changelog.index("> **Changelog v3.")
-    newest_line = changelog[newest:changelog.index("\n", newest)]
-    assert newest == header, (
-        "§4.8 must be recorded in the NEWEST changelog block (this file is "
-        f"newest-first); it sits under {header_line!r} while the newest block "
-        f"is {newest_line!r}")
+    assert _model_version(block_version.group(1)) <= _model_version(declared.group(1)), (
+        f"§4.8 is recorded under {header_line!r} — a block NEWER than the "
+        f"v{declared.group(1)} this model document declares; a section cannot be "
+        "recorded in a release that has not been published")
     assert "#3554" in header_line, (
         "the §4.8 block's header must name the issue whose section it records")
-    # …and the header must not enumerate an issue that landed in another block.
-    assert header_line.count("#") >= 1
+    # The RELATION: the block carrying the bullet is the release §4.8 landed in.
+    bullet_line = changelog[bullet_at:changelog.index("\n", bullet_at)]
+    landing = re.search(r"§4\.8 \(added by #3554, (\d{4}-\d{2}-\d{2})\)", bullet_line)
+    block_date = re.search(r"\*\*Changelog v3\.\d+ \((\d{4}-\d{2}-\d{2})", header_line)
+    assert landing and block_date, (
+        f"both dates must be readable: bullet={bullet_line!r} header={header_line!r}")
+    assert landing.group(1) == block_date.group(1), (
+        f"§4.8 landed on {landing.group(1)} but sits under {header_line!r}, dated "
+        f"{block_date.group(1)} — a model section belongs to the block that "
+        "released it, not to whichever block happened to be newest when the "
+        "bullet was written")
 
 
 def test_ontology_section_4_8_owner_lists_match_the_declaration() -> None:

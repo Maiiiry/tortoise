@@ -35,6 +35,7 @@ so that state cannot creep back in.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from tortoise.raw_state import (
@@ -82,6 +83,31 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
             f"§4.6 carries {banned!r} — that is build state or an internal symbol, "
             "not a model rule; the build record belongs in ONTOLOGY-CHANGELOG.md"
         )
+    # The row states a 10-day BOUND, so it must name the authority that makes the
+    # number traceable instead of an independent literal: the `R1` ruling, cited
+    # WITH the document that defines it. The constant NAME is build detail (the
+    # negative arm above keeps it out), but its retention authority is model —
+    # and `tests/test_retention_promise.py` exempts a window claim only on a line
+    # that names a canonical constant or links the canonical doc, so dropping the
+    # citation turns the §4.6 row into an unlinked retention promise (the #9495
+    # review's P1). `R1` is resolvable, not dangling: it is defined in
+    # `tortoise/raw_state.py` and in the canonical doc, which cites it FOR this row.
+    row = next(line for line in section.splitlines()
+               if "`rawState` / `rawStateAt`" in line)
+    assert "R1" in row, (
+        "§4.6's raw-availability row must cite the `R1` ruling it implements — "
+        "the clause 'never a retention period on user content' is that ruling"
+    )
+    assert "docs/retention-and-deletion.md" in row, (
+        "§4.6's raw-availability row must cite the document that DEFINES `R1` "
+        "and is the sole authority for the deletion-marker window — a bare `R1` "
+        "label, or none, leaves the row's 10-day bound untraceable"
+    )
+    retention_doc = (REPO / "docs" / "retention-and-deletion.md").read_text(
+        encoding="utf-8")
+    assert re.search(r"\bR1\b", retention_doc), (
+        "the `R1` citation in §4.6 must resolve in the canonical doc it names"
+    )
     # F5: the stamp is defined generally (every state-carrying write), not only
     # as the deletion marker's expiry input.
     assert "minted on **every** state-carrying write" in section, (
