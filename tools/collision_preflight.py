@@ -5165,6 +5165,17 @@ def run_preflight(
             # stderr, and the predicate must classify the WHOLE of it
             # (#9402 review, P1).
             _exhausted = _is_budget_exhaustion(exc)
+            # ⛔ THE THIRD OF THE THREE RESCUE SITES, AND IT WAS THE MISSING ONE
+            # (#9423 review round 12, P3). The open-PR surface records its cause as
+            # DATA on both of its branches; this one — the issue-metadata rescue —
+            # is gated on the SAME predicate and knows the cause just as well, but
+            # left `_incomplete_remedy` to re-parse a note whose gh error is cut by
+            # `_one_line(..., limit=_REFUSED_READ_NOTE_LIMIT)`. Set it HERE, before
+            # the rescue is attempted, so BOTH outcomes (rescue succeeded but the
+            # surface is INCOMPLETE for another reason, and rescue failed) carry the
+            # cause without any prose surviving a truncation.
+            if _exhausted:
+                surfaces[SURFACE_ISSUE].budget_exhausted = True
             rescued: dict | None = None
             rest_why: str | None = None
             if _exhausted:

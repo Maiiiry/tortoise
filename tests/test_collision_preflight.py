@@ -398,6 +398,18 @@ case "$1 $2" in
       echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
       exit 1
     fi
+    # ⛔ PAST THE NOTE'S TRUNCATION POINT (#9423 review round 12, P3). The
+    # remedy classifies the surface NOTE, which embeds this stderr after
+    # `_one_line(..., limit=_REFUSED_READ_NOTE_LIMIT)` — a cut that keeps the
+    # FIRST N chars. The 240-char seam above sits well INSIDE the cut, so it
+    # cannot tell a surface that records its cause as DATA from one that re-parses
+    # the cut note. This one puts the signature past the cut, which is the only
+    # shape that discriminates the two.
+    if [ "${GH_STUB_ISSUE_VIEW_VERBOSE_EXHAUSTION:-0}" = "1" ]; then
+      printf 'gh-stub: retry trace: %s\n' "$(printf 'y%.0s' {1..900})" >&2
+      echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
+      exit 1
+    fi
     f="$d/issue.json"; printf '%s\n' "$@" > "$d/issue-argv.txt" ;;
   *) echo "gh-stub: unexpected argv: $*" >&2; exit 64 ;;
 esac
@@ -5576,6 +5588,40 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("a TARGET the tool cannot resolve (issue assignee/holder", out)
         self.assertIn("re-authenticating cannot change it", out)
         self.assertIn("and PART is:", out)
+
+    def test_the_issue_metadata_surface_records_a_budget_exhaustion_as_data(self):
+        # #9423 review round 12 (P3): three rescue sites know the cause from the
+        # SAME predicate, and two of them had stopped re-parsing prose. The third —
+        # the issue-metadata rescue — still relied on the note. This pins the
+        # NEGATIVE half, which is the discriminating one: a NON-exhaustion failure
+        # must NOT be flagged, or the remedy would name the budget for a cause the
+        # run never measured (the mirror-image of #9402's defect).
+        mod = _tool_module()
+        surface = mod.Surface(name=mod.SURFACE_ISSUE)
+        self.assertFalse(
+            surface.budget_exhausted,
+            "the flag must default False — a Surface that was never rescued from an "
+            "exhaustion has measured no such cause",
+        )
+        # The positive half is asserted end-to-end: with the GraphQL read
+        # exhausted and the REST rescue ALSO down (so the surface is INCOMPLETE and
+        # the remedy is printed), the verdict line names the budget rather than
+        # `gh auth`.
+        # ⛔ A VERBOSE stderr whose signature falls PAST the note's truncation
+        # point, plus a failed rescue — the only shape that discriminates "records
+        # the cause as DATA" from "re-parses the cut note". Measured: with the
+        # `budget_exhausted` flag site removed, this test fails.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_VERBOSE_EXHAUSTION": "1",
+            "GH_STUB_ISSUE_REST_FAIL": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        # The MIXED arm: the exhausted surface is named with the budget cause, and
+        # the remaining surface (`issue landed`, which could not read the issue at
+        # all) keeps the generic remedy — the two are SCOPED, not merged.
+        self.assertIn("PART of this is issue assignee/holder: a GRAPHQL BUDGET", out)
+        self.assertIn("while the remaining surface(s) (issue landed) need", out)
 
     def test_a_verbose_exhaustion_still_yields_the_budget_remedy_when_rest_fails(self):
         # #9423 review round 11 (P3): the round-10 fix recorded the cause as DATA
