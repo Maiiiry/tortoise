@@ -170,7 +170,10 @@ the epoch — that is the fence, in the store, not in the caller.
   `refs/claims/*`: the ledger keeps its history, so "who owned this, and when did they stop" is answerable.
 - **the capacity fields are stored, never measured** — `capacity.sh` measures (`host`, `ncpu`, `lpc`,
   `lanes`); this tool persists them **with the claim**, so the fleet's claim map and capacity map are one
-  record. It is not a second probe, and it does not touch `capacity.sh`.
+  record. It is not a second probe, and it does not touch `capacity.sh`. A field that was **not**
+  supplied is stored as the explicit marker `absent`, never as `0` — `0` is a measurement of an idle box,
+  and a claim taken without a measurement must not assert one. `status --repo --json` carries all four
+  through, so the shipped reader answers "who holds this, and on how loaded a box".
 
 ### 3.1 The failure path — it REFUSES, and says why
 
@@ -255,9 +258,11 @@ stores all of them.
   dispatch to call it is a separate, reviewable change in `agent-infra`.
 - **Did not migrate any other slice** — no worklist, no worktree registry, no PR publish pipeline. The
   brief was one slice, and a ledger that grows by one authority at a time is the point.
-- **Did not declare the kind in a pack.** `work-claim` is registered in-process
-  (`domain_loader.register_kind`); promoting it into `packs/agent-ops/manifest.yaml` is the follow-up
-  once a second consumer exists.
+- **Did not declare the kind in a pack.** `work-claim` is registered in-process by the tool's own
+  idempotent `register_claim_kind()` (`domain_loader.register_kind`), which `SDKClaimStore.__init__`
+  calls — deliberately not as an import-time side effect, because loading the domain loader prints the
+  pack/ontology boundary warnings and an import hook would put them on `--json`'s stdout. Promoting it
+  into `packs/agent-ops/manifest.yaml` is the follow-up once a second consumer exists.
 - **Did not re-litigate the owner ruling**, and did not treat `#7871`'s status as a blocker: its gap 0
   ("the live graph refuses every write") was measured against the **box-local** graph at `:16379`; every
   write in this pilot was verified against a live graph, and the hosted tenant is a different endpoint.

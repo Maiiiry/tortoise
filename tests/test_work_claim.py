@@ -20,6 +20,8 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -32,7 +34,9 @@ _MODULE_PATH = REPO_ROOT / "tools" / "work_claim.py"
 
 def _load_module():
     """Load `tools/work_claim.py` by path — `tools/` is not a package, and the module must
-    be importable exactly as the CLI runs it (same file, same import-time `register_kind`)."""
+    be importable exactly as the CLI runs it. The `work-claim` kind is registered by an
+    explicit `register_claim_kind()` call (`SDKClaimStore.__init__` makes it), never as an
+    import-time side effect — see `test_the_claim_kind_is_registered_by_an_explicit_call`."""
     spec = importlib.util.spec_from_file_location("_work_claim_under_test", _MODULE_PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -124,6 +128,12 @@ class FakeStore:
                         "lease_until": rec.lease_until,
                         "epoch": rec.epoch,
                         "session": rec.session,
+                        # The shipped reader carries these through too; the fake mirrors the
+                        # SHIPPED shape rather than a convenient subset (review of #9487).
+                        "host": rec.host,
+                        "ncpu": rec.ncpu,
+                        "lpc": rec.lpc,
+                        "lanes": rec.lanes,
                     }
                 )
         return rows
@@ -806,6 +816,155 @@ def test_capacity_fields_are_persisted_with_the_claim_not_measured():
     assert out.rc == 0
     back = wc._parse(store.points[wc.claim_id("daniel-ospina/tortoise", "issue-5052")])
     assert (back.host, back.ncpu, back.lpc, back.lanes) == ("cell-1", 8, 372, 3)
+
+
+def test_a_claim_taken_without_capacity_flags_stores_absent_not_zero():
+    """⛔ `content()` emitted `ncpu=0 lpc=0 lanes=0` unconditionally and the CLI defaulted all
+    three to 0, so a claim taken without the capacity flags was INDISTINGUISHABLE from a
+    measured idle box — the one thing a capacity map must not assert. Passing them is
+    optional, so "not supplied" has to be its own value (review of #9487)."""
+    store = FakeStore()
+    rc = wc.main(
+        ["acquire", "--repo", "daniel-ospina/tortoise", "--issue", "5052",
+         "--session", "cell-t1"],
+        store=store,
+    )
+    assert rc == wc.EXIT_OK
+    (content,) = store.points.values()
+    assert "ncpu=absent" in content and "lpc=absent" in content and "lanes=absent" in content
+    back = wc._parse(content)
+    assert (back.ncpu, back.lpc, back.lanes) == (None, None, None)
+    # ...and the props omit them rather than seeding the graph's capacity map with a zero.
+    assert "ncpu" not in back.props()
+    assert back.content() == content, "an absent field must round-trip byte-identically"
+
+
+def test_an_absent_capacity_field_is_not_a_measured_zero():
+    """`0` and `absent` are different facts and must stay different in content and in props."""
+    absent = _record().content()
+    measured_idle = _record(ncpu=0, lpc=0, lanes=0).content()
+    assert absent != measured_idle
+    assert "ncpu=absent" in absent and "ncpu=0" in measured_idle
+    assert wc._parse(absent).ncpu is None
+    assert wc._parse(measured_idle).ncpu == 0
+    assert "ncpu" not in _record().props()
+    assert _record(ncpu=0).props()["ncpu"] == 0
+
+
+def test_the_shipped_repo_listing_carries_host_and_capacity():
+    """The paragraph above promises a reader can answer "who holds this, and on how loaded a
+    box" from one store — but `SDKClaimStore.query_repo` returned only key/owner/lease/epoch/
+    session and dropped `host`/`ncpu`/`lpc`/`lanes`, so that promise held only for a caller
+    writing its own Cypher (review of #9487). Pinned on the SHIPPED reader, not the fake."""
+
+    class _Result:
+        def __init__(self, rows):
+            self.result_set = rows
+
+    class _Graph:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def query(self, cypher, params=None):  # the seam's shape, not its Cypher
+            return _Result(self._rows)
+
+    class _Proj:
+        def __init__(self, rows):
+            self.g = _Graph(rows)
+
+    class _SDK:
+        _db_uri = "docker://:pw@shared.example:6379/tortoise_test_matrix"
+
+        def __init__(self, rows):
+            self._rows = rows
+
+        def _get_proj(self):
+            return _Proj(self._rows)
+
+    repo = "daniel-ospina/tortoise"
+    measured = _record(key="issue-1", host="cell-1", ncpu=8, lpc=372, lanes=3)
+    unmeasured = _record(key="issue-2", host="cell-2")
+    store = wc.SDKClaimStore(
+        sdk=_SDK(
+            [
+                (wc.claim_id(repo, "issue-1"), measured.content(), 3),
+                (wc.claim_id(repo, "issue-2"), unmeasured.content(), 1),
+            ]
+        )
+    )
+    listed = {row["key"]: row for row in store.query_repo(repo)}
+    assert (listed["issue-1"]["host"], listed["issue-1"]["ncpu"],
+            listed["issue-1"]["lpc"], listed["issue-1"]["lanes"]) == ("cell-1", 8, 372, 3)
+    assert listed["issue-2"]["host"] == "cell-2"
+    assert listed["issue-2"]["ncpu"] is None, "an unmeasured claim is not a measured idle box"
+
+
+def test_status_repo_json_exposes_the_capacity_fields():
+    """`status --repo --json` is the shipped reader a controller branches on, so the fields
+    the record holds have to reach it."""
+    store = FakeStore()
+    wc.acquire(store, _record(host="cell-1", ncpu=8, lpc=372, lanes=3), now=NOW)
+    out = wc.status(store, "daniel-ospina/tortoise", None, now=NOW)
+    assert out.rc == wc.EXIT_OK
+    row = out.as_dict()["extra"]["claims"][0]
+    assert (row["host"], row["ncpu"], row["lpc"], row["lanes"]) == ("cell-1", 8, 372, 3)
+
+
+def test_the_claim_kind_is_registered_by_an_explicit_call():
+    """The comment on `CLAIM_KIND` said the kind "is registered at import"; importing the
+    module registered NOTHING (only `SDKClaimStore.__init__` did), so the forgotten-
+    registration reader the comment warned about was exactly the one it did not cover. It is
+    now an explicit, idempotent `register_claim_kind()` — and deliberately NOT an import-time
+    side effect, which would print the domain loader's pack warnings onto `--json`'s stdout.
+
+    Measured in a FRESH interpreter: in this process the module is already loaded and other
+    tests have constructed the store, so the import-order property is not observable here.
+    """
+    script = "\n".join(
+        [
+            "import importlib.util, sys",
+            f"spec = importlib.util.spec_from_file_location('_wc_probe', {str(_MODULE_PATH)!r})",
+            "module = importlib.util.module_from_spec(spec)",
+            "sys.modules['_wc_probe'] = module",
+            "spec.loader.exec_module(module)",
+            "from tortoise.domain_loader import kind_is_known",
+            "before = kind_is_known(module.CLAIM_KIND)",
+            "module.register_claim_kind()",
+            "after = kind_is_known(module.CLAIM_KIND)",
+            "module.register_claim_kind()  # idempotent, must not raise",
+            "print('KIND', before, after, file=sys.stderr)",
+        ]
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    marker = [ln for ln in proc.stderr.splitlines() if ln.startswith("KIND ")]
+    assert marker, proc.stderr
+    assert marker[-1].split()[1:] == ["False", "True"], marker[-1]
+
+
+def test_usage_block_advertises_the_explicit_interpreter_form():
+    """⛔ The file is committed `100644`, so `tools/work_claim.py acquire …` is
+    `Permission denied` — shell exit 126, outside the tool's own documented rc 0/1/2/3 — and
+    the USAGE block advertised exactly that bare form for all six examples. The siblings
+    (`collision_preflight.py`, `who_is_on.py`, `branch_reaper.py`) all document
+    `uv run python tools/<tool>.py`, as does this module's own #5128 guard message and the
+    evidence README §6 (review of #9487)."""
+    usage = wc.__doc__ or ""
+    assert "USAGE" in usage
+    invocations = [
+        line.strip()
+        for line in usage.splitlines()
+        if re.search(r"(^|\s)tools/work_claim\.py (acquire|status|release|check)\b", line)
+    ]
+    assert len(invocations) >= 6, invocations
+    bad = [
+        line
+        for line in invocations
+        if not line.startswith("uv run python tools/work_claim.py ")
+    ]
+    assert not bad, bad
 
 
 def test_json_outcome_carries_the_decision_a_controller_logs():

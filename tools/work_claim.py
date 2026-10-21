@@ -106,21 +106,31 @@ The in-flight `capacity.sh` (`refs/boxes/<host>/<record>`) already MEASURES each
 `host`, `ncpu`, `load1`, `lpc`, `lanes`, disk, memory. This tool never measures anything:
 it accepts those fields on the command line and persists them WITH the claim, so the
 fleet's capacity map and its claim map are the same record and a reader can answer "who
-holds this, and on how loaded a box" from one store. Passing them is optional; omitting
-them stores the claim without any capacity claim rather than a zero.
+holds this, and on how loaded a box" from one store. Passing them is optional, and a field
+that was NOT supplied is stored as `absent` — an explicit marker, never a zero. That
+distinction is the whole point: `ncpu=0` is a MEASURED idle box, and a claim taken without a
+measurement must not assert one (review of #9487). `status --repo --json` carries `host`,
+`ncpu`, `lpc` and `lanes` through, so the shipped reader answers that question without
+hand-written Cypher.
 
 USAGE
 -----
-    tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 \
+⛔ The file is committed `100644` (not executable), so every invocation goes through an
+explicit interpreter: a bare `tools/work_claim.py …` is `Permission denied` — shell exit 126,
+outside the `rc 0/1/2/3` contract below (review of #9487). The repo's sibling tools document
+the same form.
+
+    uv run python tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 \
         --session cell-t1 --branch feat/x --purpose "claim registry pilot"
-    tools/work_claim.py status --repo daniel-ospina/tortoise [--json]     # repo-wide listing
-    tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json
-    tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1
-    tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 \
+    uv run python tools/work_claim.py status --repo daniel-ospina/tortoise [--json]
+    uv run python tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json
+    uv run python tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 \
+        --session cell-t1
+    uv run python tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 \
         --session cell-t9 --force --reason "holder crashed, lease expired 2h ago"
-    tools/work_claim.py check            # is the store reachable AND shared? prints the
-                                         # target; rc 2 = no (a box-local target is rc 2
-                                         # unless --allow-box-local acknowledges a trial)
+    uv run python tools/work_claim.py check   # is the store reachable AND shared? prints the
+                                              # target; rc 2 = no (a box-local target is rc 2
+                                              # unless --allow-box-local acknowledges a trial)
 
 STORE
 -----
@@ -165,14 +175,44 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-# The kind is registered at import so both the writer and every reader agree on it. The
-# registry is per-process (`domain_loader.register_kind` mutates an in-memory set), which is
-# why registration lives in the module rather than in a caller: a reader that forgot to
-# register would get a warn-not-block unknown-kind warning on every query and could sort the
-# claim out of a kind-filtered read. Promoting it into `packs/agent-ops/manifest.yaml` is the
-# follow-up once the pilot has a second consumer — that is a pack/ontology change and this
-# module does not make it.
+# The kind is registered by `register_claim_kind()` below — NOT by importing this module.
+# The registry is per-process (`domain_loader.register_kind` mutates an in-memory set), and
+# loading it pulls the pack/ontology tree in and prints its boundary warnings, so registering
+# at import time would put that noise on `--json`'s stdout. `SDKClaimStore.__init__` calls it,
+# so the write path needs nothing from a caller; a second consumer (a reader) calls it
+# explicitly, because a reader that forgot would get a warn-not-block unknown-kind warning on
+# every query and could sort the claim out of a kind-filtered read. Promoting it into
+# `packs/agent-ops/manifest.yaml` is the follow-up once the pilot has a second consumer — that
+# is a pack/ontology change and this module does not make it.
 CLAIM_KIND = "work-claim"
+
+#: The content-line marker for a capacity field that was NEVER supplied. Deliberately not `0`:
+#: this record doubles as the fleet's capacity map, so "not measured" and "measured idle" must
+#: be different values (review of #9487).
+CAP_ABSENT = "absent"
+
+
+def register_claim_kind() -> str:
+    """Register `CLAIM_KIND` in THIS process' kind registry; returns the kind.
+
+    Idempotent (`register_kind` adds to a set) and explicit rather than an import-time side
+    effect — see the comment on `CLAIM_KIND` for why. `SDKClaimStore.__init__` calls it, so
+    the writer needs no extra step; a reader that imports this module for `claim_id()` /
+    `_parse()` / `CLAIM_KIND` must call it before a kind-filtered read.
+
+    Review of #9487: the comment here used to say the kind "is registered at import", which
+    was false — importing the module registered nothing — so exactly the forgotten-
+    registration failure that comment described was reachable by the reader it was about.
+    """
+    from tortoise.domain_loader import register_kind
+
+    register_kind(CLAIM_KIND)
+    return CLAIM_KIND
+
+
+def _cap_token(value: int | None) -> str:
+    """A capacity field as it appears in the canonical content line (see `CAP_ABSENT`)."""
+    return CAP_ABSENT if value is None else str(int(value))
 
 #: Seconds a claim is held before a peer may reclaim it. Mirrors `claims.sh`'s issue-claim
 #: default (3 h) and is clamped by the caller, never extended implicitly: a lease that grows
@@ -230,9 +270,12 @@ class ClaimRecord:
     purpose: str = ""
     claimed_at: int = 0
     host: str = ""
-    ncpu: int = 0
-    lpc: int = 0
-    lanes: int = 0
+    #: `None` means NOT SUPPLIED — serialised as `CAP_ABSENT`, never as `0`. An unmeasured
+    #: claim and a measured idle box (`ncpu=0`) are different facts, and this record is the
+    #: fleet's capacity map too (review of #9487).
+    ncpu: int | None = None
+    lpc: int | None = None
+    lanes: int | None = None
 
     def content(self) -> str:
         # Field order is part of the contract: a reordering would make every historical
@@ -259,14 +302,14 @@ class ClaimRecord:
                 f"purpose={q(self.purpose)}",
                 f"claimed_at={int(self.claimed_at)}",
                 f"host={q(self.host)}",
-                f"ncpu={int(self.ncpu)}",
-                f"lpc={int(self.lpc)}",
-                f"lanes={int(self.lanes)}",
+                f"ncpu={_cap_token(self.ncpu)}",
+                f"lpc={_cap_token(self.lpc)}",
+                f"lanes={_cap_token(self.lanes)}",
             ]
         )
 
     def props(self) -> dict[str, Any]:
-        return {
+        props: dict[str, Any] = {
             "repo": self.repo,
             "claimKey": self.key,
             # ⚠️ NOT `owner`: the SDK reserves `owner` for tenant ownership and SILENTLY
@@ -282,10 +325,15 @@ class ClaimRecord:
             "purpose": self.purpose,
             "claimed_at": int(self.claimed_at),
             "host": self.host,
-            "ncpu": int(self.ncpu),
-            "lpc": int(self.lpc),
-            "lanes": int(self.lanes),
         }
+        # A capacity field that was never supplied is OMITTED from the props, not written as
+        # 0: the graph is the fleet's capacity map, and a fabricated zero there reads as a
+        # measured idle box (review of #9487).
+        for name in ("ncpu", "lpc", "lanes"):
+            value = getattr(self, name)
+            if value is not None:
+                props[name] = int(value)
+        return props
 
 
 class ClaimStore(Protocol):
@@ -418,16 +466,14 @@ class SDKClaimStore:
     """
 
     def __init__(self, sdk: Any = None, *, allow_box_local: bool = False) -> None:
+        # Register the kind HERE rather than at import (see the comment on `CLAIM_KIND`): the
+        # writer's own raw-Cypher path never needed it, but every later kind-filtered read of
+        # these points does, and an injected client (tests) needs it just the same.
+        register_claim_kind()
         if sdk is None:
-            from tortoise.domain_loader import register_kind
             from tortoise.sdk import TortoiseSDK
 
-            register_kind(CLAIM_KIND)
             sdk = TortoiseSDK()
-        else:  # injected client (tests) still needs the kind registered
-            from tortoise.domain_loader import register_kind
-
-            register_kind(CLAIM_KIND)
         # Belt and braces over `_require_store_configured` (review of #9487 P0), and it applies
         # to an INJECTED client too: if a caller reaches this class directly with a target that
         # resolved to the box-local file, the write would be confirmed by its own read-back and
@@ -602,6 +648,13 @@ class SDKClaimStore:
                     "lease_until": rec.lease_until,
                     "epoch": rec.epoch,
                     "session": rec.session,
+                    # Carried through so `status --repo --json` answers "who holds this, and on
+                    # how loaded a box" from the SHIPPED reader instead of hand-written Cypher
+                    # (review of #9487). `None` = never measured, which is not `0`.
+                    "host": rec.host,
+                    "ncpu": rec.ncpu,
+                    "lpc": rec.lpc,
+                    "lanes": rec.lanes,
                 }
             )
         return out
@@ -1066,6 +1119,18 @@ def _int_field(content: str, name: str) -> int:
         return 0
 
 
+def _opt_int_field(content: str, name: str) -> int | None:
+    """A capacity field, with `absent`/missing preserved as `None` — never coerced to `0`
+    (review of #9487: `0` is a measurement of an idle box, not the absence of one)."""
+    raw = _field(content, name)
+    if raw in ("", CAP_ABSENT):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _tokens(content: str) -> list[str]:
     """Split the canonical line into `k=v` tokens, keeping quoted values whole."""
     out: list[str] = []
@@ -1105,9 +1170,9 @@ def _parse(content: str) -> ClaimRecord:
         purpose=_field(content, "purpose"),
         claimed_at=_int_field(content, "claimed_at"),
         host=_field(content, "host"),
-        ncpu=_int_field(content, "ncpu"),
-        lpc=_int_field(content, "lpc"),
-        lanes=_int_field(content, "lanes"),
+        ncpu=_opt_int_field(content, "ncpu"),
+        lpc=_opt_int_field(content, "lpc"),
+        lanes=_opt_int_field(content, "lanes"),
     )
 
 
@@ -1173,9 +1238,11 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
     acq.add_argument("--ttl", type=int, default=DEFAULT_TTL)
     # Capacity fields: MEASURED BY capacity.sh, never by this tool (see the module docstring).
     acq.add_argument("--host", default="")
-    acq.add_argument("--ncpu", type=int, default=0)
-    acq.add_argument("--lpc", type=int, default=0, help="load-per-cpu x100, as capacity.sh emits it")
-    acq.add_argument("--lanes", type=int, default=0)
+    # `default=None` = NOT SUPPLIED, stored as `absent` rather than a fabricated 0 (review of
+    # #9487): the record is the fleet's capacity map, where 0 claims a measured idle box.
+    acq.add_argument("--ncpu", type=int, default=None)
+    acq.add_argument("--lpc", type=int, default=None, help="load-per-cpu x100, as capacity.sh emits it")
+    acq.add_argument("--lanes", type=int, default=None)
 
     rel = sub.add_parser("release", parents=[common], help="release a claim this owner holds")
     rel.add_argument("--repo", required=True)
@@ -1274,7 +1341,8 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
         # (review of #9487 P3).
         if args.cmd == "acquire":
             for flag in ("ncpu", "lpc", "lanes"):
-                if int(getattr(args, flag, 0)) < 0:
+                raw = getattr(args, flag, None)
+                if raw is not None and int(raw) < 0:
                     raise ValueError(f"--{flag} must not be negative (it is a measurement)")
         number = int(getattr(args, "pr", None) or 0) or int(getattr(args, "issue", None) or 0)
         kind = "pr" if int(getattr(args, "pr", None) or 0) else args.kind
