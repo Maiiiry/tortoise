@@ -35,22 +35,38 @@ absence. That is why this file checks the *writer census*, not another grep.
 WHAT IS PINNED
 --------------
 1. `test_the_absolute_property_free_sentences_do_not_reappear` — the retracted
-   sentences are matched as literals against the live documents. This is the
-   non-vacuity half: all of them were present before this fix.
+   sentences are matched MARKER-INSENSITIVELY (`**`, backticks, whitespace) —
+   never as raw substrings, because a `**no**` bolding once made an entry here
+   match nothing at all: a pin that cannot match is a pin that cannot red. Each
+   was live in the pre-fix documents; the entries a reader can still find are
+   quoted in the changelog, and
+   `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
+   checks that, so a dead literal cannot hide in this dict again.
 2. `test_the_corrected_passages_name_the_property_bearing_class` — the
    corrected passages must POSITIVELY name the writers and the property, so a
-   silent revert reds here.
+   silent revert reds here. Each assertion is scoped to the CORRECTED SECTION
+   (§11.1, §13, the extractor's §13.8 q2 paragraph), not to the whole file: a
+   file-wide membership test cannot red on a section's silent deletion — the
+   lesson `config/ci-surfaces.yml` records from the `#8639` review.
 3. `test_the_code_still_agrees_with_the_corrected_evidence` — each recorded
    writer still writes `confidence` onto an `about*` edge. If that code is
    removed, the document has re-rotted in the other direction and this reds
    instead of the doc quietly lying again.
 4. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
    every relationship-variable `SET <var>.<prop>` inside a function that builds
-   an `about*` edge must be one of the recorded writers. A NEW property-bearing
-   about-edge writer cannot appear without being recorded.
+   an `about*` edge must be one of the recorded writers, so a NEW writer in that
+   FORM cannot appear without being recorded. ⚠️ **The form is the limit.** A
+   property written by a property MAP (`SET r += $props` / `SET r = $p`) is
+   invisible to this leg, so those sites are pinned separately by
+   `test_map_form_relationship_writes_are_a_recorded_residual`: they are
+   GENERIC (the property set is the caller's or the record row's, on any
+   allowlisted predicate, `about*` included), which is why they are a recorded
+   residual rather than a second *named* about-edge property.
 5. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
-   the binder, that sentence becomes false while every other test stays green.
+   the binder, **or stops being the fall-through branch** of the
+   `TORTOISE_SESSION_EXTRACTOR == "m2"` selection, that sentence becomes false
+   while every other test stays green.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -78,12 +94,14 @@ STORAGE_CHANGELOG = (
 )
 
 #: The sentences that were TRUE only because the search could not see a `SET`.
-#: Each was live in the pre-fix documents (this file is red on them).
+#: Each was live in the pre-fix documents (this file is red on them). One
+#: sentence was said twice — bolded in §13, unbolded in the extractor's §13.8
+#: q2 and in §11.3 — and matching is marker-insensitive, so it is ONE entry.
 RETRACTED: dict[str, str] = {
     "§11.1 calls the links property-free and reports a zero search": (
         "Our `aboutObject` links are **property-free**"
     ),
-    "§13 closes the structural door with 'any property'": (
+    "the 'no property on an aboutObject edge' absolute (§13, §13.8 q2)": (
         "**no** `aboutObject` edge carries **any property**"
     ),
     "§13's inference of semantic freedom": (
@@ -92,13 +110,54 @@ RETRACTED: dict[str, str] = {
     "§11.1's cost sentence presents the zero as measured": (
         "a full-repo search for a property-bearing edge finds **none**"
     ),
-    "§13.8 q2 repeats the property-free claim": (
-        "no `aboutObject` edge carries any property"
+    "§11.2's cost footnote calls the retracted finding measured": (
+        "from the measured property-free finding"
+    ),
+    "§11.3's table states the retracted absolute as the cost basis": (
+        "**property-free rows**"
+    ),
+    "§11.3's prose states the retracted absolute about both predicates": (
+        "the entity links stay bare"
     ),
     "the decision ledger's reason is property-freedom": (
         "Cheap because edges are **property-free**"
     ),
 }
+
+#: Where each retracted sentence is still quoted, once the corrected live docs no
+#: longer carry it: the APPEND-ONLY changelog is the one place it is allowed to
+#: live. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
+#: requires each of these to be findable there (marker-insensitively), because a
+#: literal that matches nothing is a dead pin — and this dict already shipped one.
+RETRACTED_QUOTED_IN: dict[str, Path] = {
+    "§11.1 calls the links property-free and reports a zero search": (
+        STORAGE_CHANGELOG
+    ),
+    "the 'no property on an aboutObject edge' absolute (§13, §13.8 q2)": (
+        STORAGE_CHANGELOG
+    ),
+    "§13's inference of semantic freedom": STORAGE_CHANGELOG,
+    "§11.1's cost sentence presents the zero as measured": STORAGE_CHANGELOG,
+    "§11.2's cost footnote calls the retracted finding measured": (
+        STORAGE_CHANGELOG
+    ),
+    "§11.3's table states the retracted absolute as the cost basis": (
+        STORAGE_CHANGELOG
+    ),
+    "§11.3's prose states the retracted absolute about both predicates": (
+        STORAGE_CHANGELOG
+    ),
+}
+
+#: The one retracted sentence that this correction REWROTE rather than quoted, so
+#: it has no home to be found in today: its pre-fix form is the extractor ledger's
+#: `aboutObject` decision row (`git show <merge-base>:docs/architecture/`
+#: `EXTRACTOR-V4-ARCHITECTURE-CHANGELOG.md`). Listed so that EVERY entry above is
+#: either checkable (``RETRACTED_QUOTED_IN``) or declared un-checkable, instead of
+#: silently being neither.
+RETRACTED_PRE_FIX_ONLY: frozenset[str] = frozenset({
+    "the decision ledger's reason is property-freedom",
+})
 
 #: The writers the corrected passages must name, and the code shape that makes
 #: each one a property-bearing `about*` writer.
@@ -119,6 +178,10 @@ RECORDED_WRITERS: dict[tuple[str, str], tuple[str, ...]] = {
 PROPERTY = "confidence"
 
 _SET_ON = re.compile(r"SET\s+(\w+)\.(\w+)\s*=")
+#: The OTHER form a property is written in: a property MAP on a relationship
+#: variable. `_SET_ON` cannot see it — which is the same "the pattern cannot match
+#: the writer" defect this whole file exists to correct, one level down.
+_MAP_SET_ON = re.compile(r"SET\s+(\w+)\s*(?:\+=|=)\s*(?:\$\w+|properties\(|\{)")
 #: A relationship pattern, captured as (variable, relationship-token).
 _PATTERN = re.compile(r"\[(\w+):([^\]]{0,120})\]")
 _ABOUT_REL = re.compile(
@@ -140,10 +203,109 @@ _ABOUT_VOCAB: tuple[str, ...] = (
     "_ROLE_TARGET",
 )
 
+#: The three corrected passages, as (label, doc, start marker, end marker, the
+#: literals that must survive INSIDE the slice). Section-scoped on purpose: the
+#: same symbol names appear in the other corrected section of the same file, so a
+#: whole-file membership test cannot red on one passage's silent deletion.
+CORRECTED_PASSAGES: tuple[tuple[str, Path, str, str, tuple[str, ...]], ...] = (
+    (
+        "STORAGE-ARCHITECTURE.md §11.1",
+        STORAGE,
+        "\n### 11.1 ",
+        "\n### 11.2 ",
+        (
+            "link_entity",
+            "bind_point_subjects",
+            "_fold_entity_linked_reason",
+            f"`{PROPERTY}`",
+            # The surviving true half: the GENERIC writer sets nothing.
+            "create_about_edge",
+        ),
+    ),
+    (
+        "STORAGE-ARCHITECTURE.md §13",
+        STORAGE,
+        "\n## 13. ",
+        "\n## 14. ",
+        (
+            "link_entity",
+            "bind_point_subjects",
+            "_fold_entity_linked_reason",
+            f"`{PROPERTY}`",
+            "create_about_edge",
+        ),
+    ),
+    (
+        "EXTRACTOR-V4-ARCHITECTURE.md §13.8 q2",
+        EXTRACTOR,
+        "\n2. **Should `aboutObject` be a stored edge or a derived join?**",
+        "\n3. **Should every expansion have a hard fan-out cap**",
+        ("link_entity", "bind_point_subjects", f"`{PROPERTY}`"),
+    ),
+)
+
+#: Relationship-variable property-MAP writes (`SET r += $props`, `SET r = $p`,
+#: `ON CREATE SET r2 = properties(r)`) — the form `_SET_ON` cannot see, and the
+#: reason the census above is a bound on ONE form rather than on "properties on
+#: about edges". Every recorded site is GENERIC: the property set is the caller's
+#: or the record row's, applied to whatever allowlisted predicate it is handed
+#: (`about*` included), so it is a bounded residual of the cost argument rather
+#: than a second *named* property. A NEW one reds this leg — the pattern that
+#: cannot see a writer must never again be the reason a writer goes unrecorded.
+MAP_FORM_RESIDUAL: frozenset[tuple[str, str]] = frozenset({
+    ("tortoise/cache_projection.py", "relation_statement"),
+    ("tortoise/hosted_backup.py", "restore_graph"),
+    ("tortoise/projection/__init__.py", "_rebuild_all_replay"),
+    ("tortoise/sdk.py", "supersede_point"),
+    ("tortoise/sdk.py", "create_direct_edge"),
+    ("tortoise/session_source_migration.py", "_move_out"),
+    ("tortoise/session_source_migration.py", "_move_in"),
+})
+
 
 def _doc(path: Path) -> str:
     assert path.exists(), f"{path} is missing"
     return path.read_text(encoding="utf-8")
+
+
+_MARKUP = re.compile(r"[*`]")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def _flat(text: str) -> str:
+    """Marker-insensitive form of a sentence, for pinning RETRACTED literals.
+
+    `**no** `aboutObject` edge carries any property` and the unbolded variant are
+    the SAME retracted claim; matching raw substrings made one of them a dead pin
+    that could never red (it shipped that way once). Emphasis and code markers
+    are decoration on the claim, not part of it.
+    """
+    return _WHITESPACE.sub(" ", _MARKUP.sub("", text))
+
+
+def _section(text: str, start: str, end: str, label: str) -> str:
+    """One section slice, with BOTH markers and real content asserted.
+
+    A correction can only be pinned inside the passage that carries it: the same
+    literals appear elsewhere in a 1,400-line document, so a whole-file
+    membership test stays green while the corrected passage is deleted.
+    """
+    assert start in text, (
+        f"{label}: the section heading {start.strip()!r} is gone — the passage "
+        "this guard is scoped to no longer exists"
+    )
+    body = text[text.index(start):]
+    assert end in body, (
+        f"{label}: {end.strip()!r} is gone, so the passage cannot be bounded — "
+        "the document was restructured and this guard must be re-aimed, not "
+        "left measuring the rest of the file"
+    )
+    body = body[: body.index(end)]
+    assert len(body) > 200, (
+        f"{label}: the slice is {len(body)} characters — the passage is empty, "
+        "so every assertion below would be vacuous"
+    )
+    return body
 
 
 def _own_body(node: ast.AST, lines: list[str]) -> str:
@@ -206,6 +368,38 @@ def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
     return found
 
 
+def _map_form_relationship_writes() -> dict[tuple[str, str], set[str]]:
+    """{(module, symbol): {"r += $props", …}} for property-MAP writes on an edge.
+
+    Deliberately NOT filtered by `about*`: the relationship name at these sites is
+    a caller's or a record row's, so the predicate is not visible in the text at
+    all — which is exactly why they cannot be classified as "about" or "not".
+    """
+    found: dict[tuple[str, str], set[str]] = {}
+    for path in sorted(PKG.rglob("*.py")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "SET" not in text:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:  # pragma: no cover — a broken module fails elsewhere
+            continue
+        lines = text.splitlines()
+        module = path.relative_to(ROOT).as_posix()
+        for qualname, node in _qualified(tree):
+            body = _own_body(node, lines)
+            rel_vars = {var for var, _rel in _PATTERN.findall(body)}
+            if not rel_vars:
+                continue
+            for match in _MAP_SET_ON.finditer(body):
+                var = match.group(1)
+                if var in rel_vars:
+                    found.setdefault((module, qualname.split(".")[-1]), set()).add(
+                        f"SET {var} <map>"
+                    )
+    return found
+
+
 # ── 1. the retracted sentences ─────────────────────────────────────────────
 
 
@@ -227,9 +421,9 @@ def test_the_absolute_property_free_sentences_do_not_reappear():
         f"{label}: {sentence!r}"
         for label, sentence in RETRACTED.items()
         for name, text in live.items()
-        if sentence in text
+        if _flat(sentence) in _flat(text)
     ]
-    if RETRACTED["the decision ledger's reason is property-freedom"] in ledger:
+    if _flat(RETRACTED["the decision ledger's reason is property-freedom"]) in _flat(ledger):
         survivors.append(
             "EXTRACTOR-V4-ARCHITECTURE-CHANGELOG.md: the `aboutObject` decision "
             "row still gives property-freedom as its reason"
@@ -249,26 +443,38 @@ def test_the_absolute_property_free_sentences_do_not_reappear():
 
 
 def test_the_corrected_passages_name_the_property_bearing_class():
-    storage = _doc(STORAGE)
-    extractor = _doc(EXTRACTOR)
-    for name, text in (
-        ("STORAGE-ARCHITECTURE.md", storage),
-        ("EXTRACTOR-V4-ARCHITECTURE.md", extractor),
-    ):
-        for symbol in ("link_entity", "bind_point_subjects"):
-            assert symbol in text, (
-                f"{name} does not name `{symbol}` — the corrected evidence must "
-                "name the writers that put a property on an about edge"
+    for label, path, start, end, required in CORRECTED_PASSAGES:
+        passage = _section(_doc(path), start, end, label)
+        for literal in required:
+            assert literal in passage, (
+                f"{label} no longer names `{literal}` — the corrected passage "
+                "must POSITIVELY name the writers and the property, so that "
+                "deleting the correction reds here instead of leaving the "
+                "false 'property-free' claim to be re-derived"
             )
-        assert f"`{PROPERTY}`" in text or f"r.{PROPERTY}" in text, (
-            f"{name} does not name the `{PROPERTY}` property — the claim "
-            "'property-free' is replaced by a named, bounded exception, not by "
-            "silence"
-        )
-    # The surviving true half must stay stated: the GENERIC writer sets nothing.
-    assert "create_about_edge" in storage, (
-        "STORAGE-ARCHITECTURE.md no longer distinguishes the generic writer "
-        "(`create_about_edge`, no SET) from the binder's property-bearing one"
+
+
+def test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live():
+    #: A literal that matches nothing can never red — and this dict shipped one
+    #: (`**no**` was unpinned, so restoring the whole retracted sentence into the
+    #: extractor doc left six legs green). Every entry must therefore be either
+    #: findable in the changelog that quotes it, or declared pre-fix-only.
+    assert set(RETRACTED) == set(RETRACTED_QUOTED_IN) | set(RETRACTED_PRE_FIX_ONLY), (
+        "a RETRACTED entry is classified nowhere: it is neither quoted in a "
+        "changelog (RETRACTED_QUOTED_IN) nor declared pre-fix-only "
+        "(RETRACTED_PRE_FIX_ONLY), so nothing proves it can ever match text"
+    )
+    dead = [
+        f"{label}: {sentence!r} is not in {path.name}"
+        for label, sentence in RETRACTED.items()
+        if label in RETRACTED_QUOTED_IN
+        for path in [RETRACTED_QUOTED_IN[label]]
+        if _flat(sentence) not in _flat(_doc(path))
+    ]
+    assert not dead, (
+        "these retracted sentences are pinned but findable nowhere — a pin that "
+        "cannot match the pre-fix text cannot red on a re-rot:\n  "
+        + "\n  ".join(dead)
     )
 
 
@@ -328,7 +534,42 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
     )
 
 
-# ── 5. the reach claim the corrected text makes ────────────────────────────
+# ── 5. the other property form: a MAP on a relationship variable ────────────
+
+
+def test_map_form_relationship_writes_are_a_recorded_residual():
+    found = _map_form_relationship_writes()
+    assert found, (
+        "the map-form census found no relationship-variable `SET <var> += $props` "
+        "at all — the pattern or the relationship-pattern rule was changed and "
+        "this leg has stopped measuring anything"
+    )
+    unrecorded = sorted(
+        f"{module}::{symbol} ({', '.join(sorted(forms))})"
+        for (module, symbol), forms in found.items()
+        if (module, symbol) not in MAP_FORM_RESIDUAL
+    )
+    assert not unrecorded, (
+        "these functions write a property MAP onto a relationship variable and "
+        "are recorded nowhere:\n  " + "\n  ".join(unrecorded)
+        + "\nA generic map write can land on an `about*` predicate — the edge "
+        "is chosen by the caller or the record row, not by this code — so it "
+        "is part of the property evidence. Record it in MAP_FORM_RESIDUAL with "
+        "the reason it is generic, and re-derive the documents' property claim."
+    )
+    disappeared = sorted(
+        f"{module}::{symbol}"
+        for module, symbol in MAP_FORM_RESIDUAL
+        if (module, symbol) not in found
+    )
+    assert not disappeared, (
+        "these recorded map-form writers no longer exist — delete them from "
+        "MAP_FORM_RESIDUAL in the same change, so the residual stays a "
+        "measurement instead of a memory:\n  " + "\n  ".join(disappeared)
+    )
+
+
+# ── 6. the reach claim the corrected text makes ────────────────────────────
 
 
 def test_the_default_ingestion_path_reaches_the_binder():
@@ -340,10 +581,38 @@ def test_the_default_ingestion_path_reaches_the_binder():
         "corrected evidence's reach claim ('default-ON, ingestion path') "
         "depends on this call"
     )
+    # The DEFAULT-ON half is not in `_extract_session_v2` at all: it is the
+    # extractor selection. `m2` is the opt-out, and v2 is the fall-through — so
+    # flipping the default to m2 would make the corrected sentence false while
+    # the call above stayed in place.
+    tree = ast.parse(sdk)
+    dispatch = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "TORTOISE_SESSION_EXTRACTOR" in ast.unparse(node.test)
+    ]
+    assert dispatch, (
+        "the `TORTOISE_SESSION_EXTRACTOR` selection is gone from `sdk.py`, so "
+        "the corrected evidence's 'default-ON' claim no longer has a mechanism"
+    )
+    selected = [node for node in dispatch if "m2" in ast.unparse(node.test)]
+    assert selected, (
+        "no `TORTOISE_SESSION_EXTRACTOR == 'm2'` branch remains — re-derive the "
+        "corrected reach claim before deleting the opt-out it describes"
+    )
+    node = selected[0]
+    assert "_extract_session_llm(" in ast.unparse(node.body), (
+        "the `m2` branch no longer selects `_extract_session_llm`, so 'm2 is "
+        "the opt-out' is stale"
+    )
+    assert "_extract_session_v2(" in ast.unparse(node.orelse), (
+        "`_extract_session_v2` is no longer the FALL-THROUGH extractor — the "
+        "corrected evidence's 'default-ON, ingestion path' sentence is false"
+    )
 
 
-# ── 6. the changelogs must carry the correction, not the old claim ─────────
-
+# ── 7. the changelogs must carry the correction, not the old claim ─────────
 
 def test_the_storage_changelog_records_the_correction():
     changelog = _doc(STORAGE_CHANGELOG)
