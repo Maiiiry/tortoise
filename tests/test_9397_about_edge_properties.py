@@ -140,7 +140,10 @@ STORAGE_CHANGELOG = (
 #: claim, not decoration: the `§13.8 q2` row in this file's first version pinned
 #: an UNBOLDED literal where the document bolds it, so it matched nothing — a
 #: dead entry that would have passed on a verbatim revert. The literal is the
-#: document's own text, bold markers included.
+#: document's own text, bold markers included. Two entries were introduced and
+#: retracted INSIDE this PR (see `RETRACTED_INTRODUCED_HERE`) — their `home` is
+#: still the document the claim belongs to, and `_provenance` keeps the message
+#: from claiming a pre-fix presence that never existed.
 RETRACTED: dict[str, tuple[str, str]] = {
     "§11.1 calls the links property-free and reports a zero search": (
         "Our `aboutObject` links are **property-free**",
@@ -172,6 +175,10 @@ RETRACTED: dict[str, tuple[str, str]] = {
     ),
     "§11.3's prose says the links stay bare": (
         "the entity links stay bare",
+        "STORAGE-ARCHITECTURE.md",
+    ),
+    "§11.1's method paragraph counted the write forms as two": (
+        "Two forms write to an edge, and both are in scope",
         "STORAGE-ARCHITECTURE.md",
     ),
     "the corrected claim's own 'exactly one name' absolute": (
@@ -210,6 +217,7 @@ RETRACTED_QUOTED_IN: dict[str, Path] = {
         STORAGE_CHANGELOG
     ),
     "§11.3's prose says the links stay bare": STORAGE_CHANGELOG,
+    "§11.1's method paragraph counted the write forms as two": STORAGE_CHANGELOG,
     "the corrected claim's own 'exactly one name' absolute": STORAGE_CHANGELOG,
     "§13.8 q2's 'never a second property name'": STORAGE_CHANGELOG,
 }
@@ -222,6 +230,17 @@ RETRACTED_QUOTED_IN: dict[str, Path] = {
 #: silently being neither.
 RETRACTED_PRE_FIX_ONLY: frozenset[str] = frozenset({
     "the decision ledger's reason is property-freedom",
+})
+
+#: Retractions of wording THIS PR itself introduced in an earlier revision and
+#: then withdrew. Their literals were never live on the pre-fix tree, so listing
+#: them under the entries above (which record a PRE-FIX provenance) made the
+#: file's own metadata false — the class of unmeasured claim it exists to stop.
+#: They are still findable in the changelog (`RETRACTED_QUOTED_IN`), so the pins
+#: fire; only the provenance differs.
+RETRACTED_INTRODUCED_HERE: frozenset[str] = frozenset({
+    "the corrected claim's own 'exactly one name' absolute",
+    "§13.8 q2's 'never a second property name'",
 })
 
 #: The writers the corrected passages must NAME, and the code shape that makes
@@ -298,8 +317,12 @@ _SET_MAP = re.compile(r"SET\s+(\w+)\s*(\+=|=)\s*(\$|\{)")
 INLINE_FORM = "<inline-map>"
 _INLINE_BRACE = re.compile(r"\{([^{}]*)\}")
 _INLINE_NAME = re.compile(r"(\w+)\s*:")
-#: A relationship pattern, captured as (variable, relationship-token).
-_PATTERN = re.compile(r"\[(\w+):([^\]]{0,120})\]")
+#: A relationship pattern, captured as (variable, relationship-token). The
+#: variable may be EMPTY: `MERGE (s)-[:aboutObject {confidence:$c}]->(t)` is
+#: valid Cypher that names no variable, and `(\w+)` here made that writer
+#: invisible to every rule below — the fourth instance of this class (named-only,
+#: then map-only, then inline-only, now anonymous), found by review.
+_PATTERN = re.compile(r"\[(\w*):([^\]]{0,120})\]")
 _ABOUT_REL = re.compile(
     r"about(Subject|Object|Event|Point|Document|Action|Source)"
 )
@@ -470,6 +493,22 @@ def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
     return found
 
 
+def _provenance(label: str, home: str) -> str:
+    """The per-entry provenance a leg-1 failure prints.
+
+    Not every retracted literal was live pre-fix: two absolutes were written by
+    THIS PR's own earlier revision and withdrawn by a later one. Printing "was
+    live pre-fix" for them would put an unmeasured claim in the diagnostic of
+    the guard whose whole subject is unmeasured claims.
+    """
+    if label in RETRACTED_INTRODUCED_HERE:
+        return (
+            f"introduced and retracted inside #9397, never present pre-fix; "
+            f"quoted in the changelog ({home} is where it was written)"
+        )
+    return f"was live in {home} pre-fix"
+
+
 # ── 1. the retracted sentences ─────────────────────────────────────────────
 
 
@@ -488,7 +527,7 @@ def test_the_absolute_property_free_sentences_do_not_reappear():
     #: quotes the retracted sentences inside this correction's entry.
     ledger = _doc(EXTRACTOR_CHANGELOG)
     survivors = [
-        f"{label}: {sentence!r} (was live in {home} pre-fix)"
+        f"{label}: {sentence!r} ({_provenance(label, home)})"
         for label, (sentence, home) in RETRACTED.items()
         for name, text in live.items()
         if _flat(sentence) in _flat(text)
@@ -731,6 +770,20 @@ def test_the_census_reads_the_inline_pattern_map_form():
         "the census does not read the INLINE pattern-map form — a property "
         f"written there is invisible again (found {found!r})"
     )
+    # The same form with NO relationship variable. `(\w+)` in `_PATTERN` made
+    # this writer invisible to every rule, which is how a census reports a
+    # measured absence for a write that shipped.
+    anonymous = (
+        "def link(g, s, t, c):\n"
+        "    g.query('MERGE (s)-[:aboutObject {confidence:$c}]->(t)', "
+        "params={'c': c})\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", anonymous)
+    assert found == {("tortoise/probe.py", "link"): {"confidence"}}, (
+        "the census does not read an ANONYMOUS relationship pattern with an "
+        "inline property map (`-[:aboutObject {confidence:$c}]->`) — the "
+        f"writer is invisible (found {found!r})"
+    )
 
 
 def test_the_census_reads_a_writer_that_never_says_about():
@@ -809,10 +862,16 @@ def test_the_default_ingestion_path_reaches_the_binder():
 def test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live():
     #: A literal that matches nothing can never red. Every entry must therefore be
     #: either findable in the changelog that quotes it, or declared pre-fix-only.
-    assert set(RETRACTED) == set(RETRACTED_QUOTED_IN) | set(RETRACTED_PRE_FIX_ONLY), (
+    assert set(RETRACTED) == (
+        set(RETRACTED_QUOTED_IN)
+        | set(RETRACTED_PRE_FIX_ONLY)
+        | set(RETRACTED_INTRODUCED_HERE)
+    ), (
         "a RETRACTED entry is classified nowhere: it is neither quoted in a "
-        "changelog (RETRACTED_QUOTED_IN) nor declared pre-fix-only "
-        "(RETRACTED_PRE_FIX_ONLY), so nothing proves it can ever match text"
+        "changelog (RETRACTED_QUOTED_IN), declared pre-fix-only "
+        "(RETRACTED_PRE_FIX_ONLY), nor declared introduced-and-retracted "
+        "inside this PR (RETRACTED_INTRODUCED_HERE) — so nothing proves it "
+        "can ever match text"
     )
     dead = [
         f"{label}: {RETRACTED[label][0]!r} is not in {path.name}"
