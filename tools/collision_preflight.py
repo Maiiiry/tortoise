@@ -716,7 +716,32 @@ class NotAWorkItem(Exception):
 
 
 class SurfaceError(Exception):
-    """A surface could not be queried (INCOMPLETE — never CLEAN)."""
+    """A surface could not be queried (INCOMPLETE — never CLEAN).
+
+    ⛔ `detail` CARRIES THE UNTRUNCATED TEXT; THE MESSAGE DOES NOT (#9402
+    review, P1). `_gh_json` one-lines the failing `gh` STDERR and cuts it at 200
+    characters, so whatever the cut removes the classifier can never see — and
+    `gh` prints transport chatter before the GraphQL error on a verbose or
+    retrying run. Past 200 characters of it, the canonical `GraphQL: API rate
+    limit already exceeded for user ID …` is gone from every string the gate
+    reads: the rescue then never fired and the report prescribed
+    `gh auth/network` for a spent budget, which is the exact defect #9402 files,
+    on the exact surface it exists to rescue.
+
+    ⛔ WHAT IS *NOT* THE MECHANISM, measured on this head so the next reader does
+    not repeat the arithmetic: the cut applies to the STDERR only, never to the
+    assembled message — the (long) command line is prefixed AFTER it. So a
+    `--repo` slug of 36+ characters does NOT hide the signature on its own
+    (`test_a_long_slug_alone_does_not_hide_the_exhaustion` pins that
+    non-boundary). The hazard is the cut on the string it really applies to, and
+    the raw text is attached HERE, where it is still whole, so
+    `_is_budget_exhaustion` can classify it. A raiser that does not attach one
+    keeps the old behaviour (classify on the message), so nothing else moves.
+    """
+
+    def __init__(self, message: str = "", detail: str = "") -> None:
+        super().__init__(message)
+        self.detail = detail
 
 
 @dataclass
@@ -2815,16 +2840,36 @@ def _require_pr_dicts(prs: list, where: str, required: tuple = ()) -> None:
                 )
 
 
+#: How much of a failing `gh` stderr a NOTE carries. Wider than the 200-char
+#: DISPLAY cut in `_gh_json` because a note is the text the REMEDY is derived
+#: from (`_incomplete_remedy` classifies `Surface.note` with
+#: `_is_budget_exhaustion`), and a classifier that cannot see the signature
+#: answers "not an exhaustion" about an exhaustion — which is how a long stderr
+#: turned a spent budget into the `gh auth/network` remedy (#9402 review, P1).
+#: A note is prose, not a terminal row, so it can be wider.
+_REFUSED_READ_NOTE_LIMIT = 600
+
+
 def _gh_json(gh_bin: str, args: list[str], repo: str, timeout: float):
     rc, out, err, timed_out = _run([gh_bin, *args], repo, timeout)
     if rc != 0:
         why = "timeout" if timed_out else f"exit {rc}"
-        raise SurfaceError(f"gh {' '.join(args)} failed ({why}): {_one_line(err or out)}")
+        # ⛔ THE STDERR IS CUT FOR DISPLAY, `detail` IS NOT (#9402 review, P1).
+        # Past 200 characters of `gh` chatter the failure signature is gone from
+        # the message, and `_is_budget_exhaustion` used to read only the message
+        # — so a verbose/retrying run looked like a broken auth instead of a
+        # spent budget. Carrying the raw text keeps ONE predicate that can
+        # actually see what it is testing for, at any stderr length.
+        raise SurfaceError(
+            f"gh {' '.join(args)} failed ({why}): {_one_line(err or out)}",
+            detail=f"{why}: {err or out}",
+        )
     try:
         return json.loads(out)
     except json.JSONDecodeError as exc:
         raise SurfaceError(
-            f"gh {' '.join(args)} returned non-JSON: {exc}: {_one_line(out)}"
+            f"gh {' '.join(args)} returned non-JSON: {exc}: {_one_line(out)}",
+            detail=f"non-JSON: {exc}: {out}",
         ) from exc
 
 
@@ -2917,7 +2962,7 @@ def _issue_view_rest(gh_bin: str, slug: str, issue: int, cwd: str,
     return payload, None
 
 
-def _is_budget_exhaustion(detail: str) -> bool:
+def _is_budget_exhaustion(failure: str | BaseException) -> bool:
     """Is this gh failure a BUDGET EXHAUSTION (which REST may be able to answer)?
 
     The ONE test every rescue path and the report's remedy share, because the two
@@ -2938,8 +2983,18 @@ def _is_budget_exhaustion(detail: str) -> bool:
     fleet-shared user-level budget is gone (#9402), and note that the PRIMARY
     ``rate_limit.resources.graphql`` counter still reads thousands remaining when
     it fires — so the counter can never be the test.
+
+    ⛔ IT TESTS THE **UNTRUNCATED** TEXT WHEN THERE IS ONE (#9402 review, P1).
+    Accepting a `SurfaceError` (or its message) is not enough on its own: the
+    message embeds a 200-character one-lining of `gh`'s stderr, so a long
+    stderr can push the signature past the cut — and the predicate then answered
+    "not an exhaustion" about an exhaustion. `SurfaceError.detail` carries the
+    raw text for exactly this read; a plain string is classified as given.
     """
-    lowered = str(detail).lower()
+    raw = failure if isinstance(failure, str) else (
+        getattr(failure, "detail", "") or str(failure)
+    )
+    lowered = str(raw).lower()
     return (
         "rate limit" in lowered
         or "too many requests" in lowered
@@ -5023,8 +5078,11 @@ def run_preflight(
             # ONLY a budget exhaustion is eligible for the REST fallback (see
             # `_is_budget_exhaustion`). Any other failure is a genuine "could not
             # read", and rescuing it from a second endpoint would turn a real
-            # refusal into a reading — the fail-open direction.
-            _exhausted = _is_budget_exhaustion(str(exc))
+            # refusal into a reading — the fail-open direction. ⛔ The EXCEPTION
+            # is passed, not `str(exc)`: the message embeds a display-cut
+            # stderr, and the predicate must classify the WHOLE of it
+            # (#9402 review, P1).
+            _exhausted = _is_budget_exhaustion(exc)
             rescued: dict | None = None
             rest_why: str | None = None
             if _exhausted:
@@ -5278,7 +5336,7 @@ def run_preflight(
             try:
                 prs = _gh_json(gh_bin, args, cwd, timeout)
             except SurfaceError as exc:
-                if state != "open" or not _is_budget_exhaustion(str(exc)):
+                if state != "open" or not _is_budget_exhaustion(exc):
                     raise
                 prs, rest_truncated, rest_why = _open_prs_rest(
                     gh_bin, slug, cwd, timeout, limit
@@ -5289,7 +5347,16 @@ def run_preflight(
                     # a transport failure it did not cause.
                     raise SurfaceError(f"{rest_why} (GraphQL read: {exc})") from exc
                 via_rest = True
-                rest_cause = str(exc)
+                # ⛔ THE NOTE CARRIES THE UNTRUNCATED CAUSE (#9402 review, P1).
+                # `_incomplete_remedy` classifies `s.note` with the SAME
+                # predicate, so embedding the 200-char DISPLAY message here
+                # meant a long stderr could hide the signature from the remedy
+                # too — and the run then printed `gh auth/network` for a spent
+                # budget on the very surface the rescue had just read. A note
+                # is prose, not a terminal row, so it gets the wider cut.
+                rest_cause = _one_line(
+                    exc.detail or str(exc), limit=_REFUSED_READ_NOTE_LIMIT
+                )
             if not isinstance(prs, list):
                 raise SurfaceError(f"gh {state}-PR enumeration returned non-list JSON")
             _require_pr_dicts(prs, f"the {state}-PR enumeration for {slug}")

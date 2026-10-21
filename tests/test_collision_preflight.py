@@ -245,6 +245,20 @@ case "$1 $2" in
       echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
       exit 1
     fi
+    # #9423 review (P1): the SAME exhaustion behind a LONGER stderr. `gh` emits
+    # transport chatter before the GraphQL error on a verbose/retrying run, and
+    # the tool one-lines that stderr into its message — so a fixed display cut
+    # can land BEFORE the discriminator and the classifier then answers "not an
+    # exhaustion" about an exhaustion. ⛔ NOTE WHAT IS *NOT* THE MECHANISM: the
+    # 200-character cut applies to the STDERR only, never to the assembled
+    # message, so a long `--repo` slug alone cannot hide the signature (the
+    # `test_a_long_stderr_...` docstring records that measurement). The seam
+    # therefore pads the STDERR, which is the string the cut is applied to.
+    if [ "${state:-open}" = "open" ] && [ "${GH_STUB_PR_LIST_LONG_STDERR:-0}" = "1" ]; then
+      printf 'gh-stub: request trace: %s\n' "$(printf 'x%.0s' {1..240})" >&2
+      echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
+      exit 1
+    fi
     # #9423 review (P3): a NON-exhaustion failure of the SAME read. The REST
     # rescue is gated on the CAUSE (`_is_budget_exhaustion`), not on "the read
     # failed", so this seam is what makes that gate falsifiable: a rescue that
@@ -3057,6 +3071,79 @@ class CollisionPreflightTest(unittest.TestCase):
         # twice. The "(open PRs)" earlier in the line is the surface LIST from
         # the verdict prefix, not a contributor mention.
         self.assertEqual(verdict.count("open PRs:"), 1, verdict)
+
+    def test_a_long_stderr_does_not_hide_the_exhaustion_from_the_rescue(self):
+        """The rescue's gate sees the WHOLE failure, not a display cut (P1).
+
+        `_is_budget_exhaustion` is a substring test. It used to be run over the
+        `SurfaceError` MESSAGE, and the only untruncated text available was the
+        one inside it — so whatever the message cut away, the classifier could
+        not see. `_gh_json` one-lines the STDERR at 200 characters, and `gh`
+        prints transport chatter before the GraphQL error on a verbose/retrying
+        run: past 200 characters of it, the canonical `GraphQL: API rate limit
+        already exceeded for user ID …` is gone from everything the gate reads.
+        The rescue then never fired and the report prescribed `gh auth/network`
+        for a spent budget — the exact defect #9402 files, on the exact surface
+        this PR fixes.
+
+        ⛔ MEASURED SCOPE, so the next reader does not over-claim it: the cut is
+        applied to the STDERR, NOT to the assembled message — the command line
+        is prefixed afterwards. So a long `--repo` slug alone does NOT hide the
+        signature (verified against this head: a 40-character slug still
+        rescued), and the finding's "slug >= 36" table measured the wrong
+        string. The hazard is real all the same, and this seam is the string it
+        applies to: 240 characters of stderr, discriminator at offset 262.
+        """
+        # The long slug stays in the fixture: it is what made the original
+        # report's arithmetic look like the cause, and it must not start
+        # mattering again.
+        long_slug = "some-organisation/a-long-repository-name"
+        self.assertEqual(len(long_slug), 40)
+        _git(self.repo, "remote", "set-url", "origin",
+             f"https://github.com/{long_slug}.git")
+        # The board's `repo` stamp is compared against the queried slug, so it
+        # has to name the new one — otherwise this would measure the claim
+        # surface, not the rescue.
+        self.fleet_board(repo=long_slug)
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_LONG_STDERR": "1"})
+        self.assertEqual(rc, 2, out)
+        # THE RESCUE FIRED, and it asked for the LONG slug's own pulls.
+        argv_path = self.gh_dir / "open-prs-rest-argv.txt"
+        self.assertTrue(argv_path.exists(), out)
+        self.assertIn(f"repos/{long_slug}/pulls?state=open", argv_path.read_text())
+        # …so the refusal names the UNMEASURED test, and the remedy names the
+        # BUDGET — never the re-authenticate/rebuild advice that cannot help.
+        self.assertIn("closing-references-unmeasured", out)
+        self.assertIn("BUDGET EXHAUSTION", out)
+        self.assertNotIn("fix gh auth/network", out)
+
+    def test_a_long_slug_alone_does_not_hide_the_exhaustion(self):
+        """The boundary the P1 report measured — and it is NOT a boundary.
+
+        Keeping this as an explicit arm is deliberate: P1 as filed said the
+        rescue is gated on a signature the message has already cut off for any
+        `--repo` slug of 36+ characters, and computed a table of slug lengths.
+        That table measured a truncation the tool never performs — `_gh_json`
+        one-lines the STDERR at 200 characters and then PREFIXES the command
+        line, so the message is longer than the cut and the discriminator is
+        always inside it. A 40-character slug therefore rescued even on the
+        pre-fix tool.
+
+        So the substantive fix is the STDERR arm above (`SurfaceError.detail`);
+        this arm pins the measured NON-boundary, so a future narrowing of
+        `_gh_json` — moving the cut onto the assembled message — reds here
+        instead of silently re-introducing the filed defect at 36 characters.
+        """
+        long_slug = "some-organisation/a-long-repository-name"
+        self.assertEqual(len(long_slug), 40)
+        _git(self.repo, "remote", "set-url", "origin",
+             f"https://github.com/{long_slug}.git")
+        self.fleet_board(repo=long_slug)
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertTrue((self.gh_dir / "open-prs-rest-argv.txt").exists(), out)
+        self.assertIn("BUDGET EXHAUSTION", out)
+        self.assertNotIn("fix gh auth/network", out)
 
     def test_a_both_cause_surface_is_named_once_in_the_mixed_remedy(self):
         # #9423 review (P3-1), the MIXED arm of the same root cause. With another
