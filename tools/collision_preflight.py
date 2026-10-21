@@ -2925,6 +2925,24 @@ def _is_budget_exhaustion(detail: str) -> bool:
 _REST_PULLS_PAGE = 100
 
 
+def _rest_pulls_page_size(limit: int) -> int:
+    """The `per_page` the REST open-PR rescue actually requests (#9402 review).
+
+    ⛔ ONE FORMULA, TWO READERS — and that is the point. The request sends
+    `min(_REST_PULLS_PAGE, max(1, limit))`, while the truncation note has to tell
+    a human WHICH page size came back full. When the note recomputed its own
+    copy of the expression (or, worse, hardcoded GitHub's 100) the two could
+    disagree, and the note then prints a false statement about the very request
+    it is describing — a refusal whose stated reason is not what caused it. So
+    the size is computed once, here, and the caller interpolates it.
+
+    `--pr-limit` has no lower bound, so `limit < _REST_PULLS_PAGE` is a legal,
+    documented configuration and the requested page is genuinely smaller than
+    GitHub's maximum.
+    """
+    return min(_REST_PULLS_PAGE, max(1, int(limit)))
+
+
 def _open_prs_rest(gh_bin: str, slug: str, cwd: str, timeout: float,
                    limit: int) -> tuple[list[dict] | None, bool, str | None]:
     """Enumerate OPEN pull requests over REST when GraphQL refuses (#9402).
@@ -2950,13 +2968,17 @@ def _open_prs_rest(gh_bin: str, slug: str, cwd: str, timeout: float,
     letting the scan read absence as "closes nothing". Rescuing the enumeration
     must never be mistaken for having proved the negative.
 
-    `possibly_truncated` is decided by EVIDENCE: the request asks for GitHub's
-    maximum page size, so a full page cannot prove the list is complete. It is
-    the REST counterpart of the GraphQL path's `limit + 1` fetch, and it keeps a
-    full page out of "complete" exactly as that does.
+    `possibly_truncated` is decided by EVIDENCE: the request asks for the page
+    size in `_rest_pulls_page_size(limit)` — `limit` capped at GitHub's maximum
+    of `_REST_PULLS_PAGE`, so it is the MAXIMUM only when `--pr-limit` is at
+    least that — and a full page cannot prove the list is complete. It is the
+    REST counterpart of the GraphQL path's `limit + 1` fetch, and it keeps a
+    full page out of "complete" exactly as that does. The caller's truncation
+    note interpolates the SAME helper, so the note can never describe a page
+    size the request did not ask for.
     """
     where = f"gh api repos/{slug}/pulls?state=open"
-    per_page = min(_REST_PULLS_PAGE, max(1, int(limit)))
+    per_page = _rest_pulls_page_size(limit)
     try:
         raw = _gh_json(
             gh_bin,
@@ -3211,9 +3233,19 @@ def scan_pr_surface(
 
     `use_closing_field` selects the closing-reference test. It is True on the
     BLOCKING open-PR surface, which asks gh for `closingIssuesReferences` —
-    GitHub's own field, exact by construction. It is False on the ADVISORY
-    closed-PR surface, whose REST payload has no such field, so that one falls
-    back to the regex — and every hit it can produce there is already `weak`.
+    GitHub's own field, exact by construction. It is False in TWO places, and
+    they are NOT the same posture:
+
+    * the ADVISORY closed-PR surface, whose REST payload has no such field, so
+      that one falls back to the regex — and every hit it can produce there is
+      already `weak` (an advisory surface cannot force an exit);
+    * the BLOCKING open-PR surface when its enumeration came from the REST
+      rescue (#9402) — REST `/pulls` carries no `closingIssuesReferences`
+      either, so the same regex fallback runs, but a NON-TERMINAL hit there is
+      `strong` and decides the verdict. Every hit on this call site is therefore
+      NOT already `weak`, which is why the fallback's detail text keys on
+      `surface.authority` and not on this flag (a hit that refuses must not
+      describe itself as advisory — #9423 review).
     """
     for pr in prs:
         title = pr.get("title") or ""
@@ -3403,9 +3435,27 @@ def scan_pr_surface(
                             "weak" if terminal else "strong")
                 continue
         elif closing_reference(body, issue):
+            # ⛔ THE WORDING FOLLOWS THE AUTHORITY, NOT `use_closing_field`. Until
+            # #9402, `use_closing_field=False` meant ONLY the advisory closed-PR
+            # sample, so this detail could assert "this surface is advisory".
+            # The blocking open-PR surface now also passes False when its list
+            # came from the REST rescue (REST has no `closingIssuesReferences`),
+            # and there a non-terminal hit is `strong` — blocking. A hardcoded
+            # advisory claim would then print, under `VERDICT: COLLISION`, two
+            # false statements in the one line a human reads at the point of
+            # refusal: that the surface is advisory, and that it did not produce
+            # the refusal. `surface.authority` is the property that decides
+            # whether this hit can refuse, so it is the property the sentence
+            # states; the blocking form names the REAL cause (the field was not
+            # requested on this call) instead.
+            fallback_why = (
+                "this surface is advisory"
+                if surface.authority == AUTHORITY_ADVISORY
+                else "closingIssuesReferences was not requested on this call"
+            )
             surface.add(_pr_ref(pr),
                         f"closing reference to #{issue} in body (regex fallback — "
-                        f"this surface is advisory){suffix}",
+                        f"{fallback_why}){suffix}",
                         "weak" if terminal else "strong")
             continue
         if number_present(body, issue):
@@ -5106,11 +5156,36 @@ def run_preflight(
                 raise SurfaceError(f"gh {state}-PR enumeration returned non-list JSON")
             _require_pr_dicts(prs, f"the {state}-PR enumeration for {slug}")
             if via_rest and rest_truncated:
+                # ⛔ THE PAGE SIZE IN THE NOTE IS THE ONE THE REQUEST ASKED FOR.
+                # This note is the ONLY truncation note the REST path can emit
+                # (`len(prs) > limit` below is unreachable there by construction:
+                # `len(prs) <= per_page <= limit`), so a hardcoded "GitHub's
+                # maximum of 100" would be the sole thing a human reads — and it
+                # is FALSE whenever `--pr-limit` is under 100, where the actual
+                # page was smaller and the remedy is the very `--pr-limit` flag
+                # the sibling note names. The size comes from the same helper the
+                # request used, so the two cannot drift.
+                page = _rest_pulls_page_size(limit)
+                if page < _REST_PULLS_PAGE:
+                    pagesize = (
+                        f"per_page of {page} — less than GitHub's maximum "
+                        f"{_REST_PULLS_PAGE}, because --pr-limit asked for {page}"
+                    )
+                    remedy = (
+                        " Widen with --pr-limit (or "
+                        "COLLISION_PREFLIGHT_PR_LIMIT)."
+                    )
+                else:
+                    pagesize = (
+                        f"per_page of {_REST_PULLS_PAGE}, GitHub's maximum — "
+                        "no larger page can be requested"
+                    )
+                    remedy = ""
                 surface.mark_truncated(
-                    "the REST fallback answered ONE page at GitHub's maximum "
-                    f"per_page of {_REST_PULLS_PAGE} and returned a FULL page, so "
+                    "the REST fallback answered ONE page at the requested "
+                    f"{pagesize} and returned a FULL page, so "
                     "more open PR(s) may exist and were NOT scanned — this "
-                    "surface is INCOMPLETE (never CLEAN)."
+                    "surface is INCOMPLETE (never CLEAN)." + remedy
                 )
             if len(prs) > limit:
                 surface.mark_truncated(

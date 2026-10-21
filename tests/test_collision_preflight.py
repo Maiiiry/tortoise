@@ -207,7 +207,15 @@ fi
 # normalisation onto the `gh pr list --json` projection rather than assuming the two
 # agree. ⛔ The payload carries NO `closingIssuesReferences` — REST has no such
 # field — so a test cannot accidentally model a rescue that answered it.
-if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/pulls ]]; then
+#
+# ⛔ THE PATTERN IS ANCHORED TO THE ENDPOINT THE RESCUE ACTUALLY CALLS. It used to
+# match `^repos/<owner>/<repo>/pulls`, which also swallowed
+# `_branch_terminal_state_from_prs`'s `pulls?state=all&head=…` lookup and answered
+# it with THIS fixture (REST's `/pulls` shape, no `headSha`, no `mergedAt`), so the
+# branch surface's "targeted head-ref lookup could not run" path stopped being
+# exercised by the integration fixtures. A stub that answers an endpoint it does
+# not model is a fixture lying about the wire.
+if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/pulls\?state=open ]]; then
   printf '%s\n' "$@" > "$d/open-prs-rest-argv.txt"
   if [ "${GH_STUB_OPEN_PR_REST_FAIL:-0}" = "1" ]; then
     echo "gh-stub: could not connect to api.github.com" >&2
@@ -709,8 +717,12 @@ class CollisionPreflightTest(unittest.TestCase):
             (self.gh_dir / "issue.json").write_text(json.dumps(issue))
 
     def clear_fixtures(self) -> None:
-        for name in ("open_prs.json", "closed_prs.json", "issue.json",
-                     "timeline.json"):
+        # `open_prs_rest.json` is written as a DERIVED projection by
+        # `gh_fixtures`, so a helper that clears the open-PR fixture must clear
+        # its REST twin too — otherwise a test that clears fixtures and then
+        # drives the REST rescue reads a previous test's PR list.
+        for name in ("open_prs.json", "closed_prs.json", "open_prs_rest.json",
+                     "issue.json", "timeline.json"):
             (self.gh_dir / name).unlink(missing_ok=True)
 
     def timeline_fixture(self, events=None, pages=None) -> None:
@@ -2625,6 +2637,94 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("VERDICT: CLEAN", out)
         self.assertFalse((self.gh_dir / "open-prs-rest-argv.txt").exists(), out)
+
+    def test_rest_rescued_body_closing_reference_is_not_described_as_advisory(self):
+        # #9423 review (P2, finding 1). `use_closing_field=False` used to mean
+        # ONLY the advisory closed-PR sample, so the regex-fallback detail
+        # hardcoded "this surface is advisory". #9402 made the BLOCKING open-PR
+        # surface pass False as well (its REST rescue carries no
+        # `closingIssuesReferences`), and a NON-TERMINAL hit there is `strong` —
+        # it DECIDES the refusal. The report then told the reader, under
+        # `VERDICT: COLLISION`, that a blocking surface was advisory: two false
+        # statements (the authority, and which surface produced the refusal) in
+        # the one line a human reads at the point of refusal.
+        #
+        # The fixture states the closing reference in the BODY ONLY — no number
+        # in the title, none in the head ref — so the fallback arm is the only
+        # branch that can fire, and the hit can only be `strong`.
+        self.gh_fixtures(open_prs=[{
+            "number": 9411, "title": "fix(dispatch): unrelated wording",
+            "body": f"Closes #{ISSUE}.", "headRefName": "feat/9999-other",
+            "state": "open",
+        }])
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertIn(f"closing reference to #{ISSUE}", out)
+        # The detail names the REAL cause — the computed field was not requested
+        # on this call — instead of mislabelling the surface.
+        self.assertIn("closingIssuesReferences was not requested on this call", out)
+        self.assertNotIn("regex fallback — this surface is advisory", out)
+
+    def test_advisory_closed_pr_body_closing_reference_still_says_advisory(self):
+        # The other arm of #9423 finding 1, pinned so the fix cannot be "delete
+        # the advisory wording": on the ADVISORY closed-PR surface the regex
+        # fallback really IS advisory, it can never refuse, and the detail must
+        # keep saying so. Without this test a silent reversion to the blocking
+        # wording on the advisory call site would pass the suite.
+        self.gh_fixtures(closed_prs=[{
+            "number": 9412, "title": "fix(dashboard): plaintext mint",
+            "body": f"Closes #{ISSUE}.", "headRefName": "fix/unrelated-slug",
+            "state": "closed",
+        }])
+        rc, out = self.run_tool()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertIn("regex fallback — this surface is advisory", out)
+        self.assertNotIn("closingIssuesReferences was not requested on this call", out)
+
+    def test_rest_truncation_note_names_the_requested_page_size(self):
+        # #9423 review (P2, finding 2). `--pr-limit` has NO lower bound, and the
+        # REST rescue requests `per_page = min(100, --pr-limit)`. This note is the
+        # ONLY truncation note the REST path can emit (`len(prs) > limit` is
+        # unreachable there by construction), so a hardcoded "GitHub's maximum of
+        # 100" is the sole thing a human reads — and it is FALSE below 100, where
+        # the actual remedy is the very `--pr-limit` flag the note withheld.
+        prs = [{"number": 9000 + n, "title": f"chore: unrelated {n}",
+                "body": "", "headRefName": f"chore/9{n}-unrelated",
+                "state": "open"}
+               for n in range(20)]
+        self.gh_fixtures(open_prs=prs)
+        rc, out = self.run_tool(extra_args=["--pr-limit", "20"],
+                                env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        # The request really asked for the smaller page, so the note's claim has
+        # to match it — this is the fact the pre-fix note contradicted.
+        mod = _tool_module()
+        argv = (self.gh_dir / "open-prs-rest-argv.txt").read_text()
+        self.assertIn("per_page=20", argv)
+        self.assertNotIn("per_page=100", argv)
+        self.assertIn("requested per_page of 20", out)
+        self.assertNotIn(
+            f"per_page of {mod._REST_PULLS_PAGE} and returned a FULL page", out)
+        # …and the remedy it implies is the one that works at this setting.
+        self.assertIn("Widen with --pr-limit", out)
+
+        # The >= 100 arm: GitHub's maximum really WAS the requested size there,
+        # so the note may say so — and must NOT offer a widening that does not
+        # exist.
+        cap = mod._REST_PULLS_PAGE
+        self.gh_fixtures(open_prs=[{
+            "number": 9500 + n, "title": f"chore: unrelated {n}", "body": "",
+            "headRefName": f"chore/95{n}-unrelated", "state": "open",
+        } for n in range(cap)])
+        rc, out = self.run_tool(extra_args=["--pr-limit", str(cap)],
+                                env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn(f"requested per_page of {cap}, GitHub's maximum", out)
+        self.assertNotIn("Widen with --pr-limit", out)
 
     def test_graphql_exhaustion_with_rest_also_down_still_fails_closed(self):
         # The fallback must never become a fail-open. With BOTH budgets gone the
