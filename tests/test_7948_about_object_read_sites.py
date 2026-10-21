@@ -241,16 +241,23 @@ WHAT THIS PINS
    to 19 rows over 22 doors (measured at this head). The
    inputs are the TABLE's twenty-two doors, not the 99-tool registry, so adding a tool
    does not move them — which is what makes them pinnable without churn.
-23. `test_the_gate_walk_comment_pins_no_wall_clock_figure` — the `#9506` arm, and the
-   one arm here about this instrument's OWN prose rather than §13's. The gate-walk
-   comment in `_about_call_time_census.py` said "No magnitude is stated on purpose"
-   and stated one in the same sentence (`~2.6 s of ~17 s`), a figure whose framing
-   (whole arm? control step? which box?) was not in the comment, so a re-verifier
-   could not settle it — the defect class three earlier rounds removed from that
-   file. The sentence is held to its own object: a comment claiming it pins no
-   magnitude must pin none, while a duration carrying its framing is still allowed
-   (the arm encodes the CONTRADICTION, not a style preference). Red on the pre-fix
-   text, green after the figure was dropped.
+23. `test_the_gate_walk_comment_pins_no_wall_clock_figure` +
+   `test_the_gate_walk_comment_arm_reds_on_the_text_it_replaced` — the `#9506` arms,
+   and the only ones here about this instrument's OWN prose rather than §13's. The
+   gate-walk comment in `_about_call_time_census.py` carried a duration a re-verifier
+   cannot settle — `measured 10.36 s of the control's 10.85 s` on the merge base, and
+   `~2.6 s of ~17 s` on an intermediate head of the branch — neither with the framing
+   that produced it (whole arm? control step? `--durations=0`? which box?), the
+   defect class three earlier rounds removed from that file. The rule is stated once
+   as `_unframed_durations()`: a duration is a claim, and it is allowed only when the
+   comment also carries the framing that produced it. ⚠️ The first version of the
+   guard keyed on the self-denial PHRASE instead (`no (magnitude|wall-clock)` AND a
+   duration), which was **green on the merge base** — the text the PR exists to
+   replace names no denial — and would go green again on any rewording of the denial,
+   so it retired itself on the next prose edit. The predicate no longer reads the
+   denial at all, and the second arm is its non-vacuity: the merge-base string and
+   the intermediate string RED, a duration carrying its framing stays GREEN, and a
+   duration with only "one box" for company (hardware is not framing) REDs.
 
 ⚠️ **What this deliberately does NOT claim.** The LITERAL census is a LOWER
 BOUND: it sees a relationship pattern naming the edge, so a reader that
@@ -3688,38 +3695,131 @@ def _gate_walk_comment() -> str:
     )
 
 
-def test_the_gate_walk_comment_pins_no_wall_clock_figure():
-    """A comment that says it pins no magnitude must not pin one (`#9506`).
+#: A duration, as a comment pins one (`10.36 s`, `~2.6 s`, `850 ms`).
+_DURATION = re.compile(r"\d+(?:\.\d+)?\s?(?:ms|s)\b")
 
-    ⚠️ **The `#9506` defect was a sentence falsified by its own object.** The
+#: What makes a pinned duration SETTLEABLE — the framing that produced it.
+#: Each entry names the measurement a re-verifier must reproduce to check the
+#: number; "one box" deliberately is NOT here, because hardware is the condition
+#: a number is taken under, not the measurement it was taken OF.
+_DURATION_FRAMING = (
+    "--durations",
+    "whole arm",
+    "control step",
+    "in-suite",
+)
+
+
+def _unframed_durations(comment: str) -> list[str]:
+    """Durations `comment` pins WITHOUT the framing that produced them (`#9506`).
+
+    ⚠️ **This predicate is the fix to a FAIL-OPEN guard, not a rewording of one.**
+    The first version of the arm red on the co-occurrence of a self-denial phrase
+    (`no magnitude` / `no wall-clock`) AND a duration. That made it **green on the
+    merge base** — `git show origin/main:tests/_about_call_time_census.py` carried
+    *"re-reading `_sources()` and rebuilding the same 29 `_File`s measured 10.36 s
+    of the control's 10.85 s for byte-identical output"*, which says no denial at
+    all, so there was nothing for the guard to fire on: the arm passed on precisely
+    the text this PR deletes, and would pass again if that figure were re-introduced.
+    It was also fail-open on REWORDING — turning "No magnitude is pinned" into "No
+    timing figure is named" silently retired it.
+
+    So the rule now reads the CLAIM rather than a phrase about it: a duration is a
+    fact asserted about a measurement, and it is acceptable only when the comment
+    also states the framing that produced it. This reds on the merge-base text and
+    on the intermediate `~2.6 s of ~17 s` sentence alike, and no rewording can
+    retire it because it never reads the denial.
+
+    Coarse in one documented direction: the framing marker is matched over the whole
+    comment, not per number, so a comment that carries its framing may also mention
+    a second figure. That is the harmless direction — it can only stay GREEN where
+    the framing IS stated, which is the state the reviewer asked to keep allowed.
+    """
+    found = _DURATION.findall(comment)
+    if any(marker in comment for marker in _DURATION_FRAMING):
+        return []
+    return found
+
+
+def test_the_gate_walk_comment_pins_no_wall_clock_figure():
+    """A pinned duration must carry the framing that produced it (`#9506`).
+
+    ⚠️ **The `#9506` defect was a claim a re-verifier cannot settle.** The
     refactor's comment read *"No magnitude is stated on purpose: the redundant
     rebuild is a fraction of this arm (a re-verifier measured ~2.6 s of ~17 s on one
     box)"* — an assertion that no magnitude is stated, immediately followed by one,
-    on the exact axis the change exists to fix. The figure was also unsettleable: the
-    framing that produced it (whole arm in-suite, `--durations=0`, one box) was not
-    in the comment, so a re-verifier running the control step alone measures
-    something else and cannot tell which reading was meant.
+    on the exact axis the change exists to fix — and its merge-base predecessor read
+    *"measured 10.36 s of the control's 10.85 s"*, a ratio that reproduces under no
+    framing the reviewer constructed (the redundant rebuild is ~2.6 s of a ~17 s
+    arm; the arm's dominant cost is the 242-module ungated walk, not the control).
+    Either way the framing (whole arm? control step? which box?) was absent, so a
+    re-verifier running the control step alone measures something else and cannot
+    tell which reading was meant.
 
     Both directions, so the arm is not a style rule: a duration WITH its framing is
-    allowed (the reviewer's alternative fix), but a comment that claims it pins none
-    while pinning one is red. Prose alone would leave the contradiction to the next
-    reader; the file's own thesis is that a claim it makes about itself is one a
-    guard can hold it to (`test_section_13_carries_no_line_citations` is the same
-    shape, one document over).
+    allowed (the reviewer's alternative fix), but a duration without it is red. The
+    predicate is `_unframed_durations`; its non-vacuity — that it reds on the text
+    this PR replaced — is its own arm below, because a guard that is green on the
+    pre-fix code guards nothing (the defect the round-5 review found here).
     """
     comment = _gate_walk_comment()
     assert comment, (
         "`_narrow_gate_walk_sites` carries no `#` comment any more, so this arm "
         "asserts nothing — the mechanism it states was the whole point of the change"
     )
-    says_none = re.search(r"no (?:magnitude|wall-clock)", comment, re.IGNORECASE)
-    durations = re.findall(r"\d+(?:\.\d+)?\s?(?:ms|s)\b", comment)
-    assert not (says_none and durations), (
-        "the gate-walk comment claims it pins no magnitude and then pins one "
-        f"({durations}) — a sentence falsified by its own object, and a duration "
-        "without its framing (whole arm? control step? which box?) is a claim a "
-        "re-verifier cannot settle. Drop the figure, or state it with the framing "
-        "that produced it."
+    assert not _unframed_durations(comment), (
+        "the gate-walk comment pins a duration without the framing that produced it "
+        f"({_unframed_durations(comment)}) — a claim a re-verifier cannot settle. "
+        "Drop the figure, or state it with the framing that produced it (whole arm / "
+        "control step / `--durations=0` / in-suite). Note that \"on one box\" is not "
+        "framing: it is the condition, not the measurement."
+    )
+
+
+def test_the_gate_walk_comment_arm_reds_on_the_text_it_replaced():
+    """Non-vacuity for `_unframed_durations`, on the MERGE BASE — not an
+    intermediate commit of this branch (`#9506`).
+
+    ⚠️ **The round-5 review found the first guard green on `origin/main`.** It red
+    only on `says_none AND duration`, and the base text says no denial, so the arm
+    passed on the very text this PR exists to delete. This arm feeds the same
+    three states through the same predicate the guard uses — the base string, the
+    intermediate string, and a framed duration — so "the guard reds on what it
+    replaced" is executed rather than asserted in a docstring, the shape this file
+    already uses elsewhere ("mutation applied, all arms re-run").
+    """
+    merge_base = (
+        "# `_literal_files()` is already parsed and cached; re-reading `_sources()` "
+        "and\n# rebuilding the same 29 `_File`s measured 10.36 s of the control's "
+        "10.85 s for\n# byte-identical output."
+    )
+    intermediate = (
+        "# ... only object identity changes. No magnitude is stated on purpose: the\n"
+        "# redundant rebuild is a fraction of this arm (a re-verifier measured "
+        "~2.6 s of\n# ~17 s on one box), and a wall-clock number pinned into a "
+        "comment is the\n# claim that rots."
+    )
+    assert _unframed_durations(merge_base) == ["10.36 s", "10.85 s"], (
+        "the predicate must red on the MERGE BASE text (`measured 10.36 s of the "
+        "control's 10.85 s`) — that is the figure this PR removes, so an arm that "
+        "passes on it is vacuous: it would let the identical figure be re-introduced"
+    )
+    assert _unframed_durations(intermediate), (
+        "the predicate must red on the intermediate `~2.6 s of ~17 s` sentence, "
+        "which is the state the earlier round called \"pre-fix\" — it is a commit on "
+        "this branch, never on main"
+    )
+    assert not _unframed_durations(
+        "# the arm measured 14.4 s whole arm, --durations=0, one box"
+    ), (
+        "a duration that carries its framing must stay allowed (the reviewer's "
+        "alternative fix) — otherwise this is a style rule that would red on a "
+        "settleable figure"
+    )
+    assert not _unframed_durations(_gate_walk_comment()), (
+        "the live comment must be green under the same predicate the two arms above "
+        "use — this is the arm the guard asserts, restated so a divergence between "
+        "the predicate and its non-vacuity arm cannot go unnoticed"
     )
 
 
