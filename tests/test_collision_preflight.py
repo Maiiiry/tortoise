@@ -1012,16 +1012,22 @@ class CollisionPreflightTest(unittest.TestCase):
         The refusal guard keys on `surface.authority` (may this surface refuse?)
         while the closing-reference read keys on `use_closing_field` (did the
         CALLER request the field?). Those are different questions, and this is the
-        only shape where they diverge: authority BLOCKING with the field not
-        requested. `linked` stays empty but `unreadable` is True, so the message
-        says the field could not be read instead of asserting contents the tool
-        never looked at.
+        shape where they diverge: authority BLOCKING with the field not requested.
+        `linked` stays empty but `unreadable` is True, so the message says the
+        field could not be read instead of asserting contents the tool never
+        looked at.
 
-        No production call site reaches this arm today — which is exactly why it
-        needs a test. A branch already shipped in this PR unpinned (the
-        `use_closing_field` scoping at `48ceaca5a`), and a defence that no test
-        exercises can be deleted without anything going red: mutation confirmed a
-        hard `raise` substituted for this arm left the whole suite green.
+        ⛔ THE DIVERGENCE IS LIVE since #9402, not hypothetical: the BLOCKING
+        open-PR call site passes `use_closing_field=not via_rest`, so a list
+        retrieved by the REST rescue (no `closingIssuesReferences` on the wire) is
+        scanned with the field NOT requested — and a pre-flight on an OPEN PR's
+        own number reaches this arm for real. This test drives the arm DIRECTLY
+        (it must not depend on a rate-limit seam to be exercised) and
+        `test_open_pr_number_refusal_survives_a_rest_rescued_list` pins the live
+        end-to-end route. The arm is still worth a unit test on its own: a branch
+        already shipped in this PR unpinned (the `use_closing_field` scoping at
+        `48ceaca5a`), and mutation confirmed a hard `raise` substituted for this
+        arm left the whole suite green before this test existed.
         """
         cp = _tool_module()
         surface = cp.Surface("open PRs", authority=cp.AUTHORITY_BLOCKING)
@@ -2784,6 +2790,45 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("regex fallback — this surface is advisory", out)
         self.assertNotIn("closingIssuesReferences was not requested on this call", out)
 
+    def test_open_pr_number_refusal_survives_a_rest_rescued_list(self):
+        """The `unreadable` arm is LIVE on the rescue path (#9423 review, P3-2).
+
+        The code comment at that arm used to say "the two agree at both call
+        sites today, so this is the drift arm, not the live one", and the unit
+        test above said "no production call site reaches this arm today". #9402
+        makes both false: the BLOCKING open-PR surface is scanned with
+        `use_closing_field=not via_rest`, and a REST-rescued list has no
+        `closingIssuesReferences` — so a pre-flight on an OPEN PR's OWN NUMBER
+        during a GraphQL exhaustion reaches the arm for real and refuses with
+        "its closing-reference field could not be read".
+
+        That wording is the right one (the caller never requested the field), so
+        what this pins is that the live route keeps it — and that the route is a
+        NAMED refusal, not a traceback and not a VERDICT line mis-remedied as a
+        broken surface. Nothing exercised this shape before, which is why the
+        stale claims could sit next to a green suite.
+        """
+        self.gh_fixtures(open_prs=[{
+            "number": ISSUE, "title": "fix(battery): restore the pin test",
+            "body": "no closing reference in this body", "state": "open",
+            "headRefName": "fix/2712-pin-preflight-test",
+        }])
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        # The list really came from the REST rescue (not the GraphQL read), so
+        # the arm is reached through the path the claim is about.
+        argv = (self.gh_dir / "open-prs-rest-argv.txt").read_text()
+        self.assertIn("repos/test-owner/test-repo/pulls?state=open", argv)
+        self.assertIn("is an OPEN PULL REQUEST, not a work item", out)
+        # The UNREAD wording, never a claim about a field that was not requested.
+        self.assertIn("closing-reference field could not be read", out)
+        self.assertNotIn("It names no closing issue", out)
+        # A refusal, not a crash and not a surface-level INCOMPLETE: `main()`
+        # prints the refusal and returns BEFORE `format_report`, so the caller
+        # keys its remedy on the cause instead of on a broken read.
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("VERDICT", out)
+
     def test_rest_truncation_note_names_the_requested_page_size(self):
         # #9423 review (P2, finding 2). `--pr-limit` has NO lower bound, and the
         # REST rescue requests `per_page = min(100, --pr-limit)`. This note is the
@@ -2859,6 +2904,78 @@ class CollisionPreflightTest(unittest.TestCase):
         # help with a cap.
         self.assertNotIn("fix gh auth/network", out)
         self.assertNotIn("rebuild the fleet board and re-run", out)
+
+    @staticmethod
+    def _verdict_line(out: str) -> str:
+        """The ONE `VERDICT:` line of a report, so a cause is asserted on the
+        line a caller actually keys its remedy on (not merely somewhere in the
+        report, where the surface rows repeat it)."""
+        lines = [
+            line for line in out.splitlines()
+            if line.startswith("VERDICT: INCOMPLETE")
+        ]
+        if len(lines) != 1:
+            raise AssertionError(f"expected exactly one VERDICT line: {out}")
+        return lines[0]
+
+    def test_both_causes_on_one_surface_are_both_named(self):
+        # #9423 review (P3-1). ONE surface can carry BOTH measured causes at
+        # once, and the REST rescue makes that routine rather than a corner:
+        # `--pr-limit 20` + 20 open PRs + an exhausted GraphQL budget leaves the
+        # open-PR surface `incomplete()` (closing-references-unmeasured) AND
+        # `truncated` (the REST page came back FULL). The remedy tested "all
+        # incomplete surfaces are exhausted" FIRST, so it returned the budget
+        # cause alone and dropped the truncation cause — the cause whose cure is
+        # a SETTING the operator controls, so re-running after the budget resets
+        # at `--pr-limit 20` truncates again.
+        #
+        # The `assertIn("Widen with --pr-limit")` in the test above cannot red
+        # this, because that string comes from the SURFACE's truncation note; the
+        # cause is only stated in the VERDICT line, which is what a caller keys
+        # its remedy on.
+        prs = [{"number": 9000 + n, "title": f"chore: unrelated {n}",
+                "body": "", "headRefName": f"chore/9{n}-unrelated",
+                "state": "open"}
+               for n in range(20)]
+        self.gh_fixtures(open_prs=prs)
+        rc, out = self.run_tool(extra_args=["--pr-limit", "20"],
+                                env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        verdict = self._verdict_line(out)
+        self.assertIn("BUDGET EXHAUSTION", verdict)
+        self.assertIn("TRUNCATED list", verdict)
+        # …and the surface is named ONCE as a cause-carrier (`open PRs:`), not
+        # twice. The "(open PRs)" earlier in the line is the surface LIST from
+        # the verdict prefix, not a contributor mention.
+        self.assertEqual(verdict.count("open PRs:"), 1, verdict)
+
+    def test_a_both_cause_surface_is_named_once_in_the_mixed_remedy(self):
+        # #9423 review (P3-1), the MIXED arm of the same root cause. With another
+        # incomplete surface present, `parts` named the SAME surface twice — once
+        # as exhausted and once as truncated — so the report said
+        # "open PRs: <budget>; PART is open PRs: <truncation>". Folding a
+        # both-flagged surface into one contributor list is what makes the list
+        # of causes read as a list of CAUSES rather than of flags.
+        self.gh_fixtures(open_prs=[{
+            "number": 9000 + n, "title": f"chore: unrelated {n}",
+            "body": "", "headRefName": f"chore/9{n}-unrelated",
+            "state": "open",
+        } for n in range(20)])
+        rc, out = self.run_tool(
+            extra_args=["--pr-limit", "20"],
+            env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1",
+                       "GH_STUB_TIMELINE_FAIL": "1"},
+        )
+        self.assertEqual(rc, 2, out)
+        verdict = self._verdict_line(out)
+        self.assertIn("PART of this is", verdict)
+        self.assertEqual(verdict.count("open PRs:"), 1, verdict)
+        self.assertEqual(verdict.count("TRUNCATED list"), 1, verdict)
+        self.assertEqual(verdict.count("BUDGET EXHAUSTION"), 1, verdict)
+        # The second cause-carrier is the landed surface, whose failure IS a
+        # read failure — so the generic remedy is kept for it, not dropped.
+        self.assertIn("issue landed", verdict)
+        self.assertIn("fix gh auth/network", verdict)
 
     def test_graphql_exhaustion_with_rest_also_down_still_fails_closed(self):
         # The fallback must never become a fail-open. With BOTH budgets gone the

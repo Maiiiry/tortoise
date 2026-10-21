@@ -3434,10 +3434,18 @@ def scan_pr_surface(
                     # payload, which may still lack it: that is the SurfaceError
                     # arm below) — different questions, so they may legitimately
                     # diverge. `unreadable` is what keeps the divergence from
-                    # becoming a false claim; the two agree at both call sites
-                    # today, so this is the drift arm, not the live one, and
+                    # becoming a false claim. ⛔ THE DIVERGENCE IS LIVE, NOT
+                    # HYPOTHETICAL (#9402): the BLOCKING open-PR call site passes
+                    # `use_closing_field=not via_rest`, so when the enumeration
+                    # came from the REST rescue its list has no
+                    # `closingIssuesReferences` and a pre-flight on an OPEN PR's
+                    # own number reaches EXACTLY this arm — it refuses with "its
+                    # closing-reference field could not be read", which is the
+                    # right wording for a field the caller never asked for.
                     # `test_blocking_surface_without_the_closing_field_reports_it_unread`
-                    # is what keeps it from being silently deletable.
+                    # pins the wording and
+                    # `test_open_pr_number_refusal_survives_a_rest_rescued_list`
+                    # pins the live route end to end.
                     unreadable = True
             except SurfaceError:
                 # `unreadable` is carried so the message below does NOT assert a
@@ -5104,6 +5112,13 @@ def run_preflight(
     #    `gh pr list` (one GraphQL request, fetched as `--limit cap+1`), where
     #    hitting the cap marks the surface TRUNCATED — which keeps the run out
     #    of CLEAN. That is the BLOCKING path and its posture is unchanged.
+    #    ⛔ "OVER `gh pr list`" IS NOT THE WHOLE STORY (#9402): that read is
+    #    GraphQL, the GraphQL budget is fleet-shared, and when it is EXHAUSTED
+    #    the enumeration is RESCUED over REST (`gh api repos/<slug>/pulls`, see
+    #    the `via_rest` block below). The rescue does not loosen the posture —
+    #    the surface still ends INCOMPLETE (the computed closing-reference test
+    #    is GraphQL-only and stays unmeasured), so CLEAN is unreachable either
+    #    way — but it does mean the open-PR list below can arrive from REST.
     #    Closed PRs are the ADVISORY surface: ONE bounded request (`api -i`, no
     #    `--paginate`) whose own `Link` header supplies the total, so a partial
     #    sample stays visible without an unbounded, rate-limit-blowing
@@ -5637,15 +5652,38 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
     `--pr-limit`. A remedy that names a cause the report has disproved is the
     same defect class as a wrong verdict reason.
 
-    Four arms, and the multi-cause ones are not decoration: when only SOME
-    surfaces are exhausted or truncated, claiming the generic cause in general
-    would be wrong for the others, so each recognised cause is named as a
-    CONTRIBUTOR and the generic remedy is kept for the remainder.
+    ⛔ ONE SURFACE CAN CARRY BOTH CAUSES, so the partition is THREE-WAY and
+    `both` is decided FIRST. The REST rescue (#9402) makes that the COMMON case
+    rather than a corner: an exhausted GraphQL read rescued over REST whose page
+    comes back FULL leaves the open-PR surface `incomplete()` (the
+    closing-reference test is unmeasured) AND `truncated` (the page was capped)
+    in the SAME run. An arm that tested "every incomplete surface is exhausted"
+    before looking at truncation then returned the budget cause alone and
+    DROPPED the cap — a remedy omitting a cause this same report MEASURES, and
+    the dropped one is the cause whose cure is a SETTING the operator controls:
+    re-running after the budget resets at `--pr-limit 20` truncates again. The
+    same partition is what keeps a both-flagged surface from being named TWICE
+    in the mixed arm (once as exhausted, once as truncated).
+
+    The multi-cause arms are not decoration: when only SOME surfaces are
+    exhausted or truncated, claiming the generic cause in general would be wrong
+    for the others, so each recognised cause is named as a CONTRIBUTOR and the
+    generic remedy is kept for the remainder.
     """
-    exhausted = [s for s in incomplete if _is_budget_exhaustion(s.note or "")]
-    truncated = [s for s in incomplete if s.truncated]
+    both = [
+        s for s in incomplete
+        if s.truncated and _is_budget_exhaustion(s.note or "")
+    ]
+    both_ids = {id(s) for s in both}
+    exhausted = [
+        s for s in incomplete
+        if id(s) not in both_ids and _is_budget_exhaustion(s.note or "")
+    ]
+    truncated = [
+        s for s in incomplete if id(s) not in both_ids and s.truncated
+    ]
     generic = "fix gh auth/network (or rebuild the fleet board) and re-run"
-    if not exhausted and not truncated:
+    if not both and not exhausted and not truncated:
         return generic
     budget = (
         "a GRAPHQL BUDGET EXHAUSTION shared by the whole fleet — `gh auth` is "
@@ -5663,19 +5701,36 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
         "with --pr-limit (or COLLISION_PREFLIGHT_PR_LIMIT) and re-run; `gh "
         "auth` is fine and the fleet board does not need rebuilding"
     )
+    if len(both) == len(incomplete):
+        # Every incomplete surface carries BOTH measured causes: name BOTH, and
+        # name the surface once. Gated on the FULL set (not on "no exclusive
+        # contributor") so a mixed run still falls through to the contributor
+        # arm below and keeps the generic remedy for the remainder.
+        return (
+            f"the causes are BOTH, both measured on "
+            f"{', '.join(s.name for s in both)}: {budget} — AND, independently, "
+            f"{truncation}"
+        )
     if len(exhausted) == len(incomplete):
         return f"the cause is {budget}"
     if len(truncated) == len(incomplete):
         return f"the cause is {truncation}"
     remaining = [
         s for s in incomplete
-        if not s.truncated and not _is_budget_exhaustion(s.note or "")
+        if id(s) not in both_ids
+        and id(s) not in {id(x) for x in exhausted}
+        and id(s) not in {id(x) for x in truncated}
     ]
     parts: list[str] = []
     if exhausted:
         parts.append(f"{', '.join(s.name for s in exhausted)}: {budget}")
     if truncated:
         parts.append(f"{', '.join(s.name for s in truncated)}: {truncation}")
+    if both:
+        parts.append(
+            f"{', '.join(s.name for s in both)}: BOTH {budget} — AND, "
+            f"independently, {truncation}"
+        )
     tail = ""
     if remaining:
         tail = (
