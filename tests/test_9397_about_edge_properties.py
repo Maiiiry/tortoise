@@ -768,6 +768,22 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
         "positive, so one of the two rows is lying:\n  "
         + "\n  ".join(f"{m}::{s}" for m, s in both_roles)
     )
+    #: The declared false positive must STAY a false positive: its `SET` is
+    #: IMPL|NAND-scoped, and the about transfer is a bare MERGE. If either shape
+    #: moves, this row is describing code that no longer exists — re-derive the
+    #: documents' property set instead of trusting the exemption.
+    sdk = (PKG / "sdk.py").read_text(encoding="utf-8")
+    for key in NOT_AN_ABOUT_WRITER:
+        assert key[0] == "tortoise/sdk.py", key
+        assert key not in RECORDED_WRITERS and key not in MAP_WRITERS, key
+    assert (
+        "MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t)" in sdk
+        and "MERGE (new)-[:{rel}]->(t)" in sdk
+    ), (
+        "`supersede_point` no longer matches the shape that makes it a census "
+        "false positive (IMPL|NAND-scoped `SET`, BARE about transfer) — "
+        "re-derive the property set and drop or amend NOT_AN_ABOUT_WRITER"
+    )
     #: Every recorded row must DECLARE its name set, or a new name on that site
     #: would slip past the subset test below.
     undeclared = sorted(
