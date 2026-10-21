@@ -481,12 +481,80 @@ def test_box_local_target_is_refused_unless_acknowledged():
 
 
 def test_owner_token_uses_a_real_hostname_not_just_the_env_var(monkeypatch):
-    """With HOSTNAME unset every box collapsed to `box:<session>`, so a PEER's live claim
-    compared equal and was reported `already-held` rc 0 — no claim taken, dispatch proceeds."""
+    """With HOSTNAME unset the STORED `host` field was empty (the token already had a socket
+    fallback), so the record asserted no capacity provenance under cron/systemd — and the
+    "claim map and capacity map are one record" promise silently held nothing."""
     monkeypatch.delenv("HOSTNAME", raising=False)
     import socket as _socket
 
+    store = FakeStore()
+    out = wc.acquire(store, _record(owner="cell-1:100", host=""), now=NOW)
+    assert out.rc == 0
+    stored = wc._parse(store.points[wc.claim_id("daniel-ospina/tortoise", "issue-5052")])
+    assert stored.host == _socket.gethostname()
     assert wc._owner_token("cell-t1").startswith(_socket.gethostname() + ":")
+
+
+def test_status_and_release_refuse_a_box_local_store():
+    """The loopback refusal belongs on EVERY verb that consults the store: `status` answering
+    `free` from a graph no peer can read is what a controller then dispatches on, and a
+    `release` there frees a claim nobody could see."""
+
+    class LoopbackSDK:
+        _db_uri = "docker://:@127.0.0.1:16379/tortoise"
+
+        def _get_proj(self):
+            raise AssertionError("must refuse before touching the graph")
+
+    store = wc.SDKClaimStore(sdk=LoopbackSDK())
+    single = wc.status(store, "o/r", "issue-1", now=NOW)
+    listing = wc.status(store, "o/r", None, now=NOW)
+    released = wc.release(store, "o/r", "issue-1", owner="box:1", now=NOW)
+    # The REASON must be the box-local refusal, not "unanswerable": a store that raises for
+    # any other cause would otherwise satisfy an rc-only assertion and the guard could be
+    # deleted without a test failing (measured by mutation).
+    for out in (single, listing, released):
+        assert out.rc == 2, out.reason
+        assert "BOX-LOCAL" in out.reason, out.reason
+    allowed = wc.SDKClaimStore(sdk=LoopbackSDK(), allow_box_local=True)
+    assert allowed.require_shared() is None
+
+
+def test_reclaim_uses_the_window_the_caller_asked_for():
+    """`--ttl` is the caller's statement of how long the unit is theirs; a reclaim that swapped
+    in DEFAULT_TTL silently gave the next holder a different lease than it requested."""
+    store = FakeStore()
+    store.points[wc.claim_id("daniel-ospina/tortoise", "issue-5052")] = _record(
+        owner="cell-1:100", lease_until=NOW - 1
+    ).content()
+    out = wc.acquire(store, _record(owner="cell-4:200", lease_until=NOW + 600), now=NOW)
+    assert out.rc == 0, out.reason
+    assert out.lease_until - NOW == 600
+
+
+def test_release_json_reports_the_tombstone_it_wrote():
+    """`release --json` reported `epoch: 0, lease_until: 0` for the record it had just written,
+    so a controller logging the release logged zeros."""
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    out = wc.release(store, "daniel-ospina/tortoise", "issue-5052", owner="cell-1:100", now=NOW + 5)
+    assert out.rc == 0
+    payload = json.loads(json.dumps(out.as_dict(), sort_keys=True))
+    assert payload["epoch"] == 1
+    assert payload["lease_until"] == NOW + 5
+
+
+def test_negative_capacity_fields_are_a_usage_error():
+    """The record doubles as the fleet's capacity map; `ncpu=-8` there asserts something
+    impossible, so a negative measurement is refused rather than persisted."""
+    rc = wc.main(
+        [
+            "acquire", "--repo", "o/r", "--issue", "5052", "--session", "cell-t1",
+            "--ncpu", "-8", "--lpc", "-1", "--lanes", "-3",
+        ],
+        store=FakeStore(),
+    )
+    assert rc == wc.EXIT_USAGE
 
 
 def test_check_survives_an_injected_store_without_a_target_method(monkeypatch):

@@ -67,7 +67,7 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 | Resident size of that map | **35 MB graph memory**, **0.1499 GB** at the measured 1,672 B/resident node | same census; `STORAGE-ARCHITECTURE.md` §17.4.6 |
 | **Charged** nodes of that map | **≈10,435** (Points + Object/Subject/Event; the `GraphEvent` journal is **not** charged) | `tortoise/quota.py` (the `points` counter IS the pricing `max_graph_nodes` cap) |
 | **One claim**, measured on a private lane graph today (`docker://:@127.0.0.1:16393`) | **+2 nodes per claim on the `create_point` path** (1 `:Point` + 1 `:GraphEvent` journal entry); **+5 MB for 3,000 claims** (incl. 2 MB of index) ⇒ **≈1,748 B resident/claim**; **10.7 ms per create** (3,000 creates in 32.0 s) | this lane's probe, `GRAPH.MEMORY USAGE` + `MATCH (n) RETURN count(n)` |
-| **One claim on the SHIPPED write path** (re-measured in review, since the tool no longer uses `create_point` — it needs an atomic `MERGE`, see §3) | **+1 node** (`:Point`) per claim; `create_point` on the same graph adds **4** (`:Point`, `:GraphEvent`, `EpMeta`, `GraphEventMeta`) | `MATCH (n) RETURN count(n)` and label deltas before/after `SDKClaimStore.create` vs `sdk.create_point` |
+| **One claim on the SHIPPED write path** (re-measured in review, since the tool no longer uses `create_point` — it needs an atomic `MERGE`, see §3) | **+1 node** (`:Point`) per claim; `create_point` on the same graph adds **≈+2 per point** (`:Point` + `:GraphEvent`) plus two ONE-OFF graph-level meta nodes (`EpMeta`, `GraphEventMeta`) on a graph's first point | 30 `create_point` calls on the review graph: total +62 nodes; `MATCH (n) RETURN count(n)` and label deltas before/after `SDKClaimStore.create` vs `sdk.create_point` |
 | Chargeable nodes per claim | **1** (the journal entry is not counted; the Point is) | `tortoise/quota.py` |
 | **Writes per day** — lane dispatches ≈ PR creation | **63–118/day** across the two repos: `tortoise` 39/81/52/28 PRs on 10-18…10-21, `agent-infra` 27/37/27/11/18 | `gh pr list --state all` on each repo, run today |
 | **Claims per month** | **≈3,000** (100/day × 30) ⇒ **3,000 chargeable nodes**, **3,000 resident nodes** (the shipped MERGE path), **≈3 MB**, **≈6,000 write ops** (create + release) | derived from the two rows above |
@@ -111,8 +111,9 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 
 ## 3. The pilot — one slice, the claim, in the graph
 
-`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (32 fake-store tests + 1 live test), contract
-`rc 0/1/2` identical to `claims.sh` so a caller needs no new branch (`rc 3` is a malformed invocation).
+`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (37 fake-store tests + 3 live tests, 40
+collected), contract `rc 0/1/2` identical to `claims.sh` so a caller needs no new branch (`rc 3` is a
+malformed invocation).
 
 **What it stores.** One `:Point` per held unit, id = `sha256(repo, key)` rendered as the SDK's ULID shape —
 **deterministic, and never containing a box** (`claims.sh`'s own recorded lesson: *"a KEY CONTAINING THE
@@ -233,13 +234,14 @@ stores all of them.
 ```bash
 # the per-claim volume probe (private lane graph, so no peer's target is touched)
 uri="$(uv run python tools/test_lane.py uri)" && eval "$uri"
-uv run pytest tests/test_work_claim.py -q            # 36 passed (3 live legs skip without a URI; 33 pass hermetically)
+uv run pytest tests/test_work_claim.py -q            # 40 passed (3 live legs skip without a URI; 37 pass hermetically)
 
-# `--allow-box-local`: this lane's container is loopback BY DESIGN. Dispatch refuses a loopback
-# store otherwise, because a claim there is invisible to every peer (see §3).
+# `--allow-box-local`: this lane's container is loopback BY DESIGN. EVERY verb that reads or
+# writes the store (`acquire`, `status`, `release`) refuses a loopback target otherwise,
+# because a claim there is invisible to every peer (see §3).
 tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 --allow-box-local \
     --session cell-t1 --branch feat/x --purpose "pilot" --host cell-t1 --ncpu 8 --lpc 372 --lanes 3
-tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json
-tools/work_claim.py status --repo daniel-ospina/tortoise --json      # repo-wide listing
-tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1
+tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json --allow-box-local
+tools/work_claim.py status --repo daniel-ospina/tortoise --json --allow-box-local   # repo-wide
+tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1 --allow-box-local
 ```

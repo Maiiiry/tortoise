@@ -118,9 +118,11 @@ free — the duplicate-dispatch failure, reported as a success.
 
 ⚠️ The guard validates that a store is CONFIGURED, not that it is SHARED. A loopback URI
 (`docker://…@127.0.0.1:16379/…`) is exactly as invisible to a peer as the embedded file, and
-every cell's own graph looks like that (see the evidence README §1). So `acquire` refuses a
-loopback target unless `--allow-box-local` acknowledges a single-box trial, and `check` prints
-the target with the password REDACTED and warns when it is box-local.
+every cell's own graph looks like that (see the evidence README §1). So EVERY verb that
+consults the store — `acquire`, `status`, `release` — refuses a loopback target unless
+`--allow-box-local` acknowledges a single-box trial (`status` included: its `free` is what a
+controller dispatches on). `check` prints the target with the password REDACTED and warns
+when it is box-local.
 
 There is deliberately no default: see the fail-closed note.
 """
@@ -609,7 +611,7 @@ def acquire(
     cid = claim_id(record.repo, record.key)
     record.claimed_at = record.claimed_at or now
     record.lease_until = record.lease_until or (now + DEFAULT_TTL)
-    record.host = record.host or _host_name()
+    record.host = record.host or hostname or _host_name()
 
     # Is this a store a PEER can read? (review of #9487 P2.) The env guard above can only prove
     # that a URI is set: the README's own inventory records that every cell writes to its own
@@ -1191,6 +1193,13 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
         # fence exists to prevent, reachable from one flag (review of #9487 P2).
         if args.cmd == "acquire" and int(getattr(args, "ttl", 0)) <= 0:
             raise ValueError("--ttl must be a positive number of seconds")
+        # A negative capacity reading is a caller bug, and the record is the fleet's capacity
+        # map too — persisting `ncpu=-8` would make that map assert something impossible
+        # (review of #9487 P3).
+        if args.cmd == "acquire":
+            for flag in ("ncpu", "lpc", "lanes"):
+                if int(getattr(args, flag, 0)) < 0:
+                    raise ValueError(f"--{flag} must not be negative (it is a measurement)")
         number = int(getattr(args, "pr", None) or 0) or int(getattr(args, "issue", None) or 0)
         kind = "pr" if int(getattr(args, "pr", None) or 0) else args.kind
         key = None if args.cmd == "status" and number == 0 else normalise_key(kind, number)
