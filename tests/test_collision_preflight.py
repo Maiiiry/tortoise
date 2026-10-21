@@ -221,6 +221,17 @@ if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/pulls\?state=open ]]; then
     echo "gh-stub: could not connect to api.github.com" >&2
     exit 1
   fi
+  # #9423 review (P3): the REST rescue's own `except ValueError` arm — the
+  # strict-decoding refusal `_issue_view_rest` has carried since #3435 — was
+  # UNPINNED: no seam wrote a bad byte to `open_prs_rest.json`, so DELETING the
+  # arm left the suite green. The sibling path's note records why that matters
+  # ("without this seam the malformed-REST arm is never executed, which is why a
+  # crash on it survived a review cycle"); this is the same hole on the new
+  # transport.
+  if [ "${GH_STUB_OPEN_PR_REST_INVALID_UTF8:-0}" = "1" ]; then
+    printf '\xff\xfe[]\n'
+    exit 0
+  fi
   f="$d/open_prs_rest.json"
   if [ ! -f "$f" ]; then echo "gh-stub: no fixture: $f" >&2; exit 1; fi
   cat "$f"
@@ -3315,6 +3326,27 @@ class CollisionPreflightTest(unittest.TestCase):
         rc, out = self.run_tool(env_extra={
             "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
             "GH_STUB_ISSUE_REST_INVALID_UTF8": "1",
+        })
+        self.assertNotIn("Traceback", out)
+        self.assertNotIn("UnicodeDecodeError", out)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("not decodable as text", out)
+
+    def test_a_non_utf8_rest_open_pr_body_is_a_named_incomplete_not_a_traceback(self):
+        # #9423 review (P3): the REST rescue's `except ValueError` arm is the
+        # strict-decoding refusal `_issue_view_rest` has carried since #3435, and
+        # it was UNPINNED — no seam wrote a bad byte to the open-PR REST fixture,
+        # so DELETING the arm left the whole suite green. That matters because
+        # the rescue is called from INSIDE `run_preflight`'s `except
+        # SurfaceError` body: an uncaught `UnicodeDecodeError` (a ValueError, not
+        # a SurfaceError) bypasses that handler AND `main()`'s refusal pair, and
+        # escapes as a traceback with no VERDICT line at exit 1 — the code this
+        # module documents as COLLISION, which callers read as "another lane is
+        # on it".
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_PR_LIST_RATE_LIMITED": "1",
+            "GH_STUB_OPEN_PR_REST_INVALID_UTF8": "1",
         })
         self.assertNotIn("Traceback", out)
         self.assertNotIn("UnicodeDecodeError", out)
