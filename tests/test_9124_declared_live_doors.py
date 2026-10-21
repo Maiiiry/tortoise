@@ -1041,8 +1041,16 @@ def test_no_two_census_entries_share_a_bare_function_name():
 #: `sdk.py: 23508` decays into a pointer at whatever function holds that line
 #: exactly as `sdk.py:23508` does. `test_the_line_anchor_matches_every_spelling`
 #: holds the variants red-eyed.
+#: ⛔ WIDENED AGAIN (review, measured): `[\s,:]*` cannot consume a CLOSING
+#: BACKTICK, so the spelling this very note uses — a backticked module path — went
+#: green: `` `sdk.py`:23508 ``, `` `sdk.py` line 23508 ``, `` `sdk.py` 23508 ``,
+#: `` `tortoise/sdk.py`:23508 ``. The backticked form is the MOST likely next
+#: spelling, since the note writes `` `tortoise/sdk.py` `` in backticks
+#: throughout; `@` (a "file@rev" habit) and `#?`/`line #23508` are admitted too.
+#: Same rot, same reasoning:
+#: the separator is noise, the `sdk.py` + digits pair is the citation.
 _SDK_LINE_ANCHOR = re.compile(
-    r"sdk\.py[\s,:]*(?:\(?\s*(?:at\s+)?line\s*[:\s]*)?[Ll]?\d+")
+    r"sdk\.py[\s,:`@]*(?:\(?\s*(?:at\s+)?line\s*[:\s#]*)?[Ll]?\d+")
 
 #: ⛔ NO LOCAL WRITE-CLAUSE REGEX HERE. What counts as a write is
 #: `_statement_writes` + `_WRITE_CLAUSE_RE` from `tortoise.projection` — the
@@ -1243,9 +1251,19 @@ _MODULE_BINDINGS_CACHE: dict[int, tuple[object, dict[str, list[ast.expr]]]] = {}
 
 
 def _function_returns(func) -> list[ast.expr]:
-    """Every expression a function RETURNS — the values its callers receive."""
+    """Every expression a function RETURNS — the values its callers receive.
+
+    YIELDS count too (review, measured): a generator has no `Return`, so a
+    resolved callee that yields its text contributed NO fragments and nothing to
+    `unread` — `query = "MATCH … " + "".join(_parts())` where `_parts()` yields
+    `" SET n.poked = 1"` passed GREEN in both the same-module and the
+    package-`__init__` hop, which is the P1 class this branch closed one branch
+    over. `yield`/`yield from` are exactly as reachable as `return` here: both
+    hand the caller a string it may splice into a statement.
+    """
     return [node.value for node in ast.walk(func)
-            if isinstance(node, ast.Return) and node.value is not None]
+            if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom))
+            and node.value is not None]
 
 
 def _resolve_callee(name: str, module, path: Path):
@@ -1562,6 +1580,16 @@ def test_the_line_anchor_matches_every_spelling():
         "sdk.py (line 23508)",
         "sdk.py at line 23508",
         "sdk.py::23508",
+        # Third spelling family (review round 3, measured): the note writes
+        # `tortoise/sdk.py` in BACKTICKS throughout, and `[\s,:]*` cannot
+        # consume a closing backtick — so the spelling this file is most likely
+        # to grow next was the one that passed. `#?` also admits `line #23508`.
+        "`sdk.py`:23508",
+        "`sdk.py` line 23508",
+        "`sdk.py` 23508",
+        "`tortoise/sdk.py`:23508",
+        "sdk.py line #23508",
+        "sdk.py@23508",
     ]
     for variant in must_match:
         assert _SDK_LINE_ANCHOR.search(variant), (
@@ -1652,7 +1680,7 @@ def test_the_symbol_pin_reads_the_comment_not_the_rows():
 
 
 def _census_writer_names() -> frozenset[str]:
-    """Bare names of every `sdk.py` function the census PROVES reaches a write.
+    """Bare names the census either PROVES reaches a write or CANNOT prove a read.
 
     `enumerate_handle_surface` keeps a fact for every function holding at least
     one mutating `<handle>.<verb>` call, so that surface IS the census's own
@@ -1663,11 +1691,30 @@ def _census_writer_names() -> frozenset[str]:
     `_bare_name`, the SAME resolver `_inventory_of` uses — it strips the
     `@<lineno>` suffix too, so a same-scope redefinition cannot make a writer
     name unmatchable by accident.
+
+    ⛔ THE POLARITY IS "WRITE **OR** NOT-PROVEN-READ", NOT "WRITE" (review,
+    measured). A surface entry whose every mutating call is `<unresolved>` is a
+    function the census could not settle — it is on the surface for the same
+    reason `_UNRESOLVED` exists, and 45 of 83 entries here are that shape. The
+    message this set drives therefore may not say "the census PROVES reaches the
+    write handle": for that majority the census proves nothing at all.
+
+    What IS subtracted is the file's own positive verdict: a name registered in
+    `_PROVEN_READS` has been hand-checked AND mechanically pinned as an
+    unresolved-but-read row (`test_every_proven_read_names_a_real_census_entry`
+    checks both its census verdict and the exact statement kinds), so calling it
+    from another row may not red on the census's silence.
+
+    The remaining `_UNRESOLVED`-declared names still red — deliberately. Their
+    hand-check covers THEIR OWN statement, not a call from someone else's row,
+    and the over-report direction is the one this file prefers. What was wrong
+    was the reason, not the direction.
     """
     cached = _CENSUS_WRITER_NAMES.get("names")
     if cached is None:
         surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
-        cached = frozenset(_bare_name(key) for key in surface)
+        proven_read = {_bare_name(key) for _rel, key in _PROVEN_READS}
+        cached = frozenset(_bare_name(key) for key in surface) - proven_read
         _CENSUS_WRITER_NAMES["names"] = cached
     return cached
 
@@ -1744,9 +1791,12 @@ def _calibration_read_offenders(functions, readers=_CALIBRATION_READERS,
                     receiver, aliases, params):
                 continue
             offenders.append(
-                f"{name}: CALLS `{callee}`, which the census proves reaches the "
-                "write handle — the note says this row is a read, so either "
-                "the call goes or the row moves out of `_UNRESOLVED`")
+                f"{name}: CALLS `{callee}`, which the census either proves "
+                "reaches the write handle or cannot prove read-only (both are "
+                "on `enumerate_handle_surface`, and this message may not claim "
+                "more than that) — the note says this row is a read, so either "
+                "the call goes, the row moves out of `_UNRESOLVED`, or the "
+                "callee is registered in `_PROVEN_READS` with its statements")
     return offenders
 
 
@@ -2268,6 +2318,89 @@ def test_a_shadowed_scalar_coercion_does_not_exempt_its_argument():
                for offender in _offenders_for(module_level, with_module=True)), (
         "a MODULE-level rebind of a scalar coercion exempted its argument, so "
         "a caller-supplied fragment passed through the pin")
+
+
+def test_a_yielding_callee_is_read_not_skipped():
+    """NON-VACUITY for the generator arm of `_fragments_of` (review P2).
+
+    The callee arm followed `_function_returns` only, so a RESOLVED callee with
+    no `Return` — a generator — contributed NO fragments and nothing to
+    `unread`: the resolver succeeded, so the "cannot be resolved" arm never ran
+    either. Measured: a write yielded by a helper passed GREEN, same-module and
+    through the package hop, which is the silent-drop class this branch closed
+    for an unresolvable NAME, one branch over. `yield`/`yield from` hand the
+    caller a string exactly as `return` does.
+
+    The control is the same source with `yield` swapped for `return`: it reds,
+    so this test distinguishes the arm and not merely "some offender".
+    """
+    yielding = (
+        'def _parts():\n'
+        '    yield " SET n.poked = 1"\n'
+        '\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(_parts())\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(yielding, with_module=True)
+    assert any("not a read any more" in offender for offender in offenders), (
+        "a write YIELDED by a resolved callee was neither read nor reported — "
+        f"the generator shape is invisible (offenders={offenders})")
+
+    returning = yielding.replace('yield " SET n.poked = 1"',
+                                 'return [" SET n.poked = 1"]')
+    assert any("not a read any more"
+               for offender in _offenders_for(returning, with_module=True)), (
+        "the control does not red, so this test proves nothing about the "
+        "yield arm")
+
+
+def test_the_census_writer_set_states_its_own_polarity():
+    """The writers arm is "write OR NOT-PROVEN-READ", and its message says so.
+
+    `enumerate_handle_surface` keys a function for ANY mutating call, including
+    one it could not resolve — so 45 of 83 entries are functions the census
+    proves nothing about (33 of them this file's own hand-checked `_UNRESOLVED`
+    READ rows). The arm's message claimed "the census PROVES reaches the write
+    handle", which is false for that majority, and a call to a name already
+    proven read here (`_PROVEN_READS`) redded a correct row for it.
+
+    So: the proven-read register is subtracted, a provable writer is not, and
+    the message may not assert more than "write or not-proven-read".
+    """
+    names = _census_writer_names()
+    proven = {_bare_name(key) for _rel, key in _PROVEN_READS}
+    assert proven, "`_PROVEN_READS` is empty, so this test proves nothing"
+    assert not (names & proven), (
+        "a name this file has already proven READ is still reported as a "
+        f"writer, so a correct row reds on the census's silence: "
+        f"{sorted(names & proven)}")
+    assert "invalidate_point" in names, (
+        "a name the census genuinely proves writes is missing from the set — "
+        "the subtraction above cannot be the whole surface")
+
+    source = '''
+class Door:
+    def reading(self, proj):
+        query = "MATCH (n:Point) WHERE n.id IN $ids RETURN n.id"
+        self._find_point_by_content("x")
+        return proj.g.query(query).result_set
+'''
+    func = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef))
+    offenders = _calibration_read_offenders(
+        {"reading": func}, (("reading", "RETURN n.id"),),
+        writers=frozenset({"_find_point_by_content"}))
+    assert offenders, "the unproven-callee arm produced nothing to inspect"
+    assert all("which the census proves reaches the write handle" not in offender
+               for offender in offenders), (
+        "the message asserts the census PROVES a write for an entry that may "
+        f"only be unproven (offenders={offenders})")
+    assert all("either proves reaches the write handle or cannot prove "
+               "read-only" in offender for offender in offenders), (
+        "the message does not state the set's real polarity, so the next "
+        f"reader will trust a claim the census does not make "
+        f"(offenders={offenders})")
 
 
 def test_the_calibration_reader_list_is_bound_to_the_rows_it_guards():
