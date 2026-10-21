@@ -135,8 +135,14 @@ _APPEND_NOT_A_RECORD = {
     # census credited that door with a commit point it does not have and filed
     # it as apply-first on the strength of a warning builder. A `_journal_*`
     # NAME is not a journal write; that is exactly what this set exists to
-    # refuse, and `capture_session` is inventoried under `_NO_JOURNAL` for the
-    # reason the source actually shows.
+    # refuse — and this exclusion is what bought that door a false lane, not
+    # what earns it a home: `capture_session` is in NO inventory at this head
+    # (#9349 moved its last handle write to declared doors, so the census no
+    # longer keys it — see `_NO_JOURNAL`'s comment). The exclusion still does
+    # work in the direction that matters:
+    # `test_the_capture_door_delegates_its_writes_to_declared_doors` asserts it
+    # remains the door's ONLY append-pattern call, so a future real append reds
+    # there instead of hiding under it.
     "_journal_write_failure_warning",  # sdk.py: builds a receipt warning string
 }
 
@@ -224,10 +230,12 @@ _DECLARATION_DECORATORS = (*_LIVE_LANE_NAMES, *_APPLY_FIRST_LANE_NAMES)
 #: this set's pointer will not find the other five. The remaining TWO
 #: (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`) were never
 #: inventory entries at all: they were inline statements inside
-#: `capture_session`, which appends NO record of its own and is therefore
-#: inventoried under `_NO_JOURNAL` for its four provenance stamps (`#9350`) — a
-#: function holding BOTH scoped and unscoped writes is refused by this census
-#: ("presence is not containment"), so the stamps became doors of their own.
+#: `capture_session`, which appends NO record of its own — a function holding
+#: BOTH scoped and unscoped writes is refused by this census ("presence is not
+#: containment"), so the stamps became doors of their own, and the parent door
+#: then reached no handle write at all (#9349). It has no row and needs none;
+#: `test_the_capture_door_delegates_its_writes_to_declared_doors` pins both
+#: halves of that split.
 #: A declaration does not convert the order: the entries that remain are still
 #: apply-first, and the lane's own pin requires each declared door to append its
 #: record and to be genuinely apply-first.
@@ -267,11 +275,13 @@ _APPLY_FIRST_HELPERS = {
 #:   `on_session_merged=lambda record: self._emit_event(...)` argument — a
 #:   callback the CALLEE invokes, not a record this door appends. #9206 removed
 #:   that lambda (the shared writer journals its own `:Session` now) AND the
-#:   door's two state writes (they are declared doors now), and what is left is
-#:   stamps only: it appends NO record, so it belongs in `_NO_JOURNAL` — its
-#:   first attempt at a home, `_APPLY_FIRST_DOORS`, was only reachable by
-#:   counting `_journal_write_failure_warning` (a warning-string builder) as an
-#:   append. See that entry's comment.
+#:   door's two state writes (they are declared doors now), and what was left
+#:   was stamps only: it appends NO record, so at that head `_NO_JOURNAL` was
+#:   its only honest home — the earlier attempt at THIS set was reachable only
+#:   by counting `_journal_write_failure_warning` (a warning-string builder) as
+#:   an append. #9349 then moved those stamps onto declared doors and the door
+#:   left every inventory: a door with no handle write of its own has no lane to
+#:   name. See `_NO_JOURNAL`'s comment for the current state.
 _MIXED_ARM_DOORS: set[str] = set()
 
 #: Reach the handle with a write-like statement and append NO record at all, so
@@ -280,23 +290,27 @@ _MIXED_ARM_DOORS: set[str] = set()
 #: fold. Measured on #9124; this is the "19 writers that journal nothing" class
 #: in the issue's landing path, at the count the source actually holds.
 _NO_JOURNAL = {
-    # ⛔ `capture_session` LEFT THIS SET (#9206 → #9349). It was here because it
-    # "reaches the handle with a write-like statement and appends no record" —
-    # and #9349 moved that last reach OUT of the door: every write it still makes
-    # is delegated to a door that is itself on the census surface and declared
+    # ⛔ #9206/#9349 — `capture_session` LEFT this set, and the reason is the
+    # history this list keeps: #9206 put it here after excluding
+    # `_journal_write_failure_warning` (a receipt-warning STRING BUILDER) as a
+    # commit point, because what remained at the handle was four provenance
+    # stamps. #9349 then moved those stamps to their OWN declared doors
+    # (`_stamp_capture_attempt_state` / `_stamp_entity_link_counters`, both
+    # `apply-first-declared`) and the door now reaches no mutating handle call
+    # at all — so a row here would be a STALE census entry, which
+    # `test_the_inventories_hold_no_stale_entry` reds on. A door that issues no
+    # handle write has no lane to name; the two successors carry the stamps'
+    # declaration, and
+    # `test_the_capture_door_delegates_its_writes_to_declared_doors` pins that
+    # split so the stamps cannot slip back into an undeclared body. That test
+    # also pins the other half: the five doors the write moved TO
     # (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`,
     # `_write_session_and_turns`, `_materialize_session_source`,
-    # `_stamp_capture_provenance`). With no write-like call of its own the census
-    # no longer KEYS it, so an entry here stops naming a function the census
-    # emits — a stale row, which this file's own
-    # `test_the_inventories_hold_no_stale_entry` refuses. The door's remaining
-    # claim ("appends nothing of its own") is pinned in
-    # `test_the_capture_door_is_inventoried_as_appending_no_record`, now as an
-    # ABSENCE from both the surface and every inventory rather than a row.
-    # The warning-string builder (`_journal_write_failure_warning`) that once
-    # bought this door a false `apply-first` lane stays in
-    # `_APPEND_NOT_A_RECORD`, and that test still asserts it is the door's only
-    # pattern-matching call — so the exclusion is still load-bearing.
+    # `_stamp_capture_provenance`) are on the census surface, so the writes
+    # moved rather than vanished. `_journal_write_failure_warning` stays in
+    # `_APPEND_NOT_A_RECORD` — the door's only append-pattern call — so a FUTURE
+    # real append here (the fix #9350 owes) FAILS instead of slipping under an
+    # exclusion that no longer has anything to exclude.
     "_clear_reliability_cache",
     "_connect_issue_objects",
     "_extract_session_llm",
@@ -4594,30 +4608,38 @@ def test_the_append_exclusions_append_nothing():
     assert not offenders, "\n  " + "\n  ".join(offenders)
 
 
-def test_the_capture_door_is_inventoried_as_appending_no_record():
-    """`capture_session` writes through DECLARED doors, so it needs no row here.
+def test_the_capture_door_delegates_its_writes_to_declared_doors():
+    """`capture_session` reaches NO mutating handle call of its own any more.
 
-    #9206 review P2 settled that the door appends nothing of its own: the only
-    append-pattern call in its body is `_journal_write_failure_warning`, the
-    receipt-warning STRING BUILDER, and the `_emit_event` the census once
-    credited was a lambda the CALLEE invoked. #9349 then moved the last
-    write-like reach out of the door entirely — its state writes and stamps are
-    now delegated to doors that are on the census surface and declared — so the
-    census stopped keying `capture_session` at all.
+    ⛔ This test used to assert the opposite (`…inventoried_as_appending_no_record`,
+    a `_NO_JOURNAL` row), and it was TRUE when #9206 landed: the door still held
+    its four provenance stamps (`eventId`/`source_session`/`source_harness`/
+    `ingested_at`) and the only append-shaped name in its body was
+    `_journal_write_failure_warning`, a receipt-warning STRING BUILDER that must
+    never be counted as a commit point. #9349 then moved the stamps to their own
+    declared doors — `_stamp_capture_attempt_state` / `_stamp_entity_link_counters`,
+    both `apply-first-declared` — so the door now delegates every write and the
+    census has NOTHING to classify in it. A `_NO_JOURNAL` row is therefore a
+    STALE ENTRY (it is what redded `test_the_inventories_hold_no_stale_entry` on
+    `origin/main`), and the honest statement is the split itself: the parent
+    issues no handle write, its two successors carry the declaration.
 
-    Both halves are pinned, because each one ALONE would read as an accident:
-    the door is absent from the surface AND absent from every inventory, and the
-    doors it delegates its writes to ARE on the surface (so its writes moved
-    rather than vanished). The exclusion below is still load-bearing in the
-    direction that matters: `_journal_write_failure_warning` remains the door's
-    only append-pattern call, so a FUTURE real append (the fix #9350 owes)
-    FAILS here instead of slipping under that exclusion.
+    The set of append-pattern names in the body is asserted too, so a FUTURE
+    append added here (the real fix, #9350) FAILS instead of slipping under an
+    exclusion that no longer has anything to exclude.
     """
     surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
+
     assert "TortoiseSDK.capture_session" not in surface, (
-        "the census keys the capture door again — it has a write-like reach of "
-        "its own, so it needs a lane row and this pin needs re-writing")
-    assert "capture_session" not in _NO_JOURNAL
+        "the capture door reaches a mutating handle call again — it must be "
+        "inventoried (and declared), not left as a delegating parent whose "
+        "writes are invisible to the census"
+    )
+    assert "capture_session" not in _NO_JOURNAL, (
+        "`capture_session` is back in `_NO_JOURNAL`, but it issues no handle "
+        "write of its own — a `no-journal` row for a door with nothing to "
+        "journal is a stale census entry (see `_NO_JOURNAL`'s comment)"
+    )
     assert "capture_session" not in _APPLY_FIRST_DOORS
     assert "capture_session" not in _all_inventoried(), (
         "a stale inventory row names a function the census no longer emits — "
@@ -4633,10 +4655,19 @@ def test_the_capture_door_is_inventoried_as_appending_no_record():
         f"{missing} are no longer on the census surface, so the capture door "
         "has no write-like reach AND no proven home for the ones it lost")
 
-    # The exclusion is LOAD-BEARING: re-read the door's body with the pattern
-    # alone and name every call it would call an append. Exactly one, and it is
-    # excluded — when that stops being true, the door has a real record and
-    # belongs in `_NO_JOURNAL` no longer.
+    # The stamps did not become orphans: both successors ARE in the census and
+    # both DECLARE, which is the whole point of the split.
+    for door in ("TortoiseSDK._stamp_capture_attempt_state",
+                 "TortoiseSDK._stamp_entity_link_counters"):
+        assert door in surface, (
+            f"{door} reaches no mutating handle call — the provenance stamps "
+            "have no declared home any more (#9350)"
+        )
+        assert _kind(surface[door]) == "apply-first-declared", (
+            f"{door} is not declared: {_kind(surface[door])} — the stamps' "
+            "write lane is what keeps them off the undeclared set"
+        )
+
     tree = ast.parse(SDK_PY.read_text())
     door = next(
         node for node in ast.walk(tree)
@@ -4647,8 +4678,12 @@ def test_the_capture_door_is_inventoried_as_appending_no_record():
             getattr(call.func, "id", None) or getattr(call.func, "attr", None)
             for call in ast.walk(door) if isinstance(call, ast.Call))
         if name and _APPEND_CALL_RE.match(name)})
-    assert matched == ["_journal_write_failure_warning"], matched
-    assert set(matched) <= _APPEND_NOT_A_RECORD, matched
+    assert set(matched) <= _APPEND_NOT_A_RECORD, (
+        "the capture door calls something append-shaped that is NOT a proven "
+        f"non-record ({sorted(set(matched) - _APPEND_NOT_A_RECORD)}) — if it "
+        "now appends a record of its own it needs a real inventory row and this "
+        "delegation test must move with it"
+    )
 
 
 def test_the_append_exclusions_cannot_buy_a_door_a_lane():
@@ -4751,6 +4786,75 @@ def test_the_measure_mode_census_is_what_a_flip_would_refuse(armed_sdk_factory):
         assert not undeclared_handle_writes()
     finally:
         projection._HANDLE_GUARD_ENFORCES = False
+
+
+#: The `durations:` row this file OWNS in the CI manifest, and the phrase in it
+#: that states how many test functions the file holds. Both are committed claims
+#: about THIS artifact, and they rotted the way every hand-copied figure does:
+#: the row quoted `59` while the tree collected `60`, because the figure was
+#: carried over from a commit message written one test earlier (#9315 review
+#: P2). `to **N**` is the pinned spelling — the count is DERIVED in the pin, so
+#: a test added to this file reds until the row re-states it.
+_CI_MANIFEST = ROOT / "config" / "ci-surfaces.yml"
+_DURATION_ROW_RE = re.compile(
+    r"^\s*test_9124_declared_live_doors\.py:\s*(?P<weight>[\d.]+)\s+#(?P<tail>.*)$",
+    re.MULTILINE)
+_DURATION_ROW_COUNT_RE = re.compile(r"to\s+\*\*(?P<count>\d+)\*\*")
+
+
+def test_the_duration_row_states_this_files_real_test_count():
+    """NON-VACUITY for the `durations:` row's committed test count (review P2).
+
+    The row this PR rewrites (`test_9124_declared_live_doors.py: 120.0`) is the
+    recorded justification for the file's weight, and it states how many test
+    functions the file holds. That figure was quoted from an older commit
+    message and was one out — `59` against a tree that collects `60` — the
+    exact claim-vs-artifact class this file's own
+    `test_the_offenders_helper_docstring_states_the_real_polarity` exists for,
+    except it was recorded in the CI manifest, where no pin looked.
+
+    So the number is DERIVED from this module's AST, not trusted: the `to **N**`
+    figure must equal the module-level `test_` count. Red on the pre-fix text
+    (`to 59` while this head defines more).
+    """
+    tree = ast.parse(Path(__file__).read_text())
+    counted = [(node.name, node) for node in tree.body
+               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and node.name.startswith("test_")]
+    # The equality below is only "the module-level count IS the collected count"
+    # while nothing decorates, parametrises or shadows a test, so those three
+    # structural conditions are checked rather than assumed.
+    decorated = [name for name, node in counted if node.decorator_list]
+    assert not decorated, (
+        f"{decorated} are decorated, so a module-level count is no longer the "
+        "collected count — this pin's equality needs re-deriving")
+    names = [name for name, _ in counted]
+    assert len(names) == len(set(names)), (
+        "a duplicate test name shadows an earlier definition, so the count is "
+        "not what pytest collects")
+    assert not [n for n in tree.body
+                if isinstance(n, ast.Assign)
+                and any(getattr(t, "id", None) == "pytestmark"
+                        for t in n.targets)], (
+        "a module-level `pytestmark` changes what is collected, so this pin's "
+        "count is no longer the runnable count")
+
+    row = _DURATION_ROW_RE.search(_CI_MANIFEST.read_text())
+    assert row, (
+        "`config/ci-surfaces.yml` no longer carries a `durations:` row for this "
+        "file — the weight that keeps a slow leg from under-packing it is gone "
+        "(see #3400's trap for a file added by a PR)")
+    claimed = _DURATION_ROW_COUNT_RE.search(row.group("tail"))
+    assert claimed, (
+        "the `durations:` row no longer states the file's test count in the "
+        "pinned `to **N**` form, so the figure a reader is told cannot be "
+        f"checked (tail={row.group('tail')[:160]!r})")
+    assert int(claimed.group("count")) == len(counted), (
+        "the `durations:` row states this file holds "
+        f"{claimed.group('count')} test functions; the module defines "
+        f"{len(counted)} (29 at `origin/main`, the rest added by #9315). "
+        "Re-state the row with the real count — and revisit its weight, which "
+        "is declared above the file's per-file local reading.")
 
 
 @pytest.fixture
