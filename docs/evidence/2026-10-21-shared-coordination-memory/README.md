@@ -110,26 +110,40 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 
 ## 3. The pilot — one slice, the claim, in the graph
 
-`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (27 tests), contract `rc 0/1/2` identical
-to `claims.sh` so a caller needs no new branch.
+`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (32 fake-store tests + 1 live test), contract
+`rc 0/1/2` identical to `claims.sh` so a caller needs no new branch (`rc 3` is a malformed invocation).
 
 **What it stores.** One `:Point` per held unit, id = `sha256(repo, key)` rendered as the SDK's ULID shape —
 **deterministic, and never containing a box** (`claims.sh`'s own recorded lesson: *"a KEY CONTAINING THE
 BOX ID IS NOT A CAS"*). Content = one canonical line (`repo`, `key`, `owner`, `session`, `branch`, `head`,
 `lease_until`, `epoch`, `purpose`, `claimed_at`, plus the capacity fields); props are the same fields
 namespaced (`claim_owner`, `claim_epoch` — the SDK **silently ignores** a client-supplied `owner`, measured
-on a live write). The **graph's id uniqueness is the CAS**: `create_point` on an existing id returns the
-**existing** point rather than overwriting (verified live), so the second box is handed the winner's record
-and refuses with the holder's name.
+on a live write).
 
-- **create = CAS**, keyed `issue-<N>` / `pr-<N>` — disjoint prefixes, like `claims.sh`'s two keyings.
+⛔ **`create_point` is NOT the CAS — the first version of this pilot said it was, and measurement
+falsified it.** Two `create_point(id='probe-dup-1')` calls on a live FalkorDB left **two `:Point` nodes
+with the same id** (contents `A` and `B`), and `get_point` returned A: the loser's node exists and is
+invisible to every read by id, so a property query reports one unit of work **twice, with two owners**.
+Every write is therefore ONE atomic statement —
+
+```cypher
+MERGE (n:Point {id:$id}) ON CREATE SET n += $props, n.content=$content, n.__cas=$token
+RETURN count(n) AS c, n.content AS content, n.__cas = $token AS won
+```
+
+with a token unique to the call: `won` is true only for the creator, so the statement itself is the CAS.
+State changes are `MATCH … WHERE n.claim_epoch = $expected SET …`, which touches 0 rows when a peer moved
+the epoch — that is the fence, in the store, not in the caller.
+
+- **create = atomic MERGE + token**, keyed `issue-<N>` / `pr-<N>` — disjoint prefixes, like `claims.sh`.
 - **read-back is the authority**, never the write's exit code.
 - **lease is data, not liveness** (`#1709` rec 3) — a remote pid cannot be probed.
-- **fencing by epoch** (`#1709` rec 6) — a reclaim bumps it through a store that can express the
-  precondition (`replace_if_epoch`), and a lost reclaim names the winner. A store without that
-  capability (the shipped `SDKClaimStore` — `update_point` is a blind write) **refuses** to reclaim
-  (rc 2) rather than double-granting; the operator route is `release --force --reason`, which records
-  the reason and the releasing identity in the tombstone.
+- **fencing by epoch** (`#1709` rec 6) — a reclaim bumps it, the write is conditional on the epoch the
+  caller read, and a lost reclaim names the winner. The hand-off closes: acquire → release → acquire is
+  covered by the live test (epoch 1 → 2); a released record is reclaimable because there is no holder
+  left to race, and a **live** holder is never displaced. A store that cannot express the precondition
+  (a blind `update_point`) makes `acquire` refuse (rc 2) rather than double-grant, and the operator
+  route is `release --force --reason`, which records the reason and the releasing identity.
 - **release expires in place instead of deleting**, which is the one behaviour deliberately different from
   `refs/claims/*`: the ledger keeps its history, so "who owned this, and when did they stop" is answerable.
 - **the capacity fields are stored, never measured** — `capacity.sh` measures (`host`, `ncpu`, `lpc`,
@@ -215,9 +229,11 @@ stores all of them.
 # the per-claim volume probe (private lane graph, so no peer's target is touched)
 uri="$(uv run python tools/test_lane.py uri)" && eval "$uri"
 export TORTOISE_DB_URI="$uri"
-uv run pytest tests/test_work_claim.py -q            # 27 passed (1 skipped without a live URI)
+uv run pytest tests/test_work_claim.py -q            # 33 passed (1 live test skips without a URI)
 
-tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 \
+# `--allow-box-local`: this lane's container is loopback BY DESIGN. Dispatch refuses a loopback
+# store otherwise, because a claim there is invisible to every peer (see §3).
+tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 --allow-box-local \
     --session cell-t1 --branch feat/x --purpose "pilot" --host cell-t1 --ncpu 8 --lpc 372 --lanes 3
 tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json
 tools/work_claim.py status --repo daniel-ospina/tortoise --json      # repo-wide listing

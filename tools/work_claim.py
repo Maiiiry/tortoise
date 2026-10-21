@@ -15,18 +15,22 @@ This tool moves exactly ONE slice into the graph: **who holds a unit of work, ri
 
 WHAT IT STORES
 --------------
-One `:Point` per held unit, id = a DETERMINISTIC digest of `(repo, key)`, so the graph's
-own uniqueness is the compare-and-swap:
+One `:Point` per held unit, id = a DETERMINISTIC digest of `(repo, key)`, and every write
+is ONE atomic `MERGE`-on-id statement carrying a per-call token, so the statement itself
+reports whether THIS caller created the record — that is the compare-and-swap:
 
     work-claim:<sha256(repo + key)>  pointKind=work-claim
       props: repo, key, owner, session, branch, head, lease_until, epoch,
              purpose, claimed_at, host, ncpu, lpc, lanes
       content: the same fields in ONE canonical line (the CAS compares CONTENT)
 
-`create_point` with an id that already exists does NOT overwrite — verified against a
-live FalkorDB: the second creator is handed the FIRST point back (its content, not the
-caller's). That is the same property `claims.sh` gets from `git push` to a new ref, and
-it is why the read-back below is the authority rather than the write's exit code.
+⛔ `create_point` IS NOT A CAS, and the first version of this tool was wrong to say it was.
+Measured on a live FalkorDB (this branch): two `create_point(id='probe-dup-1')` calls left
+TWO `:Point` nodes with the same id — contents `A` and `B` — and `get_point` returned A. The
+loser's node is created and invisible to any read by id, so a property query reports one
+unit of work TWICE with two owners. `MERGE (n:Point {id:$id}) ON CREATE SET … , n.__cas=$token`
+keeps the id unique and returns `n.__cas = $token`, which only the creator can see: the
+loser's statement matches the existing node and returns the winner's content.
 
 ⚠️ THE ID MUST NOT CONTAIN THE BOX. `claims.sh` learned this the hard way and says so:
 "a KEY CONTAINING THE BOX ID IS NOT A CAS. Two boxes mint two DISTINCT refs and BOTH
@@ -36,18 +40,18 @@ is a ledger and not a lock.
 THE FIVE PROPERTIES (each one is a copy of something `claims.sh` already proved)
 --------------------------------------------------------------------------------
 1. **Content-addressed key** — `issue-<N>` / `pr-<N>`, never a box, never a random id.
-2. **Create = CAS** — the loser gets the winner's point back and REFUSES (rc 1).
+2. **Create = CAS** — an atomic `MERGE`-on-id with a per-call token; the loser's statement
+   matches the existing node and REFUSES (rc 1).
 3. **Read back, never trust the write** — the write's return value is re-read by id and
    the content compared. A store that answers with something else is a lost race.
 4. **The lease is DATA, not liveness** (#1709 rec 3) — a remote pid cannot be probed, so
    `lease_until` in the record is what frees a claim, and an expired claim is reclaimable.
-5. **Fencing** (#1709 rec 6) — a reclaim bumps `epoch`, and the bump is only trusted
-   through a store that can express the precondition (`replace_if_epoch`, a real CAS). A
-   blind replace cannot: A.replace → A.read → B.replace → B.read lets BOTH boxes observe the
-   same expired epoch and both report `acquired`. So a store without the fence (the shipped
-   `SDKClaimStore`: `update_point` has no conditional form) REFUSES to reclaim an expired
-   claim (rc 2) and the operator frees it explicitly (`release --force --reason`). Refusing a
-   capability the store does not have is the same discipline as refusing an unset store.
+5. **Fencing** (#1709 rec 6) — a reclaim bumps `epoch`, and the bump is conditional: the write
+   applies only while the stored epoch is the one we read (`replace_if_epoch`). A stale holder's
+   release is conditional the same way, so it cannot erase a peer's newer record. A store that
+   cannot express the precondition (a `update_point`-style blind write) makes `acquire` REFUSE to
+   reclaim (rc 2) rather than double-granting — a capability the store does not have is not a
+   gap to paper over.
 
 ⛔ FAIL-CLOSED, AND THAT IS A DELIBERATE DEPARTURE — SEE `OVERRIDES:` BELOW
 -------------------------------------------------------------------------
@@ -110,8 +114,15 @@ reads only that variable; `TORTOISE_API_URL` names a hosted HTTP surface this to
 client for, so accepting it as proof of a store disarmed the guard and let the SDK fall back
 to this box's EMBEDDED file. Measured on this branch: `check` printed `ok: claim store
 reachable` and exited 0 while the claim lived in a box-local file that every peer reads as
-free — the duplicate-dispatch failure, reported as a success. There is deliberately no
-default: see the fail-closed note.
+free — the duplicate-dispatch failure, reported as a success.
+
+⚠️ The guard validates that a store is CONFIGURED, not that it is SHARED. A loopback URI
+(`docker://…@127.0.0.1:16379/…`) is exactly as invisible to a peer as the embedded file, and
+every cell's own graph looks like that (see the evidence README §1). So `acquire` refuses a
+loopback target unless `--allow-box-local` acknowledges a single-box trial, and `check` prints
+the target with the password REDACTED and warns when it is box-local.
+
+There is deliberately no default: see the fail-closed note.
 """
 
 from __future__ import annotations
@@ -131,6 +142,7 @@ import argparse
 import hashlib
 import json
 import os
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -246,17 +258,22 @@ class ClaimRecord:
 
 
 class ClaimStore(Protocol):
-    """The three calls the CAS needs, plus two OPTIONAL capabilities.
+    """The calls the CAS needs, plus two OPTIONAL capabilities.
 
-    `replace` is a blind write and is therefore used ONLY for a holder's own record (release);
-    it is never the reclaim path. Two capabilities are optional because a store may not be able
-    to express them, and their ABSENCE is an answer rather than a default:
+    `create` is the atomic "create only if absent" and `replace_if_epoch` the fenced update;
+    both return whether THIS caller won. `replace` is a release: it must be conditional on the
+    epoch the caller observed (a blind overwrite can erase a peer's reclaim).
+
+    Two capabilities are optional because a store may not be able to express them, and their
+    ABSENCE is an answer rather than a default:
 
     - `replace_if_epoch(cid, record, expected_epoch) -> str | None` — the fenced reclaim. `None`
       means the precondition failed (a peer moved the epoch) and the caller lost the race. A
       store without it cannot reclaim: two boxes would both report `acquired`.
     - `query_repo(repo) -> list[dict]` — the repo-wide listing. A store without it must make
       `status --repo` REFUSE (rc 2), never answer `0 claim records`.
+    - `require_shared() -> str | None` — a refusal reason when the target is not readable by a
+      peer (box-local). Absent means "no opinion", which is not the same as "shared".
     """
 
     def read(self, claim_id: str) -> str | None: ...
@@ -264,6 +281,26 @@ class ClaimStore(Protocol):
     def create(self, claim_id: str, record: ClaimRecord) -> str: ...
 
     def replace(self, claim_id: str, record: ClaimRecord) -> str: ...
+
+
+def _redact_uri(uri: str) -> str:
+    """`docker://:s3cret@host:6379/g` → `docker://***@host:6379/g`.
+
+    The documented URI form carries a password, and `check` runs in routine diagnostics whose
+    output is pasted into issues and controller logs.
+    """
+    import re
+
+    return re.sub(r"//[^/@\s]*@", "//***@", uri)
+
+
+def _uri_host(uri: str) -> str:
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(uri).hostname or "").strip().lower()
+    except ValueError:
+        return ""
 
 
 def claim_id(repo: str, key: str) -> str:
@@ -324,13 +361,29 @@ def _require_store_configured(environ: dict[str, str] | None = None) -> str:
 
 
 class SDKClaimStore:
-    """The shipped store: Tortoise points through the SDK.
+    """The shipped store: `:Point` nodes in the Tortoise graph, written atomically.
 
-    `create` never overwrites (the graph's id uniqueness is the CAS); `replace` is the
-    fenced reclaim path and is only reachable after an observed expired lease + epoch.
+    Every write is ONE Cypher statement, so the graph applies it atomically (FalkorDB runs a
+    query single-threaded):
+
+        MERGE (n:Point {id:$id}) ON CREATE SET n += $props, n.content=$content, n.__cas=$token
+
+    The token is unique per call, so the statement RETURNS whether THIS call did the create —
+    that is the compare-and-swap, and it is why two boxes cannot both win.
+
+    ⛔ `create_point` is NOT a CAS and is deliberately NOT used here. Measured on a live graph
+    (this worktree, `falkordb`): two `create_point(id='probe-dup-1')` calls left TWO `:Point`
+    nodes with the same id and contents `A` and `B`, and `get_point` returned A — the loser's
+    node is created but invisible to every read by id. A listing that queries by property then
+    reports one unit of work TWICE with two owners. `MERGE` on the id is the only primitive
+    here that keeps id unique, and it carries the token test above.
+
+    State transitions (acquire, reclaim, release) are conditional on `claim_epoch`, so a
+    stale holder cannot overwrite a peer's newer record: the statement touches 0 rows and the
+    caller loses.
     """
 
-    def __init__(self, sdk: Any = None) -> None:
+    def __init__(self, sdk: Any = None, *, allow_box_local: bool = False) -> None:
         if sdk is None:
             from tortoise.domain_loader import register_kind
             from tortoise.sdk import TortoiseSDK
@@ -353,91 +406,148 @@ class SDKClaimStore:
                 "Set TORTOISE_DB_URI to the shared store (docker://… or bolt://…)."
             )
         self._sdk = sdk
+        self._allow_box_local = allow_box_local
+
+    def _rows(self, cypher: str, **params: Any) -> list[list[Any]]:
+        """One statement in, rows out. Any failure is UNANSWERABLE — never an empty answer."""
+        try:
+            return self._sdk._get_proj().g.query(cypher, params=params).result_set or []
+        except Exception as exc:
+            raise StoreUnanswerable(
+                f"the claim store could not answer ({type(exc).__name__}: {str(exc)[:200]})"
+            ) from exc
 
     def read(self, cid: str) -> str | None:
-        try:
-            point = self._sdk.get_point(cid)
-        except Exception as exc:
-            # A missing point is not an error the SDK reports uniformly across deployments
-            # (a hosted 404 and a self-hosted empty match differ), so an exception is
-            # classified by asking the SDK for a definite answer a second way: by id list.
-            return self._read_via_query(cid, exc)
-        if not point:
+        # ORDER BY epoch: a graph written by the pre-MERGE version may hold duplicate nodes for
+        # one id (that version used create_point, which does not enforce uniqueness). Reading the
+        # highest epoch is the one answer that both versions agree on.
+        rows = self._rows(
+            "MATCH (n:Point {id:$id}) RETURN n.content AS content "
+            "ORDER BY n.claim_epoch DESC LIMIT 1",
+            id=cid,
+        )
+        if not rows:
             return None
-        return point.get("content") or ""
+        return rows[0][0] or ""
 
-    def _read_via_query(self, cid: str, exc: Exception) -> str | None:
-        try:
-            rows = self._sdk.query(kind=CLAIM_KIND)
-        except Exception:
+    def _transition(
+        self, cid: str, record: ClaimRecord, *, expected_epoch: int | None
+    ) -> str | None:
+        """Atomically set the record, optionally only when `claim_epoch` is still what we read.
+
+        `None` means the precondition failed (a peer moved it) — the caller lost the race.
+        `count(n) > 1` is a store we refuse to interpret: two nodes for one id means a write
+        bypassed the MERGE, and picking one would be a guess.
+        """
+        props = {**record.props(), "pointKind": CLAIM_KIND}
+        match = "MATCH (n:Point {id:$id})"
+        if expected_epoch is not None:
+            match += " WHERE n.claim_epoch = $expected"
+        rows = self._rows(
+            match + " SET n += $props, n.content = $content RETURN count(n) AS c",
+            id=cid,
+            expected=expected_epoch,
+            props=props,
+            content=record.content(),
+        )
+        moved = rows[0][0] if rows else 0
+        if moved == 0:
+            return None
+        if moved != 1:
             raise StoreUnanswerable(
-                f"the graph could not be read ({type(exc).__name__}: {str(exc)[:200]})"
-            ) from exc
-        for row in rows or []:
-            if row.get("id") == cid:
-                return row.get("content") or ""
-        return None
+                f"the claim store holds {moved} nodes for id {cid} — refusing to pick one"
+            )
+        return record.content()
 
     def create(self, cid: str, record: ClaimRecord) -> str:
-        try:
-            point = self._sdk.create_point(CLAIM_KIND, record.content(), id=cid, **record.props())
-        except Exception as exc:
+        """`MERGE` + a per-call token: the statement itself reports whether WE created it."""
+        import uuid
+
+        props = {**record.props(), "pointKind": CLAIM_KIND}
+        rows = self._rows(
+            "MERGE (n:Point {id:$id}) "
+            "ON CREATE SET n += $props, n.content = $content, n.__cas = $token "
+            "RETURN count(n) AS c, n.content AS content, n.__cas = $token AS won",
+            id=cid,
+            props=props,
+            content=record.content(),
+            token=uuid.uuid4().hex,
+        )
+        if not rows:
+            raise StoreUnanswerable("the claim store returned no row for the claim write")
+        found, content, _won = rows[0][0], rows[0][1], rows[0][2]
+        if found != 1:
             raise StoreUnanswerable(
-                f"the claim could not be written ({type(exc).__name__}: {str(exc)[:200]})"
-            ) from exc
-        return (point or {}).get("content") or ""
+                f"the claim store holds {found} nodes for id {cid} — refusing to pick one"
+            )
+        return content or ""
 
     def replace(self, cid: str, record: ClaimRecord) -> str:
-        try:
-            point = self._sdk.update_point(cid, **record.props(), content=record.content())
-        except Exception as exc:
-            raise StoreUnanswerable(
-                f"the claim could not be reclaimed ({type(exc).__name__}: {str(exc)[:200]})"
-            ) from exc
-        return (point or {}).get("content") or ""
+        """Release: conditional on the epoch the caller OBSERVED, so a release cannot
+        overwrite a peer's newer reclaim (the residual TOCTOU window of a blind write)."""
+        return self._transition(cid, record, expected_epoch=int(record.epoch)) or ""
 
-    # ⚠️ There is deliberately NO `replace_if_epoch` here (review of #9487 P1). The SDK's
-    # `update_point` is a blind write: it cannot express "set this ONLY if the stored epoch is
-    # still E", and the interleaving (A.replace → A.read → B.replace → B.read) lets TWO boxes
-    # both observe the old epoch, both write, and both report `acquired` — one holder in the
-    # graph, two lanes believing they own the unit. `acquire` therefore REFUSES to reclaim an
-    # expired claim through this store rather than pretending the bump fences (rc 2). An
-    # expired claim is freed explicitly (`release --force`) and then acquired fresh.
+    def replace_if_epoch(self, cid: str, record: ClaimRecord, *, expected_epoch: int) -> str | None:
+        return self._transition(cid, record, expected_epoch=int(expected_epoch))
 
     def target(self) -> str:
-        """Which store answered — printed by `check` so a human sees it rather than trusting"""
+        """Which store answered — printed by `check` so a human sees it rather than trusting.
+
+        The password is REDACTED: the documented URI form carries one
+        (`docker://:<password>@host:port/graph`), and `check` runs in routine diagnostics whose
+        output lands in controller logs.
+        """
         uri = getattr(self._sdk, "_db_uri", None)
-        return str(uri) if uri else "embedded (box-local — NOT a shared claim store)"
+        if not uri:
+            return "embedded (box-local — NOT a shared claim store)"
+        return _redact_uri(str(uri))
+
+    def require_shared(self) -> str | None:
+        """Is this a store a PEER can read? A box-local target is not, and the guard above
+        cannot tell: it validates that a URI is SET, not that the graph is shared."""
+        if self._allow_box_local:
+            return None
+        host = _uri_host(str(getattr(self._sdk, "_db_uri", "") or ""))
+        if host in ("", "localhost", "::1", "0.0.0.0") or host.startswith("127."):
+            return (
+                f"the claim store target is BOX-LOCAL ({host or 'no host'}) — a claim written "
+                "there reads as acquired here and free on every peer, which is the duplicate-"
+                "dispatch failure this tool exists to prevent. Point TORTOISE_DB_URI at the "
+                "shared graph, or pass --allow-box-local to acknowledge a single-box trial."
+            )
+        return None
 
     def query_repo(self, repo: str) -> list[dict]:
-        """Every claim record for one repo (review of #9487 P1).
+        """Every claim record for one repo, ONE ROW PER UNIT OF WORK (highest epoch wins).
 
-        `status --repo` used to answer `0 claim record(s)` for every store, because the caller
-        guarded a missing method with `hasattr` and turned "this store cannot list" into "there
-        is nothing to list". A fleet reader would conclude nobody holds anything. A store that
-        cannot list must refuse (rc 2), never fabricate an empty success.
+        Grouping by id is not cosmetic: a graph written by the pre-MERGE version holds
+        duplicate nodes for one id, so a raw property query reports the same unit twice with
+        two owners — the ledger would contradict itself about who holds it.
         """
-        try:
-            rows = self._sdk.query(kind=CLAIM_KIND, repo=repo)
-        except Exception as exc:
-            raise StoreUnanswerable(
-                f"the claim store could not be listed ({type(exc).__name__}: {str(exc)[:200]})"
-            ) from exc
+        rows = self._rows(
+            "MATCH (n:Point) WHERE n.pointKind = $kind AND n.repo = $repo "
+            "RETURN n.id AS id, n.content AS content, n.claim_epoch AS epoch",
+            kind=CLAIM_KIND,
+            repo=repo,
+        )
+        best: dict[str, tuple[str, int]] = {}
+        for cid, content, epoch in rows:
+            epoch_i = int(epoch or 0)
+            current = best.get(str(cid))
+            if current is None or epoch_i > current[1]:
+                best[str(cid)] = (content or "", epoch_i)
         out: list[dict] = []
-        for row in rows or []:
-            props = row.get("properties") if isinstance(row.get("properties"), dict) else row
-            if not isinstance(props, dict):
-                continue
-            got_repo = props.get("repo", row.get("repo", ""))
-            if got_repo != repo:
+        for content, _epoch in best.values():
+            rec = _parse(content)
+            if rec.repo != repo:
                 continue
             out.append(
                 {
-                    "key": props.get("claimKey") or props.get("key") or "",
-                    "owner": props.get("claim_owner") or props.get("owner") or "",
-                    "lease_until": int(props.get("lease_until") or 0),
-                    "epoch": int(props.get("claim_epoch") or props.get("epoch") or 0),
-                    "session": props.get("session") or "",
+                    "key": rec.key,
+                    "owner": rec.owner,
+                    "lease_until": rec.lease_until,
+                    "epoch": rec.epoch,
+                    "session": rec.session,
                 }
             )
         return out
@@ -494,6 +604,24 @@ def acquire(
     record.claimed_at = record.claimed_at or now
     record.lease_until = record.lease_until or (now + DEFAULT_TTL)
     record.host = record.host or (hostname or os.environ.get("HOSTNAME") or "")
+
+    # Is this a store a PEER can read? (review of #9487 P2.) The env guard above can only prove
+    # that a URI is set: the README's own inventory records that every cell writes to its own
+    # BOX-LOCAL graph, and a loopback docker:// target passes every check while a claim there is
+    # visible to this box alone. That is the same failure the embedded fallback had, one
+    # variable away, so it is a refusal unless the caller acknowledges a single-box trial.
+    shared = getattr(store, "require_shared", None)
+    if shared is not None:
+        refusal = shared()
+        if refusal:
+            return Outcome(
+                rc=EXIT_UNANSWERABLE,
+                status="REFUSED",
+                reason=f"dispatch refused: {refusal}",
+                claim_id=cid,
+                record=record,
+            )
+
     mine = record.content()
 
     # Read BEFORE the create (review of #9487): `create_point` hands back the EXISTING content
@@ -752,28 +880,9 @@ def release(
         tomb.purpose = (tomb.purpose + " [released:" + reason.replace("]", ")") + "]" + actor).strip()
     else:
         tomb.purpose = (tomb.purpose + " [released]").strip()
-    # Narrow the overwrite window (review of #9487 P1): re-read IMMEDIATELY before the blind
-    # write and refuse if the record already moved. Without a store-side CAS this cannot be
-    # atomic — the residual window is documented in the module docstring — but a release must
-    # not overwrite a peer's freshly reclaimed claim when the move is observable at all.
-    try:
-        pre = store.read(cid) or ""
-    except StoreUnanswerable as exc:
-        return Outcome(
-            rc=EXIT_UNANSWERABLE,
-            status="REFUSED",
-            reason=f"release could not be confirmed — dispatch state unknown: {exc}",
-            claim_id=cid,
-        )
-    if pre != existing:
-        return Outcome(
-            rc=EXIT_HELD,
-            status="refused",
-            reason="release lost a race: the claim moved while being released",
-            owner=_field(pre, "owner"),
-            epoch=_int_field(pre, "epoch"),
-            claim_id=cid,
-        )
+    # The write is conditional on the epoch we OBSERVED, so it cannot erase a peer's newer
+    # reclaim — the store enforces the fence, and the read-back below reports the loss. A
+    # release that landed against a moved record returns its content and is refused here.
     try:
         store.replace(cid, tomb)
         back = store.read(cid)
@@ -935,7 +1044,7 @@ def _owner_token(session: str = "", pid: int | None = None) -> str:
     The lease (not `kill -0`) is still what expires a claim: a session id is a name, not a
     liveness proof.
     """
-    host = os.environ.get("HOSTNAME") or "box"
+    host = os.environ.get("HOSTNAME") or socket.gethostname() or "box"
     if session:
         return f"{host}:{session}"
     pid = os.getpid() if pid is None else pid
@@ -950,6 +1059,13 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                         help="machine-readable outcome on stdout")
+    common.add_argument(
+        "--allow-box-local",
+        action="store_true",
+        default=False,
+        help="acknowledge a single-box trial: a loopback claim store is invisible to peers, so "
+        "`acquire` refuses it unless this flag is given",
+    )
 
     parser = argparse.ArgumentParser(
         prog="work_claim",
@@ -961,9 +1077,10 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
     acq = sub.add_parser("acquire", parents=[common], help="claim a unit of work (CAS; refuses if held)")
     acq.add_argument("--repo", required=True, help="owner/name whose issue/PR number is claimed")
     acq.add_argument("--kind", default="issue", choices=("issue", "pr"))
-    acq.add_argument("--issue", type=int, default=0, help="number (issue or PR per --kind)")
-    acq.add_argument("--pr", type=int, default=0, help="alias for --kind pr --issue N")
-    acq.add_argument("--session", default="", help="the lane/session id taking the claim")
+    acq.add_argument("--issue", type=int, default=None, help="number (issue or PR per --kind)")
+    acq.add_argument("--pr", type=int, default=None, help="alias for --kind pr --issue N")
+    acq.add_argument("--session", default="", help="the lane/session id taking the claim (required)")
+    acq.add_argument("--owner", default="", help="explicit owner token; overrides <host>:<session>")
     acq.add_argument("--branch", default="")
     acq.add_argument("--head", default="", help="head sha, for a content-addressed key")
     acq.add_argument("--purpose", default="")
@@ -977,8 +1094,8 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
     rel = sub.add_parser("release", parents=[common], help="release a claim this owner holds")
     rel.add_argument("--repo", required=True)
     rel.add_argument("--kind", default="issue", choices=("issue", "pr"))
-    rel.add_argument("--issue", type=int, default=0)
-    rel.add_argument("--pr", type=int, default=0)
+    rel.add_argument("--issue", type=int, default=None)
+    rel.add_argument("--pr", type=int, default=None)
     rel.add_argument("--owner", default="", help="defaults to <host>:<session> when --session is given, else <host>:<pid>")
     rel.add_argument("--session", default="", help="the lane/session id that took the claim")
     rel.add_argument(
@@ -992,8 +1109,8 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
     st = sub.add_parser("status", parents=[common], help="who holds it right now")
     st.add_argument("--repo", required=True)
     st.add_argument("--kind", default="issue", choices=("issue", "pr"))
-    st.add_argument("--issue", type=int, default=0)
-    st.add_argument("--pr", type=int, default=0)
+    st.add_argument("--issue", type=int, default=None)
+    st.add_argument("--pr", type=int, default=None)
 
     sub.add_parser("check", parents=[common], help="is the store reachable? rc 2 = no")
 
@@ -1004,7 +1121,7 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
         try:
             _require_store_configured()
             if store is None:
-                store = SDKClaimStore()
+                store = SDKClaimStore(allow_box_local=getattr(args, "allow_box_local", False))
             # A definite read, not a write: `check` must be safe to run on any box at any
             # time, and an empty answer still proves the store answered.
             store.read(claim_id("probe", "probe"))
@@ -1014,25 +1131,45 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
         except Exception as exc:
             print(f"REFUSED: claim store unanswerable ({type(exc).__name__}: {exc})", file=sys.stderr)
             return EXIT_UNANSWERABLE
-        print(f"ok: claim store reachable ({store.target()})")
+        where = getattr(store, "target", None)
+        print(f"ok: claim store reachable ({where() if where else 'unknown target'})")
+        # Reachable is not the same as SHARED. Say so here, where a human reads it — the
+        # dispatch path refuses a box-local target outright (see `require_shared`).
+        shared = getattr(store, "require_shared", None)
+        if shared is not None and shared():
+            print(f"WARNING: {shared()}", file=sys.stderr)
         return EXIT_OK
 
     # `status --repo` with NO number is the repo-wide listing, not a malformed single-key
-    # query (review of #9487 P2). Any other command still needs a number, and a bad
-    # invocation is EXIT_USAGE — never EXIT_UNANSWERABLE, which means "the store could not
-    # answer" and is retried by a controller.
+    # query (review of #9487 P2). Any other command still needs a number, an EXPLICIT 0 is a
+    # usage error wherever it appears, and a bad invocation is EXIT_USAGE — never
+    # EXIT_UNANSWERABLE, which means "the store could not answer" and is retried.
     try:
-        number = int(getattr(args, "pr", 0) or 0) or int(getattr(args, "issue", 0) or 0)
-        kind = "pr" if int(getattr(args, "pr", 0) or 0) else args.kind
+        for name in ("issue", "pr"):
+            if getattr(args, name, None) == 0:
+                raise ValueError(f"--{name} must be a positive number (omit it for a listing)")
+        number = int(getattr(args, "pr", None) or 0) or int(getattr(args, "issue", None) or 0)
+        kind = "pr" if int(getattr(args, "pr", None) or 0) else args.kind
         key = None if args.cmd == "status" and number == 0 else normalise_key(kind, number)
     except (ValueError, TypeError) as exc:
         print(f"usage: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
+    if args.cmd == "acquire" and not (args.session.strip() or args.owner.strip()):
+        # A pid-shaped owner cannot be reproduced by a later process, so the claim could never be
+        # released (measured: acquire stored box:42368; the separate release process compared
+        # box:61443 and refused). Requiring an identity is what makes the release path reachable.
+        print(
+            "usage: acquire needs --session (or an explicit --owner) — a process-scoped owner "
+            "cannot be reproduced by the release that follows it",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
     if store is None:
         try:
             _require_store_configured()
-            store = SDKClaimStore()
+            store = SDKClaimStore(allow_box_local=getattr(args, "allow_box_local", False))
         except StoreUnanswerable as exc:
             print(f"REFUSED: {exc}", file=sys.stderr)
             return EXIT_UNANSWERABLE
@@ -1041,7 +1178,7 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
             return EXIT_UNANSWERABLE
 
     if args.cmd == "acquire":
-        owner = _owner_token(args.session)
+        owner = args.owner or _owner_token(args.session)
         record = ClaimRecord(
             repo=args.repo,
             key=key,

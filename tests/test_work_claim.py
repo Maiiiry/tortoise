@@ -182,7 +182,7 @@ def test_main_refuses_with_rc2_when_the_store_is_unset(monkeypatch):
     value a controller branches on — rc 0 here would be the fail-open this tool removes."""
     monkeypatch.delenv("TORTOISE_DB_URI", raising=False)
     monkeypatch.delenv("TORTOISE_API_URL", raising=False)
-    rc = wc.main(["acquire", "--repo", "o/r", "--issue", "5052"])
+    rc = wc.main(["acquire", "--repo", "o/r", "--issue", "5052", "--session", "cell-t1"])
     assert rc == wc.EXIT_UNANSWERABLE == 2
 
 
@@ -360,7 +360,7 @@ def test_listing_returns_the_claims_the_store_holds():
     assert keys == ["issue-5052", "issue-5053"]
 
 
-def test_cli_status_without_a_number_lists_and_acquire_without_one_is_a_usage_error():
+def test_cli_status_without_a_number_lists_and_acquire_without_a_number_is_a_usage_error():
     """Review of #9487 (P2): `status --repo` (no number) used to flow into `normalise_key(0)`
     and return rc 2 — which a controller reads as "the store is unanswerable" and retries.
     A malformed invocation is rc 3; a store that cannot answer stays rc 2."""
@@ -368,8 +368,14 @@ def test_cli_status_without_a_number_lists_and_acquire_without_one_is_a_usage_er
     wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
     rc = wc.main(["status", "--repo", "daniel-ospina/tortoise"], store=store)
     assert rc == 0
-    rc = wc.main(["acquire", "--repo", "daniel-ospina/tortoise"], store=store)
+    rc = wc.main(["acquire", "--repo", "daniel-ospina/tortoise", "--session", "cell-t1"], store=store)
     assert rc == 3 == wc.EXIT_USAGE
+    # an EXPLICIT 0 is a usage error even for the listing verb (review P3)
+    rc = wc.main(["status", "--repo", "daniel-ospina/tortoise", "--issue", "0"], store=store)
+    assert rc == wc.EXIT_USAGE
+    # and an acquire with no reproducible identity is refused too: its claim could never be released
+    rc = wc.main(["acquire", "--repo", "daniel-ospina/tortoise", "--issue", "5053"], store=FakeStore())
+    assert rc == wc.EXIT_USAGE
 
 
 # ── release identity, force, re-entrancy ───────────────────────────────────────────
@@ -426,6 +432,68 @@ def test_reentrant_acquire_is_already_held_rather_than_held_by_a_peer():
     assert again.rc == 0 and again.status == "already-held"
     assert again.epoch == 1
     assert again.lease_until == NOW + 3600
+
+
+def test_release_cannot_overwrite_a_claim_a_peer_reclaimed_meanwhile():
+    """The release is conditional on the epoch the caller observed; when a peer's reclaim lands
+    first the write must not erase it (the residual window a blind `update_point` leaves)."""
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    store.on_replace = _record(owner="cell-5:555", lease_until=NOW + 3600, epoch=2).content()
+    out = wc.release(store, "daniel-ospina/tortoise", "issue-5052", owner="cell-1:100", now=NOW + 5)
+    assert out.rc == 1
+    assert out.owner == "cell-5:555"
+
+
+def test_released_claim_is_reacquirable_through_a_fenced_store():
+    """The hand-off path MUST close: acquire → release → acquire. A fence that refuses every
+    expired record without distinguishing "released" would brick a key on its first hand-off
+    (the first fix on this branch did exactly that, on the shipped store)."""
+    store = FakeStore()
+    first = wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    assert first.rc == 0
+    released = wc.release(store, "daniel-ospina/tortoise", "issue-5052", owner="cell-1:100", now=NOW + 5)
+    assert released.rc == 0
+    second = wc.acquire(store, _record(owner="cell-4:200"), now=NOW + 10)
+    assert second.rc == 0, second.reason
+    assert second.epoch == 2
+
+
+def test_box_local_target_is_refused_unless_acknowledged():
+    """A loopback docker URL passes the env guard and is exactly as invisible to a peer as the
+    embedded file — the same duplicate-dispatch failure one variable away."""
+
+    class LoopbackSDK:
+        _db_uri = "docker://:s3cret@127.0.0.1:16379/tortoise"
+
+        def _get_proj(self):
+            raise AssertionError("must refuse before touching the graph")
+
+    store = wc.SDKClaimStore(sdk=LoopbackSDK())
+    out = wc.acquire(store, _record())
+    assert out.rc == 2 and out.status == "REFUSED"
+    assert "BOX-LOCAL" in out.reason
+    # the target is printed with the password REDACTED
+    assert store.target() == "docker://***@127.0.0.1:16379/tortoise"
+    assert "s3cret" not in store.target()
+    # an acknowledged single-box trial is allowed through the guard
+    assert wc.SDKClaimStore(sdk=LoopbackSDK(), allow_box_local=True).require_shared() is None
+
+
+def test_owner_token_uses_a_real_hostname_not_just_the_env_var(monkeypatch):
+    """With HOSTNAME unset every box collapsed to `box:<session>`, so a PEER's live claim
+    compared equal and was reported `already-held` rc 0 — no claim taken, dispatch proceeds."""
+    monkeypatch.delenv("HOSTNAME", raising=False)
+    import socket as _socket
+
+    assert wc._owner_token("cell-t1").startswith(_socket.gethostname() + ":")
+
+
+def test_check_survives_an_injected_store_without_a_target_method(monkeypatch):
+    """`check` called the injected store's `target()` unconditionally; the test seam has none."""
+    monkeypatch.setattr(wc, "_require_store_configured", lambda *a, **k: "docker://example.invalid/g")
+    rc = wc.main(["check"], store=FakeStore())
+    assert rc == 0
 
 
 def test_quoted_value_without_a_space_roundtrips():
@@ -526,10 +594,13 @@ def test_json_outcome_carries_the_decision_a_controller_logs():
     reason="needs a live graph (TORTOISE_DB_URI) — the fake-store tests above cover the CAS",
 )
 def test_live_sdk_store_acquire_status_release():
-    """The real path: `SDKClaimStore.create` → `get_point` read-back → `update_point`
-    release, on whatever graph the lane is pointed at. Skips visibly (never green) with no
-    URI, so an embedded/carve-out run cannot claim this was exercised."""
-    store = wc.SDKClaimStore()
+    """The real path, end to end: the atomic `MERGE`-token create, the epoch-conditional write,
+    the repo listing, and the hand-off that must close (acquire → release → acquire).
+
+    Skips visibly (never green) with no URI, so an embedded/carve-out run cannot claim this was
+    exercised. `allow_box_local`: the lane's own container is loopback by design.
+    """
+    store = wc.SDKClaimStore(allow_box_local=True)
     key = "issue-999999"
     repo = "daniel-ospina/tortoise"
     cid = wc.claim_id(repo, key)
@@ -546,6 +617,11 @@ def test_live_sdk_store_acquire_status_release():
         acquired = wc.acquire(store, record)
         assert acquired.rc == 0, acquired.reason
 
+        # ⛔ `create_point` DOES mint a second node for an existing id (measured); the store's
+        # MERGE must not, or the ledger reports one unit twice with two owners.
+        count = store._rows("MATCH (n:Point {id:$id}) RETURN count(n) AS c", id=cid)[0][0]
+        assert count == 1, f"the claim store holds {count} nodes for one id"
+
         # the second box must be refused, naming the holder
         held = wc.acquire(
             store,
@@ -556,9 +632,27 @@ def test_live_sdk_store_acquire_status_release():
         assert held.rc == 1, held.reason
         assert held.owner == "pytest:1"
 
+        # the listing answers, per unit of work, from the real graph
+        rows = store.query_repo(repo)
+        assert [r["key"] for r in rows].count(key) == 1, rows
+        listed = wc.status(store, repo, None)
+        assert listed.rc == 0 and listed.status == "listed"
+
         released = wc.release(store, repo, key, owner="pytest:1")
         assert released.rc == 0, released.reason
+
+        # ⛔ the hand-off must CLOSE. A fence with no way past a released record bricked the
+        # key on its first release (measured on this branch before the epoch-CAS): every later
+        # acquire returned rc 2 and `release --force` did not clear it.
+        again = wc.acquire(
+            store,
+            wc.ClaimRecord(
+                repo=repo, key=key, owner="pytest:2", lease_until=NOW + 3600, claimed_at=NOW
+            ),
+        )
+        assert again.rc == 0, again.reason
+        assert again.epoch == 2  # fenced: the released epoch-1 record is superseded
     finally:
         # The suite's own residue: best-effort, and never a test failure.
         with contextlib.suppress(Exception):
-            store._sdk.delete_point(cid)
+            store._rows("MATCH (n:Point {id:$id}) DETACH DELETE n", id=cid)
