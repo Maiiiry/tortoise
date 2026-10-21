@@ -2516,10 +2516,11 @@ class CollisionPreflightTest(unittest.TestCase):
         #
         # SCOPE: this fixture models ONE refused GraphQL call (a secondary /
         # per-query limit), not a spent primary bucket — see
-        # test_shared_graphql_exhaustion_rescues_the_issue_reads_but_not_open_prs
-        # for the shared-bucket shape, which still ends INCOMPLETE on `open PRs`
-        # because that surface is GraphQL-only BY DESIGN (its
-        # `closingIssuesReferences` field has no REST equivalent).
+        # test_shared_graphql_exhaustion_rescues_the_issue_reads_but_not_the_closing_test
+        # for the shared-bucket shape. There `open PRs` is ENUMERATED over REST
+        # too (#9402) and still ends INCOMPLETE, because the GraphQL-only
+        # `closingIssuesReferences` test cannot be measured over REST — it is
+        # the CLOSING TEST that is GraphQL-only, not the surface.
         rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1"})
         self.assertEqual(rc, 0, out)
         self.assertIn("VERDICT: CLEAN", out)
@@ -2543,23 +2544,28 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("issue state=OPEN", out)
         self.assertNotIn("issue-metadata-unavailable", out)
 
-    def test_shared_graphql_exhaustion_rescues_the_issue_reads_but_not_open_prs(self):
+    def test_shared_graphql_exhaustion_rescues_the_issue_reads_but_not_the_closing_test(self):
         # ⛔ THE REAL SHAPE OF THE FLEET SYMPTOM (#3435 review, P2). GitHub's
         # PRIMARY GraphQL budget is ONE shared bucket, so a genuine exhaustion
         # kills `gh pr list` as well as `gh issue view`. The fallback does NOT
         # make that run CLEAN — it makes the issue surfaces stop lying about
-        # why: they are READ over REST while `open PRs` stays a fail-closed
-        # refusal. Asserting both halves is what keeps the test from overstating
-        # the fix, and the CLEAN issue rows are only reachable when the fallback
-        # ran.
+        # why, and it makes `open PRs` say WHICH test it could not run.
         #
-        # #9402 REFINES the open-PR half without weakening it: that surface is
-        # now ENUMERATED over REST too (so a real title/head-ref collision still
-        # decides exit 1), but the GraphQL-only closing-reference test stays
-        # UNMEASURED, so the surface is still INCOMPLETE. This test names the
-        # refusal; `test_open_pr_graphql_exhaustion_is_enumerated_over_rest`
-        # proves the rescue, and
-        # `test_rest_rescued_open_prs_still_report_the_unmeasured_closing_test`
+        # ⛔ THE NAME IS PART OF THE PIN (#9423 review, P3). It used to be
+        # `…_but_not_open_prs`, and its docstring said `open PRs` "stays a
+        # fail-closed refusal" / was "GraphQL-only BY DESIGN" — true before
+        # #9402, FALSE after it: that surface is now ENUMERATED over REST (a
+        # real title/head-ref collision still decides exit 1). Only its
+        # closing-reference test is unmeasured, because REST has no
+        # `closingIssuesReferences`. A lane citing the old NAME as evidence that
+        # the surface is GraphQL-only is exactly the reader that would delete
+        # `_open_prs_rest` — and this file's own standard says a defence no test
+        # exercises can be deleted with nothing going red.
+        #
+        # So: the ISSUE surfaces are READ, `open PRs` is READ TOO but says
+        # `closing-references-unmeasured`, and the run is still INCOMPLETE.
+        # `test_open_pr_graphql_exhaustion_is_enumerated_over_rest` proves the
+        # rescue; `test_rest_rescued_open_prs_still_report_the_unmeasured_closing_test`
         # pins that the rescue never pretends to have proved the negative.
         rc, out = self.run_tool(env_extra={
             "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
@@ -2573,8 +2579,10 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertRegex(out, r"(?m)^issue assignee/holder\s+CLEAN")
         self.assertNotIn("issue-metadata-unavailable", out)
         self.assertIn("issue state=OPEN", out)
-        # The open-PR half is still NOT clean, and it says which test it could
-        # not run rather than blaming gh auth.
+        # The open-PR half was READ OVER REST as well — the enumeration is not
+        # what is missing; the GraphQL-only closing test is.
+        argv = (self.gh_dir / "open-prs-rest-argv.txt").read_text()
+        self.assertIn("repos/test-owner/test-repo/pulls?state=open", argv)
         self.assertIn("closing-references-unmeasured", out)
         self.assertNotIn("VERDICT: CLEAN", out)
 
@@ -2626,6 +2634,18 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("GRAPHQL BUDGET EXHAUSTION", out)
         self.assertIn("graphql budget refused", out.lower())
         self.assertNotIn("fix gh auth/network", out)
+        # ⛔ THE RESET SIGNAL MUST BE ONE THAT CAN SHOW THE REFUSAL (#9423 review,
+        # P2). The remedy states — correctly — that
+        # `rate_limit.resources.graphql` reads thousands remaining DURING this
+        # outage, and then used to tell the reader to decide when to re-run by
+        # reading exactly that counter: a lane following it polls a number that
+        # never moves and concludes the cause is not the one named. The signal
+        # must be the failing read itself, which is the only thing whose answer
+        # changes.
+        verdict = self._verdict_line(out)
+        self.assertNotIn("gh api rate_limit", verdict)
+        self.assertIn("probe the read that failed", verdict)
+        self.assertIn("gh pr list --state open --limit 1 --json number", verdict)
 
     def test_open_pr_rest_rescue_failure_stays_fail_closed(self):
         # The rescue must never become a fail-open. With BOTH budgets gone the
@@ -2930,8 +2950,10 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("requested per_page of 20", out)
         self.assertNotIn(
             f"per_page of {mod._REST_PULLS_PAGE} and returned a FULL page", out)
-        # …and the remedy it implies is the one that works at this setting.
+        # …and the remedy it implies is the one that works at this setting — on
+        # the VERDICT line, which is what a caller keys its next action on.
         self.assertIn("Widen with --pr-limit", out)
+        self.assertIn("widen with --pr-limit", self._verdict_line(out).lower())
         # ⛔ THE NOTE MUST READ AS ONE SENTENCE (#9423 review, P3). The aside
         # ("… because --pr-limit asked for 20") used to run straight into the
         # main verb, so the report said a LARGER page "was requested and
@@ -2952,7 +2974,18 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertIn(f"requested per_page of {cap}, GitHub's maximum", out)
-        self.assertNotIn("Widen with --pr-limit", out)
+        # ⛔ CASE-INSENSITIVE ON PURPOSE (#9423 review, P3): the surface note says
+        # "Widen with --pr-limit" (capital W) while the VERDICT remedy said
+        # "widen with --pr-limit" (lowercase) — so the case-sensitive assertion
+        # here passed on a report that prescribed the widening twenty lines below
+        # the note saying no larger page could be requested. Asserting on the
+        # report text, case-proof, makes the missing cure actually pinned.
+        self.assertNotRegex(out, r"(?i)widen with --pr-limit")
+        # …and the VERDICT states the cap as a cap, not as a setting to raise.
+        verdict = self._verdict_line(out)
+        self.assertIn("TRUNCATED list", verdict)
+        self.assertIn("NO SETTING to widen", verdict)
+        self.assertNotRegex(verdict, r"(?i)widen with --pr-limit")
         # The aside is CLOSED before the main verb resumes: "no larger page can
         # be requested — and returned a FULL page" (#9423 review, P3). The
         # broken sentence said the opposite of what happened.

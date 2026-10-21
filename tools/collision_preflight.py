@@ -370,7 +370,10 @@ Exit codes
                         `fix gh auth/network` when that is what failed; a budget
                         exhaustion says so and says re-authenticating cannot
                         help, `_incomplete_remedy`), or was TRUNCATED at its
-                        completeness cap (remedy: raise `--pr-limit`), or the
+                        completeness cap (remedy: raise `--pr-limit`, EXCEPT on
+                        the REST rescue, which reads one page at GitHub's
+                        maximum and has no setting to widen — the report says
+                        which kind it measured), or the
                         FLEET BOARD could not answer the claim gate —
                         unreadable, unrebuildable,
                         or an ambiguous attribution (remedy: rebuild the board,
@@ -976,6 +979,13 @@ class Surface:
     note: str = ""
     truncated: bool = False
     truncation_note: str = ""
+    # Whether this cap is a SETTING the operator can raise (`--pr-limit`), or a
+    # ceiling no setting can lift (#9423 review, P3). The REST rescue reads ONE
+    # page at GitHub's per_page maximum, so on that path `--pr-limit` cannot
+    # widen anything — and `_incomplete_remedy` must not prescribe it. Tracked
+    # as DATA beside the note (not parsed back out of the note's prose), so the
+    # note and the remedy cannot disagree about whether a cure exists.
+    truncation_widenable: bool = True
     # Whether this surface's hits and failures can affect the VERDICT.
     # `advisory` surfaces are still queried, still reported, and still HIT —
     # they simply cannot block a dispatch and cannot force INCOMPLETE (#5251).
@@ -990,12 +1000,17 @@ class Surface:
         self.status = STATUS_INCOMPLETE
         self.note = note
 
-    def mark_truncated(self, note: str) -> None:
+    def mark_truncated(self, note: str, *, widen: bool = True) -> None:
         """The surface was queried but the list hit its cap, so it is PARTIAL.
         Tracked separately from `status` so a hit found in the partial list is
-        still reported while the truncation keeps the run out of CLEAN."""
+        still reported while the truncation keeps the run out of CLEAN.
+
+        `widen=False` records a cap that NO setting can lift (the REST rescue's
+        single page at GitHub's per_page maximum), so `_incomplete_remedy`
+        states the cap without offering a `--pr-limit` that cannot help."""
         self.truncated = True
         self.truncation_note = note
+        self.truncation_widenable = widen
 
 
 # ── process helpers ──────────────────────────────────────────────────────────
@@ -5305,12 +5320,20 @@ def run_preflight(
                         " Widen with --pr-limit (or "
                         "COLLISION_PREFLIGHT_PR_LIMIT)."
                     )
+                    widen = True
                 else:
                     pagesize = (
                         f"per_page of {_REST_PULLS_PAGE}, GitHub's maximum, so no "
                         "larger page could be requested"
                     )
                     remedy = ""
+                    # ⛔ NO WIDENING EXISTS HERE, SO THE REMEDY MUST NOT OFFER ONE
+                    # (#9423 review, P3). `--pr-limit` and `PR_LIMIT` do not
+                    # bound this request — `_rest_pulls_page_size` caps it at
+                    # GitHub's maximum — so this flag is what tells
+                    # `_incomplete_remedy` to state the cap instead of
+                    # prescribing a flag that cannot change the answer.
+                    widen = False
                 surface.mark_truncated(
                     "the REST fallback answered ONE page at the requested "
                     # ⛔ THE ASIDE IS CLOSED BEFORE THE MAIN VERB RESUMES. The
@@ -5321,7 +5344,8 @@ def run_preflight(
                     # refusal (#9423 review, P3).
                     f"{pagesize} — and returned a FULL page, so "
                     "more open PR(s) may exist and were NOT scanned — this "
-                    "surface is INCOMPLETE (never CLEAN)." + remedy
+                    "surface is INCOMPLETE (never CLEAN)." + remedy,
+                    widen=widen,
                 )
             if len(prs) > limit:
                 surface.mark_truncated(
@@ -5688,6 +5712,15 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
     exhausted or truncated, claiming the generic cause in general would be wrong
     for the others, so each recognised cause is named as a CONTRIBUTOR and the
     generic remedy is kept for the remainder.
+
+    ⛔ AND THE TRUNCATION REMEDY IS PAGE-SIZE AWARE, because not every cap has a
+    cure. The REST rescue reads exactly ONE page at GitHub's `per_page` maximum,
+    so `--pr-limit` (default 1000) cannot lift it — while the PRIMARY path's cap
+    (`len(prs) > limit`) is precisely what `--pr-limit` widens. Prescribing the
+    widening for the capped case put the verdict line in contradiction with the
+    surface note twenty lines above it in the SAME report (#9423 review, P3).
+    `Surface.truncation_widenable` carries which cap this is, as DATA, so the
+    note and the remedy cannot disagree.
     """
     both = [
         s for s in incomplete
@@ -5710,16 +5743,55 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
         "`rate_limit.resources.graphql` counter can still read thousands "
         "remaining when the user-level bucket refuses, and the fleet board's own "
         "GitHub read fails for this same cause (so rebuilding it cannot help "
-        "either). Re-run when the budget resets "
-        "(`gh api rate_limit --jq .resources.graphql`); any surface above that "
+        "either). Re-run when the budget resets — NO readable counter shows "
+        "this bucket, so probe the read that failed instead "
+        "(`gh pr list --state open --limit 1 --json number`): an answer means "
+        "the bucket is back. Any surface above that "
         "answered over REST is already valid evidence"
     )
-    truncation = (
+    widen_remedy = (
         "a TRUNCATED list — the surface hit its completeness cap and the "
         "remainder was NOT scanned. That is a SETTING, not a failed read: widen "
         "with --pr-limit (or COLLISION_PREFLIGHT_PR_LIMIT) and re-run; `gh "
         "auth` is fine and the fleet board does not need rebuilding"
     )
+    # ⛔ THE TRUNCATION REMEDY IS PAGE-SIZE AWARE, EXACTLY AS THE SURFACE NOTE IS
+    # (#9423 review, P3). The REST rescue reads ONE page at GitHub's per_page
+    # MAXIMUM, so on that path `--pr-limit` (default 1000) cannot widen anything:
+    # prescribing it would put the verdict line in contradiction with the
+    # surface's own note twenty lines above, and burn a cycle. The widen case is
+    # still real for the PRIMARY path (`len(prs) > limit`) and for a REST page
+    # below the maximum, which is why the two arms are kept distinct instead of
+    # dropping the advice.
+    capped_remedy = (
+        "a TRUNCATED list — the surface hit its completeness cap and the "
+        "remainder was NOT scanned. There is NO SETTING to widen here: the REST "
+        f"rescue reads ONE page at GitHub's maximum per_page of {_REST_PULLS_PAGE}, "
+        "so --pr-limit cannot lift it. Re-run once the budget resets, or accept "
+        "a partial enumeration that is already INCOMPLETE; `gh auth` is fine and "
+        "the fleet board does not need rebuilding"
+    )
+
+    def _truncation_text(surfaces: list[Surface]) -> str:
+        """The truncation cause for `surfaces`, naming both kinds when both are
+        present: a widening that EXISTS and a cap that has none."""
+        widen = [s for s in surfaces if s.truncation_widenable]
+        capped = [s for s in surfaces if not s.truncation_widenable]
+        if widen and capped:
+            return (
+                "TRUNCATED list(s) — the surface(s) hit their completeness cap "
+                "and the remainder was NOT scanned. Part of that is a SETTING "
+                f"(widen --pr-limit for {', '.join(s.name for s in widen)}); "
+                "part has NO setting at all "
+                f"({', '.join(s.name for s in capped)}: the REST rescue reads "
+                f"ONE page at GitHub's maximum per_page of {_REST_PULLS_PAGE}, "
+                "so --pr-limit cannot lift it). Re-run once the budget resets; "
+                "`gh auth` is fine and the fleet board does not need rebuilding"
+            )
+        if capped:
+            return capped_remedy
+        return widen_remedy
+
     if len(both) == len(incomplete):
         # Every incomplete surface carries BOTH measured causes: name BOTH, and
         # name the surface once. Gated on the FULL set (not on "no exclusive
@@ -5728,12 +5800,12 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
         return (
             f"the causes are BOTH, both measured on "
             f"{', '.join(s.name for s in both)}: {budget} — AND, independently, "
-            f"{truncation}"
+            f"{_truncation_text(both)}"
         )
     if len(exhausted) == len(incomplete):
         return f"the cause is {budget}"
     if len(truncated) == len(incomplete):
-        return f"the cause is {truncation}"
+        return f"the cause is {_truncation_text(truncated)}"
     remaining = [
         s for s in incomplete
         if id(s) not in both_ids
@@ -5744,11 +5816,14 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
     if exhausted:
         parts.append(f"{', '.join(s.name for s in exhausted)}: {budget}")
     if truncated:
-        parts.append(f"{', '.join(s.name for s in truncated)}: {truncation}")
+        parts.append(
+            f"{', '.join(s.name for s in truncated)}: "
+            f"{_truncation_text(truncated)}"
+        )
     if both:
         parts.append(
             f"{', '.join(s.name for s in both)}: BOTH {budget} — AND, "
-            f"independently, {truncation}"
+            f"independently, {_truncation_text(both)}"
         )
     tail = ""
     if remaining:
