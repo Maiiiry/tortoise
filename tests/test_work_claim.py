@@ -74,8 +74,13 @@ class FakeStore:
         got = self.points[cid]
         if self.lose_next_write:
             self.lose_next_write = False
-            # A peer overwrote between our create and the read-back.
-            self.points[cid] = got
+            # A peer overwrote between our create and the read-back: the write echoed OUR
+            # content, but the store now holds theirs. Writing `got` back (the old seam) made
+            # this a no-op, so the read-back branch could not be pinned at all.
+            self.points[cid] = wc.ClaimRecord(
+                repo=record.repo, key=record.key, owner="peer:999", session="peer",
+                lease_until=record.lease_until, claimed_at=record.claimed_at,
+            ).content()
         return got
 
     def replace(self, cid: str, record) -> str:
@@ -544,13 +549,16 @@ def test_release_json_reports_the_tombstone_it_wrote():
     assert payload["lease_until"] == NOW + 5
 
 
-def test_negative_capacity_fields_are_a_usage_error():
+@pytest.mark.parametrize("flag", ["ncpu", "lpc", "lanes"])
+def test_negative_capacity_fields_are_a_usage_error(flag):
     """The record doubles as the fleet's capacity map; `ncpu=-8` there asserts something
-    impossible, so a negative measurement is refused rather than persisted."""
+    impossible, so a negative measurement is refused rather than persisted. One flag per case,
+    because a single invocation naming all three lets one of the three checks be deleted with
+    the suite still green (measured in review of #9487 P3)."""
     rc = wc.main(
         [
             "acquire", "--repo", "o/r", "--issue", "5052", "--session", "cell-t1",
-            "--ncpu", "-8", "--lpc", "-1", "--lanes", "-3",
+            f"--{flag}", "-1",
         ],
         store=FakeStore(),
     )
@@ -562,6 +570,18 @@ def test_check_survives_an_injected_store_without_a_target_method(monkeypatch):
     monkeypatch.setattr(wc, "_require_store_configured", lambda *a, **k: "docker://example.invalid/g")
     rc = wc.main(["check"], store=FakeStore())
     assert rc == 0
+
+
+def test_read_back_that_differs_from_our_write_is_held_not_acquired():
+    """Property 3 ("read back, never trust the write"): a store that echoes OUR content but
+    holds a PEER's record is a lost race. The fake's seam for this used to write the same
+    content back, so the branch could not be pinned at all (measured in review of #9487 P3)."""
+    store = FakeStore()
+    store.lose_next_write = True
+    out = wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    assert out.rc == 1 and out.status == "held"
+    assert "read-back differs" in out.reason
+    assert out.owner == "peer:999"
 
 
 def test_quoted_value_without_a_space_roundtrips():
@@ -686,7 +706,15 @@ def test_live_sdk_store_acquire_status_release():
         assert acquired.rc == 0, acquired.reason
 
         # ⛔ `create_point` DOES mint a second node for an existing id (measured); the store's
-        # MERGE must not, or the ledger reports one unit twice with two owners.
+        # MERGE must not, or the ledger reports one unit twice with two owners. Call `create`
+        # a SECOND time directly (one create for a fresh id leaves one node even under the old
+        # primitive, so the assertion above alone cannot detect a regression).
+        store.create(
+            cid,
+            wc.ClaimRecord(
+                repo=repo, key=key, owner="pytest:intruder", lease_until=NOW + 3600, claimed_at=NOW
+            ),
+        )
         count = store._rows("MATCH (n:Point {id:$id}) RETURN count(n) AS c", id=cid)[0][0]
         assert count == 1, f"the claim store holds {count} nodes for one id"
 

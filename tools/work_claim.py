@@ -16,8 +16,10 @@ This tool moves exactly ONE slice into the graph: **who holds a unit of work, ri
 WHAT IT STORES
 --------------
 One `:Point` per held unit, id = a DETERMINISTIC digest of `(repo, key)`, and every write
-is ONE atomic `MERGE`-on-id statement carrying a per-call token, so the statement itself
-reports whether THIS caller created the record — that is the compare-and-swap:
+is ONE atomic `MERGE`-on-id statement carrying a per-call token. `MERGE` applies its
+`ON CREATE` exactly once, so only one contender can create the id; the token reports whose
+create ran (a consistency check), and the CALLER's verdict is the content comparison — a
+byte-identical payload is the same identity, not a second holder.
 
     work-claim:<sha256(repo + key)>  pointKind=work-claim
       props: repo, key, owner, session, branch, head, lease_until, epoch,
@@ -370,8 +372,11 @@ class SDKClaimStore:
 
         MERGE (n:Point {id:$id}) ON CREATE SET n += $props, n.content=$content, n.__cas=$token
 
-    The token is unique per call, so the statement RETURNS whether THIS call did the create —
-    that is the compare-and-swap, and it is why two boxes cannot both win.
+    `MERGE` applies its `ON CREATE` clause exactly once, so two boxes cannot both create the
+    id; the loser's statement matches the existing node and returns the winner's content. The
+    token reports whether THIS call ran the create, which `create` uses as a consistency check
+    — the verdict belongs to the content comparison, because a contender that writes a
+    byte-identical record is the same identity, not a second holder.
 
     ⛔ `create_point` is NOT a CAS and is deliberately NOT used here. Measured on a live graph
     (this worktree, `falkordb`): two `create_point(id='probe-dup-1')` calls left TWO `:Point`
@@ -462,7 +467,8 @@ class SDKClaimStore:
         return record.content()
 
     def create(self, cid: str, record: ClaimRecord) -> str:
-        """`MERGE` + a per-call token: the statement itself reports whether WE created it."""
+        """`MERGE` + a per-call token: only one contender's `ON CREATE` runs, and the token
+        lets this call verify it is the one that wrote the content it returns."""
         import uuid
 
         props = {**record.props(), "pointKind": CLAIM_KIND}
@@ -484,11 +490,24 @@ class SDKClaimStore:
         # (measured in review of #9487 P3).
         found = int(rows[0][0] or 0)
         contents = rows[0][1] or []
+        wins = rows[0][2] or []
         if found != 1:
             raise StoreUnanswerable(
                 f"the claim store holds {found} nodes for id {cid} — refusing to pick one"
             )
-        return (contents[0] if contents else "") or ""
+        content = (contents[0] if contents else "") or ""
+        # `wins` is the statement's own report of whether OUR `ON CREATE` ran. It is a
+        # consistency check, not the verdict: a contender that lands a byte-identical payload
+        # is the SAME identity rather than a second holder, so content equality decides (and
+        # `acquire` reads before it creates, so a retry never reaches this branch). A statement
+        # that claims it created while returning someone else's content means the graph did
+        # something this store does not model — refuse instead of reporting it as a win.
+        if bool(wins and wins[0] is True) and content != record.content():
+            raise StoreUnanswerable(
+                "the claim store reported its own create but returned different content — "
+                "refusing to treat that as an acquisition"
+            )
+        return content
 
     def replace(self, cid: str, record: ClaimRecord) -> str:
         """Release: conditional on the epoch the caller OBSERVED, so a release cannot

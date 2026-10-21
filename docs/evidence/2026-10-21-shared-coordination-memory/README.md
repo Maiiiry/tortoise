@@ -111,7 +111,7 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 
 ## 3. The pilot — one slice, the claim, in the graph
 
-`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (37 fake-store tests + 3 live tests, 40
+`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (40 fake-store tests + 3 live tests, 43
 collected), contract `rc 0/1/2` identical to `claims.sh` so a caller needs no new branch (`rc 3` is a
 malformed invocation).
 
@@ -133,7 +133,11 @@ MERGE (n:Point {id:$id}) ON CREATE SET n += $props, n.content=$content, n.__cas=
 RETURN count(n) AS c, n.content AS content, n.__cas = $token AS won
 ```
 
-with a token unique to the call: `won` is true only for the creator, so the statement itself is the CAS.
+with a token unique to the call: `MERGE` applies its `ON CREATE` exactly once, so only one
+contender can create the id; the loser's statement matches the existing node and returns the
+winner's content. `won` reports whose create ran, which the store uses as a consistency check —
+the verdict is the content comparison, because a contender writing a byte-identical record is
+the same identity, not a second holder.
 State changes are `MATCH … WHERE n.claim_epoch = $expected SET …`, which touches 0 rows when a peer moved
 the epoch — that is the fence, in the store, not in the caller.
 
@@ -234,7 +238,7 @@ stores all of them.
 ```bash
 # the per-claim volume probe (private lane graph, so no peer's target is touched)
 uri="$(uv run python tools/test_lane.py uri)" && eval "$uri"
-uv run pytest tests/test_work_claim.py -q            # 40 passed (3 live legs skip without a URI; 37 pass hermetically)
+uv run pytest tests/test_work_claim.py -q            # 43 passed (3 live legs skip without a URI; 40 pass hermetically)
 
 # `--allow-box-local`: this lane's container is loopback BY DESIGN. EVERY verb that reads or
 # writes the store (`acquire`, `status`, `release`) refuses a loopback target otherwise,
