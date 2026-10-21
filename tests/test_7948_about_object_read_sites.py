@@ -3558,7 +3558,7 @@ def test_the_ungated_walk_reuses_the_gated_derivations():
     is run over a truncated module set, so an inline copy records NOTHING and reds.
     """
     census = _call_time_census()
-    sources = census._sources()
+    sources = census._universe()
     assert len(sources) > 2, "the package has too few modules to run this arm"
     subset = dict(sorted(sources.items())[:2])
 
@@ -3567,7 +3567,7 @@ def test_the_ungated_walk_reuses_the_gated_derivations():
         "_empty_pattern_sites_in": set(),
         "_call_time_sites_in": set(),
     }
-    originals = {name: getattr(census, name) for name in (*recorded, "_sources")}
+    originals = {name: getattr(census, name) for name in (*recorded, "_universe")}
 
     def _recording(name: str, real):
         def wrapper(file):
@@ -3579,7 +3579,7 @@ def test_the_ungated_walk_reuses_the_gated_derivations():
     patched: dict[str, object] = {
         name: _recording(name, getattr(census, name)) for name in recorded
     }
-    patched["_sources"] = lambda: subset
+    patched["_universe"] = lambda: subset
     try:
         for name, value in patched.items():
             setattr(census, name, value)
@@ -3664,3 +3664,34 @@ def test_a_module_constant_is_attributed_to_its_consumer():
         f"derived {sorted(derived)} — either the fallback is unreachable again (the "
         "line the review flagged) or the rule now attributes an unattributable read"
     )
+
+def test_the_census_universe_is_every_module_on_disk():
+    """The UNIVERSE must be every module under `tortoise/`, not a filtered subset.
+
+    ⚠️ This is the arm the `#9501` review earned, and it is about the gate one function
+    UPSTREAM of `_files()`. The file gate is interrogated from an ungated walk, but a
+    universe that silently drops a module removes its reader from every derivation
+    while every other arm stays green — measured: filtering one module out of the old
+    single source left all 29 arms green while §13's row 22
+    (`navigation.py::_hop_query`) stopped being derived.
+
+    Both halves are pinned against the DISK, not against each other: `_universe()` is
+    the disk enumeration, and `_sources()` is the set the derivations consume. If
+    either is narrowed, one of the two assertions reds.
+    """
+    census = _call_time_census()
+    on_disk = {path for path in census.TORTISE.rglob("*.py")}
+
+    for name in ("_universe", "_sources"):
+        observed = set(getattr(census, name)())
+        hidden = sorted(
+            str(path.relative_to(census.TORTISE)) for path in on_disk - observed
+        )
+        assert not hidden, (
+            f"`{name}()` omits {len(hidden)} module(s) that exist on disk, so every "
+            f"derivation silently stops covering them: {hidden[:5]}"
+        )
+        assert not (observed - on_disk), (
+            f"`{name}()` names paths that do not exist — the universe was built from "
+            "something other than this package"
+        )
