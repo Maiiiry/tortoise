@@ -5203,11 +5203,18 @@ def run_preflight(
                     _rest_refusal_note(rest_why, exc)
                 )
                 kind = _classify_issue_error(detail)
-                # The cause is KNOWN here (this branch runs only inside the
-                # `_is_budget_exhaustion` gate) and it is a DIFFERENT cause from
-                # `issue-absent` / `repo-unresolved`, which have their own remedy
-                # arms — so the flag is scoped to the budget branches only.
-                if kind not in ("issue-absent", "repo-unresolved"):
+                # ⛔ THIS BRANCH IS NOT EXHAUSTION-ONLY (#9423 review round 14,
+                # P2). `if _exhausted:` above guards only the REST ATTEMPT; this
+                # `else` is also reached when `_exhausted` is False and no rescue
+                # was tried at all — a plain transport/auth failure (`connection
+                # reset`, `HTTP 401`, a missing fixture), whose `kind` is
+                # "transport". Flagging THAT as a budget exhaustion made a broken
+                # credential print "gh auth is FINE (re-authenticating cannot
+                # help) … re-run when the budget resets", steering the operator
+                # away from the real cause — #9402's own defect, reintroduced in a
+                # corner. So the predicate that led here is the one that gates the
+                # flag.
+                if _exhausted and kind not in ("issue-absent", "repo-unresolved"):
                     surfaces[SURFACE_ISSUE].budget_exhausted = True
                 if kind == "issue-absent":
                     msg = (

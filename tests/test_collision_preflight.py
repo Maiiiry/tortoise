@@ -5596,13 +5596,23 @@ class CollisionPreflightTest(unittest.TestCase):
         # NEGATIVE half, which is the discriminating one: a NON-exhaustion failure
         # must NOT be flagged, or the remedy would name the budget for a cause the
         # run never measured (the mirror-image of #9402's defect).
-        mod = _tool_module()
-        surface = mod.Surface(name=mod.SURFACE_ISSUE)
-        self.assertFalse(
-            surface.budget_exhausted,
-            "the flag must default False — a Surface that was never rescued from an "
-            "exhaustion has measured no such cause",
-        )
+        # ⛔ THE NEGATIVE HALF MUST DRIVE THE NON-EXHAUSTION PATH, not a dataclass
+        # default (#9423 review round 14, P3 — the previous version asserted only
+        # `Surface(...).budget_exhausted is False`, which no code path can change,
+        # and that vacuity is why round 13's regression passed green). Here the
+        # issue read fails with a PLAIN transport error (the fixture is gone), so
+        # no exhaustion was ever measured and the remedy must keep the generic
+        # sentence.
+        self.clear_fixtures()
+        rc, out = self.run_tool()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("GRAPHQL BUDGET EXHAUSTION", out)
+        self.assertIn("fix gh auth/network", out)
+        # Restore the default fixtures: `clear_fixtures` removed ALL of them, and
+        # the positive half below must fail on the ONE surface it is about.
+        self.gh_fixtures(open_prs=[], closed_prs=[], issue=self.issue_payload())
+        self.timeline_fixture()
         # The positive half is asserted end-to-end: with the GraphQL read
         # exhausted and the REST rescue ALSO down (so the surface is INCOMPLETE and
         # the remedy is printed), the verdict line names the budget rather than
