@@ -116,10 +116,8 @@ THE SAME BLINDNESS, ONE LEVEL DOWN (review cycle on this file's first version)
 A census that reads only `SET r.<prop>` repeats the error: the property-MAP
 form `SET r += $props` / `SET r = $p` is structurally invisible to it, and two
 shipped sites already use that form on an allowlisted `aboutObject` predicate
-(`cache_projection.relation_statement`, `hosted_backup.restore_graph`), and two
-further census hits are DECLARED FALSE POSITIVES (their map `SET` names no
-`about*` predicate — pinned by test 9)
-(listed above). So the census reads all three write forms **where `_PATTERN`
+(listed above) — two MORE use it on an `IMPL|NAND` leg and are the declared
+false positives below, which is why the population is 5 writers, not 7. So the census reads all three write forms **where `_PATTERN`
 recognises the spelling** (the gap list above names the spellings it does not),
 and an interpolated
 predicate counts as about-bearing when its writer takes it from the shared about
@@ -150,7 +148,8 @@ WHAT IS PINNED (one entry per test, in file order)
    the live documents. Each entry records its own provenance — the pre-fix
    document it was measured in, or `RETRACTED_INTRODUCED_HERE` for wording this
    PR itself wrote and withdrew. Which class an entry is in is MEASURED against
-   the pre-fix revision by test 18, because a label nothing compares against the
+   the pre-fix revision by `test_every_retracted_literal_declares_its_true_`
+   `provenance`, because a label nothing compares against the
    text is the same unmeasured claim one level up.
 2. `test_the_corrected_passages_name_the_property_bearing_class` — the
    corrected passages must POSITIVELY name the writers and the property, so a
@@ -216,7 +215,8 @@ WHAT IS PINNED (one entry per test, in file order)
    invisible — so adding a predicate vocabulary, or a new way of naming one, is
    a change to `_ABOUT_VOCAB` / `_module_in_scope`, not just a change to the
    code. The remaining gap is a vocabulary list, and a list cannot be checked
-   for a token nobody has written yet. It is NOT a parse failure: test 15 makes
+   for a token nobody has written yet. It is NOT a parse failure:
+   `test_the_census_fails_closed_on_a_module_it_cannot_parse` makes
    the census STOP rather than skip.
 11. `test_the_census_reads_the_inline_pattern_map_form` — synthetic probe for the
    inline pattern map, named and anonymous.
@@ -260,6 +260,13 @@ WHAT IS PINNED (one entry per test, in file order)
    (never passes silently) when the revision is unreachable.
 19. `test_the_storage_changelog_records_the_correction` — the changelog is where
    a reader learns that a §11.1/§13 claim moved.
+20. `test_the_guard_states_its_own_execution_and_probe_coverage_honestly` —
+   this file's claims about ITSELF, re-derived from the source: the header may
+   not say the suite is network-free while `_ensure_commit` fetches, and it may
+   not claim one probe per gap while gap 6 is disclosed rather than pinned.
+21. `test_the_correction_ledger_numbers_each_round_once` — the ledger's round
+   numbering is unique (it is the ledger's only index), and the fourth round's
+   false record of §13's citation does not come back.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -268,9 +275,17 @@ that the rule keeps stating the measured set and keeps carrying the tension
 record, test 5). Line numbers are not
 asserted — the SYMBOL is authoritative, per the documents' own rule.
 
-Static, stdlib-only, with ONE exception: test 18 shells out to `git show` to
-measure a provenance claim about history, and skips when the revision is
-unreachable. No DB, no graph, no network.
+Static and stdlib-only, with one non-static corner: the provenance leg measures a
+claim about HISTORY, so it shells out. Exactly what it runs, because an earlier
+revision of this paragraph said "ONE exception: `git show` … no network" and was
+wrong on both halves: `git cat-file -e` (via `_has_commit`, on every `_git_show`
+call) to test reachability, `git show <rev>:<path>` for the text, and — where the
+rev is not already in the checkout — `git fetch --quiet
+--depth={120,400,1500} origin main` (`_ensure_commit`), which on a shallow CI
+checkout IS a NETWORK call (one per depth, each bounded by a 120 s timeout) and a
+SIDE EFFECT on the checkout under test: it deepens that clone's object database.
+The leg SKIPS, never passes, when the rev stays unreachable. No DB, no graph, no
+server.
 """
 
 from __future__ import annotations
@@ -309,7 +324,7 @@ STORAGE_CHANGELOG = (
 #: this comment claimed `fetch-depth: 0` and was false for the only job that
 #: matters (`python-ci.yml:631`; the one `fetch-depth: 0` is the `changes` job at
 #: `:224`). The rev is made reachable by `_ensure_commit`, which fetches the
-#: `main` ref at a bounded depth; leg 18 then SKIPS rather than passes on a
+#: `main` ref at a bounded depth; the provenance leg then SKIPS rather than passes on a
 #: history it genuinely could not read, and the skip message says so.
 PRE_FIX_REV = "01b5486ec"
 
@@ -322,7 +337,9 @@ PRE_FIX_REV = "01b5486ec"
 #: retracted INSIDE this PR (see `RETRACTED_INTRODUCED_HERE`) — their `home` is
 #: still the document the claim belongs to, and `_provenance` keeps the message
 #: from claiming a pre-fix presence that never existed. Which class an entry is
-#: in is MEASURED against `PRE_FIX_REV` by leg 18, not taken on trust: the
+#: in is MEASURED against `PRE_FIX_REV` by
+#: `test_every_retracted_literal_declares_its_true_provenance`, not taken on
+#: trust: the
 #: `§11.1` method entry was filed as pre-fix-live and is not (measured absent
 #: at `01b5486ec`), which made leg 1's diagnostic print a false pre-fix claim.
 RETRACTED: dict[str, tuple[str, str]] = {
@@ -600,8 +617,9 @@ _ABOUT_REL = re.compile(
 #: restorer's `_sanitize_label` belong here for the map-form writers: they do
 #: not name `aboutObject` at the write site at all — they take the predicate
 #: from the allowlist that contains it (or from the dump, sanitized). Verified
-#: against the tree: adding them raises the census from 3 writers to exactly 7,
-#: the four map-form sites above plus the three named-form ones.
+#: against the tree: adding them raises the census from 3 rows to exactly 7 ROWS —
+#: the 5 recorded writers (3 named-form + 2 map-form) plus the 2 declared false
+#: positives, which are rows the census sees and does not count as writers.
 _ABOUT_VOCAB: tuple[str, ...] = (
     "ENTITY_LINKED_RELS",
     "_ABOUT_REPLAY_RELS",
@@ -622,6 +640,13 @@ def _doc(path: Path) -> str:
 
 
 _MARKUP = re.compile(r"[*`]")
+#: A hyphen between two word characters is decoration on a CLAIM, not part of
+#: it: measured, `property free` (hyphen dropped by a human re-typing the
+#: retracted absolute) matched no pin, so every literal here was one keystroke
+#: from a dead pin. It normalises to a SPACE, not to nothing — the missing-hyphen
+#: form is the one a person types, so `property-free` and `property free` must
+#: compare equal. En/em-dash included; `\w` keeps the surrounding tokens apart.
+_HYPHEN = re.compile(r"(?<=\w)[-\u2013\u2014](?=\w)")
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -633,7 +658,7 @@ def _flat(text: str) -> str:
     pin that could never red. Emphasis and code markers are decoration on a
     claim, not part of it.
     """
-    return _WHITESPACE.sub(" ", _MARKUP.sub("", text))
+    return _WHITESPACE.sub(" ", _HYPHEN.sub(" ", _MARKUP.sub("", text)))
 
 
 def _own_body(node: ast.AST, lines: list[str]) -> str:
@@ -902,7 +927,8 @@ def _provenance(label: str, home: str) -> str:
     by THIS PR's own earlier revision and withdrawn by a later one. Printing "was
     live pre-fix" for them would put an unmeasured claim in the diagnostic of
     the guard whose whole subject is unmeasured claims — which is exactly what
-    happened to the `§11.1` method entry before leg 18 measured the split.
+    happened to the `§11.1` method entry before
+    `test_every_retracted_literal_declares_its_true_provenance` measured the split.
     """
     if label in RETRACTED_INTRODUCED_HERE:
         return (
@@ -973,8 +999,22 @@ def _section(text: str, start: str, end: str) -> str:
     same literals, so a file-wide membership test cannot red on §6.7's silent
     deletion"*).
     """
-    i = text.index(start)
-    j = text.index(end, i + len(start))
+    i = text.find(start)
+    # A moved/renumbered anchor is a plausible tidy-up in a draft document, and
+    # a bare `ValueError: substring not found` reads as a BROKEN TEST rather than
+    # a rotted guarantee — the diagnostic standard the §11.4 leg argues for. Fail
+    # with the claim named, so every section-scoped leg inherits it.
+    if i < 0:
+        pytest.fail(
+            f"the section anchor {start!r} no longer exists — it moved, so the "
+            "claim this leg scopes is UNMEASURED (a moved anchor is not a pass)"
+        )
+    j = text.find(end, i + len(start))
+    if j < 0:
+        pytest.fail(
+            f"the section end anchor {end!r} no longer follows {start!r} — the "
+            "slice would run off the end, so the claim is UNMEASURED"
+        )
     return text[i:j]
 
 
@@ -1187,7 +1227,7 @@ def test_the_cheapness_rule_states_the_measured_set_and_records_the_tension():
         "1. **Keep entity links",
         "2. **Cap the fan-out**",
     )
-    assert "near-bare" in _flat(rule), (
+    assert _flat("near-bare") in _flat(rule), (
         "§11.4 rule 1 no longer says the entity links are `near-bare` — the "
         "measured set is `confidence` on bound links plus the record "
         "projection's `idx` ordinal, so the rule cannot be stated as "
@@ -1214,6 +1254,45 @@ def test_the_cheapness_rule_states_the_measured_set_and_records_the_tension():
         "the claim is an unrecorded design decision (`#9397`), and a guard "
         "must not let prose settle it by dropping the qualifier"
     )
+    # The MEASURED SET, not only the qualifier vocabulary: measured, a rule
+    # that kept `near-bare` while dropping both property names, or while
+    # swapping `confidence` for a different noun, stayed green — a leg named
+    # `…states_the_measured_set…` that pinned no name was overnamed, which is
+    # the same defect as a document that overclaims. `weight` is called out
+    # because it is a DIFFERENT property: no about-edge writer writes it.
+    for name in (PROPERTY, SECOND_PROPERTY):
+        assert f"`{name}`" in rule, (
+            f"§11.4 rule 1 no longer names the measured property `{name}` — "
+            "the rule may not state the exception as a bare qualifier, and a "
+            "record-projected about edge carries the projection's ordinal"
+        )
+    assert "does carry a `weight`" not in rule, (
+        "§11.4 rule 1 calls the `#1370` binding attribute a `weight` — the "
+        "code sets `confidence`, and `weight` is a different property that no "
+        "about-edge writer in the census writes"
+    )
+    # The POPULATION absolute (`turns 27,310 bare rows into …`), which the
+    # retracted-imperative pin structurally cannot see: it re-asserts that the
+    # WHOLE population is bare, forty lines after §11.1 says a record-projected
+    # edge is not. Measured green on the pre-fix wording of this clause.
+    population_absolutes = (
+        # Lower-case: `_flat` does not case-fold, and the re-derivation this
+        # catches ("The entity links carry no properties at all.") is a
+        # mid-sentence phrase — measured GREEN before this list existed.
+        "bare rows",
+        "carry no properties",
+        "property free",
+    )
+    survivors = [
+        literal for literal in population_absolutes
+        if _flat(literal) in _flat(rule)
+    ]
+    assert not survivors, (
+        f"§11.4 rule 1 states the population-level absolute {survivors} — an "
+        "unqualified 'bare rows' claims the whole population is bare, which "
+        "§11.1/§11.3 contradict for every record-projected edge; scope it to "
+        "the rows that carry nothing but the id pair"
+    )
 
 
 #: The extractor ledger's KEEP row, located by its first cell (no line numbers).
@@ -1228,9 +1307,14 @@ def test_the_ledger_keep_row_names_both_recorded_properties():
     form; `#9403` review called this the weaker half of the same gap).
 
     The row's RETRACTED wording (`Cheap because edges are **property-free**`) is
-    pinned, so a revert to THAT reds. Any other re-derivation of the one-name
-    absolute in the live ledger was unpinned, which is what this leg closes: the
-    row must name both measured properties.
+    pinned, so a revert to THAT reds. Before this leg, everything else was
+    unpinned — dropping `idx`, or re-asserting a closed one-name reading in
+    other words, kept every leg green. What this leg closes, stated as measured
+    rather than as "any other route": the row must name BOTH measured
+    properties, it must not present them as the whole exception (the record-map
+    writers' further attributes are an open set), and five absolute spellings
+    are rejected. A reformulation outside those five is still unpinned — the
+    guard is a detector, and this file says so about itself.
     """
     rows = [
         line for line in _doc(EXTRACTOR_CHANGELOG).splitlines()
@@ -1248,13 +1332,43 @@ def test_the_ledger_keep_row_names_both_recorded_properties():
             "`cache_projection.relation_statement`), and the row is the reason "
             "a reader takes the layer to be cheap"
         )
-    # The RETRACTED reason, not the bare word: the row legitimately NAMES the
-    # withdrawn wording in its own correction note ("the earlier "property-free"
-    # was read from a search that cannot see a `SET r.<prop>` writer"), so a
-    # word-level test would red on the note that records the retraction.
-    assert "Cheap because edges are property-free" not in _flat(row), (
-        "the ledger's KEEP row has re-derived the retracted property-free "
-        "absolute as its reason"
+    # The OPEN SET the two names sit in: a row that presents `confidence` and
+    # `idx` as the WHOLE exception turns a named set into a closed total, which
+    # the record-map writers (`SET r += $props`, `SET r = $p`) do not support —
+    # their names are schema-driven and not statically readable
+    # (`EXPECTED_NAMES[relation_statement]` is the sentinel for exactly that).
+    assert "props" in row and "placement columns" in row, (
+        "the ledger's KEEP row presents `confidence` + `idx` as the whole "
+        "exception — the record-map writers also carry the row's placement "
+        "columns and open-set `props` tail, and a closed reading of an open "
+        "set is the retracted defect in a smaller font"
+    )
+    # The RETRACTED reason, plus the one-name spellings that re-derive it. The
+    # bare word `property-free` is deliberately NOT tested on its own: the row
+    # NAMES the withdrawn wording in its own correction note ("the earlier
+    # "property-free" was read from a search that cannot see a `SET r.<prop>`
+    # writer"), so a word-level test would red on the note that RECORDS the
+    # retraction. These spellings all assert a closed count instead.
+    one_name_absolutes = (
+        # The row's own retracted reason, and the closed-count spellings that
+        # re-derive it. The BARE word `property free` is deliberately absent:
+        # the row's correction note quotes the withdrawn wording ("the earlier
+        # "property-free" was read from a search that cannot see a
+        # `SET r.<prop>` writer"), so a bare-word test would red on the note
+        # that RECORDS the retraction. These all assert a closed count.
+        "Cheap because edges are property-free",
+        "one semantic property",
+        "only one property",
+        "essentially property free",
+    )
+    survivors = [
+        literal for literal in one_name_absolutes
+        if _flat(literal) in _flat(row)
+    ]
+    assert not survivors, (
+        f"the ledger's KEEP row re-derives the retracted absolute {survivors} "
+        "— the row is the reason a reader takes the layer to be cheap, so a "
+        "closed count there is the same defect the correction exists to stop"
     )
 
 
@@ -1484,7 +1598,8 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
     )
 
 
-# ── 4b. the two forms the census was fail-open on (synthetic probes) ───────
+# ── 4b. the write forms and spellings the census was fail-open on (synthetic
+#        probes) ───────────────────────────────────────────────────────────
 
 
 def test_the_census_reads_the_inline_pattern_map_form():
@@ -1871,4 +1986,121 @@ def test_the_storage_changelog_records_the_correction():
         "STORAGE-ARCHITECTURE-CHANGELOG.md does not record this correction — "
         "the changelog is where a reader learns a §11.1/§13 claim moved, and an "
         "unrecorded correction is the drift #9397 exists to stop"
+    )
+
+
+# ── 8. this file's description of ITSELF ──────────────────────────────────
+#: The retracted self-description: the header claimed the suite made no network
+#: call while `_ensure_commit` fetches `origin main`. Pinned by its own literal,
+#: because a claim about what the suite DOES is exactly the class of claim this
+#: file was written to stop asserting unmeasured — one level up.
+_RETRACTED_NO_NETWORK = "No DB, no graph, no network."
+
+
+def test_the_guard_states_its_own_execution_and_probe_coverage_honestly():
+    """The header's claims about the suite's OWN behaviour are measured here.
+
+    Two of them were false at the `#9403` head, and both were false in the same
+    direction — understating what runs and overstating what is pinned:
+
+    * *"ONE exception: `git show` … No DB, no graph, no network"* — the leg also
+      runs `git cat-file -e`, and `_ensure_commit` runs `git fetch --depth=…
+      origin main`, which on the shallow CI checkout is a network call whose
+      side effect is to DEEPEN the clone under test.
+    * *"pins one synthetic probe per gap below (with a recorded control)"* — the
+      gap list has six entries, the probes cover five, and there is one control.
+
+    Each assertion below re-derives the fact from the SOURCE rather than
+    restating it: the docstring may only claim what `_ensure_commit` and
+    `test_the_census_bound_is_pinned_as_a_gap_not_an_absence` actually do.
+    """
+    src = Path(__file__).read_text(encoding="utf-8")
+    header = _flat(__doc__ or "")
+
+    # The code facts. If these vanish the claims below are being checked
+    # against nothing, which is the failure mode this leg exists to catch.
+    assert '"fetch"' in src and "--depth=" in src, (
+        "`_ensure_commit` no longer fetches `origin main` — this leg's premise "
+        "moved, so re-derive the header's execution claim before trusting it"
+    )
+    assert '"cat-file"' in src, (
+        "`_has_commit` no longer shells out to `git cat-file` — the header's "
+        "execution claim is stale"
+    )
+
+    assert _flat(_RETRACTED_NO_NETWORK) not in header, (
+        f"the header still claims {_RETRACTED_NO_NETWORK!r} while "
+        "`_ensure_commit` runs `git fetch --depth=… origin main` (a network "
+        "call on a shallow checkout, and a side effect on this clone's object "
+        "database)"
+    )
+    assert "git fetch" in header, (
+        "the header does not name the `git fetch` that the provenance leg "
+        "performs when the pre-fix rev is not already present — the suite is "
+        "then not network-free, and a reader of a 'static' suite deserves to "
+        "know before a network-less runner spends the fetch timeouts"
+    )
+
+    # Probe coverage: one probe per gap is NOT what the census leg holds.
+    assert "one synthetic probe per gap" not in header, (
+        "the header claims one synthetic probe per gap, but the gap list has "
+        "SIX entries and the probes cover five (gap 6 is the file-scope gap, "
+        "which no `_writers_in_module` probe can express)"
+    )
+    assert "Gap 6" in header and "STATED and not pinned" in header, (
+        "the header no longer states that gap 6 is STATED rather than pinned — "
+        "the asymmetry is the claim, so it is pinned as one"
+    )
+
+    # The 4b section header counted the forms wrong (two vs the three the
+    # probes cover: inline map, anonymous pattern, allowlist prefilter).
+    # Sliced to the HEADER rather than searched file-wide: this leg's own
+    # message names the retracted wording, so a file-wide needle would match
+    # itself — the self-match that makes a self-description pin vacuous.
+    anchor = src.find("# ── 4b.")
+    assert anchor >= 0, "the 4b section header is gone — this leg measures nothing"
+    section_header = src[anchor : anchor + 160]
+    assert "two forms" not in section_header, (
+        "the 4b section header is back to counting two forms, but the section "
+        "holds probes for THREE write forms"
+    )
+
+
+def test_the_correction_ledger_numbers_each_round_once():
+    """The ledger's only index is its round numbering, so a repeated ordinal
+    makes the current correction unidentifiable — and the FOURTH round's false
+    record of §13's citation must not come back.
+
+    Measured at the `#9403` head: two sections were both titled *"Seventh
+    review-cycle correction"*, and the fourth said §13's `create_about_edge`
+    citation was *"also qualified (`:344` at the pinned revision) the way §11.1's
+    copy already was"* while §13 carries no line number at all. Both are
+    section-scoped here because a file-wide absence check would be satisfied by
+    the later round's correction note quoting the sentence it corrects.
+    """
+    changelog = _doc(STORAGE_CHANGELOG)
+    headings = re.findall(r"^\*\*(\w+) review-cycle correction", changelog, re.M)
+    assert headings, (
+        "no `**<Ordinal> review-cycle correction` heading found in the ledger — "
+        "the rounding scheme moved and this leg measures nothing"
+    )
+    seen: dict[str, int] = {}
+    for ordinal in headings:
+        seen[ordinal] = seen.get(ordinal, 0) + 1
+    repeats = {o: n for o, n in seen.items() if n > 1}
+    assert not repeats, (
+        "the correction ledger numbers a round more than once "
+        f"({repeats}); the round number is the ledger's only index, so a reader "
+        f"cannot tell which entry is current. Headings found: {headings}"
+    )
+
+    fourth = _section(
+        changelog,
+        "**Fourth review-cycle correction",
+        "**Fifth review-cycle correction",
+    )
+    assert "is also qualified" not in _flat(fourth), (
+        "the FOURTH correction again asserts that §13's `create_about_edge` "
+        "citation is qualified with `:344` — measured, §13 asserts the symbol "
+        "only and `:344` appears in §11.1 alone, so the record is false"
     )
