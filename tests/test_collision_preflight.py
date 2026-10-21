@@ -713,7 +713,16 @@ class CollisionPreflightTest(unittest.TestCase):
                 rest.append({
                     "number": pr.get("number"),
                     "title": pr.get("title") or "",
-                    "body": pr.get("body") or "",
+                    # ⛔ REAL REST SENDS `null` FOR AN EMPTY DESCRIPTION, NOT
+                    # `""` (#9423 review round 7, P3). The projection used to emit
+                    # `""` for every description-less PR, so the wire's null-body
+                    # ACCEPTANCE branch in `_rest_pr_wire_reason` — the one that
+                    # keeps the rescue working on any repo with a single
+                    # description-less open PR, i.e. the COMMON production shape —
+                    # was never exercised: a regression dropping `is not None`
+                    # would refuse the whole enumeration and the suite would stay
+                    # green. The projection now models the wire it claims to model.
+                    "body": pr.get("body") or None,
                     "state": str(pr.get("state") or "open").lower(),
                     "html_url": pr.get("url") or "",
                     "merged_at": pr.get("mergedAt"),
@@ -5557,6 +5566,28 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("a TARGET the tool cannot resolve (issue assignee/holder", out)
         self.assertIn("re-authenticating cannot change it", out)
         self.assertIn("and PART is:", out)
+
+    def test_a_null_rest_body_is_accepted_and_the_enumeration_still_runs(self):
+        # #9423 review round 7 (P3): `body: null` is the REAL REST shape for a PR
+        # with no description, and it is the COMMON production shape. The wire
+        # check must ACCEPT it — otherwise the rescue refuses the entire
+        # enumeration on any such element, silently disabling the mechanism this
+        # PR exists to add. Pinned because the fixture used to derive `""` and so
+        # could never produce the case.
+        self.gh_fixtures(open_prs=[{
+            "number": 9415, "title": "chore: describes nothing", "body": "",
+            "headRefName": "chore/9999-other", "state": "open",
+        }])
+        raw = json.loads((self.gh_dir / "open_prs_rest.json").read_text())
+        self.assertIsNone(raw[0]["body"], "the REST projection must send null, not ''")
+        raw[0]["body"] = None
+        (self.gh_dir / "open_prs_rest.json").write_text(json.dumps(raw))
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        # ACCEPTED means READ: one PR reached the reader, and nothing was refused
+        # for the body's shape.
+        self.assertIn("1 PR(s) WERE read", out)
+        self.assertNotIn("non-string 'body'", out)
 
     def test_falsy_non_string_rest_title_and_body_are_refused_not_laundered(self):
         # #9423 review round 6 (P3): the projection writes `title or ""` /
