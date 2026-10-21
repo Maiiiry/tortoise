@@ -136,7 +136,7 @@ and refuses with the holder's name.
 
 `rc 2` is a **refusal**, and the controller must not dispatch:
 
-```
+```text
 $ env -u TORTOISE_DB_URI -u TORTOISE_API_URL tools/work_claim.py acquire --repo … --issue 5052
 REFUSED: no claim store configured: set TORTOISE_DB_URI (self-hosted) or TORTOISE_API_URL +
 TORTOISE_API_KEY (hosted). An unset store is refused rather than answered from a default target
