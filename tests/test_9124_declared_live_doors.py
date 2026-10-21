@@ -1683,7 +1683,11 @@ def _handle_query_calls(func) -> list[ast.Call]:
     handle RECEIVED AS AN ARGUMENT has no binding to follow and that is how a
     real writer hides (`clear_config_reset(proj.g)` → `clear_config_reset(g)`)
     — so `params` is threaded through here exactly as `enumerate_handle_surface`
-    threads it (line ~700). Without it, a second reach through a handle
+    threads it (its `ast.Call` branch passes `fact["params"]` into
+    `_is_handle_ref`). ⛔ cited by SYMBOL, not by line number: the first version
+    of this sentence said `(line ~700)`, which is the citation-rot class this
+    PR exists to remove and was already ~19 lines stale at the head (review
+    MINOR). Without the `params` arm, a second reach through a handle
     parameter left the "found 1 call" assertion green over two statements.
     """
     aliases = _handle_aliases(func)
@@ -1875,7 +1879,47 @@ def test_a_second_unresolved_assignment_reds_the_pin():
         _unresolved_block_span("_UNRESOLVED: set[str] = {'a'}\n")
 
 
-def _census_writer_names() -> frozenset[str]:
+#: The module `_census_writer_names` censuses, as the census spells it (the same
+#: `relative_to(ROOT).as_posix()` form `_modules_reaching_the_handle()` emits).
+SDK_REL = "tortoise/sdk.py"
+
+
+def _proven_read_names(rel: str = SDK_REL, register=None) -> frozenset[str]:
+    """Bare names `register` proves read-only **for `rel`**, and only that module.
+
+    ⛔ THE MODULE KEY IS THE WHOLE POINT (review P2, latent fail-open).
+    `_PROVEN_READS` is keyed `(rel_path, scope-qualified name)` across the whole
+    package, while the writer set it is subtracted from is `sdk.py`'s and the
+    consumer matches BARE callee names. Subtracting without the `rel` check
+    resolves the identity of the *removed* function by bare name across every
+    module the register names, so a proven read added for, say,
+    `tortoise/event_store.py` would silently un-guard an `sdk.py` writer that
+    merely shares the bare name — and the arm would then report nothing, with
+    its note reading true for the wrong reason. That is the SAME bare-name
+    collision class `test_no_two_census_entries_share_a_bare_function_name`
+    already gates for inventories. `test_a_proven_read_is_subtracted_only_for_
+    its_own_module` reds if this filter is dropped.
+    """
+    register = _PROVEN_READS if register is None else register
+    return frozenset(_bare_name(key) for mod, key in register if mod == rel)
+
+
+def _sdk_surface() -> dict:
+    """`enumerate_handle_surface` over `sdk.py`, parsed once per process.
+
+    Cached separately from the writer set: the writer set is a DERIVED view
+    (`surface − proven reads`), so the non-vacuity tests need the raw surface to
+    show the subtraction is load-bearing rather than tautological.
+    """
+    cached = _SDK_SURFACE_CACHE.get("surface")
+    if cached is None:
+        cached = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
+        _SDK_SURFACE_CACHE["surface"] = cached
+    return cached
+
+
+def _census_writer_names(surface: dict | None = None,
+                         register=None) -> frozenset[str]:
     """Bare names the census either PROVES reaches a write or CANNOT prove a read.
 
     `enumerate_handle_surface` keeps a fact for every function holding at least
@@ -1905,18 +1949,31 @@ def _census_writer_names() -> frozenset[str]:
     hand-check covers THEIR OWN statement, not a call from someone else's row,
     and the over-report direction is the one this file prefers. What was wrong
     was the reason, not the direction.
+
+    ⛔ the subtraction is `_proven_read_names(SDK_REL)` — `sdk.py`'s proven reads
+    ONLY, because this set is matched against bare callees in `sdk.py`.
+
+    `surface` / `register` are the non-vacuity seam: supplying either bypasses
+    the cache so a test can hand in a synthetic surface and a synthetic register
+    and observe the module filter. The real pin passes neither.
     """
+    if surface is not None or register is not None:
+        surface = _sdk_surface() if surface is None else surface
+        return frozenset(_bare_name(key) for key in surface) \
+            - _proven_read_names(SDK_REL, register)
     cached = _CENSUS_WRITER_NAMES.get("names")
     if cached is None:
-        surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
-        proven_read = {_bare_name(key) for _rel, key in _PROVEN_READS}
-        cached = frozenset(_bare_name(key) for key in surface) - proven_read
+        cached = _census_writer_names(surface=_sdk_surface())
         _CENSUS_WRITER_NAMES["names"] = cached
     return cached
 
 
-#: One entry, filled on first use: parsing `sdk.py` is ~0.25 s and every
-#: `_calibration_read_offenders` call would otherwise pay it again.
+#: Filled on first use: parsing `sdk.py` is ~0.25 s and every
+#: `_calibration_read_offenders` call would otherwise pay it again. Kept apart
+#: from the derived writer set so the raw surface stays observable.
+_SDK_SURFACE_CACHE: dict[str, dict] = {}
+
+#: The derived view (`surface − sdk.py's proven reads`), filled on first use.
 _CENSUS_WRITER_NAMES: dict[str, frozenset[str]] = {}
 
 
@@ -2725,14 +2782,29 @@ def test_the_census_writer_set_states_its_own_polarity():
 
     So: the proven-read register is subtracted, a provable writer is not, and
     the message may not assert more than "write or not-proven-read".
+
+    ⛔ THE OLD `assert not (names & proven)` IS GONE (review P2, inert
+    assertion). `names` is `_census_writer_names()`, which IS
+    `surface − proven`, so `names & proven` was empty by construction: it could
+    not fail for any input, including the cross-module subtraction defect it
+    named, so it never observed the property. The subtraction is now pinned by
+    two assertions that CAN fail: the live register must actually be on the
+    censused surface (or the subtraction is decorative), and a proven read from
+    ANOTHER module must not be subtracted
+    (`test_a_proven_read_is_subtracted_only_for_its_own_module`).
     """
     names = _census_writer_names()
-    proven = {_bare_name(key) for _rel, key in _PROVEN_READS}
+    proven = _proven_read_names()
     assert proven, "`_PROVEN_READS` is empty, so this test proves nothing"
-    assert not (names & proven), (
-        "a name this file has already proven READ is still reported as a "
-        f"writer, so a correct row reds on the census's silence: "
-        f"{sorted(names & proven)}")
+    raw = frozenset(_bare_name(key) for key in _sdk_surface())
+    assert proven & raw, (
+        "no `_PROVEN_READS` name is on the censused surface at all, so the "
+        "subtraction changes nothing and the register is decorative — the "
+        f"`rel` key no longer matches the census's spelling ({SDK_REL!r})")
+    # WHAT GUARANTEES THE SUBTRACTION IS THE DEFINITION (`surface − proven`), not
+    # an `assert not (names & proven)` here: that assertion held by construction
+    # and therefore for every input. What is checkable is that the definition is
+    # CONFINED to one module and LOAD-BEARING on the real tree — both above/below.
     assert "invalidate_point" in names, (
         "a name the census genuinely proves writes is missing from the set — "
         "the subtraction above cannot be the whole surface")
@@ -2759,6 +2831,35 @@ class Door:
         "the message does not state the set's real polarity, so the next "
         f"reader will trust a claim the census does not make "
         f"(offenders={offenders})")
+
+
+def test_a_proven_read_is_subtracted_only_for_its_own_module():
+    """NON-VACUITY for the module half of the proven-read subtraction (P2).
+
+    `_PROVEN_READS` is keyed `(rel_path, scope-qualified name)` across the whole
+    package, but the set it is subtracted from is `sdk.py`'s surface and the
+    consumer (`_calibration_read_offenders`) matches BARE callee names. Dropping
+    the `rel` check — the pre-fix `{_bare_name(key) for _rel, key in
+    _PROVEN_READS}` — therefore lets a proven read registered for ANY module
+    un-guard an `sdk.py` writer that merely shares the bare name, in the
+    fail-open direction: one module's proof silences another module's write.
+
+    The subject is a SYNTHETIC surface and a SYNTHETIC register, so the test is
+    fast and independent of what `sdk.py` currently contains; it reds on exactly
+    that one-clause revert (`if mod == rel` dropped, or made unconditional).
+    """
+    surface = {"TortoiseSDK.invalidate_point": {}}
+    foreign = {("tortoise/event_store.py", "TortoiseStore.invalidate_point")}
+    still_a_writer = _census_writer_names(surface=surface, register=foreign)
+    assert "invalidate_point" in still_a_writer, (
+        "a proven read registered for ANOTHER module removed an `sdk.py` writer "
+        "of the same bare name — one module's proof un-guarded another "
+        f"module's write (writers={sorted(still_a_writer)})")
+    own = {("tortoise/sdk.py", "TortoiseSDK.invalidate_point")}
+    assert not _census_writer_names(surface=surface, register=own), (
+        "a proven read registered for `sdk.py` ITSELF was not subtracted, so "
+        "the register's whole purpose is gone — a correct row reds on the "
+        "census's silence again")
 
 
 def test_the_calibration_reader_list_is_bound_to_the_rows_it_guards():
