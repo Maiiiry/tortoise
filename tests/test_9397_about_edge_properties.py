@@ -73,14 +73,11 @@ measured against `_writers_in_module` rather than assumed:
 **So the honest statement is: the census is a regression tripwire over the
 shapes it enumerates, inside `tortoise/`.** A property it does not see is not
 evidence of absence, and this paragraph is the thing that says so.
-`test_the_census_bound_is_pinned_as_a_gap_not_an_absence` pins a synthetic
-probe for each of gaps **1-5** (each measured `{}`) beside ONE recorded control,
-so an empty result reads as the shape rather than as a broken probe. Gap **6**
-has NO probe and cannot have one: it is a file-scope gap (`PKG.rglob`), which no
-`_writers_in_module` probe can express — the walk's scope is DISCLOSED here and
-not pinned, and that asymmetry is stated rather than rounded up to "one probe
-per gap". The DOCUMENT wording is pinned by its own leg; neither pin claims to
-block every future absolute, because no test can.
+`tests/test_9397_about_edge_properties.py` pins synthetic probes for gaps 1-5
+(a control is recorded beside them), and the DOCUMENT wording is pinned by
+its own leg. Gap 6 — a writer outside `tortoise/` — cannot be probed from
+inside the walk, so it is STATED and not pinned, and no test here claims to
+block every future absolute, because none can.
 
 `sdk.supersede_point` and `projection._rebuild_all_replay` — which earlier
 revisions of this file recorded as re-materializers — are NOT. Its `SET r += $attrs` is on the 2a-DIRECT leg,
@@ -223,10 +220,11 @@ WHAT IS PINNED (one entry per test, in file order)
    the census STOP rather than skip.
 11. `test_the_census_reads_the_inline_pattern_map_form` — synthetic probe for the
    inline pattern map, named and anonymous.
-12. `test_the_census_bound_is_pinned_as_a_gap_not_an_absence` — the census's
-   DECLARED bound is pinned in prose and in code: the two escape shapes it
-   names are measured `{}` against `_writers_in_module` beside a control, so
-   the bound cannot drift back into an absence claim.
+12. `test_the_census_bound_is_pinned_as_a_gap_not_an_absence` — one probe per
+   gap category 1-5, each asserting `{}` against `_writers_in_module`, beside
+   a recorded control. No COUNT is stated here on purpose: an earlier
+   revision of this list said "two shapes" while the leg asserted more, and
+   a count in prose is a claim the code can outgrow silently.
 13. `test_the_documents_state_the_bound_as_a_detector_not_a_proof` — the
    completeness claim is WITHDRAWN, not reworded a fifth time: the detector
    wording must be present in the guard's `__doc__` and at least twice in
@@ -2049,9 +2047,9 @@ def test_the_guard_states_its_own_execution_and_probe_coverage_honestly():
         "SIX entries and the probes cover five (gap 6 is the file-scope gap, "
         "which no `_writers_in_module` probe can express)"
     )
-    assert "has NO probe" in header, (
-        "the header no longer states that gap 6 is DISCLOSED rather than "
-        "pinned — the asymmetry is the claim, so it is pinned as one"
+    assert "Gap 6" in header and "STATED and not pinned" in header, (
+        "the header no longer states that gap 6 is STATED rather than pinned — "
+        "the asymmetry is the claim, so it is pinned as one"
     )
 
     # The 4b section header counted the forms wrong (two vs the three the
