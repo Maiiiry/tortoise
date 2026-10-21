@@ -245,6 +245,17 @@ case "$1 $2" in
       echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
       exit 1
     fi
+    # #9423 review (P3): a NON-exhaustion failure of the SAME read. The REST
+    # rescue is gated on the CAUSE (`_is_budget_exhaustion`), not on "the read
+    # failed", so this seam is what makes that gate falsifiable: a rescue that
+    # fired on every SurfaceError would answer this from REST and hide a genuine
+    # "could not read" — the fail-open direction. Without a seam of this shape
+    # the scoping test could only assert the happy path, which the pre-fix tool
+    # passes too (it has no rescue at all).
+    if [ "${state:-open}" = "open" ] && [ "${GH_STUB_PR_LIST_FAIL:-0}" = "1" ]; then
+      echo "gh-stub: read tcp 127.0.0.1:1->20.26.156.210:443: read: connection reset by peer" >&2
+      exit 1
+    fi
     # The target repo is sent EXPLICITLY (#4027): record it so a test can
     # prove the selector reached gh rather than being inferred from the cwd.
     printf '%s\n' "$@" > "$d/pr-list-argv.txt"
@@ -2637,6 +2648,96 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("VERDICT: CLEAN", out)
         self.assertFalse((self.gh_dir / "open-prs-rest-argv.txt").exists(), out)
+        # ⛔ AND THE GATE IS THE CAUSE, NOT "the read failed" (#9423 review, P3).
+        # The arm above passes on the PRE-FIX tool as well (pre-fix there is no
+        # REST path at all), so on its own it pins nothing about the gate. This
+        # arm fails the same `gh pr list` with a NON-exhaustion error: a rescue
+        # gated on the exception instead of on `_is_budget_exhaustion` answers it
+        # over REST — hiding a real "could not read" — and a rescue gated
+        # correctly makes no `gh api …/pulls` call and reports the read as
+        # gh-unavailable. Dropping the exhaustion test from the gate REDS this.
+        (self.gh_dir / "open-prs-rest-argv.txt").unlink(missing_ok=True)
+        self.gh_fixtures(open_prs=[{
+            "number": 9414, "title": "chore: an unrelated open PR",
+            "body": "", "headRefName": "chore/9999-unrelated", "state": "open",
+        }])
+        (self.gh_dir / "open-prs-rest-argv.txt").unlink(missing_ok=True)
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_FAIL": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("gh-unavailable", out)
+        self.assertNotIn("closing-references-unmeasured", out)
+        self.assertFalse((self.gh_dir / "open-prs-rest-argv.txt").exists(), out)
+
+    def test_a_malformed_rest_open_pr_element_is_a_named_incomplete_not_a_collision(self):
+        # #9423 review (P2). `_open_prs_rest` fabricated the `gh pr list --json`
+        # projection and only THEN ran `_require_pr_dicts` on the records it had
+        # just built — so the element-type contract never saw the wire. A body of
+        # `[null]` raised `AttributeError` on `element.get("head")` INSIDE the
+        # `except SurfaceError` body that calls the rescue, which no handler takes:
+        # traceback, NO `VERDICT` line, exit 1 — the code this module documents as
+        # COLLISION, i.e. "another lane is on it, do not dispatch".
+        self.gh_fixtures(open_prs=[{
+            "number": 9415, "title": "chore: an unrelated open PR",
+            "body": "", "headRefName": "chore/9999-unrelated", "state": "open",
+        }])
+        (self.gh_dir / "open_prs_rest.json").write_text("[null]")
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: COLLISION", out)
+        self.assertRegex(out, r"(?m)^open PRs\s+INCOMPLETE")
+        self.assertIn("non-object element at index 0", out)
+        self.assertIn("NoneType", out)
+
+    def test_a_rest_open_pr_element_missing_a_key_is_refused_not_filled_in(self):
+        # #9423 review (P2), SECOND manifestation. Synthesising every key
+        # (`element.get("title") or ""`) turned ABSENCE into EMPTINESS, so the
+        # presence checks in `_require_pr_dicts` could never fire for this
+        # transport and a `/pulls` element without `title` (or `head.ref`)
+        # silently DROPPED that test on the BLOCKING surface — the fail-OPEN
+        # direction the contract refuses. Neither shape raised anything, so this
+        # test is the only thing that can red the guards.
+        for key, needle in (("title", "no 'title'"),
+                            ("head", "non-object 'head'")):
+            with self.subTest(missing=key):
+                self.gh_fixtures(open_prs=[{
+                    "number": 9416, "title": "chore: an unrelated open PR",
+                    "body": "", "headRefName": "chore/9999-unrelated",
+                    "state": "open",
+                }])
+                rest = json.loads(
+                    (self.gh_dir / "open_prs_rest.json").read_text())
+                del rest[0][key]
+                (self.gh_dir / "open_prs_rest.json").write_text(json.dumps(rest))
+                rc, out = self.run_tool(
+                    env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+                self.assertNotIn("Traceback", out)
+                self.assertEqual(rc, 2, out)
+                self.assertIn("VERDICT: INCOMPLETE", out)
+                self.assertIn(needle, out)
+                # The discriminator: pre-fix the run still refused, but for the
+                # WRONG reason (the computed closing test it never ran), because
+                # the absent key had been filled in and swallowed.
+                self.assertNotIn("closing-references-unmeasured", out)
+
+    def test_a_rest_open_pr_element_without_a_head_ref_is_refused(self):
+        # The same guard one level down: `head` present but `ref` absent (or not a
+        # string) is the head-ref test's ONLY input. Filling it in with "" skipped
+        # that test on a BLOCKING surface without saying so.
+        self.gh_fixtures(open_prs=[{
+            "number": 9417, "title": "chore: an unrelated open PR",
+            "body": "", "headRefName": "chore/9999-unrelated", "state": "open",
+        }])
+        rest = json.loads((self.gh_dir / "open_prs_rest.json").read_text())
+        rest[0]["head"] = {"sha": "deadbeef"}
+        (self.gh_dir / "open_prs_rest.json").write_text(json.dumps(rest))
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("no string 'head.ref'", out)
 
     def test_rest_rescued_body_closing_reference_is_not_described_as_advisory(self):
         # #9423 review (P2, finding 1). `use_closing_field=False` used to mean
@@ -2710,6 +2811,12 @@ class CollisionPreflightTest(unittest.TestCase):
             f"per_page of {mod._REST_PULLS_PAGE} and returned a FULL page", out)
         # …and the remedy it implies is the one that works at this setting.
         self.assertIn("Widen with --pr-limit", out)
+        # ⛔ THE NOTE MUST READ AS ONE SENTENCE (#9423 review, P3). The aside
+        # ("… because --pr-limit asked for 20") used to run straight into the
+        # main verb, so the report said a LARGER page "was requested and
+        # returned" — the opposite of what happened.
+        self.assertIn("— and returned a FULL page", out)
+        self.assertNotIn("asked for 20 and returned a FULL page", out)
 
         # The >= 100 arm: GitHub's maximum really WAS the requested size there,
         # so the note may say so — and must NOT offer a widening that does not
@@ -2725,6 +2832,33 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertIn(f"requested per_page of {cap}, GitHub's maximum", out)
         self.assertNotIn("Widen with --pr-limit", out)
+        # The aside is CLOSED before the main verb resumes: "no larger page can
+        # be requested — and returned a FULL page" (#9423 review, P3). The
+        # broken sentence said the opposite of what happened.
+        self.assertIn("— and returned a FULL page", out)
+        self.assertNotIn("can be requested and returned a FULL page", out)
+
+    def test_truncation_remedy_names_the_pr_limit_not_gh_auth(self):
+        # #9423 review (P3). `_incomplete_remedy` reads `s.note`, but
+        # `mark_truncated` writes `truncation_note` and never `note` — so the
+        # PURE-GraphQL truncation case (no exhaustion, no note) took the generic
+        # arm and ended the report with "fix gh auth/network (or rebuild the fleet
+        # board)" for a cause the report had just measured as a completeness CAP,
+        # while the surface's own truncation note says to widen `--pr-limit`.
+        self.gh_fixtures(open_prs=[
+            {"number": 1, "title": "a", "body": "", "headRefName": "chore/a"},
+            {"number": 2, "title": "b", "body": "", "headRefName": "chore/b"},
+        ])
+        rc, out = self.run_tool(extra_args=["--pr-limit", "1"])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        # The cause is named, and it is the one the surface measured.
+        self.assertIn("TRUNCATED list", out)
+        self.assertIn("--pr-limit", out)
+        # …and the remedy is NOT the re-authenticate/rebuild advice, which cannot
+        # help with a cap.
+        self.assertNotIn("fix gh auth/network", out)
+        self.assertNotIn("rebuild the fleet board and re-run", out)
 
     def test_graphql_exhaustion_with_rest_also_down_still_fails_closed(self):
         # The fallback must never become a fail-open. With BOTH budgets gone the

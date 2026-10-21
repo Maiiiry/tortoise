@@ -1286,15 +1286,27 @@ def _closing_ref_numbers(pr: dict) -> list[int]:
 
 
 def closing_reference(text: str, issue: int) -> bool:
-    """REGEX FALLBACK — ONLY for the surface GitHub cannot supply the field on.
+    """REGEX FALLBACK — the re-derivation, used ONLY where the field cannot be had.
 
-    That is the ADVISORY closed-PR surface, whose payload comes from the REST
-    `/pulls` endpoint and therefore carries no `closingIssuesReferences`. Every
-    hit there is already `weak`, so an imprecise regex cannot block anything.
+    `_closing_ref_numbers` reads GitHub's own computed `closingIssuesReferences`
+    and is the SOURCE every BLOCKING surface prefers (#3504: do not re-derive
+    what GitHub already computed). This regex is the fallback for the two call
+    sites where that field is unavailable — and they are NOT the same posture:
 
-    Every BLOCKING surface uses `_closing_ref_numbers` instead. Do NOT reach for
-    this one there: it is the re-derivation #3504 exists to remove, kept only
-    because REST cannot answer the question the other way.
+    * the ADVISORY closed-PR surface, whose payload comes from the REST `/pulls`
+      endpoint and therefore carries no `closingIssuesReferences`. Every hit
+      there is already `weak`, so an imprecise regex cannot block anything;
+    * the BLOCKING open-PR surface when its list was rescued over REST (#9402):
+      REST has no such field either, so on that call this regex is the ONLY
+      closing test, and a non-terminal hit from it is `strong` and DECIDES the
+      verdict. That is why the surface says the computed test is UNMEASURED
+      (never "closes nothing"), and why the hit's detail text keys on the
+      surface's AUTHORITY rather than on `use_closing_field`.
+
+    So the accurate rule for an editor is: a blocking surface uses
+    `_closing_ref_numbers` as the SOURCE, and this regex only as an
+    ADDING-ONLY union (when the field was requested) or as the documented
+    REST-rescue fallback, whose hits stay `strong`.
     """
     if not text:
         return False
@@ -2943,6 +2955,69 @@ def _rest_pulls_page_size(limit: int) -> int:
     return min(_REST_PULLS_PAGE, max(1, int(limit)))
 
 
+def _rest_pr_wire_reason(element: object, index: int, where: str) -> str | None:
+    """Why one REST `/pulls` ELEMENT cannot be read — or ``None`` when it can.
+
+    ⛔ THE WIRE ELEMENT IS VALIDATED BEFORE ANYTHING READS IT, AND NOTHING IS
+    SYNTHESISED FROM ABSENCE. `_open_prs_rest` builds the `gh pr list --json`
+    projection itself and then runs `_require_pr_dicts` on the records it just
+    built — so that contract never saw the WIRE. Two defects followed, and both
+    are the class this file already closed elsewhere:
+
+    * a non-object element (`[null]`, `[1]`, `["x"]`) reached
+      `element.get("head")` and raised `AttributeError`. That is neither
+      `SurfaceError` nor `RuntimeError`, and the rescue is called from INSIDE an
+      `except SurfaceError` body, so it escaped every handler as a TRACEBACK
+      with no `VERDICT` line and exit 1 — the code this module documents as
+      COLLISION, which callers read as "another lane is on it, do not
+      dispatch". Exactly the shape `_require_pr_dicts` and `_issue_view_rest`
+      were written for;
+    * every key was FABRICATED (`element.get("title") or ""`, `head.get("ref")
+      or ""`), so an ABSENT key became EMPTINESS and the presence checks in
+      `_require_pr_dicts` could never fire for this transport. A `/pulls` body
+      whose element lacks `title` dropped the title test — on the BLOCKING
+      surface — without saying so. Absence looks exactly like emptiness, which
+      is the fail-OPEN direction.
+
+    Returning the REASON (rather than raising) keeps the refusal a NAMED
+    INCOMPLETE: the caller turns a `None` answer into a `SurfaceError` that names
+    both this cause and the GraphQL read that sent us here.
+    """
+    if not isinstance(element, dict):
+        return (
+            f"{where} returned a non-object element at index {index} "
+            f"({type(element).__name__}) — refusing to read a malformed PR list "
+            "as if it were empty (NOT clean)"
+        )
+    # The three scalar keys every `/pulls` element carries and a blocking reader
+    # consumes. `body` is deliberately NOT here: REST sends `"body": null` for an
+    # empty description, so absence-value there is a real wire value.
+    for key in ("number", "state", "title"):
+        if key not in element:
+            return (
+                f"{where} returned an element with no {key!r} at index "
+                f"{index} — REST `/pulls` always sends number, state, title and "
+                "head.ref, so this is a MALFORMED payload, not an empty value; "
+                "filling it in would silently drop that test on a BLOCKING "
+                "surface (NOT clean)"
+            )
+    head = element.get("head")
+    if not isinstance(head, dict):
+        return (
+            f"{where} returned an element with a non-object 'head' at index "
+            f"{index} ({type(head).__name__}) — `head.ref` is the ONLY input to "
+            "the head-ref test, so refusing rather than reading it as empty "
+            "(NOT clean)"
+        )
+    if not isinstance(head.get("ref"), str):
+        return (
+            f"{where} returned an element with no string 'head.ref' at index "
+            f"{index} ({type(head.get('ref')).__name__}) — the head-ref test "
+            "would silently be skipped on a BLOCKING surface (NOT clean)"
+        )
+    return None
+
+
 def _open_prs_rest(gh_bin: str, slug: str, cwd: str, timeout: float,
                    limit: int) -> tuple[list[dict] | None, bool, str | None]:
     """Enumerate OPEN pull requests over REST when GraphQL refuses (#9402).
@@ -3004,33 +3079,54 @@ def _open_prs_rest(gh_bin: str, slug: str, cwd: str, timeout: float,
             "to read a malformed PR list as if it were empty (NOT clean)"
         )
     prs: list[dict] = []
-    for element in raw:
+    for index, element in enumerate(raw):
+        # ⛔ THE WIRE ELEMENT IS CHECKED BEFORE THE NORMALISATION BELOW READS IT.
+        # See `_rest_pr_wire_reason`: without this the element-type contract runs
+        # on records this loop built, so `[null]` is an `AttributeError` (a
+        # traceback with no VERDICT line, exit 1 = COLLISION) and an absent
+        # `title`/`head.ref` is silently fabricated into "" — a dropped test on a
+        # BLOCKING surface.
+        reason = _rest_pr_wire_reason(element, index, where)
+        if reason is not None:
+            return None, False, reason
+        head = element["head"]
         # REST spells three of these differently from the `gh pr list --json`
         # projection (`head.ref`, `html_url`, `merged_at`), and `state` in
         # lowercase. Normalising HERE keeps every downstream reader —
         # `_pr_terminal_state`, `scan_pr_surface`, the merged-head harvest — on
         # ONE shape, so a rescue cannot be read differently from a primary read.
         #
-        # ⛔ THE CONTRACT CHECK RUNS ON THE NORMALISED ELEMENTS, NOT ON THE RAW
-        # ONES (found by `test_open_pr_graphql_exhaustion_is_enumerated_over_rest`,
-        # whose first run refused every REST element for a missing
-        # `headRefName`): `_require_pr_dicts` enforces the `gh pr list --json`
-        # projection's keys, and REST deliberately does not have them. Checking
-        # the wire shape against the projection's contract turns every rescue into
-        # a refusal — fail-closed, but a gate that can never answer.
-        head = element.get("head")
+        # ⛔ TWO CHECKS, TWO DIFFERENT CONTRACTS — NEITHER ONE IS THE OTHER.
+        # `_rest_pr_wire_reason` (above) enforces what the WIRE must send, so no
+        # element is dereferenced before it is typed and no absent key is filled
+        # in. `_require_pr_dicts` (below) then enforces the `gh pr list --json`
+        # PROJECTION's contract, which is what every downstream reader consumes.
+        # Running the projection's check on the RAW elements instead was the
+        # first bug here (found by
+        # `test_open_pr_graphql_exhaustion_is_enumerated_over_rest`, whose first
+        # run refused every REST element for a missing `headRefName`): REST
+        # deliberately does not carry the projection's spellings, so that turns
+        # every rescue into a refusal — fail-closed, but a gate that can never
+        # answer.
         prs.append({
             "number": element.get("number"),
-            "title": element.get("title") or "",
+            "title": element["title"] or "",
             "body": element.get("body") or "",
-            "headRefName": (head.get("ref") if isinstance(head, dict) else "") or "",
+            "headRefName": head["ref"] or "",
             "state": str(element.get("state") or "").upper(),
             "url": element.get("html_url") or element.get("url") or "",
             "mergedAt": element.get("merged_at"),
             # ⛔ NOT SET — see the docstring. Absence here is MEASURED absence of
             # the source, and the caller says so; it is never "closes nothing".
         })
-    _require_pr_dicts(prs, f"the REST open-PR enumeration for {slug}")
+    try:
+        _require_pr_dicts(prs, f"the REST open-PR enumeration for {slug}")
+    except SurfaceError as exc:
+        # A contract violation in a record this loop BUILT (a non-integer
+        # `number`, a blank `state`) is the same class as the wire malformations
+        # above: name it and return, instead of letting it escape through the
+        # caller's `except SurfaceError` body as a traceback with no VERDICT line.
+        return None, False, str(exc)
     return prs, len(raw) >= per_page, None
 
 
@@ -5183,7 +5279,13 @@ def run_preflight(
                     remedy = ""
                 surface.mark_truncated(
                     "the REST fallback answered ONE page at the requested "
-                    f"{pagesize} and returned a FULL page, so "
+                    # ⛔ THE ASIDE IS CLOSED BEFORE THE MAIN VERB RESUMES. The
+                    # tail used to be `and returned a FULL page`, so the
+                    # parenthetical swallowed it: the report said a LARGER page
+                    # "can be requested and returned", i.e. the opposite of what
+                    # happened, in the one line a human reads at the point of
+                    # refusal (#9423 review, P3).
+                    f"{pagesize} — and returned a FULL page, so "
                     "more open PR(s) may exist and were NOT scanned — this "
                     "surface is INCOMPLETE (never CLEAN)." + remedy
                 )
@@ -5525,14 +5627,26 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
     REST rescues use (`_is_budget_exhaustion`) — the rescue and the remedy must
     agree, or the report prescribes a cure for a cause it has already recognised.
 
-    Three arms, and the third is not decoration: when only SOME surfaces are
-    exhausted, claiming "re-authenticating will not help" in general would be
-    wrong for the others, so the exhausted cause is named as a CONTRIBUTOR and
-    the generic remedy is kept for the remainder.
+    ⛔ TRUNCATION IS A CAUSE OF ITS OWN, AND IT IS READ FROM ITS OWN FIELD.
+    `Surface.mark_truncated` writes `truncation_note` and NEVER `note`, so a
+    remedy that inspects only `s.note` cannot see a truncated surface at all:
+    the pure-GraphQL truncation case (a list longer than `--pr-limit`,
+    `note == ""`) fell to the generic arm and told the reader to re-authenticate
+    and rebuild the fleet board, for a cause the report had just MEASURED to be
+    a completeness cap — while that surface's own truncation note says to widen
+    `--pr-limit`. A remedy that names a cause the report has disproved is the
+    same defect class as a wrong verdict reason.
+
+    Four arms, and the multi-cause ones are not decoration: when only SOME
+    surfaces are exhausted or truncated, claiming the generic cause in general
+    would be wrong for the others, so each recognised cause is named as a
+    CONTRIBUTOR and the generic remedy is kept for the remainder.
     """
     exhausted = [s for s in incomplete if _is_budget_exhaustion(s.note or "")]
-    if not exhausted:
-        return "fix gh auth/network (or rebuild the fleet board) and re-run"
+    truncated = [s for s in incomplete if s.truncated]
+    generic = "fix gh auth/network (or rebuild the fleet board) and re-run"
+    if not exhausted and not truncated:
+        return generic
     budget = (
         "a GRAPHQL BUDGET EXHAUSTION shared by the whole fleet — `gh auth` is "
         "FINE (re-authenticating cannot help), the primary "
@@ -5543,13 +5657,32 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
         "(`gh api rate_limit --jq .resources.graphql`); any surface above that "
         "answered over REST is already valid evidence"
     )
+    truncation = (
+        "a TRUNCATED list — the surface hit its completeness cap and the "
+        "remainder was NOT scanned. That is a SETTING, not a failed read: widen "
+        "with --pr-limit (or COLLISION_PREFLIGHT_PR_LIMIT) and re-run; `gh "
+        "auth` is fine and the fleet board does not need rebuilding"
+    )
     if len(exhausted) == len(incomplete):
         return f"the cause is {budget}"
-    names = ", ".join(s.name for s in exhausted)
-    return (
-        f"PART of this is {budget} — {names} — while the remaining surface(s) "
-        f"need {_incomplete_remedy([s for s in incomplete if s not in exhausted])}"
-    )
+    if len(truncated) == len(incomplete):
+        return f"the cause is {truncation}"
+    remaining = [
+        s for s in incomplete
+        if not s.truncated and not _is_budget_exhaustion(s.note or "")
+    ]
+    parts: list[str] = []
+    if exhausted:
+        parts.append(f"{', '.join(s.name for s in exhausted)}: {budget}")
+    if truncated:
+        parts.append(f"{', '.join(s.name for s in truncated)}: {truncation}")
+    tail = ""
+    if remaining:
+        tail = (
+            f" — while the remaining surface(s) "
+            f"({', '.join(s.name for s in remaining)}) need {generic}"
+        )
+    return "PART of this is " + "; PART is ".join(parts) + tail
 
 
 def format_report(
