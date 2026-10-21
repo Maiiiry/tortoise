@@ -478,33 +478,18 @@ _SYMBOL = r"[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?"
 #: A cited Python file, as the document writes them (`quota.py`,
 #: `projection/entities.py`).
 _CITED_FILE = r"[A-Za-z0-9_./-]+\.py"
-#: `sym` (`file.py`) or `sym` (`file.py:NNN`) — the symbol immediately precedes
-#: its citation. ⚠️ **The line number is OPTIONAL, and that is the durable
-#: form.** The census prose drops `:NNNN` hints deliberately (they rotted six of
-#: seven times against the head that rewrote them, and every unrelated edit to
-#: `sdk.py` moves them again), so the binding this guard can actually keep true
-#: is symbol-to-FILE. Requiring the number here would make the honest form
-#: unciteable — and would silently shrink this arm's inventory to whatever still
-#: carries a hint, which is the vacuity the count floor below exists to catch.
-_SYM_THEN_CITATION = re.compile(
-    rf"`({_SYMBOL})`\s*\(`?({_CITED_FILE})(?::(\d+))?"
-)
+#: `sym` (`file.py:NNN`) — the symbol immediately precedes its citation.
+_SYM_THEN_CITATION = re.compile(rf"`({_SYMBOL})`\s*\(`?({_CITED_FILE}):(\d+)")
 #: `file.py:NNN` (`sym`) — the citation immediately precedes its symbol.
 _CITATION_THEN_SYM = re.compile(rf"`?({_CITED_FILE}):(\d+)`?\s*\(`({_SYMBOL})`")
 
 
 def _quoted_symbol_citations() -> list[tuple[int, str, str, str]]:
-    """Every `(doc_line, symbol, cited_file, cited_line)` the tight forms bind.
-
-    `cited_line` is empty for the symbol-only form (`sym` (`file.py`)), which is
-    the preferred one: the number is a convenience the document drops on purpose.
-    """
+    """Every `(doc_line, symbol, cited_file, cited_line)` the tight forms bind."""
     found: list[tuple[int, str, str, str]] = []
     for lineno, line in enumerate(_doc_text().splitlines(), start=1):
         for match in _SYM_THEN_CITATION.finditer(line):
-            found.append(
-                (lineno, match.group(1), match.group(2), match.group(3) or "")
-            )
+            found.append((lineno, match.group(1), match.group(2), match.group(3)))
         for match in _CITATION_THEN_SYM.finditer(line):
             found.append((lineno, match.group(3), match.group(1), match.group(2)))
     return found
@@ -666,21 +651,18 @@ _STATUS_ADJACENT = (
 #: A change narrated as a change, rather than the rule it settled on. The record
 #: of what changed belongs in `ONTOLOGY-CHANGELOG.md`, which is what a changelog
 #: is for.
-#:
-#: ⚠️ The date arm must not be pinned to the space-separated form. The stamp this
-#: guard exists to keep out of the design documents routinely arrives with the
-#: date in parentheses — *"⚠️ **CORRECTED (2026-10-20, `#7948`): …**"*, which #7948
-#: itself landed in §13.8 — and a space-only arm reported all three documents
-#: clean while it sat there. That is a false PASS on the exact class the guard
-#: claims: the word and the field's most natural date form, neither flagged.
-#: The separator is therefore one short run of non-digits, covering ` `, ` (`,
-#: ` on `, ` — ` and `: ` without matching ordinary prose (*"the corrected
-#: figure is TEN sites"* carries no `20xx-`); measured against the three design
-#: documents at HEAD: 0 hits.
 _CHANGE_NARRATION = re.compile(
     r"(?:an|the) earlier (?:draft|version|note|row|line|passage|recommendation)"
     r"|Corrections? to (?:an )?earlier"
-    r"|(?:CORRECTED|AMENDED)\b[^0-9\n]{0,12}20[0-9]{2}[-/]"
+    # The stamp's DATE may be parenthesised and may follow a qualifier: this
+    # arm originally required `CORRECTED 20xx-` with a single space, so a
+    # "CORRECTED (2026-10-20, `#NNNN`)" stamp — the shape #7948 itself added to
+    # `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 — passed the guard while violating
+    # the rule the guard exists to enforce. The `AMENDED` in
+    # `STORAGE-ARCHITECTURE.md` §14.1 O2 is followed by `)` and a dash, not a
+    # date, so allowing the parens does not make it fire (pinned in
+    # `must_not_flag`).
+    r"|(?:CORRECTED|AMENDED)(?:\s+AGAIN)?\s*\(?\s*20[0-9]{2}-"
     r"|\bDraft [0-9]\b"
     r"|rewritten twice"
     # A version the passage says it has been true since — change history, not the
@@ -817,13 +799,12 @@ def test_the_class_check_is_neither_dead_nor_noisy():
         "this reopen is CLOSED",
         "*An earlier draft said* the opposite of this paragraph.",
         "**CORRECTED 2026-09-24** \u2014 this passage was repaired.",
-        # The PARENTHESIZED date form. Measured: this is how #7948's own §13.8
-        # stamp landed, and the space-only arm reported all three design
-        # documents clean while it sat there — a false PASS on the class this
-        # test exists to keep out, which is why the arm is no longer pinned to
-        # one separator.
-        "\u26a0\ufe0f **CORRECTED (2026-10-20, `#7948`): TEN sites are customer-callable.**",
-        "The row was amended on 2026-10-19, after the recount.",
+        # The parenthesised-date form, verbatim from what #7948 added to
+        # `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 and then moved to the changelog.
+        # The arm above required `CORRECTED 20xx-`, so this line passed the guard.
+        "**\u26a0\ufe0f CORRECTED (2026-10-20, `#7948`): TEN sites are "
+        "customer-callable, behind EIGHT doors.**",
+        "**CORRECTED AGAIN 2026-10-20, second pass (`#7948`): 23 sites.**",
         "**Implementation status.** Both halves are now implemented.",
         "**\u26a0\ufe0f Draft 1** claimed the index is RAM-mandatory.",
         "\u00a716.2's rule is now also a billing rule (see `#5024` CLOSED).",
@@ -838,9 +819,6 @@ def test_the_class_check_is_neither_dead_nor_noisy():
         "`aboutObject` source only.",
     ]
     must_not_flag = [
-        # A near-miss for the date arm: the word is used, but nothing is stamped
-        # — no `20xx-` date-form, so this is a design statement, not narration.
-        "The corrected figure is TEN sites behind eight doors.",
         "The gate is FAIL-CLOSED at the boundary.",
         "`goalState` is a CLOSED vocabulary.",
         "A 384-dim float32 embedding is a fixed-width row.",
@@ -853,6 +831,11 @@ def test_the_class_check_is_neither_dead_nor_noisy():
         # A near-miss for the version-date arm: a version NAMED, not asserted as
         # a period the passage has held true since.
         "Model version v3.15 retires the `:Document` label.",
+        # A near-miss for the parenthesised-date arm: `AMENDED` closed by a
+        # paren and followed by a dash. The state word is design prose here
+        # (`STORAGE-ARCHITECTURE.md` §14.1 O2), not a dated correction stamp.
+        "The owner re-affirmed **2026-09-30** that this measurement is wanted "
+        "(§14.1 **O2**, AMENDED) \u2014 **only the goal is deferred.**",
     ]
     # The SCOPE is pinned too, and pinned ABSOLUTELY. Two narrowings are possible
     # and both must red a test:
