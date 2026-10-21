@@ -32,14 +32,14 @@ would be the same hand-maintained duplication this test exists to catch, one lay
 
 **The ``objectKind`` axis: which half this file owns.** The **§5 parse** of that axis is owned
 by ``tests/test_pack_kinds.py::TestCanonicalObjectKindAlignment``, which asserts
-``§5 == CANONICAL_OBJECT_KINDS == extractor_v2.CORE_OBJECT_KEYS`` (a three-way diff, including
-``extractor_v2.CORE_OBJECT_KEYS``, a surface this file never imports) — parsing the ``§5`` block
-here as well would be a second parser of the same block with no added coverage. What this file
-DOES assert, at the bottom of it, is the other half: the **derived tooling copies** of that
-canonical set (``tools/probe_extractor``, ``tools/calibration_harness``) against
-``CANONICAL_OBJECT_KINDS``. So the split is §5-parse **there** vs derived-copies **here**; the
-legs at the bottom of this file are deliberately owned by this file and are not covered by
-``test_pack_kinds.py``.
+``§5 == CANONICAL_OBJECT_KINDS == extractor_v2.CORE_OBJECT_KEYS`` (a three-way diff over
+``§5``, ``CANONICAL_OBJECT_KINDS`` and a surface this file never imports —
+``extractor_v2.CORE_OBJECT_KEYS``) — parsing the ``§5`` block here as well would be a second
+parser of the same block with no added coverage. What this file DOES assert, at the bottom of it,
+is the other half: the **derived tooling copies** of that canonical set
+(``tools/probe_extractor``, ``tools/calibration_harness``) against ``CANONICAL_OBJECT_KINDS``. So
+the split is §5-parse **there** vs derived-copies **here**; the legs at the bottom of this file
+are deliberately owned by this file and are not covered by ``test_pack_kinds.py``.
 **Named residual, tracked on #2786** (recorded so this file is never read as "the point axis
 is consistent"): the point axis carries a deliberate TWO-name exception — ``event`` and
 ``humanApproval`` are accepted by the Layer-1 gate and are not pack-facing (asserted below,
@@ -383,8 +383,10 @@ def test_extraction_prompt_advertises_only_canonical_core_kinds():
 
     The two constants above are the source; this is the surface. Reading the assembled system
     prompt (rather than either constant) is what makes the leg catch a stale mention in the
-    prompt's own prose: the ``core:concept`` instruction lived in the confusable-kind guard
-    paragraph, not in ``CORE_SEMANTICS``, and would have survived a fix to the table alone.
+    prompt's own prose: the ``core:concept`` instruction lived in TWO places — the
+    ``CORE_SEMANTICS`` entry AND the confusable-kind guard paragraph — so a fix to the table
+    alone would have left the paragraph's mentions in the built prompt (measured: restoring the
+    paragraph alone re-fails this leg).
     """
     pe = _tool_module("probe_extractor")
     prompt = pe._build_extraction_system(_ROOT / "packs")

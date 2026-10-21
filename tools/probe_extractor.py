@@ -100,8 +100,10 @@ def _render_kind_semantics(vocab: dict, ns: str, kinds: list[str]) -> str:
 # reader is the guard `tests/test_kind_vocabulary_consistency.py`
 # ::test_extraction_probe_object_kinds_are_the_canonical_set, which pins its contents. It is
 # kept DERIVED rather than deleted so that a consumer (an out-of-repo probe script) cannot pick
-# up a stale list, and it is NOT the surface this change fixes; the prompt fix is the two
-# retired descriptions dropped from `CORE_SEMANTICS`.
+# up a stale list, and it is NOT the surface this change fixes; the prompt was fixed in TWO
+# places — the two retired descriptions dropped from `CORE_SEMANTICS` AND the confusable-kind
+# paragraph rewritten to route abstract models to `core:other` — and the built-prompt leg reds
+# if EITHER is reverted (measured: restoring the paragraph alone re-fails it).
 CORE_OBJECT_KINDS = ", ".join(sorted(_CANONICAL_OBJECT_KINDS))
 CORE_SUBJECT_KINDS = "organization, team, role, legalPerson, naturalPerson, other"
 # The DESCRIBED SUBSET of the canonical set — the entries that carry the confusable-kind hints,
@@ -109,10 +111,11 @@ CORE_SUBJECT_KINDS = "organization, team, role, legalPerson, naturalPerson, othe
 # `objectKind`: a description is an instruction ("emit this when…"), so a stale key asks the
 # model for a kind no read path can resolve (`document` and `concept` did exactly that).
 # The subset is deliberately not the whole axis (a canonical kind with no hint is left
-# undescribed), so the leg that guards it is TWO-directional: no stale key and no silently
-# narrowed/ widened subset — `UNDESCRIBED_CORE_KINDS` below is the sized exception, and adding
-# or dropping a description is a reviewed edit, never a quiet one. Completing the descriptions
-# is rubric authoring and belongs to the calibration lane, not a vocabulary guard.
+# undescribed), so the legs that guard it are TWO-directional together: no stale key (the
+# `semantics_are_canonical_kinds` leg) and no silently narrowed/widened subset (the
+# `described_subset_is_sized` leg) — `UNDESCRIBED_CORE_KINDS` below is the sized exception, and
+# adding or dropping a description is a reviewed edit, never a quiet one. Completing the
+# descriptions is rubric authoring and belongs to the calibration lane, not a vocabulary guard.
 # Guarded by `tests/test_kind_vocabulary_consistency.py`
 # ::test_extraction_probe_semantics_are_canonical_kinds,
 # ::test_extraction_probe_described_subset_is_sized and
