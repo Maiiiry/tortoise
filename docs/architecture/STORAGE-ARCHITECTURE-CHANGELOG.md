@@ -693,6 +693,7 @@ that was itself a heading cannot collide with this file's own outline.
   - ⛔ CORRECTION TO §17.5 AS WRITTEN — `baseline_source` is NOT unconditionally DERIVED; `baseline_set` is DERIVED, but not as a record column. When an author sets the prior (`baseline_source…
 
 ---
+
 ## §13 — the `aboutObject` headline claim is SCOPED to the files it measured (`#9399`)
 
 The removed sentence and why it went. §13's evidence for the KEEP ruling opened
