@@ -3217,7 +3217,7 @@ surfaces:
   # `docs/architecture/STORAGE-ARCHITECTURE.md`-only diff does NOT take
   # `select()`'s early return — that path is claimed by the `onboarding`
   # `SOURCE_PATTERNS` entry, so `select()` returns `surfaces=['onboarding'],
-  # full=False, 120 files`; a `docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md`-only
+  # full=False, 121 files — re-derive it after any `tier1` addition, this change added one`; a `docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md`-only
   # diff DOES take the early return (`surfaces=[]`). The guard is selected in
   # both cases (measured: `guard_selected=True` for either doc), which is the
   # property that matters — `tier1` is unconditional in the tier-2 selection and

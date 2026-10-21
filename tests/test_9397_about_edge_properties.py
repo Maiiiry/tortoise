@@ -313,7 +313,7 @@ STORAGE_CHANGELOG = (
 #: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against.
 #: The reading MOVES with this file and is re-measured at every revision, never
 #: carried forward: 4 failed / 6 passed when it had 10 legs, 6 failed / 8 passed
-#: when it had 16, and **9 failed / 10 passed of the 19 legs at this revision**
+#: when it had 16, and **6 failed / 14 passed / 1 skipped of the 21 legs at this revision** (re-measured at this head; the leg population grows, so the reading is re-taken rather than carried forward)
 #: (the two `#9403`-review legs — §11.4 rule 1 and the ledger KEEP row — red on
 #: the pre-fix documents too, as does the detector-wording leg). "Was live pre-fix" is a claim about HISTORY, so it is
 #: checked against history instead of restated: an entry in
@@ -617,7 +617,7 @@ _ABOUT_REL = re.compile(
 #: restorer's `_sanitize_label` belong here for the map-form writers: they do
 #: not name `aboutObject` at the write site at all — they take the predicate
 #: from the allowlist that contains it (or from the dump, sanitized). Verified
-#: against the tree: adding them raises the census from 3 rows to exactly 7 ROWS —
+#: against the tree: adding them raises the census from 5 rows to exactly 7 ROWS (the two rows they add are the map-form writers) —
 #: the 5 recorded writers (3 named-form + 2 map-form) plus the 2 declared false
 #: positives, which are rows the census sees and does not count as writers.
 _ABOUT_VOCAB: tuple[str, ...] = (
