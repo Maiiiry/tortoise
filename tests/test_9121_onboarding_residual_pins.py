@@ -184,20 +184,27 @@ def _record(*, path: str, start: str, end: str) -> str:
     return " ".join(" ".join(lines).split())
 
 
-def _assert_site_count(region: str, template: str, what: str) -> None:
+def _assert_site_count(region: str, template: str, what: str,
+                       n: int | None = None) -> None:
     """The record's NUMERAL must equal the AST inventory's count.
 
     `template` is the record's own sentence with `{n}` standing in for the
     numeral — the same convention the exact-phrase pins already use, so a
     re-wording reds this instead of silently un-pinning the count.
+
+    `n` overrides the TOTAL for a record's PER-SITE numeral (#9150 review cycle
+    16, P2): `register_user` issues TWO of the five, and both records say so in
+    prose while only the total was pinned — editing either "two" to "three" left
+    a record contradicting the AST with every pin green.
     """
-    n = sum(_ESCAPE3_CALL_SITES.values())
+    if n is None:
+        n = sum(_ESCAPE3_CALL_SITES.values())
     word = _COUNT_WORDS.get(n)
     assert word is not None, (
         f"the escape-(3) inventory now holds {n} sites — extend `_COUNT_WORDS` "
         "and update the four records' numerals in the same change"
     )
-    for candidate in (word, word.capitalize()):
+    for candidate in (word, word.capitalize(), word.upper()):
         if template.format(n=candidate) in region:
             return
     raise AssertionError(
@@ -879,6 +886,15 @@ def test_the_declaration_note_names_the_seam_it_does_not_cover():
         )
     _assert_site_count(note, "{n} call sites build that statement",
                        "the escape-(3) NOTE in `tortoise/onboarding/state.py`")
+    # ⛔ And the PER-SITE numeral (#9150 review cycle 16, P2): the note says
+    # `register_user` issues TWO of the five, and that "two" was pinned by
+    # nothing — editing it to "three" left the note contradicting the AST with
+    # every pin green, which is the failure mode this file says prose numerals
+    # are pinned against.
+    _assert_site_count(
+        note, "({n} sites: the self-service arm and the Supabase-mode arm)",
+        "the escape-(3) NOTE's `register_user` sub-count",
+        n=_ESCAPE3_CALL_SITES[("tortoise/hosted_api.py", "register_user")])
 
 
 def test_the_note_and_the_ast_inventory_agree():
@@ -1385,9 +1401,10 @@ def test_the_opener_inventory_is_derived_not_hand_listed():
         "inventory pin can never fire on the next lane that declares there, "
         f"which is the whole point of pinning it: {sorted(derived)}"
     )
-    assert _projection_openers(None) == _projection_openers(), (
-        "the injected-module path and the on-disk path disagree, so this "
-        "instrument check is not measuring the production derivation"
+    assert _projection_openers(None) == _projection_openers(_parse(
+        "tortoise/projection/__init__.py")[0]), (
+        "the injected-module path and the on-disk `_parse` path disagree, so "
+        "this instrument check is not measuring the production derivation"
     )
 
 
@@ -1666,6 +1683,11 @@ def test_the_eager_init_finder_sees_both_call_spellings():
         def inside_a_return(proj, org):
             handle = proj.db.select_graph("g")
             return _os.eager_init_query("CREATE (:TeamMeta)", {"n": org})
+
+        def annotated(proj, org):
+            handle = proj.db.select_graph("g")
+            q: tuple = _os.eager_init_query("CREATE (:TeamMeta)", {"n": org})
+            handle.query(q[0], params=q[1])
         """
     ))
     found = {
@@ -1676,11 +1698,30 @@ def test_the_eager_init_finder_sees_both_call_spellings():
         if enclosing is not None
     }
     assert found == {"via_module", "via_bare_name", "argument_position",
-                     "bare_expression", "inside_a_return"}, (
+                     "bare_expression", "inside_a_return", "annotated"}, (
         "`_eager_init_calls()` missed a call spelling or SHAPE — it must match "
         "BOTH `_os.eager_init_query(...)` and a bare `eager_init_query(...)`, "
-        "in an assignment, an argument, a bare expression and a return, or a "
-        f"sixth site can exist with the note claiming there are five: {sorted(found)}"
+        "in an assignment, an annotation, an argument, a bare expression and a "
+        f"return, or a sixth site can exist with the note claiming five: {sorted(found)}"
+    )
+
+    # ⛔ …and the TARGETS each site carries (#9150 review cycle 16, P2): the
+    # `AnnAssign` arm of `_binding_parent()` (and of the target extraction) was
+    # deletable with the suite green, although `_eager_init_calls()`' own
+    # docstring enrols "an `AnnAssign` site" and `_binding_parent()`'s names the
+    # shape. A site with no targets is one the linkage pin cannot inspect.
+    annotated = next(
+        (node, targets)
+        for node, _call, targets in _eager_init_calls(tree)
+        if isinstance(node, ast.AnnAssign)
+    )
+    assert annotated[1], (
+        "an ANNOTATED-assignment site came back with NO binding target — the "
+        "linkage pin cannot inspect a site whose target list is empty"
+    )
+    assert _bound_names(annotated[1][0]) == {"q"}, (
+        "an ANNOTATED-assignment site came back with no (or the wrong) binding "
+        f"target — the linkage pin cannot inspect it: {annotated[1]}"
     )
 
 
@@ -2172,12 +2213,20 @@ def test_the_storage_ledger_declares_every_lane_the_tree_has():
     n = len(derived)
     word = _COUNT_WORDS.get(n)
     assert word is not None, f"the ledger now has {n} lanes — extend `_COUNT_WORDS`"
-    for phrase in (f"has {word.upper()} named lanes",
-                   f"it is {word.upper()} declared classes"):
+    # ⛔ EVERY ordinal phrasing, not just the headline two (#9150 review cycle 16,
+    # P1): after the numeral went FIVE, the same paragraph still said "The other
+    # THREE lanes declare through the same primitive" — the under-count the row
+    # pin cannot see, because it is prose about the OTHER lanes.
+    phrases = [f"has {word.upper()} named lanes",
+               f"it is {word.upper()} declared classes"]
+    if n >= 2:
+        phrases.append(f"the other {_COUNT_WORDS[n - 1]} lanes")
+    for phrase in phrases:
         assert phrase.lower() in preamble.lower(), (
             f"the ledger preamble no longer says {phrase!r} while the table has "
             f"{n} rows — a numeral that disagrees with its own table is how this "
-            "said FOUR for a five-lane carve-out (#9150 review cycle 15, P2)"
+            "said FOUR for a five-lane carve-out, and then FIVE while still "
+            "telling the reader there were three OTHER lanes (#9150)"
         )
 
     for lane, pin in recorded.items():
@@ -2268,6 +2317,12 @@ def test_the_plan_doc_and_the_storage_ledger_carry_the_residual():
         "coverage the residual does not have, and a site the record omits reads as "
         "closed — the same class the `state.py` note is pinned both ways for (#9157)"
     )
+    # …and the plan doc's PER-SITE numeral (`register_user` "(two statements)"),
+    # the same unpinned sub-count as the note's "TWO sites" (#9150 cycle 16, P2).
+    _assert_site_count(
+        plan, "({n} statements)",
+        "the increment-4 tracker's `register_user` sub-count",
+        n=_ESCAPE3_CALL_SITES[("tortoise/hosted_api.py", "register_user")])
 
 
 def test_the_inventory_cites_the_issue_that_owns_the_journalling_increment():
