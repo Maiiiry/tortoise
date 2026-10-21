@@ -167,3 +167,84 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
         "the declared write surface must remain exactly `present` / `deleted` — "
         "the code half of the binding the doc clause above pins from the other side"
     )
+
+
+def _flatten(text: str) -> str:
+    """One-line form of a wrapped document passage (line breaks are noise)."""
+    return " ".join(text.split())
+
+
+def test_the_companion_documents_describe_the_row_that_exists() -> None:
+    """#9495 — the two documents that EXPLAIN §4.6's row must describe the
+    mechanism in force, not the constant name the row no longer carries.
+
+    The row states the model and names no internal symbol (the negative arm
+    above). That leaves two prose records describing it, and each had drifted:
+
+    (1) FAILS on the pre-fix text, on both arms.
+        (a) ``docs/retention-and-deletion.md`` explained the §4.6 exemption as
+            *"it names ``RAW_DELETION_MARKER_TTL`` on that same line"*. The row
+            names no constant — it passes the retention gate because it **links**
+            the canonical doc — so an ops reader who follows the row's new
+            citation landed on a paragraph describing a line that does not
+            exist. (``tests/test_retention_promise.py`` is green either way: the
+            link exempts the line, so only prose was false.)
+        (b) ``docs/ONTOLOGY-CHANGELOG.md``'s v3.30 entry said the row now cites
+            ``R1`` *"beside the existing ``(R2)`` citation"* — placing ``(R2)``
+            IN the row. ``(R2)`` lives in §4.6's *version-record* note below the
+            table; the row carries no ``(R2)``, now or at ``origin/main``.
+    (2) REACHABLE: both files are read from this repo, and the facts are read
+        back out of the row/entry themselves rather than restated here — the
+        row is the same line these tests already locate.
+    """
+    doc = ONTOLOGY.read_text(encoding="utf-8")
+    assert "### §4.6 Source" in doc, "the §4.6 Source section moved"
+    section = doc[doc.index("### §4.6 Source"):]
+    section = section[:section.index("\n### ", 1)]
+    row = next(line for line in section.splitlines()
+               if "`rawState` / `rawStateAt`" in line)
+
+    # (a) The retention doc must describe the exemption the row actually uses:
+    # a LINK to the canonical document (plus the `R1` ruling), not a constant
+    # name the model document deliberately does not carry.
+    assert "RAW_DELETION_MARKER_TTL" not in row, (
+        "this arm presumes the §4.6 row names no constant — the mechanism "
+        "`docs/retention-and-deletion.md` describes"
+    )
+    retention = (REPO / "docs" / "retention-and-deletion.md").read_text(
+        encoding="utf-8")
+    passages = [p for p in re.split(r"\n\s*\n", retention)
+                if "`docs/ONTOLOGY.md`" in p]
+    assert passages, (
+        "docs/retention-and-deletion.md must state how `docs/ONTOLOGY.md` is "
+        "treated by the retention-link gate"
+    )
+    flat = _flatten(" ".join(passages))
+    assert "names `RAW_DELETION_MARKER_TTL` on that same line" not in flat, (
+        "docs/retention-and-deletion.md explains the §4.6 exemption by a constant "
+        "the row does NOT name — the row passes the gate by LINKING this document "
+        "(its constant name is build detail; `ONTOLOGY.md` does not carry it)"
+    )
+    assert "links this document" in flat, (
+        "the retention doc's §4.6 explanation must name the mechanism actually in "
+        "force: the row links this document, which is what exempts the line"
+    )
+    assert "R1" in flat and "§4.6" in flat, (
+        "…and it must name the `R1` ruling the row carries, for the §4.6 row"
+    )
+
+    # (b) The build record must not place the `(R2)` citation in the row.
+    assert "(R2)" not in row, "the §4.6 row carries no `(R2)` citation"
+    changelog = (REPO / "docs" / "ONTOLOGY-CHANGELOG.md").read_text(encoding="utf-8")
+    entry_at = changelog.index("**Changelog v3.30")
+    entry = _flatten(changelog[entry_at:changelog.index("**Changelog v3.29", entry_at)])
+    at = entry.find("(R2)")
+    assert at != -1, (
+        "the v3.30 entry records the §4.6 citation change, so it must still say "
+        "where the `(R2)` citation sits rather than dropping the fact"
+    )
+    assert "version-record" in entry[max(0, at - 320):at + 160], (
+        "the v3.30 entry places `(R2)` in 'the row' — it lives in §4.6's "
+        "*version-record* note below the table, and the entry must say so: a "
+        "build record that misplaces a citation is a false record"
+    )

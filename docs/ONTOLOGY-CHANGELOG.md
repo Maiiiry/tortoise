@@ -45,7 +45,8 @@ aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 > **The row's retention authority is NAMED, not assumed.** Dropping the constant name removed the only thing on the
 > line that tied its 10-day bound to an authority, so the row now cites **R1** *with the document that defines it* —
 > `docs/retention-and-deletion.md`, whose `RAW_DELETION_MARKER_TTL` row is the **sole authority** for that guarantee
-> window — beside the existing `(R2)` citation of `docs/durability-posture.md`. `R1` is the owner ruling *restore
+> window — beside §4.6's existing `(R2)` citation of `docs/durability-posture.md`, which lives in the version-record
+> note below the table, not in the row. `R1` is the owner ruling *restore
 > window ≠ retention window; no retention window on user **content***, stated in code at `tortoise/raw_state.py`, in
 > `docs/retention-and-deletion.md`, and in `docs/plans/2026-09-18-4179-retention-deletion.md`; it is a resolvable
 > citation, so it is **kept** — and it now resolves on sight instead of by lookup. (The constant NAME is build
