@@ -1,4 +1,4 @@
-"""#9397 — the "property-free `aboutObject` edge" evidence is FALSE, and the ruling leans on it.
+r"""#9397 — the "property-free `aboutObject` edge" evidence is FALSE, and the ruling leans on it.
 
 THE DEFECT THIS PINS
 --------------------
@@ -37,16 +37,32 @@ SEE — and it is blind to a sixth SHIPPED site, which the count must not hide:*
 `session_source_migration._move_in` moves an edge by
 `MERGE ({src})-[r2:`{rel}`]->(new) ON CREATE SET r2 = properties(r)`, i.e. it
 copies the WHOLE property map, and `rel` is handed to it from
-`MOVABLE_SOURCE_RELS` — which contains `aboutSource` and `aboutDocument`. Both
-census rules miss it, and neither is cheaply widenable: the vocabulary is in the
-CALLER, not the writer's body (so "names an about vocabulary in its own body"
-never matches — measured: adding `MOVABLE_SOURCE_RELS` to `_ABOUT_VOCAB` still
-yields `{}`), and `SET r2 = properties(r)` is an fn-call RHS, which `_SET_MAP`
-(`$|{`) structurally cannot read. **So the honest bound is: no writer that
-SPELLS an about vocabulary in its own body, or takes its predicate from an
-allowlist named in `_ABOUT_VOCAB`, can add a property unseen — a predicate
-passed into a helper as a PARAMETER is not covered, and the site above is that
-gap in the shipped tree.**
+`MOVABLE_SOURCE_RELS` — which contains `aboutSource` and `aboutDocument`.
+**The bound is what the CODE enforces, and it is narrower than "spells the
+vocabulary": THREE escape shapes are uncovered, all measured against
+`_writers_in_module`:**
+
+1. **A predicate handed in as a PARAMETER** — the vocabulary lives in the
+   caller, so the body never names it (`_move_in`, above; measured: adding
+   `MOVABLE_SOURCE_RELS` to `_ABOUT_VOCAB` still yields `{}` for that module).
+2. **An UNTYPED binding tested with `WHERE type(r) = 'about…'`** —
+   `_PATTERN` (`\[(\w*):([^\]]{0,120})\]`) requires a TYPED relationship
+   pattern, so an untyped `MATCH (s)-[r]->(t)` is `continue`d before any rule
+   runs. Measured: `MATCH (s)-[r]->(t) WHERE type(r) = 'aboutObject'
+   SET r.confidence = $c` -> `{}`. This shape is already live style in the
+   tree (`sdk.py` / `analyze.py` use `WHERE type(r) = 'NAND'`).
+3. **An fn-call RHS** (`SET r = properties(x)`) — `_SET_MAP` (`$|{`) cannot
+   read it, **even when the about predicate IS spelled in a typed pattern**.
+   Measured: `MATCH (s:Point)-[r:aboutObject]->(t) SET r = properties(x)` ->
+   `{}`, while the same writer with `SET r = $p` is recorded (`<map:$props>`).
+
+**So the honest bound is: a property is seen only when the predicate sits in a
+TYPED relationship pattern (or is interpolated from a vocabulary listed in
+`_ABOUT_VOCAB`) AND the write is one of `SET var.<prop>`,
+`SET var (+=|=) $map/{…}`, or an inline pattern map. Parameter-passed
+predicates, untyped `WHERE type(r) = …` bindings and fn-call RHS forms are all
+outside the census** — `tests/test_9397_about_edge_properties.py` pins the two
+synthetic shapes so this bound cannot silently drift back to an absolute.
 
 `sdk.supersede_point` and `projection._rebuild_all_replay` — which earlier
 revisions of this file recorded as re-materializers — are NOT. Its `SET r += $attrs` is on the 2a-DIRECT leg,
@@ -1332,6 +1348,63 @@ def test_the_census_reads_the_inline_pattern_map_form():
         "the census does not read an ANONYMOUS relationship pattern with an "
         "inline property map (`-[:aboutObject {confidence:$c}]->`) — the "
         f"writer is invisible (found {found!r})"
+    )
+
+
+def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
+    """The census's BOUND, measured on the two shapes it structurally cannot
+    read. The module docstring states the bound as a gap; these probes keep it
+    from decaying into the absolute it replaces (*"no writer that spells an
+    about vocabulary can add a property unseen"* was false on the tree and is
+    now false on both of these synthetic writers).
+
+    Pinning an EMPTY result is deliberate: the census is not being asked to
+    catch these, it is being asked not to CLAIM them. A shipped instance of
+    shape 1 is `session_source_migration._move_in` (predicate handed in from
+    `MOVABLE_SOURCE_RELS`, which contains `aboutSource`/`aboutDocument`).
+    """
+    # Shape 1+n: an UNTYPED binding whose predicate is tested in a WHERE clause.
+    # `_PATTERN` needs a typed relationship pattern, so the function is
+    # continued before any rule runs. This is already live style in the tree
+    # (`WHERE type(r) = 'NAND'` in sdk.py / analyze.py).
+    untyped = (
+        "def link(g, s, t, c):\n"
+        "    g.query(\"MATCH (s)-[r]->(t) WHERE type(r) = 'aboutObject' "
+        "SET r.confidence = $c\", params={'c': c})\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", untyped)
+    assert found == {}, (
+        "the census now reads an UNTYPED `WHERE type(r) = 'about…'` binding — "
+        "if that is a real widening, the documented bound and the sixth-site "
+        "disclosure must be updated in the same change (found "
+        f"{found!r})"
+    )
+    # Shape 2: the predicate IS spelled in a typed pattern, but the write is an
+    # fn-call RHS that `_SET_MAP` (`$|{`) cannot read. The parameter is
+    # therefore NOT what makes `_move_in` invisible.
+    fn_call_rhs = (
+        "def link(g, s, t):\n"
+        "    g.query('MATCH (s:Point)-[r:aboutObject]->(t) SET r = "
+        "properties(s)')\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", fn_call_rhs)
+    assert found == {}, (
+        "the census now reads an fn-call RHS (`SET r = properties(x)`) on a "
+        "typed about pattern — if that is a real widening, the documented "
+        "bound must be updated in the same change (found "
+        f"{found!r})"
+    )
+    # Control, so the two empties above are the two shapes and not a broken
+    # probe: the same writer with a readable RHS IS recorded.
+    control = (
+        "def link(g, s, t, p):\n"
+        "    g.query('MATCH (s:Point)-[r:aboutObject]->(t) SET r = $p', "
+        "params={'p': p})\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", control)
+    assert found == {("tortoise/probe.py", "link"): {"<map:$props>"}}, (
+        "the control probe (a readable property-MAP write on a typed about "
+        f"pattern) is no longer recorded — the census changed (found {found!r})"
     )
 
 
