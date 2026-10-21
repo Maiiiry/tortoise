@@ -9441,12 +9441,16 @@ class FalkorProjection(
     #     projection that never bound a journal is NOT under the guard, because
     #     with no journal there is no truth store for its cache to be ahead of
     #     (§17.1 has nothing to enforce). Only ``_bind_journal`` sets it
-    #     ``True``, and NOTHING clears it — ``close()`` releases the
-    #     `(store, graph)` REGISTRY entry, never this flag (#9079 review, P2:
-    #     clearing it disarmed this projection's own doors while the graph was
+    #     ``True``, and NOTHING clears it — ``close()`` releases NEITHER this
+    #     flag NOR the `(store, graph)` REGISTRY entry: the registration goes
+    #     away with its OWNER (an explicit ``_bind_journal(None)`` or the
+    #     weakref finalizer), never with the connection (#9079 review, P2
+    #     twice: clearing either half disarmed a door while the graph was
     #     still writable, because a server close is a pool disconnect that
-    #     redis-py reconnects on the next command). A live door that OWNS a
-    #     journal calls ``_bind_journal``.
+    #     redis-py reconnects on the next command — clearing the flag disarmed
+    #     this projection's own doors, releasing the registry key disarmed the
+    #     CLIENT-level door one hop below). A live door that OWNS a journal
+    #     calls ``_bind_journal``.
     #   * the REFUSAL lives in the authorization ContextVar
     #     (``_CACHE_WRITE_AUTHORIZED``, default ``None`` = refusal), and it is
     #     read ONLY on the ``_journal_backed`` branch. So the gate refuses by
