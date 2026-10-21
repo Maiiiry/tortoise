@@ -28,7 +28,6 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
 import argparse
 import json
 import re
-import sys as _sys
 from pathlib import Path
 from pathlib import Path as _Path
 
@@ -39,7 +38,7 @@ import yaml
 # The ONE canonical object-kind set (#2786). Imported, never re-typed: the vocabulary this
 # probe compiles and the kind semantics below must agree with §5, and a hand-typed copy is
 # exactly how they stopped agreeing.
-_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 from tortoise.pack_registry import (
     CANONICAL_OBJECT_KINDS as _CANONICAL_OBJECT_KINDS,
 )

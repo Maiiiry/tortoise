@@ -30,15 +30,15 @@ module's regression: measured at ``4d9a0ddef`` as
 Reading ONTOLOGY §5 rather than restating it in Python is deliberate: a hardcoded copy here
 would be the same hand-maintained duplication this test exists to catch, one layer over.
 
-**Axes this file does NOT own, on purpose.** ``objectKind``'s **§5 parse** is owned by
-``tests/test_pack_kinds.py::TestCanonicalObjectKindAlignment``, which asserts
+**The ``objectKind`` axis: which half this file owns.** The **§5 parse** of that axis is owned
+by ``tests/test_pack_kinds.py::TestCanonicalObjectKindAlignment``, which asserts
 ``§5 == CANONICAL_OBJECT_KINDS == extractor_v2.CORE_OBJECT_KEYS`` (a three-way diff, including
-a surface this file cannot see) — parsing the ``§5`` block here as well would be a second parser
-of the same block with no added coverage. What this file DOES assert, at the bottom, is the axis
-that test cannot see: the **derived tooling copies** of that canonical set
+a surface the pack-kinds pin does not reach) — parsing the ``§5`` block here as well would be a
+second parser of the same block with no added coverage. What this file DOES assert, at the bottom
+of it, is the other half: the **derived tooling copies** of that canonical set
 (``tools/probe_extractor``, ``tools/calibration_harness``) against ``CANONICAL_OBJECT_KINDS``. So
-the split is §5-parse here vs derived-copies there, not "objectKind is not ours" — the legs
-down there are deliberately owned by this file and are not covered by ``test_pack_kinds.py``.
+the split is §5-parse **there** vs derived-copies **here**; the legs at the bottom of this file
+are deliberately owned by this file and are not covered by ``test_pack_kinds.py``.
 **Named residual, tracked on #2786** (recorded so this file is never read as "the point axis
 is consistent"): the point axis carries a deliberate TWO-name exception — ``event`` and
 ``humanApproval`` are accepted by the Layer-1 gate and are not pack-facing (asserted below,
@@ -442,9 +442,13 @@ def test_extraction_probe_descriptions_carry_text():
     them green, because the key is still canonical, the subset is still sized, and
     ``_build_extraction_system`` still renders the token ``core:tool`` (the parse finds it and
     the vacuity control is satisfied) — while the prompt loses the instruction for that kind
-    exactly as if the key had been deleted. That is the drift the sized leg's own docstring
-    promises is a failing test ("a description silently dropped (narrowing the prompt's menu)"),
-    so the value is asserted here rather than left to the key sets.
+    exactly as if the key had been deleted.
+
+    This is a SEPARATE mutation from the one the sized leg owns, not a restatement of it: the
+    sized leg catches a description *dropped* (the key removed — ``tools/probe_extractor.py``'s
+    ``UNDESCRIBED_CORE_KINDS`` comment promises that much), and it cannot see an emptied value,
+    measured at ``4 passed`` under the mutant above. So the value is asserted here rather than
+    left to the key sets.
 
     Prose that is only whitespace is the same hole (``"  core:tool —    "`` renders an empty
     instruction), so the assertion is on the STRIPPED value.
