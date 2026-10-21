@@ -18,13 +18,20 @@ move alone.
 
 Class-B test doctrine:
   (1) *What value makes this test fail?*  Deleting the row, or any of the named
-      anchors from it — the ruling, the expiry constant, the read-time
-      precedence, the caller-supplied-observation disclosure (and its #8740
-      follow-up), the ``SourceVersioned`` coverage half, or the #8739
-      read-bag residual.
+      anchors from it — the recorded-act ruling, the expiry bound, the read-time
+      precedence, the caller-supplied-and-never-persisted observation, the
+      ``SourceVersioned`` version-transition half, or the fail-closed read of a
+      stored condition.
   (2) *Does the test reach it?*  Yes — the §4.6 section text is read from the
       committed ONTOLOGY and each anchor is asserted, and the stored properties
       are checked against the real declared write surface.
+
+WHAT IT DOES NOT PIN, deliberately: issue numbers, issue state, internal function
+names or module constants. ``ONTOLOGY.md`` states the model we want; whether a
+reader wires a seam yet is build history (``ONTOLOGY-CHANGELOG.md``), and a doc
+pin that demands issue state forces the model into a status report — the defect
+owner-ruled out on 2026-10-21 (#8745). The assertions below carry a NEGATIVE arm
+so that state cannot creep back in.
 """
 from __future__ import annotations
 
@@ -63,39 +70,43 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
         "§4.6 has no raw-availability row (#8474)"
     )
     for claim in ("deletion is an ACT", "observed live", "NEVER stored",
-                  "RAW_DELETION_MARKER_TTL", "resolve_raw_availability",
-                  "recorded act WINS"):
+                  "deletion-marker TTL", "caller-supplied", "recorded act WINS"):
         assert claim in section, f"the §4.6 row does not state {claim!r}"
+    # NEGATIVE arm: the model row states no issue state and names no internal
+    # symbol. A lane reading it as specification must never take a build status
+    # for a rule (owner ruling 2026-10-21, #8745).
+    for banned in ("#8740", "#8739", "no reader supplies", "the tracked follow-up",
+                   "the tracked residual", "RAW_DELETION_MARKER_TTL",
+                   "resolve_raw_availability", "_fold_source_versioned"):
+        assert banned not in section, (
+            f"§4.6 carries {banned!r} — that is build state or an internal symbol, "
+            "not a model rule; the build record belongs in ONTOLOGY-CHANGELOG.md"
+        )
     # F5: the stamp is defined generally (every state-carrying write), not only
     # as the deletion marker's expiry input.
     assert "minted on **every** state-carrying write" in section, (
         "§4.6 must define `rawStateAt` generally — the writer stamps it on "
         "every state-carrying write, including `rawState='present'` (F5)"
     )
-    # F6: the observation is caller-supplied and no reader supplies one today.
-    assert "#8740" in section, (
-        "§4.6 must name #8740 — the tracked follow-up for wiring the "
-        "`observed=` seam into a reader (F6)"
+    # F6: the observation is caller-supplied at read time and never persisted —
+    # the MODEL rule. NOT "no reader supplies one today" and NOT the
+    # `resolve_raw_availability(…)` signature: both are build state.
+    assert "never persisted" in section and "a read holding no observation" in section, (
+        "§4.6 must state that an observation is caller-supplied at read time, is "
+        "never persisted, and is absent from a read that supplies none (F6)"
     )
-    assert "no reader supplies an observation today" in section, (
-        "§4.6 must not imply a read derives the conditions: no reader supplies "
-        "an observation today (F6), and the claim must be worded without a "
-        "delivery participle — the design-document guard refuses issue state "
-        "here (#8745/#8738)"
+    # F7: a version transition carries the state on the `SourceVersioned` record.
+    # The fold path (`_fold_source_versioned` → `_upsert_source`) is build record.
+    assert "SourceVersioned" in section and "version transition" in section, (
+        "§4.6's coverage clause must name the `SourceVersioned` record — a state "
+        "change riding a version transition is journalled there (F7)"
     )
-    # F7: a version transition's state rides `SourceVersioned`, folded back
-    # through `_fold_source_versioned` -> `_upsert_source`.
-    assert "SourceVersioned" in section and "_fold_source_versioned" in section, (
-        "§4.6's coverage clause must name the `SourceVersioned` record and "
-        "`_fold_source_versioned` — a state change riding a version transition "
-        "is journalled there, not only on `SourceCreated` (F7)"
-    )
-    # F10: the fail-closed claim is scoped to the availability resolver, and the
-    # `:Source` read-bag residual is named.
-    assert "#8739" in section, (
-        "§4.6 must name #8739 — the `:Source`-property read bag still serves a "
-        "legacy stored `rawState` verbatim, so the fail-closed claim is not "
-        "universal (F10)"
+    # F10: the fail-closed claim is scoped — a condition found in stored data is
+    # not part of the axis and reads `unrecognised`. (What the `:Source` read bag
+    # does with a legacy stored condition is build state, tracked at #8739.)
+    assert "fail-closed as" in section and "unrecognised" in section, (
+        "§4.6 must state that a stored condition reads fail-closed as "
+        "`unrecognised` (F10)"
     )
     # The row's claim is true of the code, and the vocabulary is the one the
     # row names — so neither half can move alone.

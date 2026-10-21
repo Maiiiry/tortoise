@@ -33,6 +33,28 @@ aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 
 ---
 
+> **Changelog v3.30 (2026-10-21 — issue #8745 — §4.6's `rawState` row states the model, not the build):**
+>
+> **The row no longer carries build status or tracker references.** Removed from it: *"no reader supplies an
+> observation today (`#8740`, the tracked follow-up)"*; the `resolve_raw_availability(props, observed=…)` call
+> signature; the `:Source`-property read-bag sentence that named the residual `#8739` and a source file path; the
+> internal coverage list (`create_source`/`_upsert_source`, `_fold_source_versioned` → `_upsert_source`, the
+> `SourceCreated` replay); the module constant `raw_state.RAW_DELETION_MARKER_TTL` (now "the deletion-marker TTL",
+> with the value and its rationale kept); and a dangling `R1` citation that has no definition anywhere in the
+> repository.
+>
+> **Why.** `ONTOLOGY.md` states the model we want; *whether something is built* is this file's job, and its own
+> header says so. The row had drifted into a status report — and a lane reading it as specification would take
+> "no reader supplies one today" for a rule. Owner ruling, 2026-10-21.
+>
+> **Nothing is lost.** The two open gaps the removed text described remain tracked at **#8740** (no reader
+> supplies an observation yet) and **#8739** (the `:Source` read bag still serves a stored condition verbatim).
+> Every *rule* in the row is unchanged: `rawState` recordable as `present`/`deleted`, **a deletion is an ACT**,
+> the 10-day bound, `rawStateAt` minted on every state-carrying write, conditions never stored, the observation
+> caller-supplied and never persisted, a recorded act winning over any observation, a stored condition read
+> fail-closed as `unrecognised`, expiry authorising a journalled drop, and the property refused on the generic
+> entity surface.
+
 > **Changelog v3.29 (2026-10-17 — issue #3554 — the canonical `:Session` capture-container is declared, and §4.1's `speaker` row is corrected):**
 >
 > **A new model section (§4.8), recorded in its OWN release.** The `:Session` capture container
