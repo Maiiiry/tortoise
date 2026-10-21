@@ -88,6 +88,10 @@ _NON_MUTATING_HANDLE_METHODS = {
     # here on behalf of an unguarded verb.
     "_refuse_unauthorized_graph_wipe",
     "_refuse_key_space_handle_command",
+    # #9157/#9409 (landed on `main`): the L2 name rule's reader — it returns
+    # `self._g.name` and dispatches nothing, so the verbs that CONSULT it stay
+    # in their own buckets and this helper cannot smuggle one past them.
+    "_statement_graph_name",
 }
 
 #: Helpers that DISPATCH on a handle they are handed — `_dispatch_decided(self._g,
