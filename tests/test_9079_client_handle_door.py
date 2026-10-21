@@ -456,7 +456,7 @@ def test_a_graph_that_is_nobodys_cache_is_outside_section_17_1(armed_sdk, enforc
 # ── the registry itself ──────────────────────────────────────────────────
 
 def test_the_registry_names_the_journal_backed_graph_and_carries_its_store(tmp_path):
-    """The registration names the STORE and follows its OWNER, not its connection."""
+    """The key is `(store, graph)`, and it outlives the CONNECTION that made it."""
     from tortoise.sdk import TortoiseSDK
 
     journal = tmp_path / "journal.jsonl"
@@ -475,9 +475,10 @@ def test_the_registry_names_the_journal_backed_graph_and_carries_its_store(tmp_p
     # and `proj.g._g` — for a graph that is still writable (a server
     # `db.close()` is a pool disconnect and redis-py reconnects), while the
     # write handle stayed armed. One decision, two answers: the drift the door
-    # exists to prevent. The weakref finalizer owns the release; the next case
-    # proves it still fires, and `test_a_dropped_projection_releases_its_…`
-    # proves the drop path.
+    # exists to prevent. The release belongs to the OWNER instead: the next case
+    # pins that the door is still armed after `close()`, and
+    # `test_a_dropped_projection_releases_its_registration` pins that the
+    # finalizer still fires.
     assert (store, name) in _journal_backed_keys(), (
         "close() released the (store, graph) registration while the graph "
         f"stayed writable; keys={_journal_backed_keys()}")
