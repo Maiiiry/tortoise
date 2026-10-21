@@ -143,8 +143,14 @@ from tortoise.monitoring import (
     health_probe_interval as _health_probe_interval,  # #2988: shared with selfhost
 )
 from tortoise.onboarding import state as _os  # #2001 (W5) canonical FLOW-state module
+
+# #9206: `_declares_apply_first_write_lane` is the APPLY-FIRST declaration —
+# used by this module's cache-first writer (`_delete_session_sync`): its removal
+# records follow the removes they describe, so a journal-first lane would be a
+# false claim about it.
 from tortoise.projection import (
     DirectCacheWriteRefused,  # #9233: §17.1 refusal is not a crypto failure
+    _declares_apply_first_write_lane,
     is_missing_graph_error,  # #2163: absent-graph GRAPH.DELETE family == success
     journal_mint_write_ahead,  # #3390: journal the intended name BEFORE the CREATE
 )
@@ -175,6 +181,7 @@ from tortoise.sdk import (
     _capture_minted_ids,  # W5 Phase D (#2104): provenance-stamp gate (minted only)
     _capture_redaction_warning,  # #4911: the shared "a secret was redacted" receipt warning
     _capture_resp_error_split,  # #2335 WI-2: customer error contract (headline/diagnostics)
+    _capture_stamp_targets,  # #9350: the ids a guarded provenance stamp WOULD write
     _capture_turn_embeddings,  # #4194: batched local-embedder call for stored turn Points
     _capture_turn_id,  # #3551: the ONE offset-aware turn-id derivation
     _capture_turn_role_text,  # #4675: the inverse of the stored turn format
@@ -184,6 +191,7 @@ from tortoise.sdk import (
     _session_capture_event_id,  # W5 Phase F (#2104): deterministic sessionCaptured Event id
     _session_extraction_estimate,  # #1532 D4: v2-aware pre-write quota estimate
     _session_llm_transcript,  # P1 #1529: the shared empty/blank conversation gate
+    _stamp_capture_provenance,  # #9350: the journal-first capture provenance stamp door
     _supersede_window_end,  # #5363: the ONE inverted-window predicate (pre-write check)
     _supersede_window_start_source,  # #3985: the ONE home for the stored-start predicate
     _write_session_and_turns,  # #3551: the ONE :Session + turn store writer (shared with sdk.capture_session)
@@ -4906,7 +4914,13 @@ async def provision_tenant(request: Request):
         # call, so the write-ahead ordering (journal ⇒ CREATE) is preserved.
         if _minted_here:
             journal_mint_write_ahead(graph_name)
-        org_graph.query(_init_q, params=_init_p)
+        # #9157: the eager-init CREATE rides a §17.1 GUARDED handle bound to this
+        # org graph (the projection is bound to another one) through the declared
+        # route — it used to be issued on `org_graph` (escape 3), unjournalled and
+        # undeclared.
+        from tortoise.projection import guarded_write_handle as _guarded_write_handle
+        _os.run_eager_init(
+            _guarded_write_handle(sdk._get_proj(), graph_name), _init_q, _init_p)
 
         # Create Membership (creator is Owner)
         sdk._get_registry().query(
@@ -8359,8 +8373,19 @@ def _graph_unavailable() -> HTTPException:
     failure on the activation scorecard, activation_scorecard.py): this one
     means only that the offload did not complete inside the lane's budget, so
     the request may be retried. The code is body-only today — no client maps it yet (the REST
-    write lane is consumed by agents/SDKs, which treat any 5xx as retryable);
-    the dashboard renders a 503 on the auth lane, not this one.
+    write lane is consumed by agents/SDKs, which treat any 5xx as retryable).
+
+    #3718 (read half): the SIX read handlers now submit their per-request SDK
+    construction here too (``list_points``, ``get_point``, ``dream_health``,
+    ``list_sessions``, ``get_session_detail``, ``org_info``), so this body is
+    reachable on the READ routes as well — including the dashboard's Overview
+    reads (``GET /v1/team``, ``/v1/sessions``, ``/v1/points``). That is NOT the
+    "dashboard renders a 503 on the auth lane" case above: those routes now
+    carry this body, and they carry it fail-CLOSED rather than degrading to
+    their ``#1591`` empty shape (see ``org_info`` / ``list_sessions`` /
+    ``get_session_detail``). Retrying is safe for every one of them: the
+    off-loaded unit is a CONSTRUCTION, and a submission that never ran did no
+    work.
     """
     return HTTPException(
         status_code=503,
@@ -9440,7 +9465,14 @@ async def list_points(
         if kind not in allowed:
             raise HTTPException(status_code=400, detail=f"kind must be one of {sorted(allowed)}")
     _require_scope(org, "graphs:read", "list_points")
-    sdk = _data_sdk(org)
+    # #3718 (construction half of #4660): the per-request SDK is BUILT off the
+    # loop, not just used off it. In embedded mode `_make_sdk` probes the
+    # keepalive anchor (`_anchor_usable`) and may eagerly connect with the
+    # socket held, so an inline construction froze the loop on this handler's
+    # first statement even though the query below was already off-loaded. Same
+    # `_data_sdk_offloaded` twin the write lane uses (#3773) — it returns the
+    # identical SDK (`_data_sdk`), so only WHERE the call runs changes.
+    sdk = await _data_sdk_offloaded(org)
     conditions = ["n.is_operator = false"]
     # #432 Task 2: retracted points (status='retracted') are EXCLUDED from the
     # default listing surface — tombstone contract: retrievable by id via
@@ -9485,7 +9517,8 @@ async def list_points(
 async def get_point(point_id: str, org: dict = Depends(get_current_org_gated)):  # noqa: B008
     """Get a single Point by ID."""
     _require_scope(org, "graphs:read", "get_point")
-    sdk = _data_sdk(org)
+    # #3718: the construction is off the loop (see list_points).
+    sdk = await _data_sdk_offloaded(org)
     # #3718 residual 2: sync FalkorDB read off the loop (see list_points).
     rows = await asyncio.to_thread(
         lambda: sdk._get_proj().g.query(
@@ -9623,7 +9656,9 @@ async def dream_health(
     backlog, alarm verdict (zero-output silent-death detection, A8),
     region_attempts (C5) and warm-start savings (C4)."""
     _require_scope(org, "graphs:read", "dream_health")
-    sdk = _data_sdk(org)
+    # #3718: the construction is off the loop (see list_points) — the pass below
+    # already ran on the dream pool, but the SDK it takes was built inline.
+    sdk = await _data_sdk_offloaded(org)
     # #3718 residual 2 (code review): `dream_health_check` first runs
     # `_hydrate_dirty_roots()` — an UNBOUNDED all-`Point` `ep_dirty` scan with
     # no index — so it is the "long/stallable" class the module's #3060
@@ -9775,7 +9810,30 @@ async def org_info(org: dict = Depends(get_current_org_session_ungated)):  # noq
     P1: ungated — overview reads stay reachable for tt_ keys on flag-off
     orgs (the #1148 gate stays scoped to the management set)."""
     _reject_graph_bound_org_surface(org, "team overview")
-    sdk = _make_sdk(namespace=org["org_id"])
+    # #3718: this body builds its SDK directly (not through `_data_sdk`), so it
+    # uses the raw `_graph_offload` seam rather than the `_data_sdk_offloaded`
+    # twin. The CALL is unchanged — only which thread runs it — so the
+    # namespace, the embedded anchor probe and every reader below are
+    # byte-identical.
+    #
+    # CONTRACT, scoped (recorded here because the `#1591` note below promises
+    # fail-soft for this route): `#1591` covers a MISSING/BROKEN org graph — a
+    # STORE condition, where `point_count=0 / graph_ready=false` is the honest
+    # answer. This `await` adds a second, DIFFERENT failure mode that is
+    # fail-CLOSED: a saturated `graph`-pool backlog or a bound miss raises 503
+    # `graph_unavailable` HERE, before the fail-soft `try`. Deliberate —
+    # rendering `point_count=0` because OUR pool refused the call would report
+    # a healthy org as empty, i.e. the clean-empty-for-a-store-we-could-not-
+    # reach shape `#3892` forbids; and a read retry is safe (see
+    # `_graph_unavailable`). `#1591` is not repealed: the reads below degrade
+    # exactly as before. Pinned by
+    # `test_graph_pool_capacity_is_fail_closed_not_a_silent_empty` (#3718).
+    # OVERRIDES: the "every failure on this route is `#1591` fail-soft" reading
+    # — pool capacity is not a store condition, so it stays a hard 503. Relayed
+    # to the burn-down tracker rather than left here alone: #3718,
+    # issuecomment-6305730612 (DECISION RELAY).
+    sdk = await _graph_offload(
+        lambda: _make_sdk(namespace=org["org_id"]), op="org_sdk")
     # Count REAL Points in default graph. #2360: demo/sample Points
     # (_seed_demo_graph: the 12 sample Points + _demo_sentinel) are EXCLUDED
     # — the Overview memory digest (this count) presents the user's own
@@ -9784,7 +9842,10 @@ async def org_info(org: dict = Depends(get_current_org_session_ungated)):  # noq
     # it can never drift. #1591: FAIL SOFT — a missing/broken org graph
     # (half-failed provisioning, restores) must not dead-end the dashboard
     # with a hard 500; the client renders the empty state and a write
-    # recreates the graph.
+    # recreates the graph. SCOPE (#3718): the SDK construction above is a
+    # `graph`-POOL submission, and its capacity refusal is a retryable 503
+    # `graph_unavailable` — deliberately NOT this soft shape (a `0` for a
+    # healthy org would report real data as absent).
     point_count = 0
     graph_ready = True
     try:
@@ -10598,7 +10659,11 @@ async def register_user(request: Request, response: Response):
         # line is the ownership tombstone for that drop.
         journal_mint_write_ahead(graph_name)
         try:
-            org_graph = _make_sdk(namespace=org_id)._get_proj().db.select_graph(graph_name)
+            # #9157: a §17.1 GUARDED handle on the org graph, issued through the
+            # declared route (was `select_graph(...).query(...)` — escape 3).
+            from tortoise.projection import guarded_write_handle as _guarded_write_handle
+            _init_graph = _guarded_write_handle(
+                _make_sdk(namespace=org_id)._get_proj(), graph_name)
             # #2001 (W5): eager OnboardingState init in the same statement as
             # TeamMeta — first-org semantics (a fresh register has no prior
             # memberships → fork None → the fork card is asked exactly once).
@@ -10607,7 +10672,7 @@ async def register_user(request: Request, response: Response):
                 "CREATE (:TeamMeta {name: $name, created: $now})",
                 {"name": org_name, "now": now},
                 org_id=org_id)
-            org_graph.query(_init_q, params=_init_p)
+            _os.run_eager_init(_init_graph, _init_q, _init_p)
         except Exception:
             raise HTTPException(status_code=500, detail="Registration failed")  # noqa: B904
         try:
@@ -10690,7 +10755,10 @@ async def register_user(request: Request, response: Response):
             )
 
             # Provision FalkorDB namespace for the org
-            org_graph = sdk._get_proj().db.select_graph(graph_name)
+            # #9157: a §17.1 GUARDED handle on the org graph, issued through the
+            # declared route (was `select_graph(...).query(...)` — escape 3).
+            from tortoise.projection import guarded_write_handle as _guarded_write_handle
+            _init_graph = _guarded_write_handle(sdk._get_proj(), graph_name)
             # #2001 (W5): eager OnboardingState init in the same statement as
             # TeamMeta — first-org semantics (fresh register, no memberships).
             from tortoise.onboarding import state as _os
@@ -10701,7 +10769,7 @@ async def register_user(request: Request, response: Response):
             # #3390 WRITE-AHEAD: journal BEFORE the CREATE (was
             # record-after-effect — an unowned org_* graph on a mid-gap kill).
             journal_mint_write_ahead(graph_name)
-            org_graph.query(_init_q, params=_init_p)
+            _os.run_eager_init(_init_graph, _init_q, _init_p)
 
             # #318 (multi-tenant pack isolation): activate the starter pack
             # set — registry-mode self-service path (the Supabase-mode path
@@ -14024,6 +14092,15 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
     # exact result rather than paying a second scrub of the same window. All of
     # it stays off the event loop: a legal-maximum 500x5,000 capture is 2.5 MB
     # of client-controlled text.
+    #
+    # #9206: THE SHARED WRITER JOURNALS ITS `:Session` NODE. Hosted used to pass
+    # no `on_session_merged`, so this lane's session-container MERGE was
+    # UNJOURNALLED — a raw graph write with no record, which a journal-only
+    # `rebuild()`/`recover_from_log` drops. Since #9206 the shared writer emits
+    # `SessionRecorded` itself, BEFORE the MERGE, so no caller can forget it.
+    # (This comment deliberately does NOT spell that statement out: a guard in
+    # `tests/test_write_session_and_turns_3551.py` asserts the shared primitive
+    # is the only carrier of the session-merge text, prose included.)
     _capture_write = await _run_off_loop(
         _CAPTURE_EXECUTOR, _write_session_and_turns, proj, sdk, session_id,
         windowed, now=now, harness=capture_harness,
@@ -14344,13 +14421,22 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
                 # its original ingest; re-stamping would clobber the first
                 # session's single-eventId provenance (mirror byte-parity).
                 minted_ids = _capture_minted_ids(extracted)
-                proj.g.query(
-                    "MATCH (n:Point) WHERE n.id IN $ids "
-                    "SET n.eventId=$eid, n.source_session=$sid, "
-                    "    n.source_harness=$harness, n.ingested_at=$ing",
-                    params={"ids": minted_ids,
-                            "eid": event_id, "sid": session_id,
-                            "harness": source_harness, "ing": now},
+                # #9350: JOURNAL-FIRST (§17.1), byte-parity with
+                # `sdk.capture_session` — one `PointRevised` per minted id is
+                # appended BEFORE the stamp reaches the write handle, and the
+                # stamp then runs inside its own `_live_write_scope` lane. A
+                # raw write here had no carrier at all, so a journal-only
+                # rebuild lost the four fields on every minted Point that is
+                # never promoted.
+                _stamp_capture_provenance(
+                    sdk, proj, minted_ids, event_id=event_id,
+                    session_id=session_id, harness=source_harness,
+                    ingested_at=now,
+                    statement=(
+                        "MATCH (n:Point) WHERE n.id IN $ids "
+                        "SET n.eventId=$eid, n.source_session=$sid, "
+                        "    n.source_harness=$harness, n.ingested_at=$ing"),
+                    what="hosted capture minted-point provenance stamp",
                 )
                 # #2552 (layer-2 WIRE — the structural leg): mirror of the
                 # sdk capture stamp — the reified operator Points this
@@ -14363,18 +14449,28 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
                 # emitted later by _apply_capture_ingest_ep snapshots the
                 # stamped state (rebuild-durable).
                 if minted_ids:
-                    proj.g.query(
+                    _op_prefix = (
                         "MATCH (o:Point {is_operator:true})-"
                         "[:IMPL|NAND]->(c:Point) "
                         "WHERE c.id IN $ids "
                         "AND (o.status IS NULL OR o.status = 'draft') "
-                        "AND o.eventId IS NULL "
-                        "SET o.eventId=$eid, o.source_session=$sid, "
-                        "    o.source_harness=$harness, "
-                        "    o.ingested_at=$ing",
-                        params={"ids": minted_ids,
-                                "eid": event_id, "sid": session_id,
-                                "harness": source_harness, "ing": now},
+                        "AND o.eventId IS NULL ")
+                    _op_ids = _capture_stamp_targets(
+                        sdk, proj, _op_prefix + "RETURN DISTINCT o.id",
+                        {"ids": minted_ids},
+                        what="hosted capture operator-label stamp targets")
+                    _stamp_capture_provenance(
+                        sdk, proj, _op_ids, event_id=event_id,
+                        session_id=session_id, harness=source_harness,
+                        ingested_at=now,
+                        statement=(
+                            _op_prefix
+                            + "AND o.id IN $stamp_ids "
+                              "SET o.eventId=$eid, o.source_session=$sid, "
+                              "    o.source_harness=$harness, "
+                              "    o.ingested_at=$ing"),
+                        what="hosted capture operator-label provenance stamp",
+                        params={"ids": minted_ids},
                     )
                 # #4936 (mirror of the sdk capture stamp): the minted-point
                 # join above CANNOT reach an operator whose endpoint RE-KEYED
@@ -14393,16 +14489,28 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
                 # (the M2 projection path).
                 operator_ids = list(meta.get("operator_ids") or [])
                 if operator_ids:
-                    proj.g.query(
+                    _o_prefix = (
                         "MATCH (o:Point {is_operator:true}) "
                         "WHERE o.id IN $ids "
-                        "AND o.eventId IS NULL "
-                        "SET o.eventId=$eid, o.source_session=$sid, "
-                        "    o.source_harness=$harness, "
-                        "    o.ingested_at=$ing",
-                        params={"ids": operator_ids,
-                                "eid": event_id, "sid": session_id,
-                                "harness": source_harness, "ing": now},
+                        "AND o.eventId IS NULL ")
+                    _requested = set(operator_ids)
+                    _written = [pid for pid in _capture_stamp_targets(
+                        sdk, proj, _o_prefix + "RETURN DISTINCT o.id",
+                        {"ids": operator_ids},
+                        what="hosted capture operator-id stamp targets")
+                        if pid in _requested]
+                    _stamp_capture_provenance(
+                        sdk, proj, _written, event_id=event_id,
+                        session_id=session_id, harness=source_harness,
+                        ingested_at=now,
+                        statement=(
+                            _o_prefix
+                            + "AND o.id IN $stamp_ids "
+                              "SET o.eventId=$eid, o.source_session=$sid, "
+                              "    o.source_harness=$harness, "
+                              "    o.ingested_at=$ing"),
+                        what="hosted capture operator-id provenance stamp",
+                        params={"ids": operator_ids},
                     )
                 if retry_failed_capture:
                     # #2335 WI-2b / review (PR #2473): a RETRY heals the
@@ -14418,13 +14526,24 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
                     # pointKind 'event') never carry the sessionCaptured
                     # eventId in the normal flow — excluded via the
                     # non-episodic clause (mirror of the sdk heal).
-                    proj.g.query(
+                    _heal_prefix = (
                         "MATCH (s:Session {id:$sid})-[c:CONTAINS]->"
-                        "(n:Point) WHERE n.eventId IS NULL AND coalesce(n.is_episodic,false) <> true "
-                        "SET n.eventId=$eid, n.source_session=$sid, "
-                        "    n.source_harness=$harness, n.ingested_at=$ing",
-                        params={"sid": session_id, "eid": event_id,
-                                "harness": source_harness, "ing": now},
+                        "(n:Point) WHERE n.eventId IS NULL AND coalesce(n.is_episodic,false) <> true ")
+                    _heal_ids = _capture_stamp_targets(
+                        sdk, proj, _heal_prefix + "RETURN DISTINCT n.id",
+                        {"sid": session_id},
+                        what="hosted capture retry-heal stamp targets")
+                    _stamp_capture_provenance(
+                        sdk, proj, _heal_ids, event_id=event_id,
+                        session_id=session_id, harness=source_harness,
+                        ingested_at=now,
+                        statement=(
+                            _heal_prefix
+                            + "AND n.id IN $stamp_ids "
+                              "SET n.eventId=$eid, n.source_session=$sid, "
+                              "    n.source_harness=$harness, n.ingested_at=$ing"),
+                        what="hosted capture retry-heal provenance stamp",
+                        params={"sid": session_id},
                     )
             else:
                 # P1 #1529 (D4): create_event returning no id/eventId silently
@@ -15785,6 +15904,12 @@ def _execute_commit_writes(sdk: TortoiseSDK, payload: CommitPayload, plan):  # n
     # `coalesce` is CREATE-ONLY (#398's never-overwrite contract): a node an
     # authoritative writer already stamped — e.g. a `_mint_source_stub` stub
     # for a non-`session:` doc url — keeps its kind.
+    # #5140 (P2 finding 5): `ingestedAt` rides the same CREATE-only shape. §4.6
+    # marks it REQUIRED on every `:Source` and this MERGE wrote none (only
+    # `updatedAt`), so the D10 requirement sweeps read the transcript Source it
+    # mints as a violation — the same class #5082 closed for `sourceKind` here.
+    # `$now` is this commit's own instant, the transaction-time value §4.6 asks
+    # for; `coalesce` keeps an instant a prior writer recorded.
     proj.g.query(
         "MERGE (s:Source {url:$did}) "
         "SET s.id=coalesce(s.id, $did), "
@@ -15792,6 +15917,7 @@ def _execute_commit_writes(sdk: TortoiseSDK, payload: CommitPayload, plan):  # n
         "    s.documentKind='transcript', s.title=$title, s.summary=$summary, "
         "    s.story_arc=$arc, s.sessionId=$sid, s.eventId=$eid, "
         "    s.sourcePath=$srcpath, s.is_episodic=true, "
+        "    s.ingestedAt=coalesce(s.ingestedAt, $now), "
         "    s.updatedAt=$now",
         params={"did": doc_id, "title": payload.summary or session_id,
                 "summary": payload.summary, "arc": payload.story_arc,
@@ -16790,7 +16916,11 @@ async def list_sessions(request: Request, org: dict = Depends(get_current_org_se
 
     #1591: FAIL SOFT — a missing org graph (half-failed provisioning)
     returns an empty list, never a 500 (a 500 also strips the CORS headers
-    and surfaces as a misleading 'CORS blocked' to the browser).
+    and surfaces as a misleading 'CORS blocked' to the browser). SCOPE (#3718):
+    that is the BROKEN-STORE condition. A graph-pool CAPACITY refusal at the
+    SDK construction below is a RETRYABLE 503 `graph_unavailable`, never this
+    empty list — a `[]` for an org that has sessions would report real data as
+    absent (see the note at the construction).
 
     #3520: each row carries the server-resolved per-session EXTRACTION status
     (`extraction`: `{status, extractor, outcome_known}`), so the dashboard can
@@ -16825,7 +16955,25 @@ async def list_sessions(request: Request, org: dict = Depends(get_current_org_se
         # against stored canonical hyphenated actor_user_id).
         import uuid as _canon_uuid
         actor_filter = str(_canon_uuid.UUID(actor_filter))
-    sdk = _data_sdk(org)
+    # #3718: the construction is off the loop (see list_points).
+    #
+    # CONTRACT, scoped (recorded here because the docstring above promises
+    # `#1591` fail-soft for this route): `#1591` covers a MISSING/BROKEN org
+    # graph — a STORE condition, where `sessions: []` is the honest answer.
+    # This `await` adds a second, DIFFERENT failure mode that is fail-CLOSED: a
+    # saturated `graph`-pool backlog or a bound miss raises 503
+    # `graph_unavailable` HERE, before the fail-soft `try` below. Deliberate —
+    # serving `sessions: []` because OUR pool refused the call would report an
+    # org that HAS sessions as empty, the clean-empty-for-a-store-we-could-not-
+    # reach shape `#3892` forbids; and a read retry is safe (see
+    # `_graph_unavailable`). `#1591` is not repealed: the reads below degrade
+    # exactly as before. Pinned by
+    # `test_graph_pool_capacity_is_fail_closed_not_a_silent_empty` (#3718).
+    # OVERRIDES: the "every failure on this route is `#1591` fail-soft" reading
+    # — pool capacity is not a store condition, so it stays a hard 503. Relayed
+    # to the burn-down tracker rather than left here alone: #3718,
+    # issuecomment-6305730612 (DECISION RELAY).
+    sdk = await _data_sdk_offloaded(org)
     try:
         # #2600: actor filter rides a MATCH-level WHERE (before the OPTIONAL
         # CONTAINS so the count(p) grouping semantics hold); the appended
@@ -16986,7 +17134,24 @@ async def get_session_detail(session_id: str, org: dict = Depends(get_current_or
     _session_user_org (?org_id= → non-member 403); keys are org-scoped.
     """
     _require_scope(org, "graphs:read", "get_session_detail")
-    sdk = _data_sdk(org)
+    # #3718: the construction is off the loop (see list_points).
+    #
+    # CONTRACT, scoped: `#1591` covers a MISSING/BROKEN org graph — a STORE
+    # condition, where `{"session": None}` below is the honest answer. This
+    # `await` adds a second, DIFFERENT failure mode that is fail-CLOSED: a
+    # saturated `graph`-pool backlog or a bound miss raises 503
+    # `graph_unavailable` HERE, before the `try` below. Deliberate — serving
+    # `session: None` (which reads as "no such session", 200) because OUR pool
+    # refused the call would report an existing session as missing, the
+    # clean-empty-for-a-store-we-could-not-reach shape `#3892` forbids; and a
+    # read retry is safe (see `_graph_unavailable`). `#1591` is not repealed:
+    # the attach/read below still degrades to the soft shape. Pinned by
+    # `test_graph_pool_capacity_is_fail_closed_not_a_silent_empty` (#3718).
+    # OVERRIDES: the "every failure on this route is `#1591` fail-soft" reading
+    # — pool capacity is not a store condition, so it stays a hard 503. Relayed
+    # to the burn-down tracker rather than left here alone: #3718,
+    # issuecomment-6305730612 (DECISION RELAY).
+    sdk = await _data_sdk_offloaded(org)
     try:
         # #3718 residual 2: `_get_proj()` opens/attaches the SYNC FalkorDB
         # client — off-load the attach as well as the reads below, so the
@@ -18280,6 +18445,17 @@ async def delete_session(session_id: str, org: dict = Depends(get_current_org_se
     url = f"session:{session_id}"
     org_id = org["org_id"]
 
+    # §17.1 LANE (#9206): APPLY-FIRST, DECLARED. This writer removes the
+    # session's Points, Events, Source stub and container FIRST and appends the
+    # record that describes each removal AFTER it — `EntityMutated` op=delete
+    # per removed node (keyed off the DELETE's OWN result, so a concurrent
+    # capture cannot leave an unrecorded removal) and `SessionDeleted` for the
+    # container (whose fold also removes the agentSession Source). The order is
+    # the same trade `delete_point` makes (#9207): a record for a destroy the
+    # cache never performed is worse than a reported window, and the records can
+    # only be stated once the destroy's result is known. Without a declaration
+    # an armed handle refused the product's own session-delete path.
+    @_declares_apply_first_write_lane("hosted.delete_session")
     def _delete_session_sync() -> dict:
         proj = sdk._get_proj()
 
@@ -19050,7 +19226,13 @@ def _eager_provision_org_graph(cp, org_id: str, name: str, user_id: str,
         "CREATE (:TeamMeta {name: $name, created: $now})",
         {"name": name, "now": datetime.now(UTC).isoformat()},
         org_id=org_id, fork=init_fork, compact=init_compact)
-    graph.query(_init_q, params=_init_p)
+    # #9157: the eager-init CREATE is issued on a §17.1 GUARDED handle through
+    # the declared route. `graph` (== `proj.db.select_graph(graph_name)`, escape
+    # 3) stays the READ handle for the idempotency probe above; a guard that
+    # never sees the write cannot authorize, refuse or count it.
+    from tortoise.projection import guarded_write_handle as _guarded_write_handle
+    _os.run_eager_init(
+        _guarded_write_handle(proj, graph_name), _init_q, _init_p)
     return graph_name
 
 

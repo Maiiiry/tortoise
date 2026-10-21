@@ -810,6 +810,16 @@ def test_no_redirect_stems_registry_exact():
         # on the addition is the pin working as designed, so the stem is
         # DECLARED here rather than exempted.
         "test_5097_capture_source_replay",
+        # #9350: the capture provenance stamp's journal carrier. The fixtures
+        # build `TortoiseSDK(<tmpfile>)` and drive BOTH replay engines
+        # (`rebuild()` and `rebuild_all()`) against that embedded store, so the
+        # load-bearing reason is the REDIRECT: a URI-set lane would discard the
+        # path and connect the construction to the server, and the embedded
+        # replay this file exists to prove would never happen. Registered in
+        # all three homes — config/ci-surfaces.yml `carve_out:`, the `core`
+        # surface row, TEST_NO_REDIRECT_STEMS and this declaration — so the pin
+        # reding on the addition is the pin working as designed.
+        "test_9350_capture_provenance_journalled",
         # #8488: the in-process Okapi BM25 lexical arm. The module carries
         # module-level `pytestmark = pytest.mark.embedded_only`, so the
         # exemption's load-bearing reason is the SKIP (a URI-set lane skips
@@ -851,6 +861,19 @@ def test_no_redirect_stems_registry_exact():
         # working as designed, so the stem is DECLARED here rather than
         # exempted.
         "test_record_reconcile_trigger",
+        # #5140: the behavioural `ingestedAt` file. It carries NO module-level
+        # `embedded_only` marker, so the load-bearing reason it needs the
+        # exemption is the REDIRECT: every test builds its own
+        # `FalkorProjection(<mkdtemp>/t.db, graph_name="test")` and asserts the
+        # `objectType='Document'` event branch's write on THAT graph — a URI-set
+        # lane would discard the path, connect the construction to the server,
+        # and the minted-node `ingestedAt` it exists to prove would certify a
+        # lane (and a graph) it does not target. The third leg of the
+        # three-way mirror: config/ci-surfaces.yml:carve_out and
+        # TEST_NO_REDIRECT_STEMS were registered with the PR — this pin reding
+        # on the addition is the pin working as designed, so the stem is
+        # DECLARED here rather than exempted.
+        "test_document_source_ingested_at_5140",
     })
     assert frozenset(TEST_NO_REDIRECT_STEMS) == expected, (
         "TEST_NO_REDIRECT_STEMS drifted from the pinned carve-out stems "

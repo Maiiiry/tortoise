@@ -52,6 +52,8 @@ import pytest
 from tortoise.projection import (
     _HANDLE_MUTATING_VERBS,
     DirectCacheWriteRefused,
+    _dispatch_decided,
+    _graph_metadata_write_scope,
     _GuardedGraph,
     _live_write_scope,
     _replay_write_scope,
@@ -86,7 +88,20 @@ _NON_MUTATING_HANDLE_METHODS = {
     # here on behalf of an unguarded verb.
     "_refuse_unauthorized_graph_wipe",
     "_refuse_key_space_handle_command",
+    # #9157/#9409 (landed on `main`): the L2 name rule's reader — it returns
+    # `self._g.name` and dispatches nothing, so the verbs that CONSULT it stay
+    # in their own buckets and this helper cannot smuggle one past them.
+    "_statement_graph_name",
 }
+
+#: Helpers that DISPATCH on a handle they are handed — `_dispatch_decided(self._g,
+#: "query", …)` reaches `self._g.query` exactly as `self._g.query(…)` does, and
+#: since #9079 EVERY wire-reaching dispatch in `_GuardedGraph` uses this form, so
+#: a detector that only followed attribute calls would have been blind to all
+#: seven of them (#9079 review, P2: the gate read as live but could no longer
+#: fail on the form the class actually uses).
+_DISPATCH_HELPERS = frozenset({"_dispatch_decided"})
+
 
 def _wire_reaching_calls(func) -> set[str]:
     """Calls in `func`'s BODY (never its prose) that reach the client.
@@ -119,12 +134,38 @@ def _wire_reaching_calls(func) -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         target = node.func
+        # ⛔ THE DISPATCH FORM COUNTS TOO (#9079 review, P2).
+        # `_dispatch_decided(self._g, "query", …)` is how every verb in the
+        # class now reaches the wire, so skipping it made this gate
+        # unfalsifiable on the very form it is meant to police.
+        if isinstance(target, ast.Name) and target.id in _DISPATCH_HELPERS:
+            if not node.args:
+                continue
+            base = ast.unparse(node.args[0])
+            if base not in roots:
+                continue
+            verb = "*"
+            if (len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)):
+                verb = node.args[1].value
+            found.add(f"{base}.{verb}")
+            continue
         if not isinstance(target, ast.Attribute):
             continue
         base = ast.unparse(target.value)
         if base in roots:
             found.add(f"{base}.{target.attr}")
     return found
+
+
+def _dispatch_probe(self):
+    """AST FIXTURE for `test_the_wire_detector_sees_a_dispatch_half`.
+
+    Never called. Its body is the shape every `_GuardedGraph` verb now uses, and
+    the test asserts the detector can see it — a detector that returned an empty
+    set for this source is the P2 the test exists for.
+    """
+    return _dispatch_decided(self._g, "query", "CREATE (n:Probe {id:'p'})")
 
 
 #: #9209 — the third bucket: MUTATING verbs on the handle whose refusal is NOT
@@ -444,6 +485,27 @@ def test_the_handle_exposes_no_unguarded_mutating_query_verb(armed_sdk):
     )
 
 
+def test_the_wire_detector_sees_a_dispatch_half():
+    """The `_NON_MUTATING_HANDLE_METHODS` gate must be able to FAIL on the
+    dispatch form the class actually uses (#9079 review, P2).
+
+    RED before the detector fix: every wire-reaching dispatch in `_GuardedGraph`
+    was rewritten from `self._g.<verb>(…)` to `_dispatch_decided(self._g,
+    "<verb>", …)`, whose `func` is an `ast.Name` — so the attribute-only walker
+    returned an EMPTY set for the probe below and the "a non-mutating method must
+    not reach the client" assertion could no longer reds on the form it polices.
+    """
+    assert _wire_reaching_calls(_dispatch_probe) == {"self._g.query"}, (
+        "the detector cannot see `_dispatch_decided(self._g, \"query\", …)`, so "
+        "the non-mutating-handle-methods gate is decorative for every verb in "
+        "the class"
+    )
+    # ... and it stays TRUE for the members it polices.
+    for name in sorted(_NON_MUTATING_HANDLE_METHODS):
+        assert not _wire_reaching_calls(getattr(_GuardedGraph, name)), (
+            f"`_GuardedGraph.{name}` reaches the wire")
+
+
 def test_a_mutating_statement_through_the_command_channel_is_refused(armed_sdk, enforced):
     """`execute_command` is a mutating verb too.
 
@@ -656,14 +718,11 @@ def test_a_declared_door_writes_through_the_handle_with_no_declaration_of_its_ow
     would otherwise refuse. A door declared too early (i.e. apply-first) would
     fail here rather than silently pass in measure mode.
 
-    ⚠️ `delete_point` is NOT in this list any more: #9207 reversed its order
-    (the `DETACH DELETE` first, the record after a landed destroy), so its
-    #9124 live-lane declaration was WITHDRAWN and it is inventoried in
-    `_APPLY_FIRST_DOORS`. Keeping it here would assert that an apply-first door
-    rides an armed handle — the exact dishonesty
-    `tests/test_9124_declared_live_doors.py::
-    test_every_live_declared_door_is_journal_first` exists to catch. Its
-    behaviour under an armed handle is pinned by the test below instead.
+    ⚠️ `delete_point` is NOT in this list: #9207 reversed its order (the
+    `DETACH DELETE` first, the record after a landed destroy), so it carries the
+    APPLY-FIRST declaration (#9206) rather than a journal-first one. Its
+    behaviour under an armed handle — the door completes AND an undeclared raw
+    destroy is still refused — is pinned by the test below.
 
     `force_sparse_tfidf` pins the embedder OFF for the same reason the
     sanctioned-lane test above does: seven `create_point`s against a cold HF
@@ -687,48 +746,62 @@ def test_a_declared_door_writes_through_the_handle_with_no_declaration_of_its_ow
     assert sdk.supersede_point(old, new)["invalidated"] is True
 
 
-def test_an_apply_first_door_is_refused_by_the_armed_guard(
+def test_a_declared_apply_first_door_writes_under_the_armed_guard(
         armed_sdk, enforced, force_sparse_tfidf):
-    """`delete_point` is APPLY-FIRST by decision (#9207) — an armed handle refuses it.
+    """`delete_point` is APPLY-FIRST BY DECISION (#9207) AND DECLARED (#9206).
 
-    The other half of the withdrawal above, executable. #9207 reversed this
-    door's order (the `DETACH DELETE` is issued BEFORE the record exists), which
-    is the apply-first shape, so no journal-first lane is honest on it and its
-    writes are UNDECLARED. With the handle refusing, that has to be visible: the
-    statement is REFUSED rather than silently blessed by a lane whose premise no
-    longer holds.
+    This test replaced `test_an_apply_first_door_is_refused_by_the_armed_guard`
+    in #9206, and it is STRONGER, not looser. Before the declaration, the
+    refusal it asserted only proved the door was unauthorized; what it could not
+    prove is that the DOOR still works — an armed handle refused the product's
+    own delete path, which is the regression §17.1's third door exists to avoid.
 
-    Two properties are asserted, and the second is #9207's invariant:
+    Three properties, and the second and third are what make the declaration
+    honest rather than an amnesty:
 
-    1. the destroy is refused BEFORE it lands (the Point is still served by
-       `get_point` — a refusal that deleted anyway would be the same divergence
-       in the other direction), and
-    2. NOTHING is appended: no destruction record for a destroy the cache never
-       performed.
-
-    NON-VACUITY: on the pre-#9207 shape (append-first, decorated with
-    `@_declares_live_write_lane("delete_point")`) the lane authorizes the write,
-    so no refusal is raised and `pytest.raises` fails — measured by the reversed
-    order reddening this test. `tests/test_9124_declared_live_doors.py`
-    (`_APPLY_FIRST_DOORS`) carries the same fact statically, so neither the
-    inventory nor this behaviour can drift alone.
+    1. the door COMPLETES under an armed handle (its lane authorizes the
+       `DETACH DELETE`), and the destroy LANDED;
+    2. the destruction RECORD is appended for it — the apply-first lane is only
+       allowed to cover a write whose record still exists (the #9068 defect a
+       lane must never bless), and its census pin refuses a door that appends
+       nothing;
+    3. a raw, UNDECLARED `DETACH DELETE` through the same handle is STILL
+       REFUSED. This is the assertion that keeps the test from becoming a
+       blanket "the guard no longer refuses deletes": the declaration lives on
+       the door, not on the statement.
     """
     sdk = armed_sdk
-    doomed = sdk.create_point("statement", "apply-first door refused")["id"]
+    doomed = sdk.create_point("statement", "apply-first door declared")["id"]
     journal = Path(sdk._journal_path_for_test)
     records_before = journal.read_text() if journal.exists() else ""
 
-    with pytest.raises(DirectCacheWriteRefused):
-        sdk.delete_point(doomed)
+    assert sdk.delete_point(doomed) is True, (
+        "the declared apply-first door must complete under an armed handle — a "
+        "guard that refuses the product's own delete path is the regression "
+        "#9124 part 2 must not ship")
+    assert not sdk.get_point(doomed), (
+        "the destroy must LAND: the record this door appends is true of the "
+        "cache only when the `DETACH DELETE` ran")
 
-    assert sdk.get_point(doomed) is not None, (
+    records_after = journal.read_text() if journal.exists() else ""
+    appended = records_after[len(records_before):]
+    assert appended.strip(), (
+        "a landed destroy left NO record — the apply-first lane covers a write "
+        "whose record follows it, never an unjournalled cache write (#9068)")
+    assert "EntityMutated" in appended, (
+        "the destroy landed but its `EntityMutated` op=delete record did not: "
+        f"appended={appended!r}")
+
+    # 3. The lane is on the DOOR, not on the statement: an undeclared raw
+    #    destroy through the same handle is still refused, BEFORE it lands.
+    survivor = sdk.create_point("statement", "raw destroy refused")["id"]
+    with pytest.raises(DirectCacheWriteRefused):
+        sdk._get_proj().g.query(
+            "MATCH (n:Point {id:$id}) DETACH DELETE n", params={"id": survivor})
+    assert sdk.get_point(survivor) is not None, (
         "the refusal must precede the destroy — a refused DETACH DELETE that "
         "still removed the Point is the #9207 divergence with the stores "
         "swapped")
-    records_after = journal.read_text() if journal.exists() else ""
-    assert records_after == records_before, (
-        "a destruction the cache never performed was recorded — the record "
-        f"must follow a LANDED destroy: {records_after[len(records_before):]!r}")
 
 
 # ── the schema-DDL decision (#9124's own, per the issue thread) ───────────
@@ -758,10 +831,17 @@ def test_schema_ddl_survives_the_armed_guard(armed_sdk, enforced):
     not the armed sweep created anything — measured: with `enforced` added and
     the declaration deleted, this test still passed, because the indexes were
     inherited from construction. So the two indexes the sweep owes are DROPPED
-    first (through the inner handle, escape (2) of the three the module's SCOPE
-    block names) and the test requires the ARMED sweep to put them back. Armed +
+    first, and the test requires the ARMED sweep to put them back. Armed +
     undeclared, the creation sites' `except Exception` swallow the refusal and
     both assertions below red.
+
+    ⛔ THE DROP DECLARES A LANE NOW (#9079). It used to go through the inner
+    handle (`proj.g._g`, escape (2)), which was the SHORTEST way to say "not a
+    production writer". That escape is a §17.1 DOOR as of #9079 — an UNDECLARED
+    write to a journal-backed cache, refused when armed — so a fixture that
+    reached through it would be asserting the hole this suite exists to close.
+    The fixture states what it is instead (`_graph_metadata_write_scope`), which
+    is exactly the declaration the door asks a real writer for.
     """
     sdk = armed_sdk
     proj = sdk._get_proj()
@@ -769,8 +849,9 @@ def test_schema_ddl_survives_the_armed_guard(armed_sdk, enforced):
 
     # Remove the two indexes this test is about, so their presence afterwards is
     # the armed sweep's work and nothing else.
-    proj.g._g.query("DROP INDEX ON :Point(pointKind)")
-    proj.g._g.query("CALL db.idx.fulltext.drop('Point')")
+    with _graph_metadata_write_scope("test-fixture: drop the indexes"):
+        proj.g._g.query("DROP INDEX ON :Point(pointKind)")
+        proj.g._g.query("CALL db.idx.fulltext.drop('Point')")
     before = {str(cell) for row in proj.g.ro_query("CALL db.indexes()").result_set
               for cell in row}
     assert not any("pointKind" in c for c in before), (
@@ -838,18 +919,30 @@ def test_the_schema_lane_also_authorizes_the_documented_corpus_fixup(
         returns is still refused (`DirectCacheWriteRefused`), which is the
         boundary the companion test above pins from the other side.
 
-    The seed goes through the INNER handle (`proj.g._g`, escape (2) of the three
-    the module's SCOPE block names) on purpose: it is a test-only fixture write,
-    and the guarded handle would rightly refuse it under `enforced`.
+    The seed DECLARES a lane (#9079): it used to go through the INNER handle
+    (`proj.g._g`, escape (2)), which was the shortest way to reach the graph
+    without the guard object. That escape is a §17.1 door now — refused when
+    armed and undeclared — so the fixture deposits its owed state the way a real
+    writer must, with a declaration.
+
+    ⛔ THE LANE IS THE REPLAY ONE, not the graph-metadata one (#9079 review). A
+    `CREATE (n:Point …)` is recoverable CORPUS state — the exact `:Point` a
+    replayed `PointAdded` would produce — and `_graph_metadata_write_scope`'s own
+    contract refuses that: *"a write that a journal record COULD describe belongs
+    on `_live_write_scope` … `#9068` is the shape this must never become"*. The
+    seeded state stands in for a replayed record, so `_replay_write_scope` is the
+    lane that states the truth; the index DDL above is the opposite case and
+    keeps the graph-metadata lane.
     """
     sdk = armed_sdk
     proj = sdk._get_proj()
     assert proj._journal_backed
 
-    proj.g._g.query(
-        "CREATE (n:Point {id:'search-keys-owed', content:'owed search keys', "
-        "search_keys:['alpha','beta']})"
-    )
+    with _replay_write_scope():
+        proj.g._g.query(
+            "CREATE (n:Point {id:'search-keys-owed', content:'owed search keys', "
+            "search_keys:['alpha','beta']})"
+        )
     assert proj._array_valued_search_keys_exist(), (
         "the fixture did not create the owed fixup state — without an array "
         "`search_keys` the sweep never reaches `_fix_point_search_keys` and "
@@ -871,3 +964,91 @@ def test_the_schema_lane_also_authorizes_the_documented_corpus_fixup(
 
     with pytest.raises(DirectCacheWriteRefused):
         proj.g.query("CREATE (n:Point {id:'handle-after-fixup'})")
+
+
+# ── the sibling file's stated evidence is pinned, not just asserted ───────
+def test_the_doors_stated_case_count_matches_what_it_actually_collects():
+    """`test_9079_client_handle_door.py`'s headline numbers are VERIFIED here.
+
+    That file's module docstring states its own case count as evidence that the
+    pins are discriminating ("what this file proves on the pre-fix tree"): a
+    count a reader cannot check is how the docstring came to claim 15 test
+    functions with a 5+7 breakdown while the file had 22 functions and three
+    parametrisations (#9079 review, claim-accuracy — the numbers did not add up
+    and `_dispatch_decided` was listed as a module-level import when it is
+    imported inside a test body).
+
+    RED before the fix: the assertions below reject the previous text, which
+    stated ``15 test functions`` and a breakdown of ``5`` and ``7``. Read the
+    count from pytest's own marks (``pytestmark`` → parametrize argvalues) so a
+    new case or a new parametrisation cannot silently falsify the docstring.
+    """
+    import importlib.util
+    import pathlib
+
+    door_path = pathlib.Path(__file__).with_name("test_9079_client_handle_door.py")
+    spec = importlib.util.spec_from_file_location(
+        "_door_case_count_subject", door_path)
+    assert spec is not None and spec.loader is not None
+    door = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(door)
+
+    functions = {
+        name: value for name, value in vars(door).items()
+        if name.startswith("test_") and callable(value)
+    }
+    sizes = []
+    for func in functions.values():
+        cases = 1
+        for mark in getattr(func, "pytestmark", []):
+            if mark.name == "parametrize":
+                cases *= len(mark.args[1])
+        sizes.append(cases)
+    parametrised = sorted(size for size in sizes if size > 1)
+    total = sum(sizes)
+    doc = door.__doc__ or ""
+
+    assert f"**{total}** cases" in doc, (
+        f"the sibling file collects {total} cases but its docstring does not "
+        f"state that number"
+    )
+    assert f"**{len(functions)}** test functions" in doc, (
+        f"the sibling file defines {len(functions)} test functions but its "
+        f"docstring does not state that number"
+    )
+    import re
+
+    stated = re.search(r"\((\d+), (\d+) and (\d+) parameter\s+sets", doc)
+    assert stated is not None, (
+        "the docstring must state its parametrisation sizes in the same "
+        "`(a, b and c parameter sets)` form this test reads"
+    )
+    assert sorted(int(g) for g in stated.groups()) == parametrised, (
+        "the docstring's parametrisation sizes must be the sizes pytest "
+        f"actually collects ({parametrised}): the extras it states must equal "
+        f"{[size - 1 for size in parametrised]}"
+    )
+    # The module-level import list is the other half of the pre-fix claim: the
+    # names it enumerates must be the ones this module really imports at module
+    # level. `_dispatch_decided` is a TEST-BODY import and was wrongly listed as
+    # a module-level one, so the enumeration is compared to the truth rather than
+    # to a second hand-written list.
+    module_level = door.__dict__
+    for name in ("_client_store_key", "_journal_backed_graphs", "_journal_backed_keys"):
+        assert name in module_level, f"{name} is no longer a module-level import"
+    enumerated = re.search(r"module-level imports\s*\n?\s*\(([^)]*)\)", doc)
+    assert enumerated is not None, (
+        "the docstring must enumerate the module-level imports that fail on "
+        "`origin/main`, in the `module-level imports (...)` form this test reads"
+    )
+    listed = set(re.findall(r"`(_[A-Za-z0-9_]+)`", enumerated.group(1)))
+    assert listed == {
+        "_client_store_key", "_journal_backed_graphs", "_journal_backed_keys"
+    }, (
+        "the enumerated module-level imports must be exactly the names this "
+        f"module really imports at module level (docstring lists {sorted(listed)})"
+    )
+    assert "_dispatch_decided" not in module_level, (
+        "`_dispatch_decided` is imported inside a test body; if it ever becomes "
+        "a module-level import, say so in the docstring and widen `listed` here"
+    )

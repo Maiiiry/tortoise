@@ -477,7 +477,9 @@ SOURCE_PATTERNS = {
                    # and §17.1's own door ledger. Reviewer-measured: both were
                    # WITHOUT the residual, and an auditor reading either concludes
                    # the onboarding class has no second writer, which the five
-                   # `eager_init_query()` sites disprove (`#9157`). `docs/` is in
+                   # `eager_init_query()` sites used to disprove (`#9157`; they
+                   # now ride `run_eager_init` and the pin asserts that route in
+                   # the AST for all five). `docs/` is in
                    # NON_PYTHON_PREFIXES and is not itself a pattern, so without
                    # these CONCRETE entries a docs-only edit to either record
                    # selects NO surface and the pin never runs on the only change
@@ -714,7 +716,20 @@ SOURCE_PATTERNS = {
     # which includes core. Listing it would drop that guard's coverage on the
     # very PR that changes the deploy spec.
     "ep": ("tortoise/dream.py", "tortoise/analyze.py",
-           "tortoise/ranking.py"),
+           "tortoise/ranking.py",
+           # #2786 review P2: the extraction probe and the calibration harness
+           # are the two TOOLING copies of the core object-kind vocabulary (the
+           # PR makes both DERIVE from `pack_registry.CANONICAL_OBJECT_KINDS`),
+           # and `tests/test_calibration_tools.py` — registered `ep` — imports
+           # BOTH at module level, so a tool-only edit is precisely the change
+           # that can break it. `tools/` is a flat NON_PYTHON_PREFIXES entry and
+           # neither file had a SOURCE_PATTERNS row, so such an edit selected NO
+           # surface and fell back to tier-1 smoke, where that guard is not
+           # registered (the #1349/#3332/#3616 silent-drop class). A
+           # SOURCE_PATTERNS match REPLACES the `core` fallback, which is why
+           # both are paired with CORE_ALSO below (their other guard,
+           # `tests/test_kind_vocabulary_consistency.py`, is `core`).
+           "tools/calibration_harness.py", "tools/probe_extractor.py"),
     "sdk": ("tortoise/ids.py", "tortoise/models.py", "tortoise/crypto.py",
             "tortoise/reader.py", "tortoise/retrieval.py",
             # #3849: the ask PIPELINE now lives here (moved out of
@@ -1132,6 +1147,41 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # queue_resweep / write_op_reachability entries above.
              "tools/why_layer_rate.py",
              "tools/write_op_reachability.py",
+             # #9206 review P1 (the DERIVED-RECOMPUTE lane): the lane's own
+             # disclosure points operators at
+             # `tools/source_dedup_report.py --backfill` as the repair path for a
+             # corpus whose `urlAliases` matter, and that tool is a DECLARED
+             # WRITER of the lane (`_derived_recompute_write_scope`) — so it is
+             # held by the SOURCE CENSUS in
+             # tests/test_9206_derived_recompute_lane.py, which is `core`-
+             # registered. `tools/` is a flat NON_PYTHON_PREFIXES entry and no
+             # SOURCE_PATTERNS row matches the tool, so a tool-only change came
+             # back with `changed == []` and took the docs-only early return:
+             # the census that pins the tool's lane would never run on the PR
+             # that changes it, and an undeclared write added there would go
+             # unnoticed (the #1349/#3332/#3616 silent-drop class). CORE_ALSO
+             # (not TOOL_CARVEOUTS) because the census is hermetic and `core` is
+             # where the suite is registered. Pinned by
+             # tests/test_ci_selection.py::test_9206_lane_suites_run_on_the_diffs_that_can_break_them.
+             "tools/source_dedup_report.py",
+             # #2786 review P2: `tools/probe_extractor.py` (the classification
+             # prompt put in front of the model) and `tools/calibration_harness.py`
+             # (the harness whose `VOCAB` the `minted` metric reads) are the two
+             # tooling copies of the core object-kind vocabulary, and the guard
+             # that pins both to `pack_registry.CANONICAL_OBJECT_KINDS` —
+             # tests/test_kind_vocabulary_consistency.py — is `core`-registered.
+             # MEASURED before these entries: `select(["tools/probe_extractor.py",
+             # "tools/calibration_harness.py"])` -> surfaces=[], full=False, 52
+             # tier-1 files, guard absent — so the exact drift the drift-gate
+             # exists to catch (someone retyping a stale `core:<kind>` into a
+             # tool) stays green on the very PR that introduces it. These entries
+             # also keep `core` selected for the `ep` SOURCE_PATTERNS rows both
+             # files now carry (a named-surface match replaces the `core`
+             # fallback otherwise). Same #1349/#3332/#3616 silent-drop class as
+             # tools/test_lane.py above. Pinned by
+             # tests/test_ci_selection.py::test_extractor_tooling_change_selects_core_and_ep_not_tier1.
+             "tools/probe_extractor.py",
+             "tools/calibration_harness.py",
              # #3036: oauth.py is pinned by BOTH api-registered tests
              # (test_oauth_mcp.py, test_oauth_token_fault.py, ...) and core
              # (test_control_plane_offload_3498.py), so the SOURCE_PATTERNS

@@ -1700,6 +1700,46 @@ def test_docs_lint_baseline_tool_change_selects_core_not_tier1():
     assert r["full"] is False, r
 
 
+def test_extractor_tooling_change_selects_core_and_ep_not_tier1():
+    # #2786 review P2: `tools/probe_extractor.py` (the classification prompt put
+    # in front of the model) and `tools/calibration_harness.py` (the harness whose
+    # `VOCAB` the `minted` metric reads) are the two TOOLING copies of the core
+    # object-kind vocabulary. #2786 makes both DERIVE from
+    # `pack_registry.CANONICAL_OBJECT_KINDS`, and the guards that pin them live in
+    # TWO surfaces: `tests/test_kind_vocabulary_consistency.py` is `core` (the
+    # canonical-derivation legs), and `tests/test_calibration_tools.py` is `ep`
+    # (it imports BOTH tools at module level).
+    #
+    # `tools/` is a flat NON_PYTHON_PREFIXES entry and neither file had a
+    # SOURCE_PATTERNS row, so a tooling-only diff selected NO surface and fell
+    # back to the 52-file tier-1 smoke set, which contains NEITHER guard.
+    # MEASURED on the PR head: `select(["tools/probe_extractor.py",
+    # "tools/calibration_harness.py"])` -> surfaces=[], full=False, 52 files,
+    # both guards absent. So the exact drift the guard exists to prevent —
+    # someone retyping a stale `core:<kind>` into a tool — was green on the very
+    # PR that introduces it. Same #1349/#3332/#3616 silent-drop class as
+    # tools/docs_lint_baseline.py above.
+    #
+    # Both halves are asserted because the fix has both: the CORE_ALSO entries
+    # add `core` (the vocabulary guard), and the `ep` SOURCE_PATTERNS rows add
+    # `ep` (the harness/probe behaviour guard) — and a SOURCE_PATTERNS match
+    # REPLACES the `core` fallback, which is exactly why the two must be paired.
+    #
+    # Mutation check: removing a CORE_ALSO entry fails the `core` assert
+    # (`surfaces` becomes `["ep"]`); removing an `ep` SOURCE_PATTERNS entry fails
+    # the `ep` assert. Neither guard is in tier-1, so the pre-fix selection ran
+    # neither — that is what makes these asserts non-vacuous.
+    for path in ("tools/probe_extractor.py", "tools/calibration_harness.py"):
+        r = _sel([path])
+        assert r["full"] is False, (path, r)
+        assert "core" in r["surfaces"], (path, r["surfaces"])
+        assert "test_kind_vocabulary_consistency.py" in r["test_files"], (
+            path, "the vocabulary guard is not selected by a change to the tool it pins")
+        assert "ep" in r["surfaces"], (path, r["surfaces"])
+        assert "test_calibration_tools.py" in r["test_files"], (
+            path, "the harness/probe behaviour guard is not selected by a change to it")
+
+
 def test_e1_e2_evidence_bundle_change_selects_core_not_the_docs_only_return():
     # #9076: the E1+E2 evidence bundle (`docs/evidence/7949-capstone/` — the probe,
     # the corpus JSON + builder, the evidence log) and its structural checker
@@ -1768,6 +1808,38 @@ def test_socket_bound_2969_guard_runs_on_every_spread_site():
         assert r["surfaces"] == ["core"], (core_source, r)
         assert "test_socket_bound_not_multiplied_2969.py" in r["test_files"], (
             core_source, r)
+
+
+def test_7357_note_guard_runs_on_every_surface_its_subjects_select():
+    # PR #9393 review (three cycles, P2): `tests/test_7357_transport_legibility.py`
+    # pins the instance-outage NOTE on the two in-package raw clients
+    # (`hosted_backup._restore_copy_client`, `acl_graph_users._admin_client`) and
+    # the classifier arms behind it (`tortoise/retry.py`). Its registration was
+    # `core`-only — but `tortoise/acl_graph_users.py` is an exact
+    # SOURCE_PATTERNS["api"] entry and is deliberately NOT in `CORE_ALSO`, so an
+    # `acl_graph_users.py`-only diff selected `api`, REPLACED the `core` fallback,
+    # and never ran the only test that pins what the seam SAYS on that channel —
+    # the #1349/#2938/#9190 silent-drop class. The anti-REVERT half
+    # (`test_bounded_raw_clients_3065.py`) is an AST inventory: it pins THAT the
+    # client goes through the seam, not WHAT the seam emits.
+    # Mutation check: deleting the `api` arm fails the first loop; deleting the
+    # `core` row fails the second.
+    for api_source in ("tortoise/acl_graph_users.py",):
+        r = _sel([api_source])
+        assert r["full"] is False, (api_source, r)
+        assert r["surfaces"] == ["api"], (api_source, r)
+        assert "test_7357_transport_legibility.py" in r["test_files"], (
+            api_source, r)
+    # `hosted_backup.py` is a `CORE_ALSO` entry, so it selects BOTH; the two
+    # modules that match no named pattern fall through to the `core` fallback.
+    for name, expected in (
+            ("tortoise/hosted_backup.py", ["api", "core"]),
+            ("tortoise/retry.py", ["core"]),
+            ("tortoise/cypher_guard.py", ["core"])):
+        r = _sel([name])
+        assert r["full"] is False, (name, r)
+        assert r["surfaces"] == expected, (name, r)
+        assert "test_7357_transport_legibility.py" in r["test_files"], (name, r)
 
 
 def test_record_schema_pin_runs_on_migration_or_doc_change():
@@ -9029,3 +9101,45 @@ def test_dashboard_deploy_script_change_selects_core_not_tier1():
     assert r["full"] is False, r
     assert r["surfaces"] == ["core"], r
     assert "test_e2e_wrangler_prewarm.py" in r["test_files"], r
+
+
+def test_9206_lane_suites_run_on_the_diffs_that_can_break_them():
+    # #9206 review P1: `test_9206_apply_first_lane.py` and
+    # `test_9206_derived_recompute_lane.py` are the proof that §17.1's write
+    # handle COMPLETES the SDK's own doors under an armed guard. A REGISTRATION
+    # alone closed `--integrity` (the required `manifest-integrity` job) but is
+    # not a SELECTION pin — the same distinction `test_9192_guard_runs_on_the_
+    # diff_that_can_break_it` records. Each arm below is the diff that can
+    # silently disarm one of the two lanes:
+    #
+    #   * `tortoise/source_identity.py` — the derived-recompute lane's ONLY
+    #     product writer (`resolve_source_key`'s adopt-on-touch). It matches no
+    #     SOURCE_PATTERNS row, so it falls through to `core`, which is where the
+    #     suite is registered.
+    #   * `tools/source_dedup_report.py` — the lane's second DECLARED writer and
+    #     the repair path its own disclosure recommends. `tools/` is a flat
+    #     NON_PYTHON_PREFIXES entry, so WITHOUT the CORE_ALSO entry this diff
+    #     selected NO surface at all (`surfaces: []`, `full: false`) and took
+    #     the docs-only early return: the census that pins the tool's lane never
+    #     ran on the PR editing the tool (the #1349/#3332/#3616 silent-drop
+    #     class).
+    #   * `tortoise/sdk.py` — the apply-first lane's doors. It is a
+    #     SHARED_MODULE (full matrix), so the assertion here is `full is True`,
+    #     not a surface list: it documents that this arm is covered by the trunk
+    #     backstop rather than by the `core` row.
+    #
+    # Mutation: removing either the `core` registration or the CORE_ALSO entry
+    # fails the corresponding assert below.
+    r = _sel(["tortoise/source_identity.py"])
+    assert r["full"] is False, r
+    assert r["surfaces"] == ["core"], r
+    assert "test_9206_derived_recompute_lane.py" in r["test_files"], r
+
+    r = _sel(["tools/source_dedup_report.py"])
+    assert r["full"] is False, r
+    assert r["surfaces"] == ["core"], r
+    assert "test_9206_derived_recompute_lane.py" in r["test_files"], r
+    assert set(r["test_files"]) != _tier1(), r
+
+    r = _sel(["tortoise/sdk.py"])
+    assert r["full"] is True, r

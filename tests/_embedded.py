@@ -324,6 +324,14 @@ TEST_NO_REDIRECT_STEMS: tuple[str, ...] = (
     # shipped read's own fusion), so it is exempt from the docker redirect and
     # routed to the URI-unset carve-out job.
     "test_bm25_lexical_8488",
+    # #5140: the behavioural `ingestedAt` file constructs its own embedded
+    # `FalkorProjection` per test (`tempfile.mkdtemp` + `graph_name=`), so the
+    # construction IS the under-test input — a URI-set run would discard the
+    # path and assert against the server lane. Mirrors the `carve_out:` row in
+    # `config/ci-surfaces.yml`; a stem in only one of the two is the silent
+    # hole `test_ci_selection.py::test_carve_out_mirrors_test_no_redirect_stems`
+    # catches.
+    "test_document_source_ingested_at_5140",
     "test_backup_e2e",
     "test_config",
     "test_embedded_concurrency",
@@ -438,6 +446,15 @@ TEST_NO_REDIRECT_STEMS: tuple[str, ...] = (
     # two are one set in two homes; tests/test_ci_selection.py pins the
     # equality).
     "test_5097_capture_source_replay",
+    # #9350: the capture provenance stamp's journal carrier. The fixtures build
+    # `TortoiseSDK(<tmpfile>)` and drive BOTH replay engines (`rebuild()` and
+    # `rebuild_all()`) against that embedded store, so a URI-set lane would
+    # redirect the construction to the server and the embedded replay this file
+    # exists to prove would never happen. Registered in all three homes
+    # (config/ci-surfaces.yml `carve_out:`, TEST_NO_REDIRECT_STEMS, and the
+    # test_markers declaration) — the pin reding on the addition is the pin
+    # working as designed.
+    "test_9350_capture_provenance_journalled",
     "test_redis_guard",
     "test_resume_gate_parity",
     "test_smoke_embedded",
