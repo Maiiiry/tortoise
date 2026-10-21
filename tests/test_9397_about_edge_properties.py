@@ -23,16 +23,16 @@ sites, and the ingestion path reaches one of them by default:
   3. `projection/entities._fold_entity_linked_reason` — the REPLAY fold
      re-SETs it, i.e. the property is journaled and reproduced (`live == rebuild`).
 
-THREE further shipped paths RE-MATERIALIZE the edge, and one of them adds a
+TWO further shipped paths RE-MATERIALIZE the edge, and one of them adds a
 SECOND name, so the earlier "exactly one name" reading was one form short:
 `cache_projection.relation_statement` (the record-layer projection) writes the
 record row's whole property set by property MAP over a predicate allowlist that
 includes `aboutObject`, and it also stamps `idx` — `public.relation.idx`, the
-parallel-edge ordinal — as an INLINE pattern property, unconditionally;
-`projection._rebuild_all_replay` re-materializes the journal's attributes, and
+parallel-edge ordinal — as an INLINE pattern property, unconditionally; and
 `hosted_backup.restore_graph` the dump's (`SET r = $p`). The measured set is
 therefore `confidence` (originated) plus `idx` (re-materialized): one semantic
-attribute and one identity coordinate, not one property name.
+attribute and one identity coordinate, not one property name. The measured
+population is **3 originating + 2 re-materializing = 5** writers.
 
 `sdk.supersede_point` — which an earlier revision of this file also recorded as
 a re-materializer — is NOT one. Its `SET r += $attrs` is on the 2a-DIRECT leg,
@@ -42,6 +42,16 @@ BARE `MERGE (new)-[:{rel}]->(t)` with no `SET`. On an about edge it writes no
 property — it DROPS `confidence` (filed as `#9417`). The census's whole-function
 variable union cannot tell the two legs apart, so the row is declared a FALSE
 POSITIVE in `NOT_AN_ABOUT_WRITER` rather than counted as a re-materialization.
+
+`projection._rebuild_all_replay` is the SAME false positive, one row along — an
+earlier revision of this file counted it. Its `SET r += $attrs` belongs to the
+`DirectEdgeCreated` fold, and that event has exactly ONE producer:
+`create_direct_edge`, which refuses any `op_type` outside `{IMPL, NAND}`. Its
+about*/structural transfer is a separate BARE `MERGE` whose own comment says so
+(*"Structural 2b transfers are bare: NO attr SET, no direction/confidence/
+weight"*), and `create_about_edge` journals no `DirectEdgeCreated` at all, so no
+about edge can enter the attr fold. It therefore carries NO property on an
+about edge either, and is declared a false positive with that premise pinned.
 
 ROOT CAUSE OF THE FALSE CLAIM — the method, not the measurement
 ---------------------------------------------------------------
@@ -55,7 +65,7 @@ absence. That is why this file checks the *writer census*, not another grep.
 THE SAME BLINDNESS, ONE LEVEL DOWN (review cycle on this file's first version)
 -----------------------------------------------------------------------------
 A census that reads only `SET r.<prop>` repeats the error: the property-MAP
-form `SET r += $props` / `SET r = $p` is structurally invisible to it, and four
+form `SET r += $props` / `SET r = $p` is structurally invisible to it, and two
 shipped sites already use that form on an allowlisted `aboutObject` predicate
 (listed above). So the census reads ALL THREE write forms, and an interpolated
 predicate counts as about-bearing when its writer takes it from the shared about
@@ -72,18 +82,15 @@ by synthetic probes; the residual gap is a list of names, and a list cannot be
 checked for a token nobody has written yet. Adding a predicate vocabulary is a
 change to `_ABOUT_VOCAB`, not only to the code that uses it.
 
-WHAT IS PINNED
---------------
+WHAT IS PINNED (one entry per test, in file order)
+-----------------------------------------------
 1. `test_the_absolute_property_free_sentences_do_not_reappear` — the retracted
    sentences are matched MARKER-INSENSITIVELY (`*`, backticks, whitespace) against
    the live documents. Each entry records its own provenance — the pre-fix
    document it was measured in, or `RETRACTED_INTRODUCED_HERE` for wording this
    PR itself wrote and withdrew; the first version of this file claimed all of
    them were live pre-fix and one was not (its literal was unbolded while the
-   document bolds it), so the claim is now per entry — and leg 7 machine-checks
-   that no entry is
-   a dead pin by requiring it to be findable, marker-insensitively, in the
-   changelog that quotes it.
+   document bolds it), so the claim is now per entry.
 2. `test_the_corrected_passages_name_the_property_bearing_class` — the
    corrected passages must POSITIVELY name the writers and the property, so a
    silent revert reds here. The assertions are SECTION-scoped (§11.1, §13,
@@ -92,14 +99,21 @@ WHAT IS PINNED
    (`#8639` review, the `test_entity_attachment_brief_claims.py` precedent).
 3. `test_the_code_still_agrees_with_the_corrected_evidence` — each recorded
    writer still writes what the documents claim it writes (`confidence` for the
-   originating three; the map/inline forms for the re-materializing four,
+   originating three; the map/inline forms for the re-materializing two,
    `idx` included). If that code is removed, the document has re-rotted in the
    other direction and this reds instead of the doc quietly lying again.
-4. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
+4. `test_the_named_and_map_form_writer_populations_are_disjoint` — no site is
+   recorded twice, the map population has not shrunk below the shipped sites,
+   every declared FALSE POSITIVE keeps the code shape that makes it one, and
+   every recorded row (exemptions included) declares its exact name set.
+5. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
    every property write on an `about*` relationship pattern (named variable or
    anonymous) — named (`SET r.<prop>`), map-assigned (`SET r += $props` /
    `SET r = $p`), or an inline pattern map (`[r:aboutObject {idx:$idx}]`, which
-   assigns with no `SET` clause at all) — must be one of the recorded writers.
+   assigns with no `SET` clause at all) — must be one of the recorded writers,
+   and each recorded writer must write exactly the names it declares. It also
+   asserts the census could PARSE every module it walked, because a module
+   silently dropped from the walk is a measured absence (below).
    ⚠️ **The bound on that promise, stated rather than assumed:** an `about*`
    edge is recognised by an `about*` LITERAL, or by an INTERPOLATED predicate in
    a function whose body names one of the `_ABOUT_VOCAB` vocabularies (and, at
@@ -107,26 +121,32 @@ WHAT IS PINNED
    derives its predicate from a vocabulary named NOWHERE in that list is still
    invisible — so adding a predicate vocabulary, or a new way of naming one, is
    a change to `_ABOUT_VOCAB` / `_module_in_scope`, not just a change to the
-   code. What IS machine-checked is that the inline form is read, including the
-   anonymous pattern (`test_the_census_reads_the_inline_pattern_map_form`) and
-   that the allowlist path is not skipped by the file walk
-   (`test_the_census_reads_a_writer_that_never_says_about`); the remaining gap is
-   a vocabulary list, and a list cannot be checked for a token nobody has
-   written yet.
-5. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
+   code. The residual gap is a list of names, and a list cannot be checked for a
+   token nobody has written yet. Everything else IS machine-checked: the inline
+   form (including the anonymous pattern), the allowlist path, the parse of
+   every walked module, and each writer's exact name set.
+6. `test_the_census_reads_the_inline_pattern_map_form` — synthetic probe for the
+   inline pattern map, named and anonymous.
+7. `test_the_census_reads_a_writer_that_never_says_about` — synthetic probe for
+   the allowlist-driven writer whose module never spells `about`.
+8. `test_the_census_reports_a_module_it_cannot_parse` — a module `ast.parse`
+   rejects is REPORTED, not skipped: a silent skip reports every writer inside
+   it as a measured absence, which is this file's own defect class. (An earlier
+   revision returned `{}` with no signal.)
+9. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
    the binder, **or stops being the fall-through branch** of the
    `TORTOISE_SESSION_EXTRACTOR == "m2"` selection, that sentence becomes false
    while every other test stays green.
-6. `test_the_storage_changelog_records_the_correction` — the changelog is where
-   a reader learns that a §11.1/§13 claim moved.
-7. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
+10. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
    — every RETRACTED literal is findable in the changelog that quotes it, or is
    declared pre-fix-only or introduced-and-retracted inside this PR
-   (`RETRACTED_INTRODUCED_HERE`: two absolutes were written by an earlier
-   revision of THIS PR, so claiming a pre-fix presence for them would be the
-   same unmeasured provenance this file exists to stop). A pin that cannot match
-   the pre-fix text protects nothing, and that is not a hypothesis: it shipped.
+   (`RETRACTED_INTRODUCED_HERE`: the absolutes this PR wrote and withdrew
+   itself, so claiming a pre-fix presence for them would be the same unmeasured
+   provenance this file exists to stop). A pin that cannot match the pre-fix
+   text protects nothing, and that is not a hypothesis: it shipped.
+11. `test_the_storage_changelog_records_the_correction` — the changelog is where
+   a reader learns that a §11.1/§13 claim moved.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -158,7 +178,7 @@ STORAGE_CHANGELOG = (
 #: claim, not decoration: the `§13.8 q2` row in this file's first version pinned
 #: an UNBOLDED literal where the document bolds it, so it matched nothing — a
 #: dead entry that would have passed on a verbatim revert. The literal is the
-#: document's own text, bold markers included. Two entries were introduced and
+#: document's own text, bold markers included. Three entries were introduced and
 #: retracted INSIDE this PR (see `RETRACTED_INTRODUCED_HERE`) — their `home` is
 #: still the document the claim belongs to, and `_provenance` keeps the message
 #: from claiming a pre-fix presence that never existed.
@@ -199,6 +219,11 @@ RETRACTED: dict[str, tuple[str, str]] = {
         "Two forms write to an edge, and both are in scope",
         "STORAGE-ARCHITECTURE.md",
     ),
+    "§9.6 scopes the retracted absolute to identity/containment links": (
+        "**Identity/mention** (`Object`) and **referential-containment** "
+        "(`Source → Source`) links stay **property-free**",
+        "STORAGE-ARCHITECTURE.md",
+    ),
     "the corrected claim's own 'exactly one name' absolute": (
         "The property set is exactly one name — `confidence`",
         "STORAGE-ARCHITECTURE.md",
@@ -236,6 +261,9 @@ RETRACTED_QUOTED_IN: dict[str, Path] = {
     ),
     "§11.3's prose says the links stay bare": STORAGE_CHANGELOG,
     "§11.1's method paragraph counted the write forms as two": STORAGE_CHANGELOG,
+    "§9.6 scopes the retracted absolute to identity/containment links": (
+        STORAGE_CHANGELOG
+    ),
     "the corrected claim's own 'exactly one name' absolute": STORAGE_CHANGELOG,
     "§13.8 q2's 'never a second property name'": STORAGE_CHANGELOG,
 }
@@ -259,6 +287,11 @@ RETRACTED_PRE_FIX_ONLY: frozenset[str] = frozenset({
 RETRACTED_INTRODUCED_HERE: frozenset[str] = frozenset({
     "the corrected claim's own 'exactly one name' absolute",
     "§13.8 q2's 'never a second property name'",
+    # Not live pre-fix either: §11.1's method paragraph said "two forms" from
+    # the first version of THIS correction until a review cycle showed the
+    # paragraph above it documented a third. Labelling it pre-fix would put a
+    # false provenance in the diagnostic of the guard that exists to stop one.
+    "§11.1's method paragraph counted the write forms as two",
 })
 
 #: The writers the corrected passages must NAME, and the code shape that makes
@@ -291,18 +324,14 @@ MAP_WRITERS: dict[tuple[str, str], tuple[str, ...]] = {
     ("tortoise/cache_projection.py", "relation_statement"): (
         "MERGE (src)-[r:{rel.rel_type} {{idx:$idx}}]->(tgt) SET r += $props",
     ),
-    ("tortoise/projection/__init__.py", "_rebuild_all_replay"): (
-        'SET r += $attrs',
-        '("direction", "confidence", "weight", "label",',
-    ),
     ("tortoise/hosted_backup.py", "restore_graph"): (
         'CREATE (a)-[r:{safe_type}]->(b) SET r = $p',
     ),
 }
 
 #: Census rows that are FALSE POSITIVES of the whole-function variable union: the
-#: function writes through `r`, but on a DIFFERENT relationship type than the
-#: about edge it also transfers. They are recorded here, not in `MAP_WRITERS`,
+#: function writes through a variable, but on a DIFFERENT relationship type than
+#: the about edge it also transfers. They are recorded here, not in `MAP_WRITERS`,
 #: because a row there asserts a re-materialization that does not happen — the
 #: false-POSITIVE version of this PR's own defect (an instrument that cannot
 #: tell which edge the `SET` lands on).
@@ -313,6 +342,43 @@ NOT_AN_ABOUT_WRITER: dict[tuple[str, str], str] = {
         "IMPL|NAND); the about edge is transferred by a separate BARE "
         "`MERGE (new)-[:{rel}]->(t)` with no SET — so this writer carries NO "
         "property on an about edge (it drops `confidence`; #9417)"
+    ),
+    ("tortoise/projection/__init__.py", "_rebuild_all_replay"): (
+        "the `SET r += $attrs` belongs to the `DirectEdgeCreated` fold, whose "
+        "ONLY producer is `create_direct_edge` — it refuses any op_type outside "
+        "{IMPL, NAND} — and the about*/structural transfer is a separate BARE "
+        "`MERGE` (its own comment: 'Structural 2b transfers are bare: NO attr "
+        "SET'); `create_about_edge` journals no `DirectEdgeCreated`, so no about "
+        "edge can reach the attr fold. This writer carries NO property on an "
+        "about edge either"
+    ),
+}
+
+#: For every declared false positive, the SHAPES that make the exemption TRUE.
+#: A pin that matches nothing protects nothing (this file's own rule for the
+#: RETRACTED ledger), so an exemption is only allowed to stand while the code
+#: facts that justify it are still there — a rename or a moved `SET` reds here
+#: instead of silently voiding a claim the documents make in prose.
+FALSE_POSITIVE_PREMISES: dict[
+    tuple[str, str], tuple[tuple[str, str], ...]
+] = {
+    ("tortoise/sdk.py", "supersede_point"): (
+        (
+            "tortoise/sdk.py",
+            "MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t)",
+        ),
+        ("tortoise/sdk.py", "MERGE (new)-[:{rel}]->(t)"),
+    ),
+    ("tortoise/projection/__init__.py", "_rebuild_all_replay"): (
+        (
+            "tortoise/projection/__init__.py",
+            "Structural 2b transfers are",
+        ),
+        (
+            "tortoise/projection/__init__.py",
+            "NO attr SET, no direction/confidence/weight",
+        ),
+        ("tortoise/sdk.py", 'if op_type not in ("IMPL", "NAND"):'),
     ),
 }
 
@@ -368,10 +434,14 @@ EXPECTED_NAMES: dict[tuple[str, str], frozenset[str]] = {
     ("tortoise/cache_projection.py", "relation_statement"): (
         frozenset({SECOND_PROPERTY, MAP_FORM})
     ),
+    ("tortoise/hosted_backup.py", "restore_graph"): frozenset({MAP_FORM}),
+    #: The declared FALSE POSITIVES get a row too. Without one, the exemption is
+    #: fail-open: a property name appearing at that site reds nothing, while the
+    #: documents assert in prose that it writes none (review finding).
+    ("tortoise/sdk.py", "supersede_point"): frozenset({MAP_FORM}),
     ("tortoise/projection/__init__.py", "_rebuild_all_replay"): (
         frozenset({MAP_FORM})
     ),
-    ("tortoise/hosted_backup.py", "restore_graph"): frozenset({MAP_FORM}),
 }
 #: A relationship pattern, captured as (variable, relationship-token). The
 #: variable may be EMPTY: `MERGE (s)-[:aboutObject {confidence:$c}]->(t)` is
@@ -393,8 +463,10 @@ _ABOUT_REL = re.compile(
 #: restorer's `_sanitize_label` belong here for the map-form writers: they do
 #: not name `aboutObject` at the write site at all — they take the predicate
 #: from the allowlist that contains it (or from the dump, sanitized). Verified
-#: against the tree: adding them raises the census from 3 writers to exactly 7,
-#: the four map-form sites above plus the three named-form ones.
+#: against the tree: adding them raises the census from 3 writers to 7 ROWS —
+#: the three named-form writers, the two map-form writers in `MAP_WRITERS`, and
+#: the two declared false positives in `NOT_AN_ABOUT_WRITER` (whose `SET` lands
+#: on a different edge than the about one the same function also transfers).
 _ABOUT_VOCAB: tuple[str, ...] = (
     "ENTITY_LINKED_RELS",
     "_ABOUT_REPLAY_RELS",
@@ -458,19 +530,28 @@ def _qualified(tree: ast.Module):
 
 
 def _writers_in_module(
-    module: str, text: str
+    module: str, text: str, problems: list[str] | None = None
 ) -> dict[tuple[str, str], set[str]]:
     """The census over ONE module's source. Split out so a SYNTHETIC module can be
     put through it: the two fail-open forms found in review (the inline pattern
     map, and a writer that names its predicate from the allowlist instead of
     spelling `about`) are only pinned non-vacuously by feeding this function a
     module that uses them — no shipped file has to exist for the rule to be
-    proved live."""
+    proved live.
+
+    `problems` is the fail-CLOSED half: a module `ast.parse` rejects used to be
+    dropped with `return {}` and no signal, so every writer inside it was
+    reported as a measured absence — mechanically the `rg 'aboutObject {'` zero
+    this file exists to correct. The caller passes a list and asserts it is
+    empty, so an unparseable module is a RED, not a silent gap.
+    """
     found: dict[tuple[str, str], set[str]] = {}
     if True:  # one flat body, so the file/rglob caller below stays a loop
         try:
             tree = ast.parse(text)
-        except SyntaxError:  # pragma: no cover — a broken module fails elsewhere
+        except SyntaxError as exc:
+            if problems is not None:
+                problems.append(f"{module}: unparseable ({exc.msg}, line {exc.lineno})")
             return found
         lines = text.splitlines()
         for qualname, node in _qualified(tree):
@@ -540,7 +621,9 @@ def _module_in_scope(text: str) -> bool:
     return "about" in text or any(v in text for v in _ABOUT_VOCAB)
 
 
-def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
+def _about_edge_property_writers(
+    problems: list[str] | None = None,
+) -> dict[tuple[str, str], set[str]]:
     """{(module, symbol): {property, …}} for every property-bearing about-edge write.
 
     BOUND: an edge counts as `about*` by an `about*` literal in the relationship
@@ -549,13 +632,20 @@ def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
     writer that names its predicate some other way is invisible here — the
     promise is "nothing NEW appears unrecorded among the forms and vocabularies
     we read", never "nothing can appear".
+
+    Pass `problems` to collect the modules that could not be PARSED (see
+    `_writers_in_module`); the leg-5 caller asserts it is empty.
     """
     found: dict[tuple[str, str], set[str]] = {}
     for path in sorted(PKG.rglob("*.py")):
         text = path.read_text(encoding="utf-8", errors="replace")
         if not _module_in_scope(text):
             continue
-        found.update(_writers_in_module(path.relative_to(ROOT).as_posix(), text))
+        found.update(
+            _writers_in_module(
+                path.relative_to(ROOT).as_posix(), text, problems=problems
+            )
+        )
     return found
 
 
@@ -696,6 +786,21 @@ def test_the_corrected_passages_name_the_property_bearing_class():
         "STORAGE-ARCHITECTURE.md no longer distinguishes the generic writer "
         "(`create_about_edge`, no SET) from the binder's property-bearing one"
     )
+    #: A STALE `file:line` is the citation rot this correction exists to stop:
+    #: at this head `create_about_edge` is at `projection/edges.py:1447`, and
+    #: `:344` was its line at the `c79ba1cf2` pin. The documents' own rule is
+    #: that the SYMBOL is authoritative, so an unqualified number in a REWRITTEN
+    #: passage is a false fact a reader cannot check — and no other leg can see
+    #: it, because they assert symbols. (A pin that matches nothing protects
+    #: nothing, so this asserts the ABSENCE of the known-stale citation.)
+    for label, start, end, which in CORRECTED_SECTIONS:
+        section = _section(docs[which], start, end)
+        assert "edges.py:344" not in section, (
+            f"{label} carries the STALE `projection/edges.py:344` citation — "
+            "`create_about_edge` lives at `:1447` at this head, and `:344` is "
+            "a comment block, so the reader lands nowhere. Cite the symbol, "
+            "or qualify the line as `at the pinned revision`"
+        )
     # The MAP form must be named too, or the documents describe only the half of
     # the property-bearing population that the first census could see.
     for label in ("§13", "§13.8 q2"):
@@ -746,6 +851,9 @@ def test_the_code_still_agrees_with_the_corrected_evidence():
     )
 
 
+# ── 4. the writer ledger: disjoint, premised, fully named ──────────────────
+
+
 def test_the_named_and_map_form_writer_populations_are_disjoint():
     #: A row in both dicts would mean one site is recorded twice, and the
     #: `MAP_FORM` sentinel would then be asserted against a named-form row (or
@@ -756,10 +864,11 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
         "so neither row pins what it claims:\n  "
         + "\n  ".join(f"{m}::{s}" for m, s in both)
     )
-    assert len(MAP_WRITERS) >= 3, (
-        "the map-form population shrank below the three shipped sites the "
-        "documents now record (3 originating + 3 re-materializing = 6) — if a "
-        "writer was genuinely removed, re-derive the documents' count with it"
+    assert len(MAP_WRITERS) >= 2, (
+        "the map-form population shrank below the two shipped sites the "
+        "documents now record (3 originating + 2 re-materializing = 5; two "
+        "further census hits are declared false positives) — if a writer was "
+        "genuinely removed, re-derive the documents' count with it"
     )
     #: A site cannot be both a real writer and a declared false positive.
     both_roles = sorted(set(NOT_AN_ABOUT_WRITER) & set(MAP_WRITERS))
@@ -768,26 +877,36 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
         "positive, so one of the two rows is lying:\n  "
         + "\n  ".join(f"{m}::{s}" for m, s in both_roles)
     )
-    #: The declared false positive must STAY a false positive: its `SET` is
-    #: IMPL|NAND-scoped, and the about transfer is a bare MERGE. If either shape
-    #: moves, this row is describing code that no longer exists — re-derive the
-    #: documents' property set instead of trusting the exemption.
-    sdk = (PKG / "sdk.py").read_text(encoding="utf-8")
+    #: Each declared false positive must KEEP the code shape that makes it one:
+    #: the `SET` on a provably different edge, the about transfer bare. If any
+    #: premise moves, this row describes code that no longer exists — re-derive
+    #: the documents' property set instead of trusting the exemption. (Without
+    #: this, the exemption is a pin that can never discord: `NOT_AN_ABOUT_WRITER`
+    #: keys are SKIPPED by the census legs, so a rename would void it silently.)
     for key in NOT_AN_ABOUT_WRITER:
-        assert key[0] == "tortoise/sdk.py", key
         assert key not in RECORDED_WRITERS and key not in MAP_WRITERS, key
-    assert (
-        "MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t)" in sdk
-        and "MERGE (new)-[:{rel}]->(t)" in sdk
-    ), (
-        "`supersede_point` no longer matches the shape that makes it a census "
-        "false positive (IMPL|NAND-scoped `SET`, BARE about transfer) — "
-        "re-derive the property set and drop or amend NOT_AN_ABOUT_WRITER"
+    missing_premise = sorted(
+        f"{module} no longer shows {shape!r} (premise of {key[0]}::{key[1]})"
+        for key, premises in FALSE_POSITIVE_PREMISES.items()
+        for module, shape in premises
+        if shape not in (ROOT / module).read_text(encoding="utf-8")
+    )
+    assert not missing_premise, (
+        "a declared census FALSE POSITIVE no longer matches the shape that "
+        "makes it one — re-derive the property set and drop or amend "
+        "NOT_AN_ABOUT_WRITER:\n  " + "\n  ".join(missing_premise)
+    )
+    assert set(FALSE_POSITIVE_PREMISES) == set(NOT_AN_ABOUT_WRITER), (
+        "a false-positive exemption has no pinned premise (or a premise names "
+        "a site that is no longer exempted): "
+        f"{sorted(set(FALSE_POSITIVE_PREMISES) ^ set(NOT_AN_ABOUT_WRITER))}"
     )
     #: Every recorded row must DECLARE its name set, or a new name on that site
-    #: would slip past the subset test below.
+    #: would slip past the subset test below — exemptions included, since the
+    #: documents state in prose that those sites write NO property.
     undeclared = sorted(
-        f"{m}::{s}" for m, s in (*RECORDED_WRITERS, *MAP_WRITERS)
+        f"{m}::{s}"
+        for m, s in (*RECORDED_WRITERS, *MAP_WRITERS, *NOT_AN_ABOUT_WRITER)
         if (m, s) not in EXPECTED_NAMES
     )
     assert not undeclared, (
@@ -797,11 +916,20 @@ def test_the_named_and_map_form_writer_populations_are_disjoint():
     )
 
 
-# ── 4. no unrecorded property-bearing writer ───────────────────────────────
+# ── 5. no unrecorded property-bearing writer ───────────────────────────────
 
 
 def test_no_unrecorded_property_bearing_about_edge_writer():
-    writers = _about_edge_property_writers()
+    problems: list[str] = []
+    writers = _about_edge_property_writers(problems)
+    #: A module the census could not PARSE contributes nothing and says nothing
+    #: unless it is reported — its writers become a measured absence, the exact
+    #: shape of the defect the guard exists to stop. Fail CLOSED here.
+    assert not problems, (
+        "the census silently skipped module(s) it could not parse, so every "
+        "writer inside them is an ABSENCE it never measured:\n  "
+        + "\n  ".join(problems)
+    )
     assert writers, (
         "the census found no property-bearing about-edge writer at all — the "
         "relationship-variable/SET rule or the about* filter was changed, and "
@@ -866,9 +994,24 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
         "RECORDED_WRITERS/MAP_WRITERS here), because the ruling's *cost-only* "
         "argument depends on the property set being known and bounded."
     )
+    #: The exemptions must still be SEEN. A rename (or a moved write) drops the
+    #: row from the census, and an exemption recorded for code nobody can find
+    #: is a pin that protects nothing — the rule this file applies to RETRACTED.
+    vanished = sorted(
+        f"{module}::{symbol} (declared a FALSE POSITIVE) is no longer in the "
+        "census at all"
+        for module, symbol in NOT_AN_ABOUT_WRITER
+        if (module, symbol) not in writers
+    )
+    assert not vanished, (
+        "a declared census false positive has VANISHED from the census, so "
+        "the documents' claim that it writes no property on an about edge is "
+        "no longer checked against anything:\n  " + "\n  ".join(vanished)
+        + "\nRe-derive the row (and the documents) rather than leaving it dead."
+    )
 
 
-# ── 4b. the two forms the census was fail-open on (synthetic probes) ───────
+# ── 6–8. the three forms the census was fail-open on (synthetic probes) ────
 
 
 def test_the_census_reads_the_inline_pattern_map_form():
@@ -933,7 +1076,30 @@ def test_the_census_reads_a_writer_that_never_says_about():
     )
 
 
-# ── 5. the reach claim the corrected text makes ────────────────────────────
+def test_the_census_reports_a_module_it_cannot_parse():
+    """A module `ast.parse` rejects used to be dropped with `return {}` and NO
+    signal, so every property-bearing about writer inside it was reported as a
+    measured absence — the same shape as the `aboutObject {` zero this file
+    exists to correct, and the one gap the docstring's "bound" did not cover
+    (a parse failure is not a missing vocabulary name). The census now surfaces
+    it, and the file-walk leg asserts the list is empty, so a broken module is
+    a RED rather than a silent hole. (`_module_in_scope` still applies at the
+    file-walk level — that prefilter's bound is stated separately — but any
+    module the walk DOES admit is now either parsed or reported.)"""
+    problems: list[str] = []
+    assert _writers_in_module("tortoise/probe.py", "def broken(:\n", problems) == {}, (
+        "an unparseable module must contribute no writers"
+    )
+    assert problems, (
+        "the census silently swallowed a module it could not parse, so every "
+        "writer inside it became a measured absence"
+    )
+    assert "tortoise/probe.py" in problems[0], (
+        f"the parse failure does not name the module: {problems[0]!r}"
+    )
+
+
+# ── 9. the reach claim the corrected text makes ────────────────────────────
 
 
 def test_the_default_ingestion_path_reaches_the_binder():
@@ -973,7 +1139,7 @@ def test_the_default_ingestion_path_reaches_the_binder():
     )
 
 
-# ── 7. no dead retracted pin ──────────────────────────────────────────────
+# ── 10. no dead retracted pin ─────────────────────────────────────────────
 
 
 def test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live():
@@ -1002,7 +1168,7 @@ def test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live()
     )
 
 
-# ── 6. the changelogs must carry the correction, not the old claim ─────────
+# ── 11. the changelogs must carry the correction, not the old claim ────────
 
 
 def test_the_storage_changelog_records_the_correction():
