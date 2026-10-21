@@ -199,6 +199,26 @@ if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/issues/[0-9]+$ ]]; then
   exit 0
 fi
 
+# #9402: the OPEN-PR REST rescue. `gh pr list --json closingIssuesReferences` is
+# GraphQL-only and the GraphQL budget is fleet-shared, so when it refuses the tool
+# enumerates open PRs over REST (`gh api repos/<slug>/pulls?state=open&per_page=N`),
+# which has its own budget. Deliberately emits REST's LOWERCASE `state`, nested
+# `head.ref` and `html_url`/`merged_at` spellings, so a test proves the
+# normalisation onto the `gh pr list --json` projection rather than assuming the two
+# agree. ⛔ The payload carries NO `closingIssuesReferences` — REST has no such
+# field — so a test cannot accidentally model a rescue that answered it.
+if [ "$1" = "api" ] && [[ "$2" =~ ^repos/[^/]+/[^/]+/pulls ]]; then
+  printf '%s\n' "$@" > "$d/open-prs-rest-argv.txt"
+  if [ "${GH_STUB_OPEN_PR_REST_FAIL:-0}" = "1" ]; then
+    echo "gh-stub: could not connect to api.github.com" >&2
+    exit 1
+  fi
+  f="$d/open_prs_rest.json"
+  if [ ! -f "$f" ]; then echo "gh-stub: no fixture: $f" >&2; exit 1; fi
+  cat "$f"
+  exit 0
+fi
+
 case "$1 $2" in
   "pr list")
     # #3587: the `gh pr list` GraphQL path for CLOSED PRs resets on this host
@@ -624,6 +644,24 @@ class CollisionPreflightTest(unittest.TestCase):
                 pr.setdefault("mergedAt", None)
                 normalized.append(pr)
             (self.gh_dir / "open_prs.json").write_text(json.dumps(normalized))
+            # #9402: the SAME list projected into REST's shape, so the REST rescue
+            # has a fixture that cannot drift from the GraphQL one. Derived here,
+            # in the ONE place the open-PR fixtures are normalised, because ~20 call
+            # sites construct them and updating each is how a deletion misses one.
+            # The projection is deliberately honest about what REST does NOT carry:
+            # no `closingIssuesReferences` key at all (see the stub's note).
+            rest = []
+            for pr in normalized:
+                rest.append({
+                    "number": pr.get("number"),
+                    "title": pr.get("title") or "",
+                    "body": pr.get("body") or "",
+                    "state": str(pr.get("state") or "open").lower(),
+                    "html_url": pr.get("url") or "",
+                    "merged_at": pr.get("mergedAt"),
+                    "head": {"ref": pr.get("headRefName") or ""},
+                })
+            (self.gh_dir / "open_prs_rest.json").write_text(json.dumps(rest))
         if closed_prs is not None:
             # `state` and `body` are normalized in for the same reason as
             # `closingIssuesReferences` above: `gh pr list --json` and the REST
@@ -2481,10 +2519,19 @@ class CollisionPreflightTest(unittest.TestCase):
         # PRIMARY GraphQL budget is ONE shared bucket, so a genuine exhaustion
         # kills `gh pr list` as well as `gh issue view`. The fallback does NOT
         # make that run CLEAN — it makes the issue surfaces stop lying about
-        # why: they are READ over REST while `open PRs` (GraphQL-only by design)
-        # stays a fail-closed refusal. Asserting both halves is what keeps the
-        # test from overstating the fix, and the CLEAN issue rows are only
-        # reachable when the fallback ran.
+        # why: they are READ over REST while `open PRs` stays a fail-closed
+        # refusal. Asserting both halves is what keeps the test from overstating
+        # the fix, and the CLEAN issue rows are only reachable when the fallback
+        # ran.
+        #
+        # #9402 REFINES the open-PR half without weakening it: that surface is
+        # now ENUMERATED over REST too (so a real title/head-ref collision still
+        # decides exit 1), but the GraphQL-only closing-reference test stays
+        # UNMEASURED, so the surface is still INCOMPLETE. This test names the
+        # refusal; `test_open_pr_graphql_exhaustion_is_enumerated_over_rest`
+        # proves the rescue, and
+        # `test_rest_rescued_open_prs_still_report_the_unmeasured_closing_test`
+        # pins that the rescue never pretends to have proved the negative.
         rc, out = self.run_tool(env_extra={
             "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
             "GH_STUB_PR_LIST_RATE_LIMITED": "1",
@@ -2497,6 +2544,87 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertRegex(out, r"(?m)^issue assignee/holder\s+CLEAN")
         self.assertNotIn("issue-metadata-unavailable", out)
         self.assertIn("issue state=OPEN", out)
+        # The open-PR half is still NOT clean, and it says which test it could
+        # not run rather than blaming gh auth.
+        self.assertIn("closing-references-unmeasured", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+
+    def test_open_pr_graphql_exhaustion_is_enumerated_over_rest(self):
+        # #9402: with the fleet-shared GraphQL budget spent, the open-PR surface
+        # used to be unqueryable, so every candidate read exit 2 and NO lane could
+        # pass the mandated dispatch gate — including for an issue that has an
+        # open PR titled with its own number, which is the duplicate this gate
+        # exists to catch.
+        #
+        # The rescue must recover the TESTS REST CAN SERVE. A title match is the
+        # strongest of them, and this fixture carries nothing else (no closing
+        # reference, no branch, no worktree), so exit 1 here can only come from the
+        # REST-enumerated list.
+        self.gh_fixtures(open_prs=[{
+            "number": 9410, "title": f"fix(dispatch): undo the duplicate ({ISSUE})",
+            "body": "", "headRefName": "feat/9999-other", "state": "open",
+        }])
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("VERDICT: COLLISION", out)
+        self.assertIn("fix(dispatch): undo the duplicate", out)
+        # It really went over REST (not a cached/GraphQL path), and the request
+        # carries `state=open` — a rescue that forgot the filter would enumerate
+        # every PR in the repo.
+        argv = (self.gh_dir / "open-prs-rest-argv.txt").read_text()
+        self.assertIn("repos/test-owner/test-repo/pulls?state=open", argv)
+        # The refusal line still reports the surface as incomplete, because the
+        # closing-reference test could not run — a collision outranks it, but the
+        # reader must not be told the surface was fully READ.
+        self.assertIn("ALSO INCOMPLETE", out)
+
+    def test_rest_rescued_open_prs_still_report_the_unmeasured_closing_test(self):
+        # ⛔ THE HONEST HALF OF #9402. REST has NO `closingIssuesReferences`, so a
+        # rescue can never prove that no open PR CLOSES the issue. Reading the
+        # absent key as "closes nothing" is the fail-open direction this whole
+        # file exists to refuse, so the surface must say which test it could not
+        # run — and ``VERDICT: CLEAN`` must remain unreachable.
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertRegex(out, r"(?m)^open PRs\s+INCOMPLETE")
+        self.assertIn("closing-references-unmeasured", out)
+        self.assertIn("closingIssuesReferences", out)
+        self.assertIn("0 PR(s) WERE read", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        # And the remedy names the CAUSE: the fleet-shared GraphQL budget, not
+        # `gh auth`/a board rebuild (which is #9402's stated defect).
+        self.assertIn("GRAPHQL BUDGET EXHAUSTION", out)
+        self.assertIn("graphql budget refused", out.lower())
+        self.assertNotIn("fix gh auth/network", out)
+
+    def test_open_pr_rest_rescue_failure_stays_fail_closed(self):
+        # The rescue must never become a fail-open. With BOTH budgets gone the
+        # tool has read nothing about open PRs, so it must still refuse — and it
+        # must NAME the REST refusal, or this test would also pass on a tool with
+        # no rescue at all (the GraphQL read fails first either way).
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_PR_LIST_RATE_LIMITED": "1",
+            "GH_STUB_OPEN_PR_REST_FAIL": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        self.assertIn("gh api repos/test-owner/test-repo/pulls", out)
+        self.assertIn("could not connect to api.github.com", out)
+        # The budget exhaustion stays visible alongside the REST failure so the
+        # reader is not sent after the wrong cause.
+        self.assertIn("GraphQL read:", out)
+
+    def test_the_rest_open_pr_rescue_is_not_attempted_when_graphql_answers(self):
+        # The rescue is scoped to a BUDGET EXHAUSTION. Rescuing any other failure
+        # would turn a genuine "could not read" into a reading from a second
+        # endpoint — the fail-open direction — so the happy path must make no
+        # REST call at all.
+        rc, out = self.run_tool()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("VERDICT: CLEAN", out)
+        self.assertFalse((self.gh_dir / "open-prs-rest-argv.txt").exists(), out)
 
     def test_graphql_exhaustion_with_rest_also_down_still_fails_closed(self):
         # The fallback must never become a fail-open. With BOTH budgets gone the
