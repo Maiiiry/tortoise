@@ -71,6 +71,7 @@ RELATIONSHIP against `_MINT_SITES` itself.
 from __future__ import annotations
 
 import ast
+import re
 import textwrap
 from functools import cache
 from pathlib import Path
@@ -138,6 +139,9 @@ _ESCAPE3_CALL_SITES = {
 #: green (#9150 review cycle 4: "the five" was unpinned in all four records).
 _COUNT_WORDS = {0: "zero", 1: "one", 2: "two", 3: "three", 4: "four",
                 5: "five", 6: "six", 7: "seven", 8: "eight", 9: "nine"}
+
+#: A `module::function` site name, as the four records spell it.
+_SITE_NAME_IN_NOTE = re.compile(r"(tortoise/[\w/]+\.py)::(\w+)")
 
 
 # ── record slices: pin the RECORD, not the module that carries it ──────────
@@ -898,6 +902,20 @@ def test_the_note_and_the_ast_inventory_agree():
             "NOTE, not merely somewhere in `state.py`"
         )
 
+    # …and the OTHER direction (#9150 review cycle 14, P1): every `module::function`
+    # the note names must be a real site. Without it, a fabricated or stale name in
+    # the record passes with every pin green while the defect this docstring's
+    # "both directions" claimed is measurable — the note-goes-stale class in the
+    # one direction that was not measured.
+    named = set(_SITE_NAME_IN_NOTE.findall(note))
+    unbacked = named - set(measured)
+    assert not unbacked, (
+        f"the note names escape-(3) sites the AST does not see: {sorted(unbacked)}. "
+        "A name that is not a site reads as coverage the residual does not have — "
+        "either it was renamed/deleted in the code (update the note) or it was "
+        "never a site (remove it) (#9157)"
+    )
+
 
 # ── what the sites DO, and the coupling to the honest fix (#9157) ─────────
 def test_every_eager_init_site_issues_its_statement_on_the_escape_three_handle():
@@ -1480,6 +1498,34 @@ def test_the_declaration_detector_can_fail():
             "residual pin green"
         )
 
+    # ⛔ And its PRECISION (#9150 review cycle 14, P2): the `_named` filter is the
+    # only thing separating "a `with` that opens a §17.1 declaration" from "any
+    # `with`". Deleting it left the suite green, after which the coupling pin reds
+    # on ANY `with` inside an escape-(3) function while its failure message still
+    # promises it can tell "#9157 is being closed" from "an UNRELATED `with` was
+    # added" — a false red with a misleading diagnosis.
+    for unrelated in ('with open("/dev/null") as _fh:',
+                      'with _not_a_scope(cypher):',
+                      'with _proj._not_a_scope(cypher):'):
+        tree = ast.parse(textwrap.dedent(
+            f"""
+            def org_create(proj, cypher):
+                {unrelated}
+                    return proj.db.select_graph("g").query(cypher)
+            """
+        ))
+        parents = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+        }
+        assert _declaring_functions(tree, parents) == set(), (
+            f"the declaration detector reports `{unrelated}` as a §17.1 "
+            "declaration — its `_named` filter is the only thing that makes it "
+            "more precise than 'any `with`', and without it the coupling pin "
+            "cries wolf with a message that blames the residual (#9157)"
+        )
+
 
 def test_the_eager_init_finder_sees_both_call_spellings():
     """The instrument check for `_eager_init_calls()` — both spellings, counted.
@@ -1490,6 +1536,13 @@ def test_the_eager_init_finder_sees_both_call_spellings():
     became invisible to the inventory, the linkage pin AND the CI-subject sweep —
     the inventory would report four functions while five sites existed, which is
     the "note goes stale green" failure this file exists to prevent.
+
+    ⛔ The PARENT-AGNOSTIC property too (#9150 review cycle 14, P2): the docstring
+    of `_eager_init_calls()` says an ARGUMENT-position site
+    (`graph.query(*eager_init_query(...))`) and a bare `Expr` site are found
+    because the finder walks calls rather than parents — and re-introducing the
+    `Assign`-parent filter that bug was, left every pin green while the promise
+    went stale. Both non-assignment shapes are exercised below.
     """
     tree = ast.parse(textwrap.dedent(
         """
@@ -1504,6 +1557,18 @@ def test_the_eager_init_finder_sees_both_call_spellings():
             handle = proj.db.select_graph("g")
             q, p = eager_init_query("CREATE (:TeamMeta)", {"n": org})
             handle.query(q, params=p)
+
+        def argument_position(proj, org):
+            handle = proj.db.select_graph("g")
+            handle.query(*_os.eager_init_query("CREATE (:TeamMeta)", {"n": org}))
+
+        def bare_expression(proj, org):
+            handle = proj.db.select_graph("g")
+            _os.eager_init_query("CREATE (:TeamMeta)", {"n": org})
+
+        def inside_a_return(proj, org):
+            handle = proj.db.select_graph("g")
+            return _os.eager_init_query("CREATE (:TeamMeta)", {"n": org})
         """
     ))
     found = {
@@ -1513,11 +1578,59 @@ def test_the_eager_init_finder_sees_both_call_spellings():
             node, {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)})]
         if enclosing is not None
     }
-    assert found == {"via_module", "via_bare_name"}, (
-        "`_eager_init_calls()` missed a call spelling — it must match BOTH "
-        "`_os.eager_init_query(...)` and a bare `eager_init_query(...)`, or a "
+    assert found == {"via_module", "via_bare_name", "argument_position",
+                     "bare_expression", "inside_a_return"}, (
+        "`_eager_init_calls()` missed a call spelling or SHAPE — it must match "
+        "BOTH `_os.eager_init_query(...)` and a bare `eager_init_query(...)`, "
+        "in an assignment, an argument, a bare expression and a return, or a "
         f"sixth site can exist with the note claiming there are five: {sorted(found)}"
     )
+
+
+def test_the_record_slice_and_the_count_pin_can_fail():
+    """The two prose-pin instruments must RED when their premise is gone.
+
+    ⛔ Both were load-bearing and unpinned (#9150 review cycle 14, P2): with
+    `_record`'s boundary assertion neutralised, a DELETED end marker widened the
+    region to the rest of the module and all eight region pins went vacuous while
+    the suite stayed green; with `_assert_site_count`'s `raise` reached only by a
+    stale record, nothing in the suite ever presented a contradictory numeral, so
+    emptying it changed no outcome. Each detector gets a synthetic premise it must
+    refuse.
+    """
+    # 1. a boundary marker that does not exist must raise, never widen the scan.
+    try:
+        _record(path="tortoise/projection/__init__.py",
+                start="#   * `onboarding.metadata`",
+                end="#   * marker-that-does-not-exist")
+    except AssertionError as exc:
+        assert "no longer carries the region" in str(exc), exc
+    else:
+        raise AssertionError(
+            "`_record()` accepted a MISSING end marker — the scan then widens to "
+            "the rest of the module and every prose pin reading that region "
+            "becomes vacuous while staying green"
+        )
+
+    # 2. a contradictory numeral must raise.
+    template = "the {n} `eager_init_query()` call sites"
+    try:
+        _assert_site_count("the four `eager_init_query()` call sites", template,
+                           "synthetic record")
+    except AssertionError as exc:
+        assert "no longer says" in str(exc), exc
+    else:
+        raise AssertionError(
+            "`_assert_site_count()` accepted a record that states the WRONG "
+            "numeral — the one guard on the word \"five\" in all four records "
+            "would then be decorative"
+        )
+
+    # 3. …and the same template at the RIGHT numeral must pass, so the check is
+    #    measuring the numeral and not merely "is there any number".
+    word = _COUNT_WORDS[sum(_ESCAPE3_CALL_SITES.values())]
+    _assert_site_count(f"the {word} `eager_init_query()` call sites", template,
+                       "synthetic record")
 
 
 def test_a_delegating_opener_joins_both_populations():
