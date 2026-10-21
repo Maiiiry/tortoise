@@ -342,10 +342,13 @@ def _consult_journal_write_authority(handle, statement) -> None:
     this function never second-guesses it.
 
     ⛔ THE UNINSTALLED CHECK COMES FIRST, because it IS the fast path (#9079
-    review): the census door is installed by the projection, which does not
-    exist in CLI / doctor / session-indexer processes — and the store key it used
-    to compute unconditionally walked several ``getattr``s and built two f-strings
-    per guarded statement in every one of them. One global read, then out.
+    review): the census door is installed by `tortoise.projection` when it
+    imports, and nothing is installed before a journal-bound projection exists —
+    but that is "before any projection", NOT "only in long-lived processes":
+    `tortoise/__main__.py` imports the projection module on the paths that build
+    one, so a CLI that opens an SDK pays for the installed hook too. What the
+    early return buys is that the store key (several ``getattr``s plus two
+    f-strings) is not computed for a process that never installs one.
     """
     if _JOURNAL_WRITE_AUTHORITY is None:
         return

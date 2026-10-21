@@ -49,6 +49,16 @@ refusal test below takes the ``enforced`` fixture, which arms the door for that
 test only — arming it globally still refuses the product's own apply-first
 doors, and that is #9206, not this lane.
 
+CLOSE() RELEASES THE CONNECTION, NOT THE GRAPH'S §17.1 STATUS (#9079 review,
+P2). Both halves of the registration — ``_journal_backed`` on the projection and
+the ``(store, graph)`` key in the process registry — outlive ``close()``, and go
+away with the OWNER (the weakref finalizer, or an explicit
+``_bind_journal(None)``). Each half was released by ``close()`` in an earlier
+revision, and each release disarmed a different door while the graph stayed
+writable — a server ``db.close()`` is a pool disconnect and redis-py reconnects
+on the next command — so a post-close write landed with no census entry and, once
+armed, no refusal. Both are pinned below.
+
 STILL OPEN, stated rather than implied — the enumeration this file is named after
 is only honest if it says where it stops:
   * a client handle's NON-Cypher destruction (``proj.db.select_graph(<own>).delete()``
@@ -445,48 +455,62 @@ def test_a_graph_that_is_nobodys_cache_is_outside_section_17_1(armed_sdk, enforc
 
 # ── the registry itself ──────────────────────────────────────────────────
 
-def test_the_registry_names_the_journal_backed_graph_and_is_released_on_close(tmp_path):
-    """A stale entry would judge a LATER projection reusing the name."""
+def test_the_registry_names_the_journal_backed_graph_and_carries_its_store(tmp_path):
+    """The registration names the STORE and follows its OWNER, not its connection."""
     from tortoise.sdk import TortoiseSDK
 
     journal = tmp_path / "journal.jsonl"
     sdk = TortoiseSDK(str(tmp_path / "registry.db"), event_log_path=str(journal))
     proj = sdk._get_proj()
     name = proj.graph_name
+    store = _client_store_key(proj.db)
     assert name in _journal_backed_graphs(), (
         "binding a journal must register the graph for the client-level door")
-    assert any(graph == name and store for store, graph in _journal_backed_keys()), (
+    assert (store, name) in _journal_backed_keys(), (
         "the registration must carry the STORE, not only the name; "
         f"keys={_journal_backed_keys()}")
     sdk.close()
-    assert name not in _journal_backed_graphs(), (
-        "closing the projection must release its registration")
+    # ⛔ THE REGISTRATION OUTLIVES THE CONNECTION (#9079 review, P2). Releasing
+    # it from `close()` disarmed the CLIENT-level door — `proj.db.select_graph`
+    # and `proj.g._g` — for a graph that is still writable (a server
+    # `db.close()` is a pool disconnect and redis-py reconnects), while the
+    # write handle stayed armed. One decision, two answers: the drift the door
+    # exists to prevent. The weakref finalizer owns the release; the next case
+    # proves it still fires, and `test_a_dropped_projection_releases_its_…`
+    # proves the drop path.
+    assert (store, name) in _journal_backed_keys(), (
+        "close() released the (store, graph) registration while the graph "
+        f"stayed writable; keys={_journal_backed_keys()}")
 
 
-def test_close_releases_the_registry_but_not_the_journal_authority(tmp_path):
-    """`close()` disarms the REGISTRY, never the projection's own doors.
+def test_a_closed_projections_client_door_still_refuses_a_write(tmp_path, enforced):
+    """`close()` releases the CONNECTION, never the graph's §17.1 status.
 
-    RED before the fix: ``close()`` also wrote ``self._journal_backed = False``,
-    which disarmed every §17.1 door on that projection (the write handle,
-    `apply`, the public `query`) while the graph stayed WRITABLE — a server
-    ``db.close()`` is a pool disconnect and redis-py reconnects on the next
-    command — so a post-close write landed with no census entry and, once armed,
-    no refusal. The flag says "this graph is a derived cache of a journal that
-    exists on disk"; closing a connection does not make that untrue.
+    RED before the fix, on BOTH doors. `close()` released the `(store, graph)`
+    registration, and that entry is the only thing that makes the client-level
+    door apply — so after `sdk.close()` a write through `proj.db.select_graph`
+    (escape 3) or `proj.g._g` (escape 2) landed on an ARMED journal-backed
+    cache with no census entry and no refusal, while the same write through
+    `proj.g` was still refused. A server `db.close()` is a pool disconnect and
+    redis-py reconnects on the next command, so the graph is writable; nothing
+    else on the command path reads `_closed`.
     """
     from tortoise.sdk import TortoiseSDK
 
-    sdk = TortoiseSDK(str(tmp_path / "closed.db"),
+    sdk = TortoiseSDK(str(tmp_path / "post-close.db"),
                       event_log_path=str(tmp_path / "journal.jsonl"))
     proj = sdk._get_proj()
     assert proj._journal_backed, "the fixture must arm the guard"
+    name = proj.graph_name
     sdk.close()
-    assert proj.graph_name not in _journal_backed_graphs(), (
-        "the (store, graph) registration is the release close() owes")
-    assert proj._journal_backed, (
-        "close() disarmed the projection's own §17.1 doors: a post-close write "
-        "would reach the journal-backed graph with no census entry and no "
-        "refusal, because the journal still exists and the client reconnects")
+    # the projection is still referenced here, which is exactly the shape: an
+    # owner that closed its connection keeps doing what it did before.
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.db.select_graph(name).query("CREATE (n:PostClose {id:'pc1'})")
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g._g.query("CREATE (n:PostClose {id:'pc2'})")
+    with pytest.raises(DirectCacheWriteRefused):
+        proj.g.query("CREATE (n:PostClose {id:'pc3'})")
 
 
 def test_a_same_named_graph_in_another_store_is_not_judged_as_this_journal(enforced):

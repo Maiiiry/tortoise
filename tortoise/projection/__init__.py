@@ -9397,10 +9397,12 @@ class FalkorProjection(
         never registers, so a graph that is nobody's derived cache keeps the
         guard's ``None`` fast path in ``cypher_guard``.
 
-        The registration is RELEASED twice, on purpose: by ``close()`` and by a
+        The registration is RELEASED when the projection goes away, not when its
+        connection does: ``_bind_journal(None)`` releases it, and so does a
         weakref finalizer, so a projection that is dropped without being closed
         cannot leave the process judging a later projection's writes by a
-        journal that no longer exists.
+        journal that no longer exists. ``close()`` deliberately does NOT release
+        it — see the note there (#9079 review).
         """
         was = bool(getattr(self, "_journal_backed", False))
         self._journal_backed = bool(journal_path)
@@ -17486,30 +17488,25 @@ class FalkorProjection(
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        if getattr(self, "_journal_backed", False):
-            # #9079: the (store, graph) pair leaves the client-level registry
-            # with its owner. A stale entry would judge a LATER projection that
-            # reuses the name without a journal — a fail-closed gate over the
-            # wrong graph, which is how a guard starts blocking the product.
-            #
-            # ⛔ THE OWNER FLAG IS NOT CLEARED (#9079 review, P2). Releasing the
-            # REGISTRY key is the intended disarm; ``_journal_backed`` is what
-            # tells THIS projection's own doors (the write handle, `apply`, the
-            # public `query`) that the graph it holds is a derived cache of a
-            # journal that still exists on disk. Clearing it disarmed every §17.1
-            # door on the projection while the graph stayed WRITABLE — a server
-            # ``db.close()`` is a pool disconnect, and redis-py reconnects on the
-            # next command — so a post-close write landed with no census entry
-            # and, once armed, no refusal. The flag is a property of the graph
-            # and its journal, not of this connection.
-            finalizer = getattr(self, "_journal_backed_finalizer", None)
-            if finalizer is not None:
-                finalizer.detach()
-                self._journal_backed_finalizer = None
-            _unregister_journal_backed_graph(
-                getattr(self, "_journal_backed_store", None),
-                getattr(self, "graph_name", None))
-            self._journal_backed_store = None
+        # ⛔ NEITHER HALF OF §17.1's REGISTRATION IS RELEASED HERE (#9079 review,
+        # P2 twice). Closing a CONNECTION does not make the graph any less the
+        # derived cache of a journal that still exists on disk, and it does not
+        # stop a write: a server ``db.close()`` is a pool disconnect, and
+        # redis-py reconnects on the next command.
+        #
+        # Both halves had the same defect in turn. Clearing ``_journal_backed``
+        # disarmed THIS projection's own doors (the write handle, `apply`, the
+        # public `query`). Releasing the ``(store, graph)`` registry key instead
+        # disarmed the CLIENT-level door below it, which is the very door this
+        # change adds — so ``proj.db.select_graph(<graph>)`` and
+        # ``proj.g._g`` still wrote an armed journal-backed cache with no
+        # census entry and no refusal, exactly as before the fix, for any
+        # writer holding ``proj`` after ``sdk.close()``.
+        #
+        # The release is a property of the OWNER, so it happens there: the
+        # weakref finalizer (dropped or GC'd) and an explicit
+        # ``_bind_journal(None)``. A projection that is closed and then dropped
+        # still releases, because ``close()`` leaves the finalizer attached.
         try:
             # #1475: route through db._t_close (when present) so the db's
             # _t_closed flag is set — the GC finalizer must recognize this
