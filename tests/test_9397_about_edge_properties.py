@@ -72,6 +72,13 @@ by synthetic probes; the residual gap is a list of names, and a list cannot be
 checked for a token nobody has written yet. Adding a predicate vocabulary is a
 change to `_ABOUT_VOCAB`, not only to the code that uses it.
 
+⚠️ AND THE CENSUS STOPS RATHER THAN SKIPS. A module `ast.parse` (or a strict
+UTF-8 decode) rejects is NOT in that list of names: it raises `UnparsableModule`,
+so the census fails CLOSED and names the file. Dropping such a module and
+returning its `{}` would report every writer it contains as a measured absence —
+the identical fail-open shape as the `rg 'aboutObject {'` zero, one level down
+(third review cycle on this file).
+
 WHAT IS PINNED
 --------------
 1. `test_the_absolute_property_free_sentences_do_not_reappear` — the retracted
@@ -108,11 +115,13 @@ WHAT IS PINNED
    invisible — so adding a predicate vocabulary, or a new way of naming one, is
    a change to `_ABOUT_VOCAB` / `_module_in_scope`, not just a change to the
    code. What IS machine-checked is that the inline form is read, including the
-   anonymous pattern (`test_the_census_reads_the_inline_pattern_map_form`) and
-   that the allowlist path is not skipped by the file walk
-   (`test_the_census_reads_a_writer_that_never_says_about`); the remaining gap is
-   a vocabulary list, and a list cannot be checked for a token nobody has
-   written yet.
+   anonymous pattern (`test_the_census_reads_the_inline_pattern_map_form`), that
+   the allowlist path is not skipped by the file walk
+   (`test_the_census_reads_a_writer_that_never_says_about`), and that a module
+   the census cannot parse STOPS it instead of vanishing
+   (`test_the_census_fails_closed_on_a_module_it_cannot_parse`) — so the
+   remaining gap is a vocabulary list, and a list cannot be checked for a token
+   nobody has written yet. Neither bound is a parse failure.
 5. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
    the binder, **or stops being the fall-through branch** of the
@@ -127,6 +136,19 @@ WHAT IS PINNED
    revision of THIS PR, so claiming a pre-fix presence for them would be the
    same unmeasured provenance this file exists to stop). A pin that cannot match
    the pre-fix text protects nothing, and that is not a hypothesis: it shipped.
+8. `test_the_corrected_passages_carry_no_bare_edges_line_citation` — the
+   corrected §13 / §13.8 q2 text cites the generic writer by SYMBOL, not by a
+   bare `projection/edges.py:<n>`. A line number is only true of the revision it
+   was measured at, so an unqualified one sends a verifying reader to whichever
+   code happens to sit there now (third review cycle: `:344` was the definition
+   at the pin and is a comment block at HEAD). §11.1's copy keeps `:344` **at the
+   pinned revision**, because there the qualifier is stated.
+9. `test_the_references_paragraph_scopes_property_freedom_to_source_version` —
+   §9.6's "identity/mention and referential-containment `references` links stay
+   **property-free**" is the SAME unqualified absolute, seventy lines above the
+   §11.1 correction, for a different link class (a record-projected `references`
+   edge carries `idx` too). Scoped to the fact the paragraph establishes: those
+   links carry **no `sourceVersion`**.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -457,6 +479,17 @@ def _qualified(tree: ast.Module):
     yield from walk(tree)
 
 
+class UnparsableModule(Exception):
+    """A module in the census's scope that `ast.parse` (or the strict UTF-8
+    decode in `_about_edge_property_writers`) rejected.
+
+    Raised rather than swallowed: a module nobody can read has an UNMEASURED
+    property-write population, and reporting `{}` for it is how a census
+    manufactures a measured absence. The message names the module so the
+    reader knows which file to fix, and the leg that raises it reds.
+    """
+
+
 def _writers_in_module(
     module: str, text: str
 ) -> dict[tuple[str, str], set[str]]:
@@ -470,8 +503,19 @@ def _writers_in_module(
     if True:  # one flat body, so the file/rglob caller below stays a loop
         try:
             tree = ast.parse(text)
-        except SyntaxError:  # pragma: no cover — a broken module fails elsewhere
-            return found
+        except SyntaxError as exc:
+            # FAIL CLOSED, and name the file. Returning `{}` here would censor a
+            # broken module as "writes no property on any about edge" — the
+            # same measured-absence-from-an-unreadable-source defect as
+            # `rg 'aboutObject {'`, and `# pragma: no cover` was wrong on both
+            # counts: the module is readable text, and this is precisely the
+            # branch `test_the_census_fails_closed_on_a_module_it_cannot_parse`
+            # must cover (third review cycle).
+            raise UnparsableModule(
+                f"{module} could not be parsed, so the property writes it "
+                f"contains are UNMEASURED — this is a STOP, not a measured "
+                f"absence: {exc}"
+            ) from exc
         lines = text.splitlines()
         for qualname, node in _qualified(tree):
             body = _own_body(node, lines)
@@ -552,7 +596,12 @@ def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
     """
     found: dict[tuple[str, str], set[str]] = {}
     for path in sorted(PKG.rglob("*.py")):
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # STRICT, not `errors="replace"`: a byte-compromised module would
+        # otherwise be censused as DIFFERENT TEXT than leg 3 (which reads it
+        # strictly) parses, and the two legs would be measuring two different
+        # files while both reported green. A decode error raises, which is the
+        # same fail-closed behaviour as an unparsable module.
+        text = path.read_text(encoding="utf-8")
         if not _module_in_scope(text):
             continue
         found.update(_writers_in_module(path.relative_to(ROOT).as_posix(), text))
@@ -708,6 +757,107 @@ def test_the_corrected_passages_name_the_property_bearing_class():
             "the documented property set then covers only `SET r.<prop>` "
             "writers, which is the blindness this file exists to stop"
         )
+
+
+#: The pre-fix spelling of §13's `create_about_edge` citation, kept as a
+#: PROBE: the rule below must red on it, and a matcher that has stopped matching
+#: protects nothing (the `RETRACTED` dead-pin lesson, same file).
+STALE_CITATION_PROBE = (
+    "The generic writer `create_about_edge` (`projection/edges.py:344`) emits "
+    "`MERGE (s)-[:aboutObject]->(t)` with **no** `SET`."
+)
+_EDGES_LINE_CITE = re.compile(r"edges\.py:(\d+)")
+_PINNED_REVISION = re.compile(r"pinned revision|at the pin\b", re.I)
+
+
+def _unqualified_edges_line_citations(text: str) -> list[str]:
+    """Every `projection/edges.py:<n>` citation in `text` that is NOT marked as
+    belonging to a PINNED revision.
+
+    This file — and the documents it guards — state that the SYMBOL is
+    authoritative and line numbers are not asserted. At HEAD
+    `create_about_edge` is `projection/edges.py:1447`; `:344` is a `#:` comment
+    block that MENTIONS the symbol, which is exactly why a stale number reads as
+    plausible: a reader who verifies the corrected §13 evidence lands on prose.
+    The pre-fix text was right AT ITS PIN (`c79ba1cf2`), so the qualifier — not
+    the number — is the part that is either true or missing.
+    """
+    return [
+        m.group(0)
+        for m in _EDGES_LINE_CITE.finditer(text)
+        if not _PINNED_REVISION.search(text[m.end(): m.end() + 120])
+    ]
+
+
+def test_the_corrected_passages_carry_no_bare_edges_line_citation():
+    """The corrected §13 passage and §13.8 q2 re-asserted a STALE `file:line`
+    (`projection/edges.py:344`) as current — the definition is at `:1447` at HEAD
+    and `:344` is a comment that mentions the symbol (third review cycle). The
+    claim itself was true and nothing rested on it, but a cited line that lands
+    on prose is how a verified-looking sentence stops being verifiable.
+
+    The qualifier is load-bearing, not decoration: §11.1's copy is `:344` **at
+    the pinned revision**, which is true and stays."""
+    assert _unqualified_edges_line_citations(STALE_CITATION_PROBE), (
+        "the citation rule does not match the PRE-FIX §13 spelling "
+        f"({STALE_CITATION_PROBE!r}), so it cannot red on a re-introduction"
+    )
+    docs = {"STORAGE": _doc(STORAGE), "EXTRACTOR": _doc(EXTRACTOR)}
+    bare = [
+        f"{label} cites {cite!r} as current — a line number without a "
+        "'pinned revision' qualifier"
+        for label, start, end, which in CORRECTED_SECTIONS
+        for cite in _unqualified_edges_line_citations(
+            _section(docs[which], start, end)
+        )
+    ]
+    assert not bare, (
+        "the corrected evidence cites a line number as if it were current:\n  "
+        + "\n  ".join(bare)
+        + "\n\nDrop the number and keep the SYMBOL (`projection/edges.py`), or "
+        "qualify it with the revision it was measured at — `create_about_edge` "
+        "is at `projection/edges.py:1447` at HEAD, and `:344` is a comment "
+        "block that merely mentions it."
+    )
+
+
+def test_the_references_paragraph_scopes_property_freedom_to_source_version():
+    """§9.6 said identity/mention and referential-containment `references` links
+    "stay **property-free**" — the same unqualified absolute this PR retracts for
+    `aboutObject`, 70 lines above the correction (third review cycle). Read as
+    written it is FALSE at HEAD for the same reason: a record-projected relation
+    is stamped `{idx:$idx}` unconditionally by
+    `cache_projection.relation_statement` (`cache_projection.py:717`) and
+    `_rebuild_all_replay` re-applies the journal's attributes over an allowlisted
+    `etypes`, so a `references` link is not property-free either.
+
+    The FACT the paragraph establishes is narrower and true: those forms carry
+    no `sourceVersion`. The word is scoped here rather than the paragraph
+    rewritten, so the derivation-anchor claim it is actually about is untouched.
+    """
+    text = _doc(STORAGE)
+    start = "The anchor extends to the **derivation** `references` link only"
+    end = "⚠️ **The mechanism discriminates on the target's LABEL"
+    paragraph = _section(text, start, end)
+    assert _flat("carry **no `sourceVersion`**") in _flat(paragraph), (
+        "§9.6 no longer states the true, narrow fact for the identity/containment "
+        "`references` links — that they carry no `sourceVersion`"
+    )
+    retracted_absolutes = [
+        "links stay **property-free**",
+        "links stay property-free",
+    ]
+    live = [
+        literal for literal in retracted_absolutes
+        if _flat(literal) in _flat(paragraph)
+    ]
+    assert not live, (
+        "§9.6 still makes the retracted absolute claim "
+        f"{live} — a `references` link stamped by the record projection carries "
+        "`idx` (`cache_projection.py:717`), so 'property-free' is false here "
+        "exactly as it was for `aboutObject`. Scope the word: those links carry "
+        "**no `sourceVersion`**."
+    )
 
 
 # ── 3. the code must still agree with the corrected evidence ───────────────
@@ -931,6 +1081,37 @@ def test_the_census_reads_a_writer_that_never_says_about():
         "the census does not read a map-form writer whose predicate comes from "
         f"the allowlist instead of the word 'about' (found {found!r})"
     )
+
+
+def test_the_census_fails_closed_on_a_module_it_cannot_parse():
+    """A module `ast.parse` rejects used to be DROPPED from the census with no
+    signal (`except SyntaxError: return found`), so every writer it contains was
+    reported as a measured absence — mechanically the same defect as the
+    `rg 'aboutObject {'` zero this PR exists to correct, one level down (third
+    review cycle). The promise's stated bound was a list of VOCABULARY NAMES, so
+    a reader was told the only gap was a token nobody had written yet; a parse
+    failure is a second, machine-detectable gap and it must stop the census.
+
+    Pinned on a synthetic module: no shipped file has to be broken for the rule
+    to be proved live."""
+    broken = (
+        "def link(g, s, t):\n"
+        "    g.query('MERGE (s)-[r:aboutObject {confidence:$c}]->(t)'\n"
+    )
+    try:
+        found = _writers_in_module("tortoise/probe.py", broken)
+    except UnparsableModule as exc:
+        assert "tortoise/probe.py" in str(exc), (
+            "the census fails closed but does not name the module it could not "
+            f"read, so the reader cannot tell which file is unmeasured: {exc}"
+        )
+    else:
+        raise AssertionError(
+            f"the census returned {found!r} for a module it cannot parse — an "
+            "unreadable module is censused as 'writes no property on any about "
+            "edge', which is a measured absence manufactured from a file nobody "
+            "read. Raise UnparsableModule and name the module."
+        )
 
 
 # ── 5. the reach claim the corrected text makes ────────────────────────────
