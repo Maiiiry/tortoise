@@ -3089,6 +3089,18 @@ surfaces:
   # for the same docs-only reason as the doc guards above: a `docs/`-only diff takes
   # `select()`'s early return, so `tier1` is where it must live.
   - test_test_design_1992_traceability.py
+  # #9397: the `about*` EDGE-PROPERTY guard (`STORAGE-ARCHITECTURE.md` §11.1/§13
+  # said the edge carries no property; three shipped writers `SET confidence` on
+  # it). Pins the retracted absolutes as ABSENT, the corrected passages as
+  # PRESENT, the three writers, a CENSUS over relationship-variable `SET` sites
+  # (the root-cause fix: the original claim came from a grep whose pattern
+  # structurally cannot match a `SET r.<prop>` writer), the default-ON reach
+  # claim, and the changelog record. `core` is its home for the code diffs that
+  # can add a writer or re-rotate the claim (`session_link.py`,
+  # `subject_binding.py`, `projection/entities.py`); `tier1` is the
+  # LOAD-BEARING one for the docs-only diff this change IS — a `docs/`-only diff
+  # takes `select()`'s early return and runs `tier1` only (the #8506 precedent).
+  - test_9397_about_edge_properties.py
   - test_falkordb_compat.py
   # #7076: the degraded-fallback snapshot's OWN guard. test_fallback_snapshot.py
   # was registered only under `api`, while the module it guards
@@ -5311,6 +5323,11 @@ tier1:
 # doc-text table/row scans plus two file reads, no DB, so a docs-only PR must run it
 # here.
 - test_test_design_1992_traceability.py
+# #9397: the `about*` edge-property guard (`core` above) — doc-text scans over
+# `docs/architecture/STORAGE-ARCHITECTURE{,-CHANGELOG}.md` plus a whole-tree
+# relationship-variable `SET` census; no DB, so a docs-only PR — the exact change
+# class that can re-introduce a retracted sentence — must run it here.
+- test_9397_about_edge_properties.py
 # ── #9017 (2026-10-18): the slow pool's weights and its leg split are MEASURED
 #
 slow_files:
@@ -6610,6 +6627,7 @@ durations:
   test_capstone_1976_report_claims.py: 1.0  # #2008 review: four doc-text/section reads + three source-file reads, plus one `tests/**` def/class index for the citation resolver (now covering module/path/glob citations, not only bare symbols) and one batch-table parse; no DB
   test_test_design_1992_traceability.py: 0.1  # #1992 review: doc-text table/row scans + two file reads; no DB. A file ADDED BY A PR has no CI junit measurement (#3400 — the refresher samples push-to-main runs only), so this is a local reading: 0.01–0.02 s per test of call time (`--durations=0`), the same no-DB shape as the doc guards above
   test_doc_affiliation_frontmatter.py: 0.1  # #8738 review P2: six frontmatter-block reads + one directory glob; same no-DB shape as the doc guards above
+  test_9397_about_edge_properties.py: 12.8  # #9397: doc-text/section scans over two markdown files + a whole-tree relationship-variable `SET` census (regex scans of the writer modules) + a module-import of `tortoise` for the writer assertions; no DB. A file ADDED BY A PR has no CI junit measurement (#3400 — the refresher samples push-to-main runs only), so this is the branch's LOCAL reading under the `# unmeasured` convention: MEASURED on this host 2026-10-20 at the PR head with `--junitxml` (sum of testcase/@time, 6 tests) came to 12.12s, 10.22s and 12.78s over three back-to-back runs (max single test 3.41-4.28s, `test_no_unrecorded_property_bearing_about_edge_writer`; the cold first run also pays a 7.05s session-setup import). The 12.8 WEIGHT is the HIGHER of the readings, the same rule as the neighbouring #8098 row. Without this row the file joins `fast_pool()` at the flat 2.0s default and `tools/ci_selection.py --integrity` reds the durations coverage floor (#4348 trap). Refresh from the first post-merge run that includes it; do NOT drop the row without re-deriving the floor at that head.
   test_file_indexer.py: 0.7
   test_open_kinds.py: 0.3
   test_postmerge_verdict.py: 0.4

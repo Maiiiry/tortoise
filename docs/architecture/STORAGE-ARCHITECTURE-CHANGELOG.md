@@ -694,7 +694,7 @@ that was itself a heading cannot collide with this file's own outline.
 
 ---
 
-### 2026-10-20 — `#9397`: §11.1 and §13 said the `aboutObject` edge carries **no** property. It carries `confidence`.
+### 2026-10-20 — `#9397`: §11.1 and §13 said the `aboutObject` edge carries **no** property — it carries `confidence`
 
 **What was recorded.** §11.1 (*"Our `aboutObject` links are **property-free** … a full-repo search for a property-bearing edge finds **none**"*) and §13 (*"**no** `aboutObject` edge carries **any property** … we lose nothing semantically by deriving later"*), plus the same fact in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 question 2 and in this ledger's `aboutObject` decision row.
 
