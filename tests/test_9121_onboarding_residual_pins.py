@@ -1401,10 +1401,26 @@ def test_the_opener_inventory_is_derived_not_hand_listed():
         "inventory pin can never fire on the next lane that declares there, "
         f"which is the whole point of pinning it: {sorted(derived)}"
     )
-    assert _projection_openers(None) == _projection_openers(_parse(
-        "tortoise/projection/__init__.py")[0]), (
-        "the injected-module path and the on-disk `_parse` path disagree, so "
-        "this instrument check is not measuring the production derivation"
+    # ⛔ A tree that DIFFERS from disk, so the on-disk call is measured against
+    # something it cannot be equal to by construction (#9150 review cycle 17,
+    # P2: the previous form compared `_projection_openers(None)` with
+    # `_projection_openers(_parse(...)[0])`, and `_parse` is `@cache`d — both
+    # sides were the identical module object, so the assertion was `f(x) == f(x)`
+    # and could not fail).
+    disk = _parse("tortoise/projection/__init__.py")[0]
+    stripped = ast.parse("")
+    stripped.body = [
+        node for node in disk.body
+        if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in _projection_openers())
+    ]
+    assert _projection_openers(stripped) == set(), (
+        "a copy of the inventory module with every opener REMOVED still derives "
+        "openers, so the derivation is not reading the tree it is given"
+    )
+    assert _projection_openers() != _projection_openers(stripped), (
+        "the on-disk path and an opener-free copy derive the same set — the "
+        "`tree` parameter is not wired to the derivation this pin measures"
     )
 
 
@@ -2159,8 +2175,8 @@ def test_a_diff_to_the_note_itself_selects_this_file():
     )
 
 
-def test_the_storage_ledger_declares_every_lane_the_tree_has():
-    """The §17.1 ledger's NUMERAL and its ROWS must agree — the drift that landed.
+def test_the_storage_ledger_matches_its_recorded_lane_snapshot():
+    """The §17.1 ledger's ROWS, NUMERALS and PINS, against a recorded snapshot.
 
     ⛔ Measured at the head this pin was written for (#9150 review cycle 15, P2):
     `docs/architecture/STORAGE-ARCHITECTURE.md` said the carve-out "has FOUR
@@ -2170,11 +2186,18 @@ def test_the_storage_ledger_declares_every_lane_the_tree_has():
     nowhere in the record. The paragraph itself says "a new lane belongs here in
     the PR that declares it", and this file quotes that preamble as the reason an
     auditor trusts the table — so a reader auditing §17.1 for second writers was
-    told the inventory was complete one lane short.
+    told the inventory was complete, one lane short. Cycle 16 then found the same
+    drift ONE LEVEL UP: the numerals said FIVE while the prose still said "the
+    other THREE lanes", and the enumeration that justifies the exemption still
+    listed four kinds of write, one of them asserting the class could not have a
+    record at all.
 
-    Content-anchored on purpose: a recorded row set in the test means a lane
-    added to the tree reds here (with the doc updated in the same change), which
-    is the pin the numeral never had.
+    ⛔ WHAT THIS PINS, EXACTLY (#9150 review cycle 17, P2): the DOC against a
+    recorded snapshot — row set, every numeral phrasing, and each row's pin file.
+    It does NOT derive the lane set from the tree, and the earlier wording claimed
+    otherwise: a lane added to `tortoise/` reds
+    `test_the_detector_population_is_pinned_by_content` (the tree-direction pin),
+    NOT this one. Both are needed, and neither alone covers the ledger.
     """
     rel = "docs/architecture/STORAGE-ARCHITECTURE.md"
     lines = (_REPO / rel).read_text(encoding="utf-8").splitlines()
@@ -2189,6 +2212,24 @@ def test_the_storage_ledger_declares_every_lane_the_tree_has():
     ]
     # header + separator are not lanes
     rows = rows[1:]
+
+    # ⛔ The EXEMPTION'S OWN ENUMERATION, pinned with the numerals (#9150 review
+    # cycle 17, P1): the sentence that justifies the carve-out listed four kinds
+    # of write while the table had five rows, and asserted a modal claim
+    # ("cannot have one") that the fifth row explicitly refutes. A numeral and a
+    # list are the same claim in two shapes; pinning one and not the other is how
+    # FIVE coexisted with "the other THREE".
+    assert "four of the five" in preamble, (
+        "the ledger preamble no longer states that FOUR of the FIVE lanes cannot "
+        "have a record — the structural-edge lane is the exception (the record "
+        "type exists, the emission does not), and a flat \"cannot have one\" "
+        "contradicts its own row (#9195)"
+    )
+    assert "cannot have one:" not in preamble.replace("cannot have one: they", ""), (
+        "the ledger preamble is back to the absolute claim that no lane can have "
+        "a record — the `structural-edge.derived` row says the opposite: the "
+        "engine has `DirectEdgeCreated`, and only the EMISSION is missing"
+    )
 
     recorded = {
         "graph-metadata": "tests/test_9079_ep_epoch_declared.py",
