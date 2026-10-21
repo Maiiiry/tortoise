@@ -135,14 +135,14 @@ _APPEND_NOT_A_RECORD = {
     # census credited that door with a commit point it does not have and filed
     # it as apply-first on the strength of a warning builder. A `_journal_*`
     # NAME is not a journal write; that is exactly what this set exists to
-    # refuse — and this exclusion is what bought that door a false lane, not
-    # what earns it a home: `capture_session` is in NO inventory at this head
-    # (#9349 moved its last handle write to declared doors, so the census no
-    # longer keys it — see `_NO_JOURNAL`'s comment). The exclusion still does
-    # work in the direction that matters:
-    # `test_the_capture_door_delegates_its_writes_to_declared_doors` asserts it
-    # remains the door's ONLY append-pattern call, so a future real append reds
-    # there instead of hiding under it.
+    # refuse. `capture_session` was its only other pattern-matching call and is
+    # no longer on the census at all (#9349 moved its writes into declared doors
+    # and into no-journal doors that hold their own rows), so this exclusion now
+    # guards the census against a warning builder wherever one appears rather
+    # than that door's lane — and
+    # `test_the_capture_door_delegates_its_writes_to_declared_doors` still
+    # asserts every append-pattern call in that door's body is a proven
+    # non-record, so a FUTURE real append reds there instead of hiding here.
     "_journal_write_failure_warning",  # sdk.py: builds a receipt warning string
 }
 
@@ -230,10 +230,11 @@ _DECLARATION_DECORATORS = (*_LIVE_LANE_NAMES, *_APPLY_FIRST_LANE_NAMES)
 #: this set's pointer will not find the other five. The remaining TWO
 #: (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`) were never
 #: inventory entries at all: they were inline statements inside
-#: `capture_session`, which appends NO record of its own — a function holding
+#: `capture_session`, which appends NO record of its own: a function holding
 #: BOTH scoped and unscoped writes is refused by this census ("presence is not
-#: containment"), so the stamps became doors of their own, and the parent door
-#: then reached no handle write at all (#9349). It has no row and needs none;
+#: containment"), so its four provenance stamps (`#9350`) and its extraction
+#: reaches became doors of their own — and the parent door then left the census
+#: entirely in #9349. It has no row and needs none;
 #: `test_the_capture_door_delegates_its_writes_to_declared_doors` pins both
 #: halves of that split.
 #: A declaration does not convert the order: the entries that remain are still
@@ -279,38 +280,44 @@ _APPLY_FIRST_HELPERS = {
 #:   was stamps only: it appends NO record, so at that head `_NO_JOURNAL` was
 #:   its only honest home — the earlier attempt at THIS set was reachable only
 #:   by counting `_journal_write_failure_warning` (a warning-string builder) as
-#:   an append. #9349 then moved those stamps onto declared doors and the door
-#:   left every inventory: a door with no handle write of its own has no lane to
-#:   name. See `_NO_JOURNAL`'s comment for the current state.
+#:   an append.
+#:   ⛔ AND #9349 THEN MOVED THE STAMPS OUT TOO: the door has no write-like reach
+#:   of its own any more, so it is in NEITHER set — `_NO_JOURNAL`'s note records
+#:   why, and its pin asserts the absence rather than a row.
 _MIXED_ARM_DOORS: set[str] = set()
 
 #: Reach the handle with a write-like statement and append NO record at all, so
 #: there is no lane to declare: each needs either a named graph-metadata lane
 #: (the `_advance_ep_version` / `onboarding.metadata` pattern) or a move onto the
-#: fold. Measured on #9124; this is the "19 writers that journal nothing" class
-#: in the issue's landing path, at the count the source actually holds.
+#: fold. Measured on #9124; this is the issue's "writers that journal nothing"
+#: landing-path class. Its SIZE is deliberately not restated in prose: the block
+#: below IS the count, and `test_the_inventories_hold_no_stale_entry` keeps every
+#: member naming a function the census still emits. A figure quoted here went
+#: stale the moment doors joined or left — it read "19" while the set held 20
+#: (#9315 review MINOR), which is the same hand-copied-number rot the
+#: `durations:` row was carrying.
 _NO_JOURNAL = {
-    # ⛔ #9206/#9349 — `capture_session` LEFT this set, and the reason is the
-    # history this list keeps: #9206 put it here after excluding
-    # `_journal_write_failure_warning` (a receipt-warning STRING BUILDER) as a
-    # commit point, because what remained at the handle was four provenance
-    # stamps. #9349 then moved those stamps to their OWN declared doors
-    # (`_stamp_capture_attempt_state` / `_stamp_entity_link_counters`, both
-    # `apply-first-declared`) and the door now reaches no mutating handle call
-    # at all — so a row here would be a STALE census entry, which
-    # `test_the_inventories_hold_no_stale_entry` reds on. A door that issues no
-    # handle write has no lane to name; the two successors carry the stamps'
-    # declaration, and
-    # `test_the_capture_door_delegates_its_writes_to_declared_doors` pins that
-    # split so the stamps cannot slip back into an undeclared body. That test
-    # also pins the other half: the five doors the write moved TO
-    # (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`,
+    # ⛔ `capture_session` LEFT THIS SET (#9206 → #9349). It was here because it
+    # "reaches the handle with a write-like statement and appends no record" —
+    # and #9349 moved its last write-like reach OUT of the door into doors of
+    # their own (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`,
     # `_write_session_and_turns`, `_materialize_session_source`,
-    # `_stamp_capture_provenance`) are on the census surface, so the writes
-    # moved rather than vanished. `_journal_write_failure_warning` stays in
-    # `_APPEND_NOT_A_RECORD` — the door's only append-pattern call — so a FUTURE
-    # real append here (the fix #9350 owes) FAILS instead of slipping under an
-    # exclusion that no longer has anything to exclude.
+    # `_stamp_capture_provenance` — the five whose WRITES MOVED, not "every
+    # write it still makes": its stamps also still reach `_capture_stamp_targets`
+    # and its extraction `_extract_session_llm` / `_extract_session_v2`, and those
+    # are no-journal doors with rows of their own). The two provenance successors
+    # are `apply-first-declared`, so the stamps' declaration did not vanish with
+    # the row. With no write-like call of its own the census no longer KEYS it,
+    # so an entry here would name a function the census does not emit — a stale
+    # row, which this file's own `test_the_inventories_hold_no_stale_entry`
+    # refuses. The door's remaining claim ("appends nothing of its own") is
+    # pinned in `test_the_capture_door_delegates_its_writes_to_declared_doors`,
+    # now as an ABSENCE from both the surface and every inventory rather than a
+    # row. The warning-string builder (`_journal_write_failure_warning`) that
+    # once bought this door a false `apply-first` lane stays in
+    # `_APPEND_NOT_A_RECORD`, and that test still asserts every append-pattern
+    # call in the door's body is a proven non-record — so a FUTURE real append
+    # (the fix #9350 owes) FAILS instead of hiding under the exclusion.
     "_clear_reliability_cache",
     "_connect_issue_objects",
     "_extract_session_llm",
@@ -1023,6 +1030,19 @@ def _duplicate_writer_offenders(surface: dict, where: str = "") -> list[str]:
 
 # ── the live gate: every SDK entry point is declared or accounted for ─────
 
+#: The kinds that ARE a declaration — a door holding a lane, so an inventory row
+#: beside it is stale and must be named. `derived-recompute` belongs here even
+#: though its lane appends nothing by construction (`_kind`'s docstring): it is
+#: still a LANE, and leaving it out did not just mislabel the door — it filed it
+#: under "NO declared lane", whose natural remedy a reader takes to be an
+#: inventory ROW, i.e. it would weaken a declared door into an inventoried one.
+#: That is the producer-without-consumer mirror of the `duplicate_writer_defs`
+#: defect this file already closed (#9315 review MINOR). It is a named constant
+#: so `test_the_derived_recompute_lane_has_its_own_kind` can bind the two halves
+#: — the kind `_kind` EMITS and the kinds this gate ACCEPTS — instead of a tuple
+#: literal only one of them can see.
+_DECLARED_KINDS = ("declared", "apply-first-declared", "derived-recompute")
+
 def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
     """THE gate. A new mutating `sdk.py` function must declare a lane.
 
@@ -1059,7 +1079,7 @@ def test_every_mutating_sdk_entry_point_is_declared_or_inventoried():
                 "not containment; move the write inside the lane or declare one "
                 "that covers it")
             continue
-        if kind in ("declared", "apply-first-declared"):
+        if kind in _DECLARED_KINDS:
             if reason is not None:
                 offenders.append(
                     f"{name}:{fact['lineno']} is DECLARED ({fact['scopes']}) but "
@@ -1172,7 +1192,8 @@ def test_no_two_census_entries_share_a_bare_function_name():
 #: Same rot, same reasoning:
 #: the separator is noise, the `sdk.py` + digits pair is the citation.
 _SDK_LINE_ANCHOR = re.compile(
-    r"sdk\.py[\s,:`@#]*(?:\(?\s*(?:at\s+)?line\s*[:\s#]*)?[Ll]?\d+")
+    r"sdk\.py[\s,:`@#()]*(?:(?:at\s+)?line[\s:,#]*)?(?:at\s+)?[Ll]?#?\d+",
+    re.IGNORECASE)
 
 #: ⛔ NO LOCAL WRITE-CLAUSE REGEX HERE. What counts as a write is
 #: `_statement_writes` + `_WRITE_CLAUSE_RE` from `tortoise.projection` — the
@@ -1360,22 +1381,51 @@ def _mutated_parameters(func) -> set[str]:
     false FAILs. The set this feeds is REPORTED, never exempted.
     """
     params = _params_of(func)
+    # A callee may hand the parameter to a LOCAL first (`acc = out;
+    # acc.append(...)`) — the alias arm (review round 5, measured GREEN). The
+    # alias map is closed the same way `_names_feeding` closes its name set, so
+    # `a = b = out` and a two-hop local are both covered.
+    alias: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign):
+                continue
+            source = node.value
+            if not isinstance(source, ast.Name):
+                continue
+            owner = source.id if source.id in params else alias.get(source.id)
+            if owner is None:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) \
+                        and target.id not in params \
+                        and alias.get(target.id) != owner:
+                    alias[target.id] = owner
+                    changed = True
+
+    def owning(name: str) -> str | None:
+        return name if name in params else alias.get(name)
+
     mutated: set[str] = set()
     for node in ast.walk(func):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                 and isinstance(node.func.value, ast.Name) \
-                and node.func.value.id in params \
                 and node.func.attr in _ACCUMULATOR_METHODS:
-            mutated.add(node.func.value.id)
+            owner = owning(node.func.value.id)
+            if owner:
+                mutated.add(owner)
         elif isinstance(node, ast.AugAssign) \
-                and isinstance(node.target, ast.Name) \
-                and node.target.id in params:
-            mutated.add(node.target.id)
+                and isinstance(node.target, ast.Name):
+            owner = owning(node.target.id)
+            if owner:
+                mutated.add(owner)
         elif isinstance(node, ast.Assign):
-            mutated |= {target.value.id for target in node.targets
-                        if isinstance(target, ast.Subscript)
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id in params}
+            mutated |= {owner for owner in (
+                owning(target.value.id) for target in node.targets
+                if isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)) if owner}
     return mutated
 
 
@@ -1412,6 +1462,26 @@ def _names_feeding(expression, func) -> set[str]:
     return names
 
 
+def _callee_name(call: ast.Call) -> str | None:
+    """The NAME to resolve for `call` — a bare function, or `self.<method>`.
+
+    Attribute callees were SKIPPED (review P2, measured): `self._fill(parts)`
+    resolved nowhere as far as this arm was concerned, so the dominant helper
+    shape in `sdk.py` — every `self._stamp_*` / `self._materialize_*` — was
+    invisible even though `_fragments_of` follows attribute callees. Only
+    `self`/`cls` receivers are named: `<handle>.append(…)` is a COLLECTION
+    mutation of the row's own local, not a callee whose parameter is mutated, and
+    resolving `append` as a module function would be a category error.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+            and func.value.id in ("self", "cls"):
+        return func.attr
+    return None
+
+
 def _accumulator_offenders(func, statement_expr, module, path) -> list[str]:
     """Calls whose callee hands text back through a MUTATED ARGUMENT.
 
@@ -1432,24 +1502,35 @@ def _accumulator_offenders(func, statement_expr, module, path) -> list[str]:
     feeding = _names_feeding(statement_expr, func)
     offenders: list[str] = []
     for node in ast.walk(func):
-        if not isinstance(node, ast.Call) \
-                or not isinstance(node.func, ast.Name):
+        if not isinstance(node, ast.Call):
+            continue
+        callee_name = _callee_name(node)
+        if callee_name is None:
             continue
         callee, _callee_module, _callee_path = _resolve_callee(
-            node.func.id, module, path)
+            callee_name, module, path)
         if callee is None:
             continue
         mutated = _mutated_parameters(callee)
         if not mutated:
             continue
-        params = list(callee.args.posonlyargs) + list(callee.args.args)
-        supplied = {arg.arg: value
-                    for arg, value in zip(params, node.args, strict=False)}
+        # `self`/`cls` are not arguments the CALL SITE passes (review P2): without
+        # dropping them every positional bound one slot to the left, so a METHOD
+        # callee's mutated parameter was never matched.
+        params = [arg.arg for arg in
+                  list(callee.args.posonlyargs) + list(callee.args.args)
+                  if arg.arg not in ("self", "cls")]
+        supplied = {param: value
+                    for param, value in zip(params, node.args, strict=False)}
+        # A KEYWORD argument binds by name whatever the position (review P2):
+        # `_fill(out=parts)` was invisible while `_fill(parts)` reported.
+        supplied.update({kw.arg: kw.value for kw in node.keywords
+                         if kw.arg is not None})
         for param in sorted(mutated):
             value = supplied.get(param)
             if isinstance(value, ast.Name) and value.id in feeding:
                 offenders.append(
-                    f"{node.func.id}(): writes into `{value.id}` (its "
+                    f"{callee_name}(): writes into `{value.id}` (its "
                     f"`{param}` parameter), and `{value.id}` feeds this row's "
                     "statement — what the callee contributes could not be read "
                     "out, so the row cannot be called a read on this walk")
@@ -1969,6 +2050,14 @@ def test_the_line_anchor_matches_every_spelling():
         "sdk.py #L23508",
         "[sdk.py](../tortoise/sdk.py#L23508)",
         "sdk.py#23508",
+        # Fifth spelling family (review round 5, measured): `\(?` only fired when
+        # `line` followed, so the parenthesised bare line and the bare `at <n>`
+        # form passed — the two a human writes next to a path.
+        "sdk.py (23508)",
+        "sdk.py (L23508)",
+        "sdk.py at 23508",
+        "tortoise/sdk.py (23508)",
+        "SDK.PY:23508",
     ]
     for variant in must_match:
         assert _SDK_LINE_ANCHOR.search(variant), (
@@ -3074,6 +3163,82 @@ def test_a_write_fed_through_an_accumulator_parameter_is_reported():
         "must name the mutating shapes, not any call that takes a parameter")
 
 
+#: Every mutating shape `_mutated_parameters` / `_names_feeding` CLAIM to see,
+#: as a (callee body, call site, how the fragment reaches the statement) triple.
+#: Enumeration matters: the first version of the accumulator test exercised
+#: `.append` only, and four of the five declared arms could then be deleted with
+#: the whole file green (review round 5, measured — `_ACCUMULATOR_METHODS`
+#: narrowed to `{"append"}`, the `+=` arm dead, the subscript arm dead, and
+#: `_names_feeding`'s aug-assign arm dead all passed).
+_ACCUMULATOR_SHAPES: dict[str, tuple[str, str, str]] = {
+    "append": (
+        'def _fill(out):\n    out.append(" SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "extend": (
+        'def _fill(out):\n    out.extend([" SET n.poked = 1"])\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "insert": (
+        'def _fill(out):\n    out.insert(0, " SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "update": (
+        'def _fill(out):\n    out.update({"k": " SET n.poked = 1"})\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts.values())\n'),
+    "augassign": (
+        'def _fill(out):\n    out += [" SET n.poked = 1"]\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "subscript": (
+        'def _fill(out):\n    out[0] = " SET n.poked = 1"\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    # …and the two CALL-SIDE shapes, which are about reaching the callee at all
+    # rather than about how it mutates (review round 5):
+    "keyword_argument": (
+        'def _fill(out):\n    out.append(" SET n.poked = 1")\n',
+        "        _fill(out=parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "method_callee": (
+        'class Door:\n    def _fill(self, out):\n'
+        '        out.append(" SET n.poked = 1")\n',
+        "        self._fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    # ⛔ …and the callee-side ALIAS: the parameter is handed to a local before it
+    # is mutated (review round 5, measured GREEN before this arm existed).
+    "callee_alias": (
+        'def _fill(out):\n    acc = out\n    acc.append(" SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    # …and the closure: `parts` reaches the statement only through an AUGMENTED
+    # local, which is what `_names_feeding`'s aug-assign arm adds.
+    "augassign_binding": (
+        'def _fill(out):\n    out.append(" SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id "\n'
+        '        query += "".join(parts)\n'),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_ACCUMULATOR_SHAPES))
+def test_every_declared_accumulator_shape_is_reported(shape):
+    """Each mutating / call-side shape the arm CLAIMS to see must report.
+
+    Table-driven on purpose: a hand-written case per arm is how `.append` became
+    the only covered shape while the docstring named six (review round 5). Each
+    row fails if its arm is deleted or narrowed, so the enumeration is the
+    non-vacuity proof for the whole declared surface rather than one sample.
+    """
+    body, call, statement = _ACCUMULATOR_SHAPES[shape]
+    source = f"{body}\nclass Row:\n    def reading(self, proj):\n        parts = []\n{call}{statement}        return proj.g.query(query).result_set\n"
+    offenders = _offenders_for(source, with_module=True)
+    assert any("writes into `parts`" in offender for offender in offenders), (
+        f"the `{shape}` shape is declared by the arm but was neither read nor "
+        f"reported (offenders={offenders})")
+
+
 def test_the_census_writer_set_states_its_own_polarity():
     """The writers arm is "write OR NOT-PROVEN-READ", and its message says so.
 
@@ -3395,10 +3560,23 @@ def test_the_derived_recompute_lane_has_its_own_kind():
     and is why the kind must say so explicitly instead of borrowing the
     journal-first label.
     """
-    assert _kind({"scopes": [(1, "_derived_recompute_write_scope")],
-                  "writes": [(2, "query", "SET n.x = 1")],
-                  "appends": [], "end_lineno": 3,
-                  "scope_spans": [(1, 3)]}) == "derived-recompute"
+    fact = {"scopes": [(1, "_derived_recompute_write_scope")],
+            "writes": [(2, "query", "SET n.x = 1")],
+            "appends": [], "end_lineno": 3,
+            "scope_spans": [(1, 3)]}
+    kind = _kind(fact)
+    assert kind == "derived-recompute"
+    # …and the gate that classifies declared-ness must ACCEPT it. Every other
+    # kind `_kind` emits here is either a lane this gate already takes
+    # (`declared`, `apply-first-declared`) or an un-accounted state; a kind that
+    # is a lane but falls through to `reason is None` gets "NO declared lane",
+    # whose remedy is an inventory row — the opposite of what a declared door
+    # needs (#9315 review MINOR).
+    assert kind in _DECLARED_KINDS, (
+        f"`_kind` emits {kind!r} for a door that HOLDS a lane, but the "
+        f"declared-ness gate only accepts {_DECLARED_KINDS} — so this door is "
+        "reported as having NO declared lane and the remedy a reader takes from "
+        "that message is an inventory row, which would DOWNGRADE it")
 
 
 #: Doors whose apply-first ORDER the census cannot prove: an append attributed
@@ -4790,11 +4968,14 @@ def test_the_measure_mode_census_is_what_a_flip_would_refuse(armed_sdk_factory):
 
 #: The `durations:` row this file OWNS in the CI manifest, and the phrase in it
 #: that states how many test functions the file holds. Both are committed claims
-#: about THIS artifact, and they rotted the way every hand-copied figure does:
-#: the row quoted `59` while the tree collected `60`, because the figure was
-#: carried over from a commit message written one test earlier (#9315 review
-#: P2). `to **N**` is the pinned spelling — the count is DERIVED in the pin, so
-#: a test added to this file reds until the row re-states it.
+#: about THIS artifact, and they rot the way every hand-copied figure does: the
+#: row quoted `59` while the tree defined `60`, because the figure was carried
+#: over from a commit message written one test earlier (#9315 review P2).
+#: `to **N**` is the pinned spelling and `N` is the MODULE-LEVEL `test_` count —
+#: the figure a reader derives from the file without running it. `parametrize`
+#: turns one function into several COLLECTED cases (one table here does), so the
+#: collected count is recorded in the row as a MEASUREMENT from the run, not as a
+#: derived claim; only the derived figure is pinned.
 _CI_MANIFEST = ROOT / "config" / "ci-surfaces.yml"
 _DURATION_ROW_RE = re.compile(
     r"^\s*test_9124_declared_live_doors\.py:\s*(?P<weight>[\d.]+)\s+#(?P<tail>.*)$",
@@ -4805,39 +4986,28 @@ _DURATION_ROW_COUNT_RE = re.compile(r"to\s+\*\*(?P<count>\d+)\*\*")
 def test_the_duration_row_states_this_files_real_test_count():
     """NON-VACUITY for the `durations:` row's committed test count (review P2).
 
-    The row this PR rewrites (`test_9124_declared_live_doors.py: 120.0`) is the
+    The row this PR rewrites (`test_9124_declared_live_doors.py: 130.0`) is the
     recorded justification for the file's weight, and it states how many test
     functions the file holds. That figure was quoted from an older commit
-    message and was one out — `59` against a tree that collects `60` — the
-    exact claim-vs-artifact class this file's own
+    message and was one out — `59` against a tree that defined `60` — the exact
+    claim-vs-artifact class this file's own
     `test_the_offenders_helper_docstring_states_the_real_polarity` exists for,
     except it was recorded in the CI manifest, where no pin looked.
 
-    So the number is DERIVED from this module's AST, not trusted: the `to **N**`
-    figure must equal the module-level `test_` count. Red on the pre-fix text
+    So the number is DERIVED from this module's AST instead of trusted: the
+    `to **N**` figure must equal the module-level `test_` count, which is what a
+    reader (and the review's own measurement) gets from the file. A test added
+    here reds this until the row is re-stated with it. Red on the pre-fix text
     (`to 59` while this head defines more).
     """
     tree = ast.parse(Path(__file__).read_text())
     counted = [(node.name, node) for node in tree.body
                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                and node.name.startswith("test_")]
-    # The equality below is only "the module-level count IS the collected count"
-    # while nothing decorates, parametrises or shadows a test, so those three
-    # structural conditions are checked rather than assumed.
-    decorated = [name for name, node in counted if node.decorator_list]
-    assert not decorated, (
-        f"{decorated} are decorated, so a module-level count is no longer the "
-        "collected count — this pin's equality needs re-deriving")
     names = [name for name, _ in counted]
     assert len(names) == len(set(names)), (
-        "a duplicate test name shadows an earlier definition, so the count is "
-        "not what pytest collects")
-    assert not [n for n in tree.body
-                if isinstance(n, ast.Assign)
-                and any(getattr(t, "id", None) == "pytestmark"
-                        for t in n.targets)], (
-        "a module-level `pytestmark` changes what is collected, so this pin's "
-        "count is no longer the runnable count")
+        "a duplicate test name shadows an earlier definition, so a name count "
+        f"is not the count of what runs: {sorted(names)}")
 
     row = _DURATION_ROW_RE.search(_CI_MANIFEST.read_text())
     assert row, (
