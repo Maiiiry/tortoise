@@ -3002,6 +3002,31 @@ def _is_budget_exhaustion(failure: str | BaseException) -> bool:
     )
 
 
+def _rest_refusal_note(rest_why: str, graphql: BaseException) -> str:
+    """Compose ``<REST reason> (GraphQL read: …)`` from the UNTRUNCATED cause.
+
+    ⛔ THIS STRING BECOMES THE SURFACE NOTE, AND THE NOTE IS WHAT THE REMEDY IS
+    DERIVED FROM (#9423 review, P3). A failed rescue is reported by the
+    per-surface handler as ``gh-unavailable: {exc}``, and `_incomplete_remedy`
+    classifies that note with `_is_budget_exhaustion`. Composing it from
+    `str(graphql)` — the 200-character DISPLAY message `_gh_json` builds —
+    reproduced #9402 on the ONE branch that did not carry the cause forward: an
+    exhaustion whose `gh` stderr chattered past 200 characters PLUS a REST
+    request that refused for its own reason produced a note with no signature,
+    the surface was therefore not classified as exhausted, and the run ended
+    with `fix gh auth/network (or rebuild the fleet board) and re-run` for a
+    budget the rescue had just matched on.
+
+    So the raw text comes from `SurfaceError.detail` (see its docstring) at the
+    SAME wider cut the successful-rescue note uses — a note is prose the remedy
+    is derived from, not a terminal row (see `_REFUSED_READ_NOTE_LIMIT`).
+    """
+    raw = getattr(graphql, "detail", "") or str(graphql)
+    return _one_line(
+        f"{rest_why} (GraphQL read: {raw})", limit=_REFUSED_READ_NOTE_LIMIT
+    )
+
+
 #: GitHub's REST maximum page size, and therefore the widest page a single
 #: `/pulls` request can return (see `_open_prs_rest`).
 _REST_PULLS_PAGE = 100
@@ -5101,8 +5126,13 @@ def run_preflight(
                 # Classify THAT, so an issue REST reports absent is named
                 # `issue-absent` rather than being blamed on the GraphQL budget,
                 # while the budget exhaustion stays visible in the reason.
+                # ⛔ BUILT FROM THE UNTRUNCATED CAUSE (#9423 review, P3): this
+                # string becomes the surface NOTE, and `_incomplete_remedy`
+                # classifies the note — so the 200-char display message meant a
+                # long stderr could hide the signature here too and the remedy
+                # then named `gh auth/network` for a spent budget.
                 detail = exc if rest_why is None else SurfaceError(
-                    f"{rest_why} (GraphQL read: {exc})"
+                    _rest_refusal_note(rest_why, exc)
                 )
                 kind = _classify_issue_error(detail)
                 if kind == "issue-absent":
@@ -5345,7 +5375,16 @@ def run_preflight(
                     # The REST attempt refused for ITS OWN reason — carry both, so
                     # the budget exhaustion stays visible without being blamed for
                     # a transport failure it did not cause.
-                    raise SurfaceError(f"{rest_why} (GraphQL read: {exc})") from exc
+                    # ⛔ AND CARRY IT UNTRUNCATED (#9423 review, P3). This raise
+                    # is turned into the surface note by the per-surface handler
+                    # (`gh-unavailable: {exc}`), and `_incomplete_remedy`
+                    # classifies THAT note: composing it from `str(exc)` — the
+                    # 200-char display message — dropped the budget signature
+                    # whenever `gh` chattered past the cut, so the run printed
+                    # `fix gh auth/network` for a spent budget on the one branch
+                    # that did not carry the cause forward.
+                    refusal = _rest_refusal_note(rest_why, exc)
+                    raise SurfaceError(refusal, detail=refusal) from exc
                 via_rest = True
                 # ⛔ THE NOTE CARRIES THE UNTRUNCATED CAUSE (#9402 review, P1).
                 # `_incomplete_remedy` classifies `s.note` with the SAME

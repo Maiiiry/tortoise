@@ -363,6 +363,20 @@ case "$1 $2" in
       echo "GraphQL: Could not resolve to an issue or pull request with the number of $3. (repository.issue)" >&2
       exit 1
     fi
+    # #9423 review (P3): the SAME exhaustion behind a LONGER stderr, on the
+    # ISSUE read. The open-PR rescue has its own long-stderr seam
+    # (`GH_STUB_PR_LIST_LONG_STDERR`) because the failure is reported on TWO
+    # branches — the rescue succeeding and the rescue failing — and the failing
+    # branch builds the surface note from the (200-char-cut) display message. A
+    # seam only on the PR read would leave the ISSUE rescue's failing branch
+    # unpinned, so this mirror exists for it. Deliberately placed AFTER the
+    # `--json number` probe branch: the cross-repo ambiguity probe is a
+    # different question and must not start failing here.
+    if [ "${GH_STUB_ISSUE_VIEW_LONG_STDERR:-0}" = "1" ]; then
+      printf 'gh-stub: request trace: %s\n' "$(printf 'x%.0s' {1..240})" >&2
+      echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
+      exit 1
+    fi
     f="$d/issue.json"; printf '%s\n' "$@" > "$d/issue-argv.txt" ;;
   *) echo "gh-stub: unexpected argv: $*" >&2; exit 64 ;;
 esac
@@ -2678,6 +2692,72 @@ class CollisionPreflightTest(unittest.TestCase):
         # The budget exhaustion stays visible alongside the REST failure so the
         # reader is not sent after the wrong cause.
         self.assertIn("GraphQL read:", out)
+
+    def test_a_long_stderr_does_not_hide_the_exhaustion_when_the_rescue_fails(self):
+        # ⛔ THE FAILING-RESCUE BRANCH CARRIES THE CAUSE TOO (#9423 review, P3).
+        # The successful rescue's note got the untruncated cause first; this
+        # raise did not, and its message becomes the surface note that
+        # `_incomplete_remedy` classifies. So with a stderr that chatters past
+        # the 200-character display cut AND a REST request that refuses for its
+        # own reason, the note carried no budget signature, no surface was
+        # classified as exhausted, and the report ended with
+        # `fix gh auth/network (or rebuild the fleet board) and re-run` — the
+        # exact remedy #9402 files, on the one branch of the fix that dropped it.
+        #
+        # ⛔ NON-VACUOUS, MEASURED: pre-fix the note embeds only
+        # `… failed (exit 1): gh-stub: request trace: xxx…` (cut at 200, the
+        # signature at offset 262), so BOTH the `BUDGET EXHAUSTION` assertion and
+        # the `assertNotIn("fix gh auth/network")` red. Neither seam is new:
+        # the suite just never combined them.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_PR_LIST_LONG_STDERR": "1",
+            "GH_STUB_OPEN_PR_REST_FAIL": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        # Both failures are still named — this widens the text, it does not
+        # replace the REST reason with the budget one.
+        self.assertIn("could not connect to api.github.com", out)
+        self.assertIn("GraphQL read:", out)
+        # …and the remedy names the cause the rescue already matched on.
+        verdict = self._verdict_line(out)
+        self.assertIn("BUDGET EXHAUSTION", verdict)
+        self.assertNotIn("fix gh auth/network", out)
+
+    def test_a_long_stderr_does_not_hide_the_exhaustion_when_the_issue_rescue_fails(self):
+        # The ISSUE-metadata rescue has the same shape, and the same one-line
+        # change covers it (#9423 review, P3): its failing branch composed
+        # `SurfaceError(f"{rest_why} (GraphQL read: {exc})")` from the display
+        # message, and the surface note is what the remedy is derived from. A
+        # fix at the open-PR site alone would leave this branch reproducing the
+        # #9402 defect, so the seam (`GH_STUB_ISSUE_VIEW_LONG_STDERR`) is the
+        # ISSUE read's own — not a re-use of the PR one.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_ISSUE_VIEW_LONG_STDERR": "1",
+            "GH_STUB_ISSUE_REST_FAIL": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        # The issue surface is the one that refused, and it names BOTH reads —
+        # with the budget signature past the 200-char cut still visible, which
+        # is exactly what the display message could not carry pre-fix.
+        self.assertIn("[issue assignee/holder]", out)
+        self.assertIn("Resource not accessible", out)
+        self.assertIn("GraphQL read:", out)
+        self.assertIn("API rate limit already exceeded", out)
+        verdict = self._verdict_line(out)
+        self.assertIn("BUDGET EXHAUSTION", verdict)
+        self.assertIn("issue assignee/holder:", verdict)
+        # ⛔ THE GENERIC ADVICE IS STILL PRESENT HERE, AND THAT IS NOT THIS BUG.
+        # `issue landed` is a SECOND incomplete surface whose note records the
+        # derived cause (`issue-metadata-unavailable: …`) and carries no failure
+        # text at all, so the mixed arm rightly keeps the generic remedy for the
+        # remainder instead of claiming the budget explains everything. What
+        # this test pins is that the surface which DID measure the exhaustion is
+        # classified and named — pre-fix NO surface was, so the report printed
+        # the generic advice alone and never mentioned the budget.
+        self.assertIn("[issue landed]", out)
 
     def test_a_rest_open_pr_element_with_a_blank_state_is_refused(self):
         # A blank `state` is the fail-OPEN value: `_pr_terminal_state` strips it,
