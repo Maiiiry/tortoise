@@ -72,8 +72,11 @@ measured against `_writers_in_module` rather than assumed:
 
 **So the honest statement is: the census is a regression tripwire over the
 shapes it enumerates, inside `tortoise/`.** A property it does not see is not
-evidence of absence, and this paragraph is the thing that says so. — `tests/test_9397_about_edge_properties.py` pins the two
-synthetic shapes so this bound cannot silently drift back to an absolute.
+evidence of absence, and this paragraph is the thing that says so.
+`tests/test_9397_about_edge_properties.py` pins one synthetic probe per gap
+below (with a recorded control), and the DOCUMENT wording is pinned by its
+own leg — neither pin claims to block every future absolute, because no test
+can.
 
 `sdk.supersede_point` and `projection._rebuild_all_replay` — which earlier
 revisions of this file recorded as re-materializers — are NOT. Its `SET r += $attrs` is on the 2a-DIRECT leg,
@@ -1378,7 +1381,7 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
     shape 1 is `session_source_migration._move_in` (predicate handed in from
     `MOVABLE_SOURCE_RELS`, which contains `aboutSource`/`aboutDocument`).
     """
-    # Shape 1+n: an UNTYPED binding whose predicate is tested in a WHERE clause.
+    # Gap 2: an UNTYPED binding whose predicate is tested in a WHERE clause.
     # `_PATTERN` needs a typed relationship pattern, so the function is
     # continued before any rule runs. This is already live style in the tree
     # (`WHERE type(r) = 'NAND'` in sdk.py / analyze.py).
@@ -1394,7 +1397,7 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "disclosure must be updated in the same change (found "
         f"{found!r})"
     )
-    # Shape 2: the predicate IS spelled in a typed pattern, but the write is an
+    # Gap 3: the predicate IS spelled in a typed pattern, but the write is an
     # fn-call RHS that `_SET_MAP` (`$|{`) cannot read. The parameter is
     # therefore NOT what makes `_move_in` invisible.
     fn_call_rhs = (
@@ -1421,7 +1424,7 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "the control probe (a readable property-MAP write on a typed about "
         f"pattern) is no longer recorded — the census changed (found {found!r})"
     )
-    # Shape 3: the predicate is a PARAMETER (the `_move_in` shape) — the
+    # Gap 1: the predicate is a PARAMETER (the `_move_in` shape) — the
     # vocabulary is in the caller, so nothing in the body names it.
     parameterised = (
         "def move(g, rel, s, t):\n"
@@ -1433,6 +1436,47 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "the census now reads a PARAMETERISED predicate — a real widening; "
         "update the documented gap list in the same change (found "
         f"{found!r})"
+    )
+
+    # Gaps 4 and 5, whose probes did not exist when the prose first claimed
+    # they were "measured with a control recorded" — an unbacked provenance
+    # claim, so the probes are here now.
+    # Gap 4: spellings `_PATTERN` does not recognise. Each is a typed about
+    # pattern with a readable write, i.e. exactly what the census claims to
+    # cover, and each is invisible.
+    spellings = {
+        "space before the type colon": (
+            "def link(g, s, t, c):\n"
+            "    g.query('MATCH (s:Point)-[r :aboutObject]->(t) "
+            "SET r.confidence = $c', params={'c': c})\n"
+        ),
+        "space after the opening bracket": (
+            "def link(g, s, t, c):\n"
+            "    g.query('MATCH (s:Point)-[ r:aboutObject]->(t) "
+            "SET r.confidence = $c', params={'c': c})\n"
+        ),
+        "a `]` inside the inline map": (
+            "def link(g, s, t, c):\n"
+            "    g.query('MERGE (s)-[r:aboutObject {tags:[\\'a\\'],"
+            "confidence:$c}]->(t)', params={'c': c})\n"
+        ),
+    }
+    for why, probe in spellings.items():
+        found = _writers_in_module("tortoise/probe.py", probe)
+        assert found == {}, (
+            f"the census now reads this spelling ({why}) — a real widening; "
+            f"the gap list must be updated in the same change (found {found!r})"
+        )
+    # Gap 5: an about-NAMED predicate outside `_ABOUT_REL`'s enumerated seven.
+    off_list = (
+        "def link(g, s, t, c):\n"
+        "    g.query('MATCH (s)-[r:aboutClaim]->(t) SET r.confidence = $c', "
+        "params={'c': c})\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", off_list)
+    assert found == {}, (
+        "the census now reads an `aboutClaim` edge — `_ABOUT_REL` widened, so "
+        f"its comment and the gap list must say so (found {found!r})"
     )
 
 
