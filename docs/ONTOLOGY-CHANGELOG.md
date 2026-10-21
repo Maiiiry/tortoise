@@ -53,9 +53,24 @@ aboutObjects: ONTOLOGY.md, canonical ontology, model versions
 > detail and belongs here; the ruling it implements is model, and the companion doc cites `R1` for this very row —
 > a row that dropped it would leave that clause with no traceable basis.)
 >
+> **Two things KEPT because they are model authority, not issue state.** (1) The decision citation on the
+> conditions clause, `(#3998 owner ruling, Option A, 2026-10-14)` — it records *why* the two-value vocabulary
+> exists, and §4.6 cites decisions the same way elsewhere (`#3644`, `#5024`, `#3590`). The class the owner's ruling
+> names is an issue cited as **build status** (*"no reader supplies one today (#8740)"*), not an issue cited as the
+> **authority for a rule**. (2) The fail-closed sentence stays **scoped** — *"the availability resolution reads it
+> fail-closed as `unrecognised`"*. An unqualified form would describe a write-off of a shipped read surface: the
+> `:Source`-property read bag still serves a stored condition verbatim, which is the open gap at **#8739** — that
+> fact is build state and lives here, not in the model.
+>
 > **Why.** `ONTOLOGY.md` states the model we want; *whether something is built* is this file's job, and its own
 > header says so. The row had drifted into a status report — and a lane reading it as specification would take
 > "no reader supplies one today" for a rule. Owner ruling, 2026-10-21.
+>
+> ⚠️ **Scoped to this row.** The ruling has NOT been applied section-wide: three other §4.6 rows still carry build
+> status (`validFrom`'s "tracked on #3644 … no such path exists yet (#3590 S2)" and two version-record notes, "no
+> `:Source` reader exists yet" / "**What remains open**"). Widening the approved span was not this change's to make
+> — `ONTOLOGY.md` line 39 requires the owner's approval of the *exact* changes — so they are tracked at **#9497**,
+> with the guard question (a section-wide negative arm needs an allow-list for authority citations) recorded there.
 >
 > **Nothing is lost.** The two open gaps the removed text described remain tracked at **#8740** (no reader
 > supplies an observation yet) and **#8739** (the `:Source` read bag still serves a stored condition verbatim).

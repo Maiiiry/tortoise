@@ -122,10 +122,12 @@ def test_the_canonical_ontology_states_the_availability_axis() -> None:
         "never persisted, and is absent from a read that supplies none (F6)"
     )
     # F7: a version transition carries the state on the `SourceVersioned` record.
-    # The fold path (`_fold_source_versioned` → `_upsert_source`) is build record.
-    assert "SourceVersioned" in section and "version transition" in section, (
-        "§4.6's coverage clause must name the `SourceVersioned` record — a state "
-        "change riding a version transition is journalled there (F7)"
+    # Pin the ROW, not the section: `SourceVersioned` and "version transition" both
+    # also occur in §4.6's `updatedAt` row, so a section-wide check still passed
+    # with this row's whole coverage clause deleted (mutation-measured 2026-10-21).
+    assert "on a **version transition**, the **`SourceVersioned`** record" in row, (
+        "§4.6's coverage clause must say the state rides a version transition on "
+        "the `SourceVersioned` record (F7)"
     )
     # F10: the fail-closed claim is scoped — a condition found in stored data is
     # not part of the axis and reads `unrecognised`. (What the `:Source` read bag
