@@ -41,9 +41,13 @@ THE FIVE PROPERTIES (each one is a copy of something `claims.sh` already proved)
    the content compared. A store that answers with something else is a lost race.
 4. **The lease is DATA, not liveness** (#1709 rec 3) — a remote pid cannot be probed, so
    `lease_until` in the record is what frees a claim, and an expired claim is reclaimable.
-5. **Fencing** (#1709 rec 6) — a reclaim bumps `epoch`. A holder that lost ownership
-   cannot overwrite the new holder's record: the reclaim re-reads and compares the epoch
-   it observed, and a mismatch is reported as a lost race, not retried.
+5. **Fencing** (#1709 rec 6) — a reclaim bumps `epoch`, and the bump is only trusted
+   through a store that can express the precondition (`replace_if_epoch`, a real CAS). A
+   blind replace cannot: A.replace → A.read → B.replace → B.read lets BOTH boxes observe the
+   same expired epoch and both report `acquired`. So a store without the fence (the shipped
+   `SDKClaimStore`: `update_point` has no conditional form) REFUSES to reclaim an expired
+   claim (rc 2) and the operator frees it explicitly (`release --force --reason`). Refusing a
+   capability the store does not have is the same discipline as refusing an unset store.
 
 ⛔ FAIL-CLOSED, AND THAT IS A DELIBERATE DEPARTURE — SEE `OVERRIDES:` BELOW
 -------------------------------------------------------------------------
@@ -72,6 +76,9 @@ CALLER CONTRACT (drop-in vocabulary with `claims.sh`, so a caller needs no new b
     rc 0  acquired (or reclaimed an EXPIRED claim, or a release/status that succeeded)
     rc 1  held by a LIVE claim (or a release refused: not the caller's / epoch moved)
     rc 2  the store could not answer — REFUSE the dispatch, do not proceed blind
+    rc 3  the INVOCATION was malformed (no number where one is required, `--force` without
+          `--reason`). Deliberately distinct from rc 2: a controller retries an unanswerable
+          store, and a retry of a malformed command can never succeed.
 
 `--json` emits one object with `status`, `owner`, `lease_until`, `epoch`, `reason` so a
 controller can log the measured reason instead of guessing.
@@ -89,15 +96,22 @@ USAGE
 -----
     tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 \
         --session cell-t1 --branch feat/x --purpose "claim registry pilot"
-    tools/work_claim.py status --repo daniel-ospina/tortoise [--json]
+    tools/work_claim.py status --repo daniel-ospina/tortoise [--json]     # repo-wide listing
     tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json
     tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1
-    tools/work_claim.py check            # is the store reachable? rc 2 = no
+    tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 \
+        --session cell-t9 --force --reason "holder crashed, lease expired 2h ago"
+    tools/work_claim.py check            # is the store reachable? prints the target; rc 2 = no
 
 STORE
 -----
-`TORTOISE_DB_URI` (self-hosted docker/bolt) or a hosted deployment's URI + key, exactly
-as the SDK reads them. There is deliberately no default: see the fail-closed note.
+`TORTOISE_DB_URI` — the shared graph (docker://… or bolt://…) — and NOTHING ELSE. The SDK
+reads only that variable; `TORTOISE_API_URL` names a hosted HTTP surface this tool has no
+client for, so accepting it as proof of a store disarmed the guard and let the SDK fall back
+to this box's EMBEDDED file. Measured on this branch: `check` printed `ok: claim store
+reachable` and exited 0 while the claim lived in a box-local file that every peer reads as
+free — the duplicate-dispatch failure, reported as a success. There is deliberately no
+default: see the fail-closed note.
 """
 
 from __future__ import annotations
@@ -143,6 +157,10 @@ MAX_KEY_LEN = 64
 EXIT_OK = 0
 EXIT_HELD = 1
 EXIT_UNANSWERABLE = 2
+# A distinct code for a malformed invocation (review of #9487 P2). `status --repo` with no
+# number used to reach `normalise_key(0)` → rc 2, which a controller reads as "the store is
+# unanswerable" and retries forever; the invocation was wrong and nothing was unreachable.
+EXIT_USAGE = 3
 
 
 class StoreUnanswerable(RuntimeError):
@@ -177,9 +195,13 @@ class ClaimRecord:
         # Field order is part of the contract: a reordering would make every historical
         # claim unreadable by identity. Values are quoted where they may contain spaces.
         def q(v: Any) -> str:
+            # ALWAYS quoted (review of #9487): the conditional form left a value containing a
+            # quote but no space unbalanced, and `_parse` then swallowed every field after it
+            # (purpose absorbed claimed_at/host/ncpu/lpc/lanes). Round-trip stability is the
+            # contract, so the escape is unconditional.
             s = str(v)
             escaped = s.replace("\\", "\\\\").replace('"', '\\"')
-            return f'"{escaped}"' if (" " in s or not s) else s
+            return f'"{escaped}"'
 
         return " ".join(
             [
@@ -224,9 +246,18 @@ class ClaimRecord:
 
 
 class ClaimStore(Protocol):
-    """The three calls the CAS needs. The SDK-backed store is the only shipped one; tests
-    inject an in-memory double so the CAS and the refusal paths are exercised without a
-    graph (the live path is covered by the URI-guarded test)."""
+    """The three calls the CAS needs, plus two OPTIONAL capabilities.
+
+    `replace` is a blind write and is therefore used ONLY for a holder's own record (release);
+    it is never the reclaim path. Two capabilities are optional because a store may not be able
+    to express them, and their ABSENCE is an answer rather than a default:
+
+    - `replace_if_epoch(cid, record, expected_epoch) -> str | None` — the fenced reclaim. `None`
+      means the precondition failed (a peer moved the epoch) and the caller lost the race. A
+      store without it cannot reclaim: two boxes would both report `acquired`.
+    - `query_repo(repo) -> list[dict]` — the repo-wide listing. A store without it must make
+      `status --repo` REFUSE (rc 2), never answer `0 claim records`.
+    """
 
     def read(self, claim_id: str) -> str | None: ...
 
@@ -266,13 +297,28 @@ def _require_store_configured(environ: dict[str, str] | None = None) -> str:
     target must name it.
     """
     env = os.environ if environ is None else environ
-    uri = (env.get("TORTOISE_DB_URI") or env.get("TORTOISE_API_URL") or "").strip()
+    uri = (env.get("TORTOISE_DB_URI") or "").strip()
+    api = (env.get("TORTOISE_API_URL") or "").strip()
     if not uri:
+        detail = ""
+        if api:
+            # Measured (review of #9487): accepting the API URL as proof of a store armed the
+            # guard and then let `TortoiseSDK()` ignore it — the SDK reads ONLY
+            # TORTOISE_DB_URI and falls back to this box's embedded file. The claim landed
+            # locally, the read-back confirmed the local write, and the tool reported
+            # `acquired` while every peer read `free` — the duplicate-dispatch failure this
+            # tool exists to prevent, reported as a win. Naming the API URL again must not
+            # re-open that, so the message says why instead of just what.
+            detail = (
+                " TORTOISE_API_URL is set, but this tool has no hosted client: the SDK consumes "
+                "ONLY TORTOISE_DB_URI and would silently fall back to the BOX-LOCAL embedded "
+                "database, where a claim reads as acquired here and FREE on every peer. Point "
+                "TORTOISE_DB_URI at the shared graph instead."
+            )
         raise StoreUnanswerable(
-            "no claim store configured: set TORTOISE_DB_URI (self-hosted) or "
-            "TORTOISE_API_URL + TORTOISE_API_KEY (hosted). An unset store is refused "
-            "rather than answered from a default target — an empty read from the wrong "
-            "graph looks exactly like 'nobody holds this' (#7871)."
+            "no claim store configured: set TORTOISE_DB_URI (the shared graph). An unset "
+            "store is refused rather than answered from a default target — an empty read "
+            "from the wrong graph looks exactly like 'nobody holds this' (#7871)." + detail
         )
     return uri
 
@@ -295,6 +341,17 @@ class SDKClaimStore:
             from tortoise.domain_loader import register_kind
 
             register_kind(CLAIM_KIND)
+        # Belt and braces over `_require_store_configured` (review of #9487 P0), and it applies
+        # to an INJECTED client too: if a caller reaches this class directly with a target that
+        # resolved to the box-local file, the write would be confirmed by its own read-back and
+        # reported as an acquisition while every peer reads FREE — the duplicate-dispatch
+        # failure in its purest form. An embedded target is not a shared claim store.
+        if getattr(sdk, "_db_uri", None) is None:
+            raise StoreUnanswerable(
+                "the SDK resolved to this box's EMBEDDED database, not a shared graph — "
+                "a claim written there reads as acquired here and free on every peer. "
+                "Set TORTOISE_DB_URI to the shared store (docker://… or bolt://…)."
+            )
         self._sdk = sdk
 
     def read(self, cid: str) -> str | None:
@@ -338,6 +395,52 @@ class SDKClaimStore:
                 f"the claim could not be reclaimed ({type(exc).__name__}: {str(exc)[:200]})"
             ) from exc
         return (point or {}).get("content") or ""
+
+    # ⚠️ There is deliberately NO `replace_if_epoch` here (review of #9487 P1). The SDK's
+    # `update_point` is a blind write: it cannot express "set this ONLY if the stored epoch is
+    # still E", and the interleaving (A.replace → A.read → B.replace → B.read) lets TWO boxes
+    # both observe the old epoch, both write, and both report `acquired` — one holder in the
+    # graph, two lanes believing they own the unit. `acquire` therefore REFUSES to reclaim an
+    # expired claim through this store rather than pretending the bump fences (rc 2). An
+    # expired claim is freed explicitly (`release --force`) and then acquired fresh.
+
+    def target(self) -> str:
+        """Which store answered — printed by `check` so a human sees it rather than trusting"""
+        uri = getattr(self._sdk, "_db_uri", None)
+        return str(uri) if uri else "embedded (box-local — NOT a shared claim store)"
+
+    def query_repo(self, repo: str) -> list[dict]:
+        """Every claim record for one repo (review of #9487 P1).
+
+        `status --repo` used to answer `0 claim record(s)` for every store, because the caller
+        guarded a missing method with `hasattr` and turned "this store cannot list" into "there
+        is nothing to list". A fleet reader would conclude nobody holds anything. A store that
+        cannot list must refuse (rc 2), never fabricate an empty success.
+        """
+        try:
+            rows = self._sdk.query(kind=CLAIM_KIND, repo=repo)
+        except Exception as exc:
+            raise StoreUnanswerable(
+                f"the claim store could not be listed ({type(exc).__name__}: {str(exc)[:200]})"
+            ) from exc
+        out: list[dict] = []
+        for row in rows or []:
+            props = row.get("properties") if isinstance(row.get("properties"), dict) else row
+            if not isinstance(props, dict):
+                continue
+            got_repo = props.get("repo", row.get("repo", ""))
+            if got_repo != repo:
+                continue
+            out.append(
+                {
+                    "key": props.get("claimKey") or props.get("key") or "",
+                    "owner": props.get("claim_owner") or props.get("owner") or "",
+                    "lease_until": int(props.get("lease_until") or 0),
+                    "epoch": int(props.get("claim_epoch") or props.get("epoch") or 0),
+                    "session": props.get("session") or "",
+                }
+            )
+        return out
 
 
 @dataclass
@@ -393,57 +496,76 @@ def acquire(
     record.host = record.host or (hostname or os.environ.get("HOSTNAME") or "")
     mine = record.content()
 
+    # Read BEFORE the create (review of #9487): `create_point` hands back the EXISTING content
+    # for an id that already exists, so a retry whose payload happened to be byte-identical to
+    # the stored claim compared equal and was reported `acquired` by a box that wrote nothing.
+    # The read also makes re-entrancy decidable without inferring identity from content.
     try:
-        got = store.create(cid, record)
+        existing = store.read(cid) or ""
     except StoreUnanswerable as exc:
         return Outcome(
             rc=EXIT_UNANSWERABLE,
             status="REFUSED",
-            reason=f"claim store unanswerable — dispatch refused: {exc}",
+            reason=f"the claim store could not be read — dispatch refused: {exc}",
             claim_id=cid,
             record=record,
         )
 
-    if got == mine:
-        # Confirm by an independent read: a create that echoed our own payload without
-        # persisting it would otherwise read as a win (the class of defect where the
-        # instrument reports success and the state never landed).
+    if existing:
+        got = None  # nothing was created; the tail decides held / reclaim
+    else:
         try:
-            back = store.read(cid)
+            got = store.create(cid, record)
         except StoreUnanswerable as exc:
             return Outcome(
                 rc=EXIT_UNANSWERABLE,
                 status="REFUSED",
-                reason=f"claim written but the read-back failed — dispatch refused: {exc}",
+                reason=f"claim store unanswerable — dispatch refused: {exc}",
                 claim_id=cid,
                 record=record,
             )
-        if back == mine:
-            return Outcome(
-                rc=EXIT_OK,
-                status="acquired",
-                reason=f"acquired {record.key} until {record.lease_until}",
-                owner=record.owner,
-                lease_until=record.lease_until,
-                epoch=record.epoch,
-                claim_id=cid,
-                record=record,
-            )
-        return Outcome(
-            rc=EXIT_HELD,
-            status="held",
-            reason=(
-                "lost the race: the store returned our payload but the read-back differs "
-                "(another box wrote first)"
-            ),
-            owner=_field(back or "", "owner"),
-            lease_until=_int_field(back or "", "lease_until"),
-            epoch=_int_field(back or "", "epoch"),
-            claim_id=cid,
-        )
 
-    # Somebody else's record came back, or nothing at all.
-    existing = got or ""
+        if got == mine:
+            # Confirm by an independent read: a create that echoed our own payload without
+            # persisting it would otherwise read as a win (the class of defect where the
+            # instrument reports success and the state never landed).
+            try:
+                back = store.read(cid)
+            except StoreUnanswerable as exc:
+                return Outcome(
+                    rc=EXIT_UNANSWERABLE,
+                    status="REFUSED",
+                    reason=f"claim written but the read-back failed — dispatch refused: {exc}",
+                    claim_id=cid,
+                    record=record,
+                )
+            if back == mine:
+                return Outcome(
+                    rc=EXIT_OK,
+                    status="acquired",
+                    reason=f"acquired {record.key} until {record.lease_until}",
+                    owner=record.owner,
+                    lease_until=record.lease_until,
+                    epoch=record.epoch,
+                    claim_id=cid,
+                    record=record,
+                )
+            return Outcome(
+                rc=EXIT_HELD,
+                status="held",
+                reason=(
+                    "lost the race: the store returned our payload but the read-back differs "
+                    "(another box wrote first)"
+                ),
+                owner=_field(back or "", "owner"),
+                lease_until=_int_field(back or "", "lease_until"),
+                epoch=_int_field(back or "", "epoch"),
+                claim_id=cid,
+            )
+
+        # Somebody else's record came back, or nothing at all.
+        existing = got or ""
+
     holder = _field(existing, "owner")
     until = _int_field(existing, "lease_until")
     epoch = _int_field(existing, "epoch")
@@ -460,6 +582,23 @@ def acquire(
         )
 
     if until > now:
+        # Re-entrancy (review of #9487 P2): a retry by the SAME caller must not be told the
+        # unit is held by a peer. `claims.sh` never expressed "already mine", so a resumed
+        # lane used to refuse work it owned — and for a CLI caller the reported holder was a
+        # different `<host>:<pid>`, so even a human could not recognise their own claim.
+        if holder and holder == record.owner:
+            return Outcome(
+                rc=EXIT_OK,
+                status="already-held",
+                reason=(
+                    f"{record.key} is already held by this caller ({holder}) until {until} "
+                    f"({until - now}s left, epoch {epoch}) — no new claim taken"
+                ),
+                owner=holder,
+                lease_until=until,
+                epoch=epoch,
+                claim_id=cid,
+            )
         return Outcome(
             rc=EXIT_HELD,
             status="held",
@@ -473,16 +612,50 @@ def acquire(
             claim_id=cid,
         )
 
-    # Expired: reclaim with a fencing bump. The reclaim re-reads and compares the epoch it
-    # OBSERVED — a peer that reclaimed in the same instant moved it, and the loser is told
-    # it lost rather than retrying into a claim it does not hold.
+    # Expired: reclaim with a fencing bump — but ONLY through a store that can express the
+    # precondition (review of #9487 P1). A blind `replace` here let two boxes observe the same
+    # expired epoch, both write, and both return `acquired`: one holder in the graph, two lanes
+    # believing they own the unit. Absence of the capability is a REFUSAL, not a fallback.
     reclaim = ClaimRecord(**{**record.__dict__})
     reclaim.epoch = epoch + 1
     reclaim.claimed_at = now
     reclaim.lease_until = now + DEFAULT_TTL
     mine = reclaim.content()
+    fenced = getattr(store, "replace_if_epoch", None)
+    if fenced is None:
+        return Outcome(
+            rc=EXIT_UNANSWERABLE,
+            status="REFUSED",
+            reason=(
+                f"{record.key} expired at {until} (holder {holder or 'unknown'}), but this "
+                "store cannot express the reclaim precondition (an epoch-CAS), so a reclaim "
+                "could double-grant. Dispatch refused; the claim must be released explicitly "
+                "(`release --force`) or reclaimed by a store that supports the fence."
+            ),
+            owner=holder,
+            lease_until=until,
+            epoch=epoch,
+            claim_id=cid,
+        )
     try:
-        got = store.replace(cid, reclaim)
+        got = fenced(cid, reclaim, expected_epoch=epoch)
+        if got is None:
+            # A peer moved the epoch between our read and our write: we lost, and we say so
+            # rather than retrying into a claim we do not hold.
+            winner = store.read(cid) or ""
+            return Outcome(
+                rc=EXIT_HELD,
+                status="held",
+                reason=(
+                    "lost the reclaim race: the record moved to "
+                    f"{_field(winner, 'owner') or 'another box'} at epoch "
+                    f"{_int_field(winner, 'epoch')}"
+                ),
+                owner=_field(winner, "owner"),
+                lease_until=_int_field(winner, "lease_until"),
+                epoch=_int_field(winner, "epoch"),
+                claim_id=cid,
+            )
         back = store.read(cid)
     except StoreUnanswerable as exc:
         return Outcome(
@@ -528,9 +701,18 @@ def release(
     *,
     owner: str,
     now: int | None = None,
+    session: str = "",
+    force: bool = False,
+    reason: str = "",
 ) -> Outcome:
     """Release a claim this owner holds. A release by a non-holder is REFUSED (rc 1), never
-    a silent no-op: releasing someone else's claim is how a peer's lane gets duplicated."""
+    a silent no-op: releasing someone else's claim is how a peer's lane gets duplicated.
+
+    `force=True` is the audited operator route for a crashed holder: the lease is expired and
+    `reason` is recorded IN the claim, so the override is legible to the next reader. It never
+    bypasses the identity check silently — the tombstone carries the reason and the releasing
+    identity, and the refusal message (absent force) names the real holder.
+    """
     now = _now() if now is None else now
     cid = claim_id(repo, key)
     try:
@@ -550,7 +732,7 @@ def release(
             claim_id=cid,
         )
     holder = _field(existing, "owner")
-    if holder != owner:
+    if holder != owner and not force:
         return Outcome(
             rc=EXIT_HELD,
             status="refused",
@@ -565,7 +747,33 @@ def release(
     # "who held this yesterday" (the refs are deleted on release).
     tomb = _parse(existing)
     tomb.lease_until = now
-    tomb.purpose = (tomb.purpose + " [released]").strip()
+    if force:
+        actor = f" (forced by {owner}" + (f" from session {session}" if session else "") + ")"
+        tomb.purpose = (tomb.purpose + " [released:" + reason.replace("]", ")") + "]" + actor).strip()
+    else:
+        tomb.purpose = (tomb.purpose + " [released]").strip()
+    # Narrow the overwrite window (review of #9487 P1): re-read IMMEDIATELY before the blind
+    # write and refuse if the record already moved. Without a store-side CAS this cannot be
+    # atomic — the residual window is documented in the module docstring — but a release must
+    # not overwrite a peer's freshly reclaimed claim when the move is observable at all.
+    try:
+        pre = store.read(cid) or ""
+    except StoreUnanswerable as exc:
+        return Outcome(
+            rc=EXIT_UNANSWERABLE,
+            status="REFUSED",
+            reason=f"release could not be confirmed — dispatch state unknown: {exc}",
+            claim_id=cid,
+        )
+    if pre != existing:
+        return Outcome(
+            rc=EXIT_HELD,
+            status="refused",
+            reason="release lost a race: the claim moved while being released",
+            owner=_field(pre, "owner"),
+            epoch=_int_field(pre, "epoch"),
+            claim_id=cid,
+        )
     try:
         store.replace(cid, tomb)
         back = store.read(cid)
@@ -626,8 +834,23 @@ def status(store: ClaimStore, repo: str, key: str | None, *, now: int | None = N
             claim_id=cid,
             record=_parse(existing),
         )
+    # Repo-wide listing (review of #9487 P1): a store that cannot list must REFUSE. The old
+    # `hasattr(store, "query_repo")` fallback turned "this store cannot list" into "there is
+    # nothing to list" and answered rc 0 `0 claim record(s)` while the store held claims —
+    # the exact default-answer-without-a-read that this tool exists to remove.
+    lister = getattr(store, "query_repo", None)
+    if lister is None:
+        return Outcome(
+            rc=EXIT_UNANSWERABLE,
+            status="REFUSED",
+            reason=(
+                "this store cannot list claims for a repo — refusing rather than reporting an "
+                "empty ledger (an empty answer from an unread store looks exactly like 'nobody "
+                "holds anything')"
+            ),
+        )
     try:
-        rows = store.query_repo(repo) if hasattr(store, "query_repo") else []
+        rows = lister(repo)
     except StoreUnanswerable as exc:
         return Outcome(rc=EXIT_UNANSWERABLE, status="REFUSED", reason=f"claim store unanswerable: {exc}")
     return Outcome(
@@ -700,11 +923,21 @@ def _parse(content: str) -> ClaimRecord:
     )
 
 
-def _owner_token(session: str, pid: int | None = None) -> str:
-    """`<host>:<pid>` — the SAME encoding `claims.sh` writes (`box:<pid>`), so a fleet reader
-    that already parses claim owners needs no second parser. The pid is local to the box by
-    construction, which is why the lease (not `kill -0`) is what expires a claim."""
+def _owner_token(session: str = "", pid: int | None = None) -> str:
+    """The caller's identity, STABLE across processes.
+
+    `claims.sh` writes `box:<pid>`; this tool keeps that shape only when no session is named.
+    A pid is not an identity for a claim (review of #9487 P1): `acquire` and `release` are
+    different processes, so a pid-derived owner made every claim unreleasable — the release
+    was always refused as "held by <a different pid>". A session id is what the caller already
+    has and what survives a retry, so it is preferred whenever it is given.
+
+    The lease (not `kill -0`) is still what expires a claim: a session id is a name, not a
+    liveness proof.
+    """
     host = os.environ.get("HOSTNAME") or "box"
+    if session:
+        return f"{host}:{session}"
     pid = os.getpid() if pid is None else pid
     return f"{host}:{pid}"
 
@@ -746,7 +979,15 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
     rel.add_argument("--kind", default="issue", choices=("issue", "pr"))
     rel.add_argument("--issue", type=int, default=0)
     rel.add_argument("--pr", type=int, default=0)
-    rel.add_argument("--owner", default="", help="defaults to this process's <host>:<pid>")
+    rel.add_argument("--owner", default="", help="defaults to <host>:<session> when --session is given, else <host>:<pid>")
+    rel.add_argument("--session", default="", help="the lane/session id that took the claim")
+    rel.add_argument(
+        "--force",
+        action="store_true",
+        help="expire a claim this caller does NOT hold (requires --reason); the audited route "
+        "for a crashed holder when the store cannot reclaim an expired claim itself",
+    )
+    rel.add_argument("--reason", default="", help="why --force is justified (recorded with the claim)")
 
     st = sub.add_parser("status", parents=[common], help="who holds it right now")
     st.add_argument("--repo", required=True)
@@ -773,16 +1014,20 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
         except Exception as exc:
             print(f"REFUSED: claim store unanswerable ({type(exc).__name__}: {exc})", file=sys.stderr)
             return EXIT_UNANSWERABLE
-        print("ok: claim store reachable")
+        print(f"ok: claim store reachable ({store.target()})")
         return EXIT_OK
 
+    # `status --repo` with NO number is the repo-wide listing, not a malformed single-key
+    # query (review of #9487 P2). Any other command still needs a number, and a bad
+    # invocation is EXIT_USAGE — never EXIT_UNANSWERABLE, which means "the store could not
+    # answer" and is retried by a controller.
     try:
         number = int(getattr(args, "pr", 0) or 0) or int(getattr(args, "issue", 0) or 0)
         kind = "pr" if int(getattr(args, "pr", 0) or 0) else args.kind
-        key = normalise_key(kind, number)
+        key = None if args.cmd == "status" and number == 0 else normalise_key(kind, number)
     except (ValueError, TypeError) as exc:
         print(f"usage: {exc}", file=sys.stderr)
-        return EXIT_UNANSWERABLE
+        return EXIT_USAGE
 
     if store is None:
         try:
@@ -813,10 +1058,24 @@ def main(argv: list[str] | None = None, store: ClaimStore | None = None) -> int:
         )
         outcome = acquire(store, record)
     elif args.cmd == "release":
-        owner = args.owner or _owner_token("")
-        outcome = release(store, args.repo, key, owner=owner)
+        # Identity must be reproducible across processes (review of #9487 P1): `release` runs
+        # in a DIFFERENT process from `acquire`, so a pid-derived default made every claim
+        # unreleasable. `--session` names the same lane the acquire named.
+        if getattr(args, "force", False) and not args.reason.strip():
+            print("usage: --force requires --reason (an audited override, not a quiet one)", file=sys.stderr)
+            return EXIT_USAGE
+        owner = args.owner or _owner_token(args.session)
+        outcome = release(
+            store,
+            args.repo,
+            key,
+            owner=owner,
+            session=args.session,
+            force=getattr(args, "force", False),
+            reason=args.reason.strip(),
+        )
     else:
-        outcome = status(store, args.repo, key)
+        outcome = status(store, args.repo, key) if key is not None else status(store, args.repo, None)
 
     if args.json:
         print(json.dumps(outcome.as_dict(), sort_keys=True))

@@ -110,7 +110,7 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 
 ## 3. The pilot — one slice, the claim, in the graph
 
-`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (18 tests), contract `rc 0/1/2` identical
+`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (27 tests), contract `rc 0/1/2` identical
 to `claims.sh` so a caller needs no new branch.
 
 **What it stores.** One `:Point` per held unit, id = `sha256(repo, key)` rendered as the SDK's ULID shape —
@@ -125,7 +125,11 @@ and refuses with the holder's name.
 - **create = CAS**, keyed `issue-<N>` / `pr-<N>` — disjoint prefixes, like `claims.sh`'s two keyings.
 - **read-back is the authority**, never the write's exit code.
 - **lease is data, not liveness** (`#1709` rec 3) — a remote pid cannot be probed.
-- **fencing by epoch** (`#1709` rec 6) — a reclaim bumps it, and a lost reclaim names the winner.
+- **fencing by epoch** (`#1709` rec 6) — a reclaim bumps it through a store that can express the
+  precondition (`replace_if_epoch`), and a lost reclaim names the winner. A store without that
+  capability (the shipped `SDKClaimStore` — `update_point` is a blind write) **refuses** to reclaim
+  (rc 2) rather than double-granting; the operator route is `release --force --reason`, which records
+  the reason and the releasing identity in the tombstone.
 - **release expires in place instead of deleting**, which is the one behaviour deliberately different from
   `refs/claims/*`: the ledger keeps its history, so "who owned this, and when did they stop" is answerable.
 - **the capacity fields are stored, never measured** — `capacity.sh` measures (`host`, `ncpu`, `lpc`,
@@ -137,18 +141,27 @@ and refuses with the holder's name.
 `rc 2` is a **refusal**, and the controller must not dispatch:
 
 ```text
-$ env -u TORTOISE_DB_URI -u TORTOISE_API_URL tools/work_claim.py acquire --repo … --issue 5052
-REFUSED: no claim store configured: set TORTOISE_DB_URI (self-hosted) or TORTOISE_API_URL +
-TORTOISE_API_KEY (hosted). An unset store is refused rather than answered from a default target
-— an empty read from the wrong graph looks exactly like 'nobody holds this' (#7871).
+$ env -u TORTOISE_DB_URI tools/work_claim.py acquire --repo … --issue 5052
+REFUSED: no claim store configured: set TORTOISE_DB_URI (the shared graph). An unset store is
+refused rather than answered from a default target — an empty read from the wrong graph looks
+exactly like 'nobody holds this' (#7871).
 rc=2
 ```
 
+⛔ **`TORTOISE_API_URL` is NOT proof of a store** (review of this branch, measured). Accepting it
+armed the guard and then let `TortoiseSDK()` ignore it — the SDK reads only `TORTOISE_DB_URI` and
+falls back to the box's EMBEDDED file. `check` printed `ok: claim store reachable` and exited 0
+while the claim landed locally: acquired here, free on every peer, which is the duplicate-dispatch
+failure reported as a success. The guard now names the API URL explicitly and refuses it, and
+`check` prints the resolved target (`ok: claim store reachable (docker://…)`).
+
 Every shape of "I cannot answer" is rc 2, and each one names its cause: an **unset** store (refused
 *before* any query — the SDK would otherwise answer from a default target, which is #7871's measured
-read defect, "an unset URI returning 0 rows silently"), an **unreachable** store, a **write whose
-read-back fails**, and a store that **neither creates nor returns** a claim. A reachable store with no
-claim is a different, real answer (`status: free`, rc 0) and the two never collapse.
+read defect, "an unset URI returning 0 rows silently"), a **store that resolved to the box-local
+embedded file**, an **unreachable** store, a **write whose read-back fails**, a **reclaim the store
+cannot fence**, and a store that **neither creates nor returns** a claim. A reachable store with no
+claim is a different, real answer (`status: free`, rc 0) and the two never collapse. A **malformed
+invocation** is rc 3, not rc 2: a controller retries rc 2, and retrying a bad command cannot help.
 
 ⛔ **This is a deliberate departure from a recorded decision, and it is marked as one:**
 
@@ -202,10 +215,11 @@ stores all of them.
 # the per-claim volume probe (private lane graph, so no peer's target is touched)
 uri="$(uv run python tools/test_lane.py uri)" && eval "$uri"
 export TORTOISE_DB_URI="$uri"
-uv run pytest tests/test_work_claim.py -q            # 18 passed, incl. the live SDK path
+uv run pytest tests/test_work_claim.py -q            # 27 passed (1 skipped without a live URI)
 
 tools/work_claim.py acquire --repo daniel-ospina/tortoise --issue 5052 \
     --session cell-t1 --branch feat/x --purpose "pilot" --host cell-t1 --ncpu 8 --lpc 372 --lanes 3
 tools/work_claim.py status --repo daniel-ospina/tortoise --issue 5052 --json
-tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --owner "$(hostname):$$"
+tools/work_claim.py status --repo daniel-ospina/tortoise --json      # repo-wide listing
+tools/work_claim.py release --repo daniel-ospina/tortoise --issue 5052 --session cell-t1
 ```

@@ -88,6 +88,37 @@ class FakeStore:
         self.points[cid] = record.content()
         return self.points[cid]
 
+    def replace_if_epoch(self, cid: str, record, *, expected_epoch: int) -> str | None:
+        """The fenced reclaim: set ONLY if the stored epoch is still `expected_epoch`.
+        `None` means the precondition failed — the caller lost the race."""
+        self._check()
+        self.writes += 1
+        if self.on_replace is not None:
+            self.points[cid] = self.on_replace
+            return None
+        current = self.points.get(cid)
+        if current is None or wc._int_field(current, "epoch") != expected_epoch:
+            return None
+        self.points[cid] = record.content()
+        return self.points[cid]
+
+    def query_repo(self, repo: str) -> list[dict]:
+        self._check()
+        rows: list[dict] = []
+        for content in self.points.values():
+            rec = wc._parse(content)
+            if rec.repo == repo:
+                rows.append(
+                    {
+                        "key": rec.key,
+                        "owner": rec.owner,
+                        "lease_until": rec.lease_until,
+                        "epoch": rec.epoch,
+                        "session": rec.session,
+                    }
+                )
+        return rows
+
 
 def _record(owner: str = "box-a:111", key: str = "issue-5052", **kw):
     return wc.ClaimRecord(
@@ -118,6 +149,34 @@ def test_unset_store_is_refused_before_any_query():
     assert "refused" in msg.lower()
 
 
+def test_api_url_alone_does_not_satisfy_the_store_guard():
+    """Review of #9487 (P0), reproduced live: `TORTOISE_API_URL=… work_claim.py check` printed
+    `ok: claim store reachable` and exited 0 while the SDK had silently resolved the BOX-LOCAL
+    embedded database — the claim would be confirmed by its own read-back here and read FREE
+    on every peer. The API URL is not a store this tool can reach, so it must not arm the
+    guard; the message has to say WHY, or the next reader re-adds it as an obvious fix."""
+    with pytest.raises(wc.StoreUnanswerable) as excinfo:
+        wc._require_store_configured({"TORTOISE_API_URL": "https://api.premiselabs.co"})
+    msg = str(excinfo.value)
+    assert "TORTOISE_API_URL" in msg
+    assert "embedded" in msg.lower()
+
+
+def test_sdk_store_refuses_a_target_that_resolved_to_the_embedded_file():
+    """Belt and braces: even if a caller reaches `SDKClaimStore` directly, an embedded target
+    (`_db_uri is None`) is not a shared claim store and must refuse rather than write locally."""
+
+    class EmbeddedSDK:
+        _db_uri = None
+
+        def query(self, **_kw):
+            return []
+
+    with pytest.raises(wc.StoreUnanswerable) as excinfo:
+        wc.SDKClaimStore(sdk=EmbeddedSDK())
+    assert "EMBEDDED" in str(excinfo.value).upper()
+
+
 def test_main_refuses_with_rc2_when_the_store_is_unset(monkeypatch):
     """The CLI contract: rc 2, and the reason says which variable is missing. This is the
     value a controller branches on — rc 0 here would be the fail-open this tool removes."""
@@ -146,9 +205,12 @@ def test_read_back_failure_after_a_write_refuses():
             self.reads = 0
 
         def read(self, cid):
-            # `create` never reads in this fake, so the FIRST read is acquire's own
-            # confirmation read-back — which is exactly the one that must fail here.
+            # `acquire` now reads BEFORE it creates, so the first read is the pre-check. Let
+            # that one answer "free"; the SECOND read is the confirmation read-back, and that
+            # is the one that must fail here.
             self.reads += 1
+            if self.reads == 1:
+                return None
             raise wc.StoreUnanswerable("read timed out")
 
     out = wc.acquire(ReadBackDies(), _record())
@@ -193,6 +255,10 @@ def test_claim_id_is_content_addressed_and_never_names_a_box():
     d = wc.claim_id("daniel-ospina/agent-infra", "issue-5052")
     assert a == b
     assert a != c and a != d  # the repo is part of the identity, not just the number
+    # Pinned to a LITERAL (review of #9487 P3): the old assertions compared two calls inside
+    # one process, so folding the hostname into the digest still passed — every box would
+    # compute a different id and the "same id on every box" property would be silently gone.
+    assert a == "d0ae66a64d3a8688208f-20ed8abdbc54"
     # the SDK's ULID shape, so an explicit id does not warn on every write
     import re
 
@@ -235,16 +301,141 @@ def test_expired_claim_is_reclaimed_and_the_epoch_fences():
     assert released.rc == 1
 
 
-def test_reclaim_race_is_reported_as_held_naming_the_new_holder():
+def test_reclaim_through_a_store_without_a_fence_is_refused_not_blindly_written():
+    """Review of #9487 (P1): the shipped `SDKClaimStore` cannot express "set only if the epoch
+    is still E" — `update_point` is a blind write — so the interleaving A.replace → A.read →
+    B.replace → B.read lets both boxes report `acquired`. A store without the fence must make
+    `acquire` REFUSE (rc 2), never fall back to the blind write that reintroduces it."""
+
+    class BlindStore(FakeStore):
+        replace_if_epoch = None
+
+    store = BlindStore()
+    store.points[wc.claim_id("daniel-ospina/tortoise", "issue-5052")] = _record(
+        owner="cell-1:100", lease_until=NOW - 1
+    ).content()
+    out = wc.acquire(store, _record(owner="cell-4:200"), now=NOW)
+    assert out.rc == 2 and out.status == "REFUSED"
+    assert "cannot express the reclaim precondition" in out.reason
+    # and the expired holder's record is untouched — no half-reclaim
+    assert wc._field(store.points[wc.claim_id("daniel-ospina/tortoise", "issue-5052")], "owner") == "cell-1:100"
+
+
+def test_reclaim_is_lost_when_the_fence_observes_a_moved_epoch():
+    """The CAS itself: a peer reclaimed between our read and our fenced write, so the write is
+    declined and we are told we lost — naming the new holder, never retrying into it."""
     store = FakeStore()
     cid = wc.claim_id("daniel-ospina/tortoise", "issue-5052")
     store.points[cid] = _record(owner="cell-1:100", lease_until=NOW - 1).content()
-    store.on_replace = _record(owner="cell-5:555", lease_until=NOW + 3600).content()
-
+    store.on_replace = _record(owner="cell-5:555", lease_until=NOW + 3600, epoch=2).content()
     out = wc.acquire(store, _record(owner="cell-4:200"), now=NOW)
-    assert out.rc == 1
-    assert "reclaim race" in out.reason
+    assert out.rc == 1 and out.status == "held"
     assert out.owner == "cell-5:555"
+    assert "lost the reclaim race" in out.reason
+
+
+# ── listing: an unread store is not an empty ledger ───────────────────────────────
+
+
+def test_listing_refuses_when_the_store_cannot_list():
+    """Review of #9487 (P1): `hasattr(store, "query_repo")` turned "cannot list" into "nothing
+    to list" and answered rc 0 with `0 claim record(s)` over a store that held claims. A fleet
+    reader would conclude the board was empty."""
+
+    class NoListStore(FakeStore):
+        query_repo = None
+
+    out = wc.status(NoListStore(), "daniel-ospina/tortoise", None, now=NOW)
+    assert out.rc == 2 and out.status == "REFUSED"
+    assert "cannot list" in out.reason
+
+
+def test_listing_returns_the_claims_the_store_holds():
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    wc.acquire(store, _record(owner="cell-1:100", key="issue-5053"), now=NOW)
+    out = wc.status(store, "daniel-ospina/tortoise", None, now=NOW)
+    assert out.rc == 0 and out.status == "listed"
+    keys = sorted(row["key"] for row in out.extra["claims"])
+    assert keys == ["issue-5052", "issue-5053"]
+
+
+def test_cli_status_without_a_number_lists_and_acquire_without_one_is_a_usage_error():
+    """Review of #9487 (P2): `status --repo` (no number) used to flow into `normalise_key(0)`
+    and return rc 2 — which a controller reads as "the store is unanswerable" and retries.
+    A malformed invocation is rc 3; a store that cannot answer stays rc 2."""
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    rc = wc.main(["status", "--repo", "daniel-ospina/tortoise"], store=store)
+    assert rc == 0
+    rc = wc.main(["acquire", "--repo", "daniel-ospina/tortoise"], store=store)
+    assert rc == 3 == wc.EXIT_USAGE
+
+
+# ── release identity, force, re-entrancy ───────────────────────────────────────────
+
+
+def test_release_accepts_the_session_identity_the_acquire_used():
+    """Review of #9487 (P1): acquire and release are DIFFERENT processes, so a `box:<pid>`
+    default made every claim unreleasable — the reported holder was always another pid. A
+    session id is the identity the caller already has and that survives a retry."""
+    store = FakeStore()
+    owner = wc._owner_token("cell-t1")
+    wc.acquire(store, _record(owner=owner, session="cell-t1"), now=NOW)
+    out = wc.release(
+        store, "daniel-ospina/tortoise", "issue-5052", owner=wc._owner_token("cell-t1"), session="cell-t1", now=NOW + 5
+    )
+    assert out.rc == 0 and out.status == "released"
+
+
+def test_forced_release_by_a_non_holder_records_the_reason_in_the_claim():
+    """The operator route for a crashed holder: legal, but AUDITED — the reason and the
+    releasing identity live in the tombstone, so the next reader sees an override rather than
+    a claim that quietly changed hands. Without a reason the CLI refuses the invocation."""
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    out = wc.release(
+        store,
+        "daniel-ospina/tortoise",
+        "issue-5052",
+        owner="cell-9:999",
+        force=True,
+        reason="holder crashed, lease expired 2h ago",
+        now=NOW + 5,
+    )
+    assert out.rc == 0, out.reason
+    cid = wc.claim_id("daniel-ospina/tortoise", "issue-5052")
+    stored = wc._parse(store.points[cid])
+    assert "holder crashed, lease expired 2h ago" in stored.purpose
+    assert "forced by cell-9:999" in stored.purpose
+    assert stored.lease_until == NOW + 5
+
+    rc = wc.main(
+        ["release", "--repo", "daniel-ospina/tortoise", "--issue", "5052", "--force"],
+        store=FakeStore(),
+    )
+    assert rc == wc.EXIT_USAGE
+
+
+def test_reentrant_acquire_is_already_held_rather_than_held_by_a_peer():
+    """Review of #9487 (P2): a retry by the SAME caller must not be told a peer holds the
+    unit. `claims.sh` never expressed "already mine", so a resumed lane refused work it owned."""
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    again = wc.acquire(store, _record(owner="cell-1:100"), now=NOW + 10)
+    assert again.rc == 0 and again.status == "already-held"
+    assert again.epoch == 1
+    assert again.lease_until == NOW + 3600
+
+
+def test_quoted_value_without_a_space_roundtrips():
+    """Review of #9487 (P3): the conditional quote left a value containing a `"` but no space
+    unbalanced, and `_parse` then swallowed every field after it."""
+    rec = _record(purpose='says "hi"')
+    back = wc._parse(rec.content())
+    assert back.purpose == 'says "hi"'
+    assert back.owner == rec.owner and back.lease_until == rec.lease_until
+    assert back.content() == rec.content()
 
 
 # ── release + status ──────────────────────────────────────────────────────────────
