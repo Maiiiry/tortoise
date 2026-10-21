@@ -367,8 +367,12 @@ _UNRESOLVED = {
     # to any `sdk.py` function the census proves reaches the write handle
     # (`calibrate_summary` names `set_point_baseline` only inside advice strings
     # — it never calls it, and neither function calls any other writer).
-    # That second claim is pinned against the CENSUS's own list of writing
-    # functions, not against a hand-written list of method names: a check that
+    # That second claim is pinned against the CENSUS's own handle surface —
+    # "write OR not-proven-read", because that surface also keys a function whose
+    # mutating call it could not RESOLVE (45 of its 83 entries are that shape),
+    # so calling it "the list of writing functions" overstates it; the names this
+    # file has already proven READ are subtracted — and not against a
+    # hand-written list of method names: a check that
     # knew only `set_point_baseline` stayed green while the sentence it was cited
     # for went false (`self.invalidate_point(…)` is not a `set_point_baseline`
     # call and not a `<handle>.<verb>` call either).
@@ -1150,7 +1154,7 @@ def test_no_two_census_entries_share_a_bare_function_name():
 #: Same rot, same reasoning:
 #: the separator is noise, the `sdk.py` + digits pair is the citation.
 _SDK_LINE_ANCHOR = re.compile(
-    r"sdk\.py[\s,:`@]*(?:\(?\s*(?:at\s+)?line\s*[:\s#]*)?[Ll]?\d+")
+    r"sdk\.py[\s,:`@#]*(?:\(?\s*(?:at\s+)?line\s*[:\s#]*)?[Ll]?\d+")
 
 #: ⛔ NO LOCAL WRITE-CLAUSE REGEX HERE. What counts as a write is
 #: `_statement_writes` + `_WRITE_CLAUSE_RE` from `tortoise.projection` — the
@@ -1328,6 +1332,112 @@ def _params_of(func) -> set[str]:
     return {name for name in names if name not in ("self", "cls")}
 
 
+def _mutated_parameters(func) -> set[str]:
+    """Parameters of `func` that it MUTATES in place — an accumulator channel.
+
+    Narrow on purpose. Only the mutating shapes that hand a value back to the
+    caller are named (`<param>.append/extend/insert/update`, `<param> += …`,
+    `<param>[…] = …`); a bare call to a void helper is not enough, because that
+    is ordinary code and reporting it would trade this silence for a wall of
+    false FAILs. The set this feeds is REPORTED, never exempted.
+    """
+    params = _params_of(func)
+    mutated: set[str] = set()
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id in params \
+                and node.func.attr in _ACCUMULATOR_METHODS:
+            mutated.add(node.func.value.id)
+        elif isinstance(node, ast.AugAssign) \
+                and isinstance(node.target, ast.Name) \
+                and node.target.id in params:
+            mutated.add(node.target.id)
+        elif isinstance(node, ast.Assign):
+            mutated |= {target.value.id for target in node.targets
+                        if isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id in params}
+    return mutated
+
+
+def _names_feeding(expression, func) -> set[str]:
+    """Every name whose VALUE can reach `expression`, closed over assignments.
+
+    The statement expression is usually a bare local (`proj.g.query(query)`), so
+    the fragment is assembled one statement away: `query = "…" + "".join(parts)`.
+    A one-level reading saw only `{query}` and missed `parts` — and `parts` is
+    precisely the accumulator argument (measured, review round 4). So the set is
+    CLOSED: a name is added when it appears in any expression assigned to (or
+    augmented into, or conditionally bound to) a name already in the set.
+    """
+    names = {node.id for node in ast.walk(expression)
+             if isinstance(node, ast.Name)}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(func):
+            target: ast.expr | None = None
+            value: ast.expr | None = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target, value = node.targets[0], node.value
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                target, value = node.target, node.value
+            if target is None or value is None \
+                    or not isinstance(target, ast.Name) \
+                    or target.id not in names:
+                continue
+            for inner in ast.walk(value):
+                if isinstance(inner, ast.Name) and inner.id not in names:
+                    names.add(inner.id)
+                    changed = True
+    return names
+
+
+def _accumulator_offenders(func, statement_expr, module, path) -> list[str]:
+    """Calls whose callee hands text back through a MUTATED ARGUMENT.
+
+    The expression walk cannot see this shape, and that is the point: the write
+    is not inside the statement, it lands in a caller LOCAL that the statement
+    then reads — `parts = []; _fill(parts); query = "… " + "".join(parts)`, with
+    `_fill` doing `out.append(" SET …")`. `_fragments_of` resolves `parts` to the
+    EMPTY list it was bound to, so the one handle reach reads as clean, the call
+    resolves (so the unresolvable-name arm stays silent), and nothing is
+    reported — measured GREEN (review round 4).
+
+    Reported, not followed: binding what a callee appends into a caller's list is
+    a dataflow problem this walk does not solve, and reported-not-skipped is this
+    file's own polarity (`unread`). SCOPED to a mutated argument name that can
+    reach the row's statement expression — without that, every call passing a
+    dict to a helper that updates it would red a correct row.
+    """
+    feeding = _names_feeding(statement_expr, func)
+    offenders: list[str] = []
+    for node in ast.walk(func):
+        if not isinstance(node, ast.Call) \
+                or not isinstance(node.func, ast.Name):
+            continue
+        callee, _callee_module, _callee_path = _resolve_callee(
+            node.func.id, module, path)
+        if callee is None:
+            continue
+        mutated = _mutated_parameters(callee)
+        if not mutated:
+            continue
+        params = list(callee.args.posonlyargs) + list(callee.args.args)
+        supplied = {arg.arg: value
+                    for arg, value in zip(params, node.args, strict=False)}
+        for param in sorted(mutated):
+            value = supplied.get(param)
+            if isinstance(value, ast.Name) and value.id in feeding:
+                offenders.append(
+                    f"{node.func.id}(): writes into `{value.id}` (its "
+                    f"`{param}` parameter), and `{value.id}` feeds this row's "
+                    "statement — what the callee contributes could not be read "
+                    "out, so the row cannot be called a read on this walk")
+    return offenders
+
+
 def _statement_argument(call: ast.Call) -> ast.expr | None:
     """The statement text of a handle call — the census's own argument index.
 
@@ -1463,6 +1573,11 @@ _BUILTIN_NAMES = frozenset(dir(builtins))
 #: argument verbatim, so `f"…{str(extra)}"` would smuggle a caller's Cypher past
 #: the pin (measured GREEN while the bare `{extra}` form was RED). Anything not
 #: on this list — `str`, `list`, an SDK helper — leaves the argument reported.
+#: The accumulation verbs a callee can use to hand text back through a parameter
+#: instead of returning it (see `_mutated_parameters`). `append`/`extend`/`insert`
+#: on a list, `update` on a dict, plus `+=`/`<param>[k] = …` handled separately.
+_ACCUMULATOR_METHODS = frozenset({"append", "extend", "insert", "update"})
+
 _SCALAR_COERCIONS = frozenset(
     {"int", "float", "bool", "len", "abs", "round", "hash"})
 
@@ -1829,6 +1944,13 @@ def test_the_line_anchor_matches_every_spelling():
         "`tortoise/sdk.py`:23508",
         "sdk.py line #23508",
         "sdk.py@23508",
+        # Fourth spelling family (review round 4, measured): `#` was admitted
+        # only INSIDE the `line` alternative, so the GitHub-anchor shape — which
+        # the `[Ll]?` in this pattern exists for — missed entirely.
+        "sdk.py#L23508",
+        "sdk.py #L23508",
+        "[sdk.py](../tortoise/sdk.py#L23508)",
+        "sdk.py#23508",
     ]
     for variant in must_match:
         assert _SDK_LINE_ANCHOR.search(variant), (
@@ -2116,6 +2238,10 @@ def _calibration_read_offenders(functions, readers=_CALIBRATION_READERS,
             offenders.append(
                 f"{name}: the assembled statement carries {write} — "
                 "this row is not a read any more")
+        statement_expr = _statement_argument(calls[0])
+        if statement_expr is not None:
+            offenders.extend(_accumulator_offenders(
+                func, statement_expr, module, path))
         if read_shape not in assembled:
             offenders.append(
                 f"{name}: the assembled statement no longer contains "
@@ -2860,12 +2986,74 @@ def test_a_yielding_callee_is_read_not_skipped():
         "a write YIELDED by a resolved callee was neither read nor reported — "
         f"the generator shape is invisible (offenders={offenders})")
 
+    # `yield from` is the second half of the fix and had NO test of its own:
+    # dropping `ast.YieldFrom` left the whole file green (review round 4,
+    # measured), i.e. the arm was correct and unguarded.
+    delegating = (
+        'def _inner():\n'
+        '    yield " SET n.poked = 1"\n'
+        '\n'
+        'def _parts():\n'
+        '    yield from _inner()\n'
+        '\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(_parts())\n'
+        '        return proj.g.query(query).result_set\n')
+    assert any("not a read any more"
+               for offender in _offenders_for(delegating, with_module=True)), (
+        "a write delegated with `yield from` was neither read nor reported — "
+        "`ast.YieldFrom` is the arm no test named")
+
     returning = yielding.replace('yield " SET n.poked = 1"',
                                  'return [" SET n.poked = 1"]')
     assert any("not a read any more"
                for offender in _offenders_for(returning, with_module=True)), (
         "the control does not red, so this test proves nothing about the "
         "yield arm")
+
+
+def test_a_write_fed_through_an_accumulator_parameter_is_reported():
+    """NON-VACUITY for the accumulator arm of a row (review round 4).
+
+    The expression walk's only fragment sources are a RETURNED or YIELDED value.
+    A callee that writes into a collection the caller passed in returns nothing
+    and yields nothing, and because the resolver SUCCEEDED the "cannot be
+    resolved" arm never ran either: `parts = []; _fill(parts)` then
+    `"".join(parts)` came back GREEN with a `SET` in `_fill`. Reported rather
+    than followed — what the callee appends is not a value this walk can bind.
+
+    The control keeps it NARROW: a callee that mutates nothing must stay clean,
+    or the arm reds every row that hands a dict to a helper.
+    """
+    accumulating = (
+        'def _fill(out):\n'
+        '    out.append(" SET n.poked = 1")\n'
+        '\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        parts = []\n'
+        '        _fill(parts)\n'
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'
+        '        return proj.g.query(query).result_set\n')
+    offenders = _offenders_for(accumulating, with_module=True)
+    assert any("writes into `parts`" in offender for offender in offenders), (
+        "a write fed back through a MUTATED PARAMETER was neither read nor "
+        f"reported (offenders={offenders})")
+
+    benign = (
+        'def _noop(out):\n'
+        '    print(out)\n'
+        '\n'
+        'class Door:\n'
+        '    def reading(self, proj):\n'
+        '        parts = []\n'
+        '        _noop(parts)\n'
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'
+        '        return proj.g.query(query).result_set\n')
+    assert not _offenders_for(benign, with_module=True), (
+        "a call that mutates NOTHING was reported as an accumulator — this arm "
+        "must name the mutating shapes, not any call that takes a parameter")
 
 
 def test_the_census_writer_set_states_its_own_polarity():
