@@ -498,9 +498,8 @@ _CITED_FILE = r"[A-Za-z0-9_./-]+\.py"
 #: move, while a line number rots on the next insertion. Requiring `:NNN` on the
 #: citation-then-symbol shape (an earlier state of THIS guard, changed in the same
 #: diff as the widened narration) silently stopped checking every symbol-only
-#: citation of that shape — `kind_classifier.classify_items`
-#: (`kind_classifier.py`) matched nothing at all, so a citation of a symbol that
-#: no longer exists passed.
+#: citation of that shape. (The worked example belongs to the OTHER shape — it is
+#: stated with that shape, further down this file, where it is true.)
 _SYM_THEN_CITATION = re.compile(rf"`({_SYMBOL})`\s*\(`?({_CITED_FILE})(?::(\d+))?")
 #: `file.py:NNN` (`sym`) — the citation immediately precedes its symbol.
 _CITATION_THEN_SYM = re.compile(rf"`?({_CITED_FILE})(?::(\d+))?`?\s*\(`({_SYMBOL})`")

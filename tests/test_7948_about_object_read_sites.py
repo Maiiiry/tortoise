@@ -2526,9 +2526,11 @@ _WORST_ROW_AT_THIS_HEAD = 17
 def test_the_attribution_predicate_does_not_swallow_the_whole_table():
     """The bound above is only a check if the predicate still DISCRIMINATES.
 
-    `_DOOR_REACH_HOPS = 5` was measured to accept 44.7 % of the
-    (row, table-door) pairs — and three substitutions that keep a REAL tool in a
-    cell stayed green under it. A bound is not a proof, so the acceptance RATE is
+    The REJECTED `_DOOR_REACH_HOPS = 5` accepted roughly two fifths of the
+    (row, table-door) pairs *as the table stood then* — and three substitutions
+    that keep a REAL tool in a cell stayed green under it. (The figure is stated as
+    a proportion on purpose: the population has grown since, and a percentage
+    restated against a fixed denominator is the rot this file retires.) A bound is not a proof, so the acceptance RATE is
     pinned as its own number: the predicate may accept, over the table's own
     doors, at most `_ACCEPTED_PAIRS_AT_THIS_HEAD` pairs and at most
     `_WORST_ROW_AT_THIS_HEAD` for any single row. A predicate that starts
