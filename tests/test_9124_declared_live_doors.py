@@ -135,8 +135,10 @@ _APPEND_NOT_A_RECORD = {
     # census credited that door with a commit point it does not have and filed
     # it as apply-first on the strength of a warning builder. A `_journal_*`
     # NAME is not a journal write; that is exactly what this set exists to
-    # refuse, and `capture_session` is inventoried under `_NO_JOURNAL` for the
-    # reason the source actually shows.
+    # refuse. `capture_session` was its only other pattern-matching call and is
+    # no longer on the census at all (#9349 moved its writes into declared
+    # doors), so this exclusion now guards the census against a warning builder
+    # wherever one appears, not that door's lane.
     "_journal_write_failure_warning",  # sdk.py: builds a receipt warning string
 }
 
@@ -224,8 +226,9 @@ _DECLARATION_DECORATORS = (*_LIVE_LANE_NAMES, *_APPLY_FIRST_LANE_NAMES)
 #: this set's pointer will not find the other five. The remaining TWO
 #: (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`) were never
 #: inventory entries at all: they were inline statements inside
-#: `capture_session`, which appends NO record of its own and is therefore
-#: inventoried under `_NO_JOURNAL` for its four provenance stamps (`#9350`) — a
+#: `capture_session`, which appends NO record of its own: its four provenance
+#: stamps (`#9350`) and its extraction reaches are doors of their own now, and
+#: the parent door left the census in #9349 — a
 #: function holding BOTH scoped and unscoped writes is refused by this census
 #: ("presence is not containment"), so the stamps became doors of their own.
 #: A declaration does not convert the order: the entries that remain are still
@@ -272,6 +275,9 @@ _APPLY_FIRST_HELPERS = {
 #:   first attempt at a home, `_APPLY_FIRST_DOORS`, was only reachable by
 #:   counting `_journal_write_failure_warning` (a warning-string builder) as an
 #:   append. See that entry's comment.
+#:   ⛔ AND #9349 THEN MOVED THE STAMPS OUT TOO: the door has no write-like reach
+#:   of its own any more, so it is in NEITHER set — `_NO_JOURNAL`'s note records
+#:   why, and its pin asserts the absence rather than a row.
 _MIXED_ARM_DOORS: set[str] = set()
 
 #: Reach the handle with a write-like statement and append NO record at all, so
@@ -282,13 +288,15 @@ _MIXED_ARM_DOORS: set[str] = set()
 _NO_JOURNAL = {
     # ⛔ `capture_session` LEFT THIS SET (#9206 → #9349). It was here because it
     # "reaches the handle with a write-like statement and appends no record" —
-    # and #9349 moved that last reach OUT of the door: every write it still makes
-    # is delegated to a door that is itself on the census surface and declared
-    # (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`,
+    # and #9349 moved its last write-like reach OUT of the door into doors of
+    # their own (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`,
     # `_write_session_and_turns`, `_materialize_session_source`,
-    # `_stamp_capture_provenance`). With no write-like call of its own the census
-    # no longer KEYS it, so an entry here stops naming a function the census
-    # emits — a stale row, which this file's own
+    # `_stamp_capture_provenance` — the five whose WRITES MOVED, not "every
+    # write it still makes": its stamps also still reach `_capture_stamp_targets`
+    # and its extraction `_extract_session_llm` / `_extract_session_v2`, and those
+    # are no-journal doors with rows of their own). With no write-like call of its
+    # own the census no longer KEYS it, so an entry here stops naming a function
+    # the census emits — a stale row, which this file's own
     # `test_the_inventories_hold_no_stale_entry` refuses. The door's remaining
     # claim ("appends nothing of its own") is pinned in
     # `test_the_capture_door_is_inventoried_as_appending_no_record`, now as an
@@ -1158,7 +1166,8 @@ def test_no_two_census_entries_share_a_bare_function_name():
 #: Same rot, same reasoning:
 #: the separator is noise, the `sdk.py` + digits pair is the citation.
 _SDK_LINE_ANCHOR = re.compile(
-    r"sdk\.py[\s,:`@#]*(?:\(?\s*(?:at\s+)?line\s*[:\s#]*)?[Ll]?\d+")
+    r"sdk\.py[\s,:`@#()]*(?:(?:at\s+)?line[\s:,#]*)?(?:at\s+)?[Ll]?#?\d+",
+    re.IGNORECASE)
 
 #: ⛔ NO LOCAL WRITE-CLAUSE REGEX HERE. What counts as a write is
 #: `_statement_writes` + `_WRITE_CLAUSE_RE` from `tortoise.projection` — the
@@ -1346,22 +1355,51 @@ def _mutated_parameters(func) -> set[str]:
     false FAILs. The set this feeds is REPORTED, never exempted.
     """
     params = _params_of(func)
+    # A callee may hand the parameter to a LOCAL first (`acc = out;
+    # acc.append(...)`) — the alias arm (review round 5, measured GREEN). The
+    # alias map is closed the same way `_names_feeding` closes its name set, so
+    # `a = b = out` and a two-hop local are both covered.
+    alias: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign):
+                continue
+            source = node.value
+            if not isinstance(source, ast.Name):
+                continue
+            owner = source.id if source.id in params else alias.get(source.id)
+            if owner is None:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) \
+                        and target.id not in params \
+                        and alias.get(target.id) != owner:
+                    alias[target.id] = owner
+                    changed = True
+
+    def owning(name: str) -> str | None:
+        return name if name in params else alias.get(name)
+
     mutated: set[str] = set()
     for node in ast.walk(func):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                 and isinstance(node.func.value, ast.Name) \
-                and node.func.value.id in params \
                 and node.func.attr in _ACCUMULATOR_METHODS:
-            mutated.add(node.func.value.id)
+            owner = owning(node.func.value.id)
+            if owner:
+                mutated.add(owner)
         elif isinstance(node, ast.AugAssign) \
-                and isinstance(node.target, ast.Name) \
-                and node.target.id in params:
-            mutated.add(node.target.id)
+                and isinstance(node.target, ast.Name):
+            owner = owning(node.target.id)
+            if owner:
+                mutated.add(owner)
         elif isinstance(node, ast.Assign):
-            mutated |= {target.value.id for target in node.targets
-                        if isinstance(target, ast.Subscript)
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id in params}
+            mutated |= {owner for owner in (
+                owning(target.value.id) for target in node.targets
+                if isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)) if owner}
     return mutated
 
 
@@ -1398,6 +1436,26 @@ def _names_feeding(expression, func) -> set[str]:
     return names
 
 
+def _callee_name(call: ast.Call) -> str | None:
+    """The NAME to resolve for `call` — a bare function, or `self.<method>`.
+
+    Attribute callees were SKIPPED (review P2, measured): `self._fill(parts)`
+    resolved nowhere as far as this arm was concerned, so the dominant helper
+    shape in `sdk.py` — every `self._stamp_*` / `self._materialize_*` — was
+    invisible even though `_fragments_of` follows attribute callees. Only
+    `self`/`cls` receivers are named: `<handle>.append(…)` is a COLLECTION
+    mutation of the row's own local, not a callee whose parameter is mutated, and
+    resolving `append` as a module function would be a category error.
+    """
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+            and func.value.id in ("self", "cls"):
+        return func.attr
+    return None
+
+
 def _accumulator_offenders(func, statement_expr, module, path) -> list[str]:
     """Calls whose callee hands text back through a MUTATED ARGUMENT.
 
@@ -1418,24 +1476,35 @@ def _accumulator_offenders(func, statement_expr, module, path) -> list[str]:
     feeding = _names_feeding(statement_expr, func)
     offenders: list[str] = []
     for node in ast.walk(func):
-        if not isinstance(node, ast.Call) \
-                or not isinstance(node.func, ast.Name):
+        if not isinstance(node, ast.Call):
+            continue
+        callee_name = _callee_name(node)
+        if callee_name is None:
             continue
         callee, _callee_module, _callee_path = _resolve_callee(
-            node.func.id, module, path)
+            callee_name, module, path)
         if callee is None:
             continue
         mutated = _mutated_parameters(callee)
         if not mutated:
             continue
-        params = list(callee.args.posonlyargs) + list(callee.args.args)
-        supplied = {arg.arg: value
-                    for arg, value in zip(params, node.args, strict=False)}
+        # `self`/`cls` are not arguments the CALL SITE passes (review P2): without
+        # dropping them every positional bound one slot to the left, so a METHOD
+        # callee's mutated parameter was never matched.
+        params = [arg.arg for arg in
+                  list(callee.args.posonlyargs) + list(callee.args.args)
+                  if arg.arg not in ("self", "cls")]
+        supplied = {param: value
+                    for param, value in zip(params, node.args, strict=False)}
+        # A KEYWORD argument binds by name whatever the position (review P2):
+        # `_fill(out=parts)` was invisible while `_fill(parts)` reported.
+        supplied.update({kw.arg: kw.value for kw in node.keywords
+                         if kw.arg is not None})
         for param in sorted(mutated):
             value = supplied.get(param)
             if isinstance(value, ast.Name) and value.id in feeding:
                 offenders.append(
-                    f"{node.func.id}(): writes into `{value.id}` (its "
+                    f"{callee_name}(): writes into `{value.id}` (its "
                     f"`{param}` parameter), and `{value.id}` feeds this row's "
                     "statement — what the callee contributes could not be read "
                     "out, so the row cannot be called a read on this walk")
@@ -1955,6 +2024,14 @@ def test_the_line_anchor_matches_every_spelling():
         "sdk.py #L23508",
         "[sdk.py](../tortoise/sdk.py#L23508)",
         "sdk.py#23508",
+        # Fifth spelling family (review round 5, measured): `\(?` only fired when
+        # `line` followed, so the parenthesised bare line and the bare `at <n>`
+        # form passed — the two a human writes next to a path.
+        "sdk.py (23508)",
+        "sdk.py (L23508)",
+        "sdk.py at 23508",
+        "tortoise/sdk.py (23508)",
+        "SDK.PY:23508",
     ]
     for variant in must_match:
         assert _SDK_LINE_ANCHOR.search(variant), (
@@ -3058,6 +3135,82 @@ def test_a_write_fed_through_an_accumulator_parameter_is_reported():
     assert not _offenders_for(benign, with_module=True), (
         "a call that mutates NOTHING was reported as an accumulator — this arm "
         "must name the mutating shapes, not any call that takes a parameter")
+
+
+#: Every mutating shape `_mutated_parameters` / `_names_feeding` CLAIM to see,
+#: as a (callee body, call site, how the fragment reaches the statement) triple.
+#: Enumeration matters: the first version of the accumulator test exercised
+#: `.append` only, and four of the five declared arms could then be deleted with
+#: the whole file green (review round 5, measured — `_ACCUMULATOR_METHODS`
+#: narrowed to `{"append"}`, the `+=` arm dead, the subscript arm dead, and
+#: `_names_feeding`'s aug-assign arm dead all passed).
+_ACCUMULATOR_SHAPES: dict[str, tuple[str, str, str]] = {
+    "append": (
+        'def _fill(out):\n    out.append(" SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "extend": (
+        'def _fill(out):\n    out.extend([" SET n.poked = 1"])\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "insert": (
+        'def _fill(out):\n    out.insert(0, " SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "update": (
+        'def _fill(out):\n    out.update({"k": " SET n.poked = 1"})\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts.values())\n'),
+    "augassign": (
+        'def _fill(out):\n    out += [" SET n.poked = 1"]\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "subscript": (
+        'def _fill(out):\n    out[0] = " SET n.poked = 1"\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    # …and the two CALL-SIDE shapes, which are about reaching the callee at all
+    # rather than about how it mutates (review round 5):
+    "keyword_argument": (
+        'def _fill(out):\n    out.append(" SET n.poked = 1")\n',
+        "        _fill(out=parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    "method_callee": (
+        'class Door:\n    def _fill(self, out):\n'
+        '        out.append(" SET n.poked = 1")\n',
+        "        self._fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    # ⛔ …and the callee-side ALIAS: the parameter is handed to a local before it
+    # is mutated (review round 5, measured GREEN before this arm existed).
+    "callee_alias": (
+        'def _fill(out):\n    acc = out\n    acc.append(" SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id " + "".join(parts)\n'),
+    # …and the closure: `parts` reaches the statement only through an AUGMENTED
+    # local, which is what `_names_feeding`'s aug-assign arm adds.
+    "augassign_binding": (
+        'def _fill(out):\n    out.append(" SET n.poked = 1")\n',
+        "        _fill(parts)\n",
+        '        query = "MATCH (n:Point) RETURN n.id "\n'
+        '        query += "".join(parts)\n'),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_ACCUMULATOR_SHAPES))
+def test_every_declared_accumulator_shape_is_reported(shape):
+    """Each mutating / call-side shape the arm CLAIMS to see must report.
+
+    Table-driven on purpose: a hand-written case per arm is how `.append` became
+    the only covered shape while the docstring named six (review round 5). Each
+    row fails if its arm is deleted or narrowed, so the enumeration is the
+    non-vacuity proof for the whole declared surface rather than one sample.
+    """
+    body, call, statement = _ACCUMULATOR_SHAPES[shape]
+    source = f"{body}\nclass Row:\n    def reading(self, proj):\n        parts = []\n{call}{statement}        return proj.g.query(query).result_set\n"
+    offenders = _offenders_for(source, with_module=True)
+    assert any("writes into `parts`" in offender for offender in offenders), (
+        f"the `{shape}` shape is declared by the arm but was neither read nor "
+        f"reported (offenders={offenders})")
 
 
 def test_the_census_writer_set_states_its_own_polarity():
