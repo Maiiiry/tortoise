@@ -115,8 +115,10 @@ CORE_SUBJECT_KINDS = "organization, team, role, legalPerson, naturalPerson, othe
 # or dropping a description is a reviewed edit, never a quiet one. Completing the descriptions
 # is rubric authoring and belongs to the calibration lane, not a vocabulary guard.
 # Guarded by `tests/test_kind_vocabulary_consistency.py`
-# ::test_extraction_probe_semantics_are_canonical_kinds and
-# ::test_extraction_probe_described_subset_is_sized.
+# ::test_extraction_probe_semantics_are_canonical_kinds,
+# ::test_extraction_probe_described_subset_is_sized and
+# ::test_extraction_probe_descriptions_carry_text (the key sets AND the values: an emptied
+# description renders an empty instruction while every set-level leg stays green).
 CORE_SEMANTICS = {
     "Project": "A top-level initiative or product line",
     "WorkItem": "A unit of work (epic, issue, task)",

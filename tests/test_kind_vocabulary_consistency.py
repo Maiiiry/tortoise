@@ -30,11 +30,15 @@ module's regression: measured at ``4d9a0ddef`` as
 Reading ONTOLOGY §5 rather than restating it in Python is deliberate: a hardcoded copy here
 would be the same hand-maintained duplication this test exists to catch, one layer over.
 
-**Axes this file does NOT own, on purpose.** ``objectKind`` already has a stronger owner —
-``tests/test_pack_kinds.py::TestCanonicalObjectKindAlignment`` asserts
+**Axes this file does NOT own, on purpose.** ``objectKind``'s **§5 parse** is owned by
+``tests/test_pack_kinds.py::TestCanonicalObjectKindAlignment``, which asserts
 ``§5 == CANONICAL_OBJECT_KINDS == extractor_v2.CORE_OBJECT_KEYS`` (a three-way diff, including
-a surface this file cannot see), so adding it here would be a second parser of the same block
-with no added coverage.
+a surface this file cannot see) — parsing the ``§5`` block here as well would be a second parser
+of the same block with no added coverage. What this file DOES assert, at the bottom, is the axis
+that test cannot see: the **derived tooling copies** of that canonical set
+(``tools/probe_extractor``, ``tools/calibration_harness``) against ``CANONICAL_OBJECT_KINDS``. So
+the split is §5-parse here vs derived-copies there, not "objectKind is not ours" — the legs
+down there are deliberately owned by this file and are not covered by ``test_pack_kinds.py``.
 **Named residual, tracked on #2786** (recorded so this file is never read as "the point axis
 is consistent"): the point axis carries a deliberate TWO-name exception — ``event`` and
 ``humanApproval`` are accepted by the Layer-1 gate and are not pack-facing (asserted below,
@@ -428,3 +432,26 @@ def test_extraction_probe_described_subset_is_sized():
         "recorded exception and must be updated in the same edit:\n"
         f"  undescribed but not recorded: {sorted(undescribed - set(pe.UNDESCRIBED_CORE_KINDS))}\n"
         f"  recorded but now described: {sorted(set(pe.UNDESCRIBED_CORE_KINDS) - undescribed)}")
+
+
+def test_extraction_probe_descriptions_carry_text():
+    """A described kind's description is TEXT, not just a surviving key.
+
+    The legs above compare KEY SETS, so they pin which kinds the prompt's menu offers but not
+    that the offer says anything: setting ``CORE_SEMANTICS["tool"] = ""`` keeps every one of
+    them green, because the key is still canonical, the subset is still sized, and
+    ``_build_extraction_system`` still renders the token ``core:tool`` (the parse finds it and
+    the vacuity control is satisfied) — while the prompt loses the instruction for that kind
+    exactly as if the key had been deleted. That is the drift the sized leg's own docstring
+    promises is a failing test ("a description silently dropped (narrowing the prompt's menu)"),
+    so the value is asserted here rather than left to the key sets.
+
+    Prose that is only whitespace is the same hole (``"  core:tool —    "`` renders an empty
+    instruction), so the assertion is on the STRIPPED value.
+    """
+    pe = _tool_module("probe_extractor")
+    empty = sorted(k for k, v in pe.CORE_SEMANTICS.items()
+                   if not isinstance(v, str) or not v.strip())
+    assert not empty, (
+        "probe_extractor.CORE_SEMANTICS carries a description with no text — the prompt renders "
+        f"an empty instruction for these kinds: {empty}")
