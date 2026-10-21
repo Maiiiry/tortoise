@@ -5623,6 +5623,27 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("PART of this is issue assignee/holder: a GRAPHQL BUDGET", out)
         self.assertIn("while the remaining surface(s) (issue landed) need", out)
 
+    def test_a_rescued_issue_that_goes_incomplete_for_the_board_does_not_blame_the_budget(self):
+        # ⛔ THE FLAG MUST NAME THE CAUSE OF *THIS* INCOMPLETE, NOT ANY EXHAUSTION
+        # THE RUN SAW (#9423 review round 13, P3). Set before the rescue attempt,
+        # `budget_exhausted` was also true when the issue read was RESCUED and the
+        # surface then went INCOMPLETE for an unrelated reason — the holder gate's
+        # "the fleet board could not answer". `_incomplete_remedy` classifies on the
+        # flag alone, so the verdict line printed "the cause is a GRAPHQL BUDGET
+        # EXHAUSTION … re-run when it resets" directly under a row naming the board:
+        # a remedy contradicting the same report, which is #9402's own defect.
+        #
+        # The board is made unanswerable by writing a board stamped for a DIFFERENT
+        # repo (the gate refuses it), while the issue read is exhausted AND rescued.
+        self.fleet_board(repo="someone/else")
+        rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        # The board's failure is reported…
+        self.assertIn("could not answer", out)
+        # …and the remedy does NOT claim the budget is the cause.
+        self.assertNotIn("the cause is a GRAPHQL BUDGET EXHAUSTION", out)
+
     def test_a_verbose_exhaustion_still_yields_the_budget_remedy_when_rest_fails(self):
         # #9423 review round 11 (P3): the round-10 fix recorded the cause as DATA
         # on the SUCCESSFUL-rescue branch only. The FAILED-rescue branch is inside

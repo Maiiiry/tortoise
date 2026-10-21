@@ -5165,17 +5165,17 @@ def run_preflight(
             # stderr, and the predicate must classify the WHOLE of it
             # (#9402 review, P1).
             _exhausted = _is_budget_exhaustion(exc)
-            # ⛔ THE THIRD OF THE THREE RESCUE SITES, AND IT WAS THE MISSING ONE
-            # (#9423 review round 12, P3). The open-PR surface records its cause as
-            # DATA on both of its branches; this one — the issue-metadata rescue —
-            # is gated on the SAME predicate and knows the cause just as well, but
-            # left `_incomplete_remedy` to re-parse a note whose gh error is cut by
-            # `_one_line(..., limit=_REFUSED_READ_NOTE_LIMIT)`. Set it HERE, before
-            # the rescue is attempted, so BOTH outcomes (rescue succeeded but the
-            # surface is INCOMPLETE for another reason, and rescue failed) carry the
-            # cause without any prose surviving a truncation.
-            if _exhausted:
-                surfaces[SURFACE_ISSUE].budget_exhausted = True
+            # ⛔ THE THIRD OF THE THREE RESCUE SITES (#9423 review round 12, P3).
+            # The flag is set where the exhaustion is the cause OF THE INCOMPLETE —
+            # i.e. on the FAILED-rescue branch below — and NOT here (#9423 review
+            # round 13, P3). Set before the attempt, it was also True on the
+            # SUCCESSFUL-rescue path, where the surface is left CLEAN here and can
+            # later go INCOMPLETE for an unrelated reason (the holder gate's "the
+            # fleet board could not answer"). `_incomplete_remedy` classifies on the
+            # flag, so the run then printed "the cause is a GRAPHQL BUDGET
+            # EXHAUSTION … re-run when it resets" while the row above named the
+            # board — a remedy naming a cause the same report contradicts, which is
+            # #9402's own defect in a narrower corner.
             rescued: dict | None = None
             rest_why: str | None = None
             if _exhausted:
@@ -5203,6 +5203,12 @@ def run_preflight(
                     _rest_refusal_note(rest_why, exc)
                 )
                 kind = _classify_issue_error(detail)
+                # The cause is KNOWN here (this branch runs only inside the
+                # `_is_budget_exhaustion` gate) and it is a DIFFERENT cause from
+                # `issue-absent` / `repo-unresolved`, which have their own remedy
+                # arms — so the flag is scoped to the budget branches only.
+                if kind not in ("issue-absent", "repo-unresolved"):
+                    surfaces[SURFACE_ISSUE].budget_exhausted = True
                 if kind == "issue-absent":
                     msg = (
                         f"issue-absent: #{issue} does not exist in {slug} — "
