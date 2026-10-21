@@ -241,6 +241,16 @@ WHAT THIS PINS
    to 19 rows over 22 doors (measured at this head). The
    inputs are the TABLE's twenty-two doors, not the 99-tool registry, so adding a tool
    does not move them — which is what makes them pinnable without churn.
+23. `test_the_gate_walk_comment_pins_no_wall_clock_figure` — the `#9506` arm, and the
+   one arm here about this instrument's OWN prose rather than §13's. The gate-walk
+   comment in `_about_call_time_census.py` said "No magnitude is stated on purpose"
+   and stated one in the same sentence (`~2.6 s of ~17 s`), a figure whose framing
+   (whole arm? control step? which box?) was not in the comment, so a re-verifier
+   could not settle it — the defect class three earlier rounds removed from that
+   file. The sentence is held to its own object: a comment claiming it pins no
+   magnitude must pin none, while a duration carrying its framing is still allowed
+   (the arm encodes the CONTRADICTION, not a style preference). Red on the pre-fix
+   text, green after the figure was dropped.
 
 ⚠️ **What this deliberately does NOT claim.** The LITERAL census is a LOWER
 BOUND: it sees a relationship pattern naming the edge, so a reader that
@@ -265,6 +275,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import inspect
 import re
 from pathlib import Path
 
@@ -3666,6 +3677,51 @@ def test_a_module_constant_is_attributed_to_its_consumer():
         f"derived {sorted(derived)} — either the fallback is unreachable again (the "
         "line the review flagged) or the rule now attributes an unattributable read"
     )
+
+
+def _gate_walk_comment() -> str:
+    """The `#` lines of `_narrow_gate_walk_sites` — the comment `#9506` is about."""
+    census = _call_time_census()
+    source = inspect.getsource(census._narrow_gate_walk_sites)
+    return "\n".join(
+        line.strip() for line in source.splitlines() if line.lstrip().startswith("#")
+    )
+
+
+def test_the_gate_walk_comment_pins_no_wall_clock_figure():
+    """A comment that says it pins no magnitude must not pin one (`#9506`).
+
+    ⚠️ **The `#9506` defect was a sentence falsified by its own object.** The
+    refactor's comment read *"No magnitude is stated on purpose: the redundant
+    rebuild is a fraction of this arm (a re-verifier measured ~2.6 s of ~17 s on one
+    box)"* — an assertion that no magnitude is stated, immediately followed by one,
+    on the exact axis the change exists to fix. The figure was also unsettleable: the
+    framing that produced it (whole arm in-suite, `--durations=0`, one box) was not
+    in the comment, so a re-verifier running the control step alone measures
+    something else and cannot tell which reading was meant.
+
+    Both directions, so the arm is not a style rule: a duration WITH its framing is
+    allowed (the reviewer's alternative fix), but a comment that claims it pins none
+    while pinning one is red. Prose alone would leave the contradiction to the next
+    reader; the file's own thesis is that a claim it makes about itself is one a
+    guard can hold it to (`test_section_13_carries_no_line_citations` is the same
+    shape, one document over).
+    """
+    comment = _gate_walk_comment()
+    assert comment, (
+        "`_narrow_gate_walk_sites` carries no `#` comment any more, so this arm "
+        "asserts nothing — the mechanism it states was the whole point of the change"
+    )
+    says_none = re.search(r"no (?:magnitude|wall-clock)", comment, re.IGNORECASE)
+    durations = re.findall(r"\d+(?:\.\d+)?\s?(?:ms|s)\b", comment)
+    assert not (says_none and durations), (
+        "the gate-walk comment claims it pins no magnitude and then pins one "
+        f"({durations}) — a sentence falsified by its own object, and a duration "
+        "without its framing (whole arm? control step? which box?) is a claim a "
+        "re-verifier cannot settle. Drop the figure, or state it with the framing "
+        "that produced it."
+    )
+
 
 def _pin_universe_to_disk(census, on_disk: set[Path]) -> None:
     """The completeness pin's BODY — factored out so its FLOOR is pinnable too.

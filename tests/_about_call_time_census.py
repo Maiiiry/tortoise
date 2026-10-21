@@ -990,9 +990,8 @@ def _narrow_gate_walk_sites() -> tuple[
     # `_literal_files()` is already parsed and cached; re-reading `_sources()` and
     # rebuilding the same 29 `_File`s is redundant work for byte-identical output —
     # the same `_File` values over the same `_sources().items()` order, so only object
-    # identity changes. No magnitude is stated on purpose: the redundant rebuild is a
-    # fraction of this arm (a re-verifier measured ~2.6 s of ~17 s on one box), and a
-    # wall-clock number pinned into a comment is the claim that rots.
+    # identity changes. No magnitude is pinned: the rebuild is a small fraction of this
+    # arm's cost, and a wall-clock number in a comment is the claim that rots.
     for file in _literal_files():
         source = file.source
         for symbol, _line in _sites_in(file):
