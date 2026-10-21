@@ -692,6 +692,45 @@ that was itself a heading cannot collide with this file's own outline.
   - ✅ The canonical id contract (`#7955`). The stable key is fixed per label — `:Point` → `id` (minted by `tortoise/ids.py::ulid()`), `:Event` → `eventId`, `:Subject`/`:Object` → `name`, `:So…
   - ⛔ CORRECTION TO §17.5 AS WRITTEN — `baseline_source` is NOT unconditionally DERIVED; `baseline_set` is DERIVED, but not as a record column. When an author sets the prior (`baseline_source…
 
+---
+
+### 2026-10-20 — `#9397`: §11.1 and §13 said the `aboutObject` edge carries **no** property — it carries `confidence`
+
+**What was recorded.** §11.1 (*"Our `aboutObject` links are **property-free** … a full-repo search for a property-bearing edge finds **none**"*) and §13 (*"**no** `aboutObject` edge carries **any property** … we lose nothing semantically by deriving later"*), plus the same fact in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 question 2 and in this ledger's `aboutObject` decision row. ⚠️ **The retraction had to reach §11.1's estimate footnote and §11.3 too**, which stated it in a third wording a reader reaches twenty lines below the correction: the cost footnote rested on *"from the measured property-free finding"*, §11.3's table called the rows *"**property-free rows**"*, and §11.3's prose said *"the entity links stay bare"*. A correction that fixes one wording and leaves three is how the same absolute gets re-derived.
+
+**Why it was wrong, and why the method hid it.** The evidence was a search for a Cypher **property MAP** (`rg -n 'aboutObject \{'`) → 0 matches. A property written by a **`SET` clause on a relationship variable** never matches that pattern, so the search could not see the writer, and a zero from a search that cannot match the writer was recorded as a measured absence. Three shipped sites originate one (three further paths re-materialize the same set — and a fourth suspect, `sdk.supersede_point`, does NOT: see the review-cycle correction at the end of this entry):
+
+| site | what it writes |
+|---|---|
+| `tortoise/session_link.py` — `link_entity` | `MERGE (s)-[r:{edge_type}]->(t) SET r.confidence=$conf`; `edge_type` **defaults to `aboutObject`** |
+| `tortoise/subject_binding.py` — `bind_point_subjects` | `SET r.confidence=$conf` on an already-present about edge; the `object` slot role binds via `aboutObject` (reached from `_extract_session_v2` on the default ingestion path) |
+| `tortoise/projection/entities.py` — `_fold_entity_linked_reason` | the **replay fold** re-SETs it, so the property is journaled — `live == rebuild` |
+
+The property is asserted by a shipped test (`tests/test_subject_binding_1370.py::test_binder_reports_already_present_and_sets_confidence`, reading `r.confidence` off a `(Point)-[:aboutObject]->(Object)` edge), so this was never an obscure branch.
+
+**What changed.** §11.1 states the measured property set (exactly one name — `confidence` — on bound entity links only; the extractor/indexer links that are the bulk of the rows are genuinely bare, so the **cost** conclusion stands) and §13 narrows *"we lose nothing semantically by deriving later"* to *"we lose one recorded attribute"*. **The KEEP ruling and its deferral to post-launch are unchanged** — if anything the finding strengthens keeping the edge. §11.4 rule 1 is now recorded as **in tension** with `#1370` rather than as satisfied: whether a binding confidence belongs on the link or on the claim is an unrecorded design decision, flagged, not resolved here.
+
+**What now prevents a repeat.** `tests/test_9397_about_edge_properties.py` — the retracted absolute sentences must not reappear; the corrected text must name the writers and the property; each recorded writer must still write it; and a **census over relationship-variable property writes** — the named `SET r.<prop>` form, the property-MAP `SET r += $props` form and an inline pattern map — reds if a NEW property-bearing `about*` writer appears without being recorded. ⚠️ **That promise is bounded and the bound is stated, not assumed:** an about edge is recognised by an `about*` literal or by a predicate interpolated from a vocabulary named in the census's `_ABOUT_VOCAB` (the predicate allowlist included), so a NEW predicate vocabulary has to be added there in the same change. The lesson is stated for the next reader: *re-derive a property claim from the WRITER CENSUS, not from a grep whose pattern cannot match the writer.*
+
+**Review-cycle correction (same day) — the first census reproduced the original error one level down, and the retraction was incomplete.** Two blocking findings, both real:
+
+- The census matched only the **named** form `SET r.<prop>`. The **property-MAP** form `SET r += $props` / `SET r = $p` was invisible to it — the same class of blindness as the `aboutObject {` grep — and three shipped sites already use it on an allowlisted `aboutObject` predicate: `cache_projection.relation_statement` (the record-layer projection; the `public.relation` row carries `confidence`), `projection._rebuild_all_replay` (rebuilding it from the journal), and `hosted_backup.restore_graph` (`SET r = $p` over the dump's stored edge properties). A fourth, `sdk.supersede_point`, was recorded here too until the next review cycle showed that its `SET r += $attrs` is on the `IMPL|NAND` leg and its about transfer is **bare** — a census FALSE POSITIVE, not a re-materialization. So "**three** shipped sites" was an incomplete enumeration at the very revision that calls it measured. The census now reads **both** forms, and its about-vocabulary includes the predicate allowlist (`validate_rel_type` / `KNOWN_REL_TYPES` / `_sanitize_label`) — because taking the predicate from the allowlist that contains `aboutObject` is exactly how a map-form writer names its edge without writing `aboutObject` anywhere. Measured against the tree: the population goes from 3 to **6** (3 originated + 3 re-materialized; a seventh candidate is a declared false positive — see below), and the property set stays **one semantic attribute** — the map-form writers re-materialize `confidence` from the record row, the journal event or the dump, and add no second attribute (the third review-cycle correction below finds the one further NAME the record projection writes).
+- The retracted "property-free" wording survived in **§11.3's table row** (*"property-free rows"*) and in **§11's estimate footnote** (*"the measured property-free finding"*) — twenty lines below the corrected §11.1, where a reader would take it as current. Both now state the measured property set, and both literals are pinned as retracted.
+
+Also corrected in the guard itself: the `§13.8 q2` retracted literal was pinned **unbolded** while the document bolds it, so it matched nothing and would have passed a verbatim revert (dead entry). And the corrected-passage pin was whole-FILE, so it could not red on one section's silent revert — it is now section-scoped (§11.1, §13, §13.8 q2), the `test_entity_attachment_brief_claims.py` precedent (`#8639` review).
+
+**Second review-cycle correction (same day) — a THIRD write form, and a second property name.** The correction above replaced *"property-free"* with *"The property set is exactly one name — `confidence`"*, and that is still an absolute one form short. A property can be set in three forms, not two: `SET r.<prop>`, the property-MAP `SET r += $props`, and an **inline pattern map** `MERGE (s)-[r:TYPE {name:$v}]->(t)` — which appears in NO `SET` clause, so both rules in the census were blind to it. `cache_projection.relation_statement` ships it: `MERGE (src)-[r:{rel.rel_type} {idx:$idx}]->(tgt) SET r += $props` (`cache_projection.py:717`), over a predicate taken from `validate_rel_type`'s allowlist, which contains every `about*` predicate (`security.py:85`), on a relation row the projection builds for `EntityLinked` (`record_projection.py:732`). So a **record-projected** about edge carries `idx` — the positional ordinal of `public.relation.idx` (`supabase/migrations/20261012000003_record_epistemic.sql:175`), a position and not a claim attribute — and §11.1/§13 now state the measured set as `confidence` (originated, three sites) **plus `idx`** (re-materialized, one site) with the placement-column and `props` tail named. `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 q2 no longer says *"never a second property name"*. Both retracted phrasings — *"The property set is exactly one name — `confidence`"* and *"never a second property name"* — are pinned in `tests/test_9397_about_edge_properties.py`, which now reads **all three** forms and asserts that `relation_statement` is seen writing `idx`. Its module prefilter was also fail-open: it skipped any file without the literal word "about", which is the very word the allowlist-driven map writer does not contain, so the widened vocabulary could never reach the modules it was widened for. ⚠️ **The row it added for `sdk.supersede_point` was a FALSE POSITIVE, removed the same day:** a whole-function census cannot tell which edge a `SET` lands on, and this function's `SET r += $attrs` is on the `IMPL|NAND` leg (`MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t)`) while its about edge is transferred by a bare `MERGE (new)-[:{rel}]->(t)` with no `SET`. On an about edge it writes nothing — it **drops** the binder's `confidence` (`#9417`, filed from this correction). The population is 6, not 7; the guard keeps the row as a declared false positive (`NOT_AN_ABOUT_WRITER`) so it stays visible without being counted, and it now compares every recorded writer's **name set** so a second property at an existing site cannot slip past. A **third** stale absolute survived in the same section: §11.1's method paragraph still said *"Two forms write to an edge, and both are in scope"* while the paragraph above it documented the inline form — it now says three forms / all three, and the discarded phrasing is pinned as retracted.
+
+**Third review-cycle correction (same day) — two surviving wordings, one stale citation, and a census that skipped what it could not read.** Three P3s, none touching the ruling, all in the evidence layer:
+
+- **A stale `file:line` cited as current.** §13 and §13.8 q2 said `create_about_edge` (`projection/edges.py:344`) unqualified. `:344` was the definition **at the `c79ba1cf2` pin**; at HEAD the definition is `projection/edges.py:1447`, and `:344` is a `#:` comment block that *mentions* the symbol — which is why the number read as plausible to anyone who checked it. Both copies now cite the **symbol** only, per this document set's own rule that line numbers are not asserted; §11.1's copy keeps `:344` because it carries the `at the pinned revision` qualifier, which is what makes it true. Pinned by `test_the_corrected_passages_carry_no_bare_edges_line_citation`, whose matcher is itself proved live against the pre-fix spelling.
+- **The same absolute survived 70 lines above the correction, for a different link class.** §9.6 said identity/mention (`Object`) and referential-containment (`Source → Source`) `references` links *"stay **property-free**"* — the wording this entry retracts for `aboutObject`, and false at HEAD for the same reason: `cache_projection.relation_statement` stamps `{idx:$idx}` **unconditionally** on every relation it materializes (`cache_projection.py:717`) and `references` is an explicitly record-projected predicate, while `_rebuild_all_replay` re-applies the journal's attributes over an allowlisted `etypes`. The FACT §9.6 establishes is narrower: those links carry **no `sourceVersion`**, and the wording now says exactly that. Pinned section-scoped by `test_the_references_paragraph_scopes_property_freedom_to_source_version` (the `RETRACTED` list is about `aboutObject` wording, so this claim needs its own leg — and the changelog thesis applies verbatim: a correction that fixes one wording and leaves three is how the same absolute gets re-derived).
+- **The census failed OPEN on a module it could not parse.** `_writers_in_module` returned its (empty or partial) finding on `SyntaxError`, so a module `ast.parse` rejects was censused as *"writes no property on any about edge"* — mechanically the `rg 'aboutObject {'` defect, one level down — and the promise's stated bound (a list of vocabulary NAMES) did not cover it, so a reader was told the only gap was a token nobody had written yet. It now raises `UnparsableModule` naming the file, and leg 3's per-module read is strict UTF-8 like the census's (it read `errors="replace"`, so a byte-compromised module would have been censused as different text than the leg that parses it). Pinned by `test_the_census_fails_closed_on_a_module_it_cannot_parse`, red on the pre-fix `return found`.
+
+⚠️ **The census also read one FALSE POSITIVE as a writer of the map form.** `projection._rebuild_all_replay` was recorded as a re-materializer alongside `cache_projection.relation_statement` and `hosted_backup.restore_graph`; it is not. Its `SET r += $attrs` belongs to the `DirectEdgeCreated` fold, and that event has exactly one producer — `create_direct_edge`, which refuses any `op_type` outside `{IMPL, NAND}` — while its about/structural transfer is a separate BARE `MERGE` (the code says so in place: *"Structural 2b transfers are bare: NO attr SET, no direction/confidence/weight"*), and `create_about_edge` journals no `DirectEdgeCreated` at all, so no about edge can reach the attr fold. **The measured population is therefore 3 originating + 2 re-materializing = 5 writers, with TWO declared false positives** (`sdk.supersede_point` and `projection._rebuild_all_replay`). Each exemption now pins the STATEMENT that makes it one — the about transfer carries no `SET`, and the `SET` the census does see names no `about*` predicate — so an exemption cannot rot into a silent lie, and §13 / §13.8 q2 state the count as 5 (`three of the five`, not `three of the six`).
+
+**Fourth review-cycle correction (same day) — the guard's own provenance claim, and its false-positive exemption.** Three fixes in `tests/test_9397_about_edge_properties.py`, all in the guard rather than the corrected text: (1) *"Two forms write to an edge, and both are in scope"* was **written by an earlier revision of this correction and then withdrawn**, not carried over from the pre-fix document — measured absent at the pre-fix revision — so it is now declared in `RETRACTED_INTRODUCED_HERE`, and a new leg MEASURES the split against the pre-fix revision instead of restating it (a misclassified entry made the guard's own failure message claim a pre-fix presence that never existed). (2) The `sdk.supersede_point` row in `NOT_AN_ABOUT_WRITER` was a **fail-open exemption**: both name-comparison legs skipped it, so a property added on that about edge redded nothing while §13 and §13.8 q2 assert it carries none. The row now declares its expected name set (`<map:$props>`) and is compared like a recorded writer, and the premise is asserted **at the statement** — the about transfer is a bare `MERGE` and the `SET r += $attrs` sits in a query whose patterns name no `about*` predicate. (3) The failure diagnostic now prints the live document a retracted sentence actually survived in, not only its recorded pre-fix home. §13's `create_about_edge` citation is also qualified (`:344` at the pinned revision) the way §11.1's copy already was, so the number reads as a pin rather than as drift.
+
 ## §13 — the `aboutObject` headline claim is SCOPED to the files it measured (`#9399`)
 
 The removed sentence and why it went. §13's evidence for the KEEP ruling opened
@@ -714,3 +753,53 @@ lane the three files bound and names the module and the door outside it;
 `tests/test_9399_search_path_claim_scope.py` holds it there by parsing the file
 list OUT of the sentence and re-running the scan over it, so widening the list or
 reverting the qualification reds.
+
+---
+
+## The capture-path write order — the invariant §9.6 states, now pinned (`#8501`)
+
+**What §9.6 says, and what the code did.** §9.6 records that the capture owns a
+session `:Source`'s version. The code did not: `capture_session` (and hosted
+`_capture_session_impl`) ran extraction — which creates the Points and MERGEs
+their `extractedFrom` links — **before** `_materialize_session_source`, the one
+writer that SETs `contentHash`. So `resolve_source_versions` read an empty hash
+**at link time**, `$v` bound nothing, and `_anchor_on_create` wrote
+`sourceVersion = NULL` on every create-path link. Measured on the pre-fix tree:
+`references` 1/1 anchored, `extractedFrom` 0/1. The consequence is not cosmetic —
+a revised transcript could never mark the claims it had superseded, because no
+claim recorded which version it was read from.
+
+**The invariant, stated so the next lane does not have to re-derive it.** *A
+capture must write its session Source's version BEFORE anything reads it at link
+time.* That is what §9.6 already assumed; it was true in prose and false in code,
+and nothing compared the two.
+
+**What changed.** Both lanes move the MINT + MATERIALIZE half above extraction,
+inside the **same gate** each lane already used (`not session_existed or
+(retry_failed_capture and not no_provider)` / `… and not store_only`), and the
+provenance stamp stays after extraction. Three consequences were handled
+deliberately rather than discovered later:
+
+- **The materializer can now CREATE the stub** (nothing created it yet), so it
+  mints `_link_source`'s create-time shape through the replay-shared
+  `_mint_source_stub` and upgrades it — and the `SourceCreated` record is
+  emitted before the link, so the raw `SET` still has a journal carrier (§17.1).
+- **`_mint_source_stub(now=…)` carries the CAPTURE's instant**, not a fresh clock
+  read: for a keyless capture this mint is the only writer of `ingestedAt`, and
+  its `SourceCreated` record carries `now`. A fresh read would put a later clock
+  on the live node than the replay folds in — a live≠replay divergence on a path
+  that previously had none.
+- **A KEYLESS capture's `:Source` gains four properties** (`title`,
+  `canonicalUrl`, `urlAliases`, `is_episodic`). Pre-fix that lane created the node
+  with only its `SET` properties, because it never reached `_link_source`. The
+  new shape is the stub shape the extracting lane has always had (and
+  `is_episodic` is the `#1486` discriminator), but it IS a behaviour change on
+  that lane, and it is pinned rather than disclosed-away.
+
+**What now prevents a repeat.** `tests/test_8501_capture_path_anchor.py` — the
+anchor must be non-NULL, equal to the Source's stored `contentHash`, and present
+in the Point's own journaled `sourceVersionTransit`; it must survive a
+destructive `rebuild_all()`; a re-capture must neither advance nor drop it; the
+keyless lane's full key set is pinned; and the pre-fix Source shape is pinned
+against the literal set. Registered on the `core` surface with a `durations:`
+weight, because a guard no CI leg selects is a guard that does not run.
