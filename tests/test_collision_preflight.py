@@ -3373,7 +3373,8 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertIn("not decodable as text", out)
 
-    def test_a_non_utf8_rest_open_pr_body_is_a_named_incomplete_not_a_traceback(self):        # #9423 review (P3): the REST rescue's `except ValueError` arm is the
+    def test_a_non_utf8_rest_open_pr_body_is_a_named_incomplete_not_a_traceback(self):
+        # #9423 review (P3): the REST rescue's `except ValueError` arm is the
         # strict-decoding refusal `_issue_view_rest` has carried since #3435, and
         # it was UNPINNED — no seam wrote a bad byte to the open-PR REST fixture,
         # so DELETING the arm left the whole suite green. That matters because
@@ -5643,16 +5644,55 @@ class CollisionPreflightTest(unittest.TestCase):
         # EXHAUSTION … re-run when it resets" directly under a row naming the board:
         # a remedy contradicting the same report, which is #9402's own defect.
         #
-        # The board is made unanswerable by writing a board stamped for a DIFFERENT
-        # repo (the gate refuses it), while the issue read is exhausted AND rescued.
-        self.fleet_board(repo="someone/else")
-        rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1"})
-        self.assertEqual(rc, 2, out)
-        self.assertIn("VERDICT: INCOMPLETE", out)
-        # The board's failure is reported…
-        self.assertIn("could not answer", out)
+        # ⛔ HOW THE BOARD IS MADE UNANSWERABLE — STATED AS THE CODE DOES IT
+        # (#9423 review, P3). The gate does NOT refuse an other-repo board: a
+        # fresh, answerable board stamped for another slug only gets a `why` from
+        # `_board_is_for_repo`, and `_read_board` then FALLS THROUGH to a rebuild
+        # ("A stale, other-repo, or unstamped board falls through to the same
+        # rebuild"). The board is unanswerable because that REBUILD cannot
+        # answer — which is why `build_state` is replaced here. The real rebuild
+        # spends `fleet_state.DEFAULT_SAMPLE_S` sleeping and shells out to bare
+        # `gh`/`cmux` from PATH, so reaching this state through it made the pin
+        # cost ~4.5 s and depend on the operator's machine (see `fleet_board`'s
+        # own docstring, and how `HolderGateTests` mocks this to stay hermetic).
+        # Driving `run_preflight` in-process over the SAME gh stub keeps the
+        # assertion on the REAL report and removes the live read.
+        cp = _tool_module()
+        board = self.fleet_board(repo="someone/else")
+        target = cp.RepoTarget(
+            slug=SLUG, path=str(self.repo), source="explicit", requested=True,
+        )
+        # Same filter `run_tool` applies: the cache seams are STATEFUL, so an
+        # exported `COLLISION_PREFLIGHT_BOARD_CACHE` must not let one run's
+        # rebuild answer this one.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("COLLISION_PREFLIGHT_")}
+        env.update({
+            "HOME": str(self.home),
+            "GH_STUB_DIR": str(self.gh_dir),
+            "GH_STUB_ISSUE_VIEW_RATE_LIMITED": "1",
+        })
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(cp.fleet_state, "DEFAULT_OUT", board), \
+                mock.patch.object(
+                    cp.fleet_state, "build_state",
+                    side_effect=RuntimeError("no live read in this test"),
+                ) as build:
+            ordered, title, number = cp.run_preflight(
+                ISSUE, target, str(self.gh), "git", 10.0,
+            )
+            report, code = cp.format_report(ordered, number, target, title)
+        # The other-repo board really did FALL THROUGH to a rebuild — this is the
+        # mechanism the paragraph above claims, and the pre-correction text ("the
+        # gate refuses it") described a branch `_read_board` does not have.
+        build.assert_called_once()
+        # The issue read is exhausted AND rescued, so the report's incomplete row
+        # is the board's, not the budget's.
+        self.assertEqual(code, 2, report)
+        self.assertIn("VERDICT: INCOMPLETE", report)
+        self.assertIn("could not answer", report)
         # …and the remedy does NOT claim the budget is the cause.
-        self.assertNotIn("the cause is a GRAPHQL BUDGET EXHAUSTION", out)
+        self.assertNotIn("the cause is a GRAPHQL BUDGET EXHAUSTION", report)
 
     def test_a_verbose_exhaustion_still_yields_the_budget_remedy_when_rest_fails(self):
         # #9423 review round 11 (P3): the round-10 fix recorded the cause as DATA
