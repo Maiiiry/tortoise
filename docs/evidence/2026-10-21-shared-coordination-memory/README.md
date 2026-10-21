@@ -64,7 +64,7 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 | Quantity | Measured value | Source |
 |---|---|---|
 | Fleet map graph, as a hosted tenant would hold it | **21,065 nodes** — 10,374 `:Point`, **10,583 `:GraphEvent`**, 60 `:Source`, 1 `:Event` | `docs/evidence/7983-cost-magnitudes/graph-content-census.json` (2026-10-17, live self-hosted map at `:16379`) |
-| Resident size of that map | **35 MB graph memory**, **0.1499 GB** at the measured 1,672 B/resident node | same census; `STORAGE-ARCHITECTURE.md` §17.4.6 |
+| Resident size of that map | **35 MB graph memory** = **0.0352 GB** (the census's own `total_graph_sz_mb`, i.e. 21,065 nodes × the measured **1,672 B/resident node**) | `docs/evidence/7983-cost-magnitudes/graph-content-census.json` (`graph_memory_usage.total_graph_sz_mb: 35`); `STORAGE-ARCHITECTURE.md` §17.4.3 for the per-node rate. ⚠️ `0.1499 GB` (§17.4.6) is **not** this map: it is the cache's 143 MiB over the **89,701**-node stock §17.4.3 derives 1,672 B from, so quoting it here overstated this map 4× |
 | **Charged** nodes of that map | **≈10,435** (Points + Object/Subject/Event; the `GraphEvent` journal is **not** charged) | `tortoise/quota.py` (the `points` counter IS the pricing `max_graph_nodes` cap) |
 | **One claim**, measured on a private lane graph today (`docker://:@127.0.0.1:16393`) | **+2 nodes per claim on the `create_point` path** (1 `:Point` + 1 `:GraphEvent` journal entry); **+5 MB for 3,000 claims** (incl. 2 MB of index) ⇒ **≈1,748 B resident/claim**; **10.7 ms per create** (3,000 creates in 32.0 s) | this lane's probe, `GRAPH.MEMORY USAGE` + `MATCH (n) RETURN count(n)` |
 | **One claim on the SHIPPED write path** (re-measured in review, since the tool no longer uses `create_point` — it needs an atomic `MERGE`, see §3) | **+1 node** (`:Point`) per claim; `create_point` on the same graph adds **≈+2 per point** (`:Point` + `:GraphEvent`) plus two ONE-OFF graph-level meta nodes (`EpMeta`, `GraphEventMeta`) on a graph's first point | 30 `create_point` calls on the review graph: total +62 nodes; `MATCH (n) RETURN count(n)` and label deltas before/after `SDKClaimStore.create` vs `sdk.create_point` |
@@ -95,8 +95,9 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
   what a lane steers by): **10,435 chargeable nodes today**, which **already exceeds free's 10,000**, so
   the floor is **solo at $9/month**; the combined count crosses solo's 25,000 in **~5 months** at the
   measured claim rate, at which point it is **pro at $25/month**. Per box (3 boxes): **$3–8.33/box/month**.
-- **Marginal infrastructure on our own hosted deployment: $0.** The whole state is **0.15 GB** against
-  an **8 GB PRO FalkorDB Cloud** instance already on the bill at $350/month (~1.9% of that line), and the
+- **Marginal infrastructure on our own hosted deployment: $0.** The whole state is **0.035 GB** (35 MB,
+  §2.1 — *not* the 0.1499 GB §17.4.6 measures over a different, 89,701-node stock) against
+  an **8 GB PRO FalkorDB Cloud** instance already on the bill at $350/month (~0.44% of that line), and the
   Fly app it fronts is already running for the product. Upgrading a *plan* is a product decision about
   our own internal tenant; it is not new infrastructure.
 - **What is missing to use hosted today** (measured, not assumed): **a credential AND a hosted write
@@ -122,8 +123,9 @@ Read on `2026-10-21` on cell-3 (`HOME=/tmp/cell-home`); counts are as-of that re
 
 ## 3. The pilot — one slice, the claim, in the graph
 
-`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (46 fake-store tests + 3 live tests, 49
-collected), contract `rc 0/1/2/3` identical to `claims.sh` for `acquire`/`release` so a caller needs no
+`tools/work_claim.py` (this branch), `tests/test_work_claim.py` (55 fake-store tests + 3 live tests, 58
+collected — re-derived with `--collect-only`, and pinned against this line by the suite itself), contract
+`rc 0/1/2/3` identical to `claims.sh` for `acquire`/`release` so a caller needs no
 new branch (`rc 3` is a malformed invocation; `status`'s rc reports that it ANSWERED — see §3.1).
 
 **What it stores.** One `:Point` per held unit, id = `sha256(repo, key)` rendered as the SDK's ULID shape —
@@ -272,7 +274,7 @@ stores all of them.
 ```bash
 # the per-claim volume probe (private lane graph, so no peer's target is touched)
 uri="$(uv run python tools/test_lane.py uri)" && eval "$uri"
-uv run pytest tests/test_work_claim.py -q            # 46 passed at this head (3 live legs skip without a URI)
+uv run pytest tests/test_work_claim.py -q            # 55 passed at this head (3 live legs skip without a URI)
 
 # `--allow-box-local`: this lane's container is loopback BY DESIGN. EVERY verb that reads or
 # writes the store (`acquire`, `status`, `release`) refuses a loopback target otherwise,

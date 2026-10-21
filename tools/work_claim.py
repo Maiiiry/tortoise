@@ -79,7 +79,8 @@ this". An unset store is therefore refused before any query is attempted.
 
 CALLER CONTRACT (drop-in vocabulary with `claims.sh`, so a caller needs no new branch)
 ------------------------------------------------------------------------------------
-    rc 0  acquired (or reclaimed an EXPIRED claim, or a release that succeeded, or a
+    rc 0  acquired (or reclaimed an EXPIRED claim, or `already-held` — the caller already
+          holds it, so a retry is not a second grant — or a release that succeeded, or a
           `status` that ANSWERED — including `status: held`, see below)
     rc 1  held by a LIVE claim (or a release refused: not the caller's / epoch moved)
     rc 2  the store could not answer — REFUSE the dispatch, do not proceed blind
@@ -367,10 +368,16 @@ def _redact_uri(uri: str) -> str:
 
     The documented URI form carries a password, and `check` runs in routine diagnostics whose
     output is pasted into issues and controller logs.
+
+    The userinfo is everything up to the LAST `@` before the path — not the first. The earlier
+    `//[^/@\\s]*@` stopped at the first `@`, so a password CONTAINING one (`:p@ssw0rd@host`) was
+    printed with its tail intact (`docker://***@ssw0rd@host`) by `check` and `store.target()`,
+    in the very output this function exists to make safe to paste (review of #9487).
+    ``urlsplit`` does the same split (`netloc.rpartition('@')`), so this matches it.
     """
     import re
 
-    return re.sub(r"//[^/@\s]*@", "//***@", uri)
+    return re.sub(r"//[^/\s]*@", "//***@", uri)
 
 
 def _uri_host(uri: str) -> str:
@@ -701,10 +708,14 @@ def acquire(
 ) -> Outcome:
     """Take the claim, or refuse. Never blocks, never retries blind.
 
-    Three shapes only: created (0), held by a live claim (1), unanswerable (2). The read-back
-    is the authority in all three — `create`'s return value is compared to what we meant to
-    write, so a store that silently hands back someone else's point is a lost race rather
-    than an acquisition.
+    Four shapes: created (0), **`already-held`** (0 — the SAME caller already holds it, so a
+    resumed lane is not told a peer has its unit), held by a LIVE claim (1), unanswerable (2).
+    The read-back is the authority in all four — `create`'s return value is compared to what we
+    meant to write, so a store that silently hands back someone else's point is a lost race
+    rather than an acquisition.
+
+    ⛔ `already-held` is rc 0 and is NOT `acquired`: a controller that branches on the status
+    vocabulary instead of on rc must accept BOTH, or it refuses its own retry (review of #9487).
     """
     now = _now() if now is None else now
     cid = claim_id(record.repo, record.key)

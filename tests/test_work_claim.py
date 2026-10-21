@@ -484,6 +484,21 @@ def test_reentrant_acquire_is_already_held_rather_than_held_by_a_peer():
     assert again.lease_until == NOW + 3600
 
 
+def test_acquire_documents_the_fourth_shape_it_can_return():
+    """`acquire` returns FOUR statuses — `already-held` (rc 0) is the re-entrancy one — while
+    its docstring said "three shapes only" and the CALLER CONTRACT's rc-0 row omitted it. A
+    controller branching on the enumerated vocabulary (rather than on rc) therefore refused
+    its own retry, which is the behaviour the re-entrancy arm exists to remove (review of
+    #9487 nit)."""
+    assert "already-held" in wc.acquire.__doc__
+    contract_rc0 = wc.__doc__.split("CALLER CONTRACT", 1)[1].split("rc 1", 1)[0]
+    assert "already-held" in contract_rc0, contract_rc0
+    # and the status it names really is what the code returns on a re-entrant acquire
+    store = FakeStore()
+    wc.acquire(store, _record(owner="cell-1:100"), now=NOW)
+    assert wc.acquire(store, _record(owner="cell-1:100"), now=NOW + 10).status == "already-held"
+
+
 def test_release_cannot_overwrite_a_claim_a_peer_reclaimed_meanwhile():
     """The release is conditional on the epoch the caller observed; when a peer's reclaim lands
     first the write must not erase it (the residual window a blind `update_point` leaves)."""
@@ -528,6 +543,35 @@ def test_box_local_target_is_refused_unless_acknowledged():
     assert "s3cret" not in store.target()
     # an acknowledged single-box trial is allowed through the guard
     assert wc.SDKClaimStore(sdk=LoopbackSDK(), allow_box_local=True).require_shared() is None
+
+
+def test_redaction_hides_a_password_that_contains_an_at_sign():
+    """The userinfo ends at the LAST `@` before the path, not the first. The old
+    `//[^/@\\s]*@` stopped at the first one, so `docker://:p@ssw0rd@host:6379/g` was printed
+    as `docker://***@ssw0rd@host:6379/g` — most of the password, in the exact output `check`
+    emits for pasting into issues and controller logs (review of #9487)."""
+
+    class HostedSDK:
+        _db_uri = "docker://:p@ssw0rd@shared.host:6379/g"
+
+        def _get_proj(self):
+            raise AssertionError("redaction is a pure string operation")
+
+    cases = {
+        "docker://:s3cret@127.0.0.1:16379/tortoise": "docker://***@127.0.0.1:16379/tortoise",
+        "docker://:p@ssw0rd@shared.host:6379/g": "docker://***@shared.host:6379/g",
+        "bolt://user:p@ss@h:7687/g": "bolt://***@h:7687/g",
+        # no userinfo at all must survive untouched (nothing to redact)
+        "docker://localhost:6379/g": "docker://localhost:6379/g",
+    }
+    for uri, expected in cases.items():
+        assert wc._redact_uri(uri) == expected, uri
+    # not one character of the password survives — the tail was the leak
+    assert "ssw0rd" not in wc._redact_uri("docker://:p@ssw0rd@shared.host:6379/g")
+    # the SAME leak was reachable through the caller-visible `store.target()`
+    assert wc.SDKClaimStore(sdk=HostedSDK()).target() == "docker://***@shared.host:6379/g"
+    # ... and the host is still the real one (redaction must not eat the address)
+    assert wc._uri_host("docker://:p@ssw0rd@shared.host:6379/g") == "shared.host"
 
 
 def test_owner_token_uses_a_real_hostname_not_just_the_env_var(monkeypatch):
@@ -1154,3 +1198,51 @@ def test_ttl_zero_is_a_usage_error_not_an_instantly_expired_claim():
         store=FakeStore(),
     )
     assert rc == wc.EXIT_USAGE
+
+
+def test_the_documented_case_counts_match_what_this_file_collects():
+    """The count of this file's cases is stated in three artefacts (the evidence README's
+    inventory row and reproduction command, and the `durations` comment in
+    `config/ci-surfaces.yml`) — plus the two carve-out comments that cite it — and every one
+    of them was carried forward by hand: the PR shipped 40 / 46 / 49 at once against a file
+    that collects 52 in-memory arms + 3 live legs, in documents whose whole purpose is to be
+    reproduced (review of #9487).
+
+    So the numbers are COMPUTED here from this module's own test functions: adding a test
+    without re-deriving the docs fails this pin instead of shipping another stale count."""
+    import inspect
+
+    module = sys.modules[__name__]
+    funcs = [
+        obj
+        for obj in vars(module).values()
+        if inspect.isfunction(obj)
+        and obj.__name__.startswith("test_")
+        and obj.__module__ == __name__
+    ]
+    assert funcs, "enumeration found no tests — the pin would be vacuous"
+
+    def cases(fn: object) -> int:
+        n = 1
+        for mark in getattr(fn, "pytestmark", []):
+            if mark.name == "parametrize":
+                n *= len(mark.args[1])
+        return n
+
+    live = [fn for fn in funcs if any(m.name == "skipif" for m in getattr(fn, "pytestmark", []))]
+    live_cases = sum(cases(fn) for fn in live)
+    total = sum(cases(fn) for fn in funcs)
+    hermetic = total - live_cases
+
+    readme = (REPO_ROOT / "docs" / "evidence" / "2026-10-21-shared-coordination-memory" / "README.md").read_text()
+    surfaces = (REPO_ROOT / "config" / "ci-surfaces.yml").read_text()
+
+    # §3 — the inventory row
+    row = re.findall(r"(\d+) fake-store tests \+ (\d+) live tests, (\d+)\s+collected", readme)
+    assert row == [(str(hermetic), str(live_cases), str(total))], row
+    # §6 — the reproduction's EXPECTED output, which a reader compares their own run against
+    expected = [ln for ln in readme.splitlines() if "test_work_claim.py -q" in ln]
+    assert expected, "the reproduction command is gone"
+    assert any(f"# {hermetic} passed at this head" in ln for ln in expected), expected
+    # the timings row's own description of this file
+    assert f"{total} tests: {hermetic} in-memory double + {live_cases} live-SDK" in surfaces
