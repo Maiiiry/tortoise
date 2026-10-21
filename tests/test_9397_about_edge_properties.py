@@ -312,10 +312,13 @@ STORAGE_CHANGELOG = (
 #: the last `main` commit before this correction's own documentation edits
 #: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against.
 #: The reading MOVES with this file and is re-measured at every revision, never
-#: carried forward: 4 failed / 6 passed when it had 10 legs, 6 failed / 8 passed
-#: when it had 16, and **6 failed / 14 passed / 1 skipped of the 21 legs at this revision** (re-measured at this head; the leg population grows, so the reading is re-taken rather than carried forward)
-#: (the two `#9403`-review legs — §11.4 rule 1 and the ledger KEEP row — red on
-#: the pre-fix documents too, as does the detector-wording leg). "Was live pre-fix" is a claim about HISTORY, so it is
+#: carried forward: 4 failed / 6 passed when it had 10 legs, and
+#: **10 failed / 11 passed of the 21 legs at this revision**, measured by
+#: swapping ALL FOUR live documents this guard reads for their `01b5486ec`
+#: versions (a partial swap measures something else: `STORAGE-ARCHITECTURE.md`
+#: alone gives 6, because the EXTRACTOR and changelog legs then still read
+#: corrected text). The population grows, so the reading is re-taken rather
+#: than carried forward. "Was live pre-fix" is a claim about HISTORY, so it is
 #: checked against history instead of restated: an entry in
 #: `RETRACTED_INTRODUCED_HERE` must be ABSENT here, every other entry PRESENT.
 #: ⛔ NOT derived from `git merge-base HEAD origin/main`: the moment this lands
