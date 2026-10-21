@@ -112,7 +112,9 @@ THE SAME BLINDNESS, ONE LEVEL DOWN (review cycle on this file's first version)
 A census that reads only `SET r.<prop>` repeats the error: the property-MAP
 form `SET r += $props` / `SET r = $p` is structurally invisible to it, and four
 shipped sites already use that form on an allowlisted `aboutObject` predicate
-(listed above). So the census reads ALL THREE write forms, and an interpolated
+(listed above). So the census reads all three write forms **where `_PATTERN`
+recognises the spelling** (the gap list above names the spellings it does not),
+and an interpolated
 predicate counts as about-bearing when its writer takes it from the shared about
 / predicate vocabulary — including the allowlist itself (`validate_rel_type`,
 `KNOWN_REL_TYPES`, `_sanitize_label`), because "validated against the whole
@@ -1510,11 +1512,10 @@ def test_the_census_reads_the_inline_pattern_map_form():
 
 
 def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
-    """The census's BOUND, measured on the two shapes it structurally cannot
-    read. The module docstring states the bound as a gap; these probes keep it
+    """The census's BOUND, measured on the shapes it structurally cannot read. The module docstring states the bound as a gap; these probes keep it
     from decaying into the absolute it replaces (*"no writer that spells an
     about vocabulary can add a property unseen"* was false on the tree and is
-    now false on both of these synthetic writers).
+    now false on each synthetic writer below).
 
     Pinning an EMPTY result is deliberate: the census is not being asked to
     catch these, it is being asked not to CLAIM them. A shipped instance of
@@ -1552,7 +1553,7 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "bound must be updated in the same change (found "
         f"{found!r})"
     )
-    # Control, so the two empties above are the two shapes and not a broken
+    # Control, so the EMPTIES above are those shapes and not a broken
     # probe: the same writer with a readable RHS IS recorded.
     control = (
         "def link(g, s, t, p):\n"
@@ -1611,12 +1612,19 @@ def test_the_documents_state_the_bound_as_a_detector_not_a_proof():
     storage = (ROOT / "docs/architecture/STORAGE-ARCHITECTURE.md").read_text(
         encoding="utf-8"
     )
+    # SECTION-scoped, not a file-wide count: a file-wide `count() >= 2` stays
+    # green when §11.1's copy is deleted and §13 keeps two — the scoping defect
+    # this file's own `_section` docstring names (`#8639`).
+    for label, start, end, which in CORRECTED_SECTIONS:
+        if which != "STORAGE" or label.endswith("§13.8 q2"):
+            continue
+        section = _flat(_section(storage, start, end))
+        assert _BOUND_MARKER in section, (
+            f"{label} no longer states the census as a {_BOUND_MARKER!r} — a "
+            "file-wide check would stay green while this section drifted back "
+            "to a completeness claim"
+        )
     flat = _flat(storage)
-    in_111 = flat.count(_BOUND_MARKER)
-    assert in_111 >= 2, (
-        "`docs/architecture/STORAGE-ARCHITECTURE.md` must state the detector "
-        f"bound in BOTH §11.1 and §13 (found {in_111} occurrence(s))"
-    )
     for absolute in _RETRACTED_BOUND_ABSOLUTES:
         assert absolute not in flat, (
             f"a retracted completeness claim is back in "
