@@ -2980,6 +2980,15 @@ class CollisionPreflightTest(unittest.TestCase):
         # fallback really IS advisory, it can never refuse, and the detail must
         # keep saying so. Without this test a silent reversion to the blocking
         # wording on the advisory call site would pass the suite.
+        #
+        # ⛔ IT IS A NON-DISCRIMINATING REGRESSION PIN, AND THAT IS STATED HERE ON
+        # PURPOSE (#9423 review, P3): it passes on the pre-fix tool as well, because
+        # the advisory wording used to be HARDCODED on every `use_closing_field=False`
+        # call. Its job is the direction this fix could break — the blocking surface
+        # getting the advisory sentence — not evidence that the fix works. The
+        # discriminating half is
+        # `test_rest_rescued_body_closing_reference_is_not_described_as_advisory`,
+        # which is red pre-fix.
         self.gh_fixtures(closed_prs=[{
             "number": 9412, "title": "fix(dashboard): plaintext mint",
             "body": f"Closes #{ISSUE}.", "headRefName": "fix/unrelated-slug",
@@ -3333,8 +3342,7 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertIn("not decodable as text", out)
 
-    def test_a_non_utf8_rest_open_pr_body_is_a_named_incomplete_not_a_traceback(self):
-        # #9423 review (P3): the REST rescue's `except ValueError` arm is the
+    def test_a_non_utf8_rest_open_pr_body_is_a_named_incomplete_not_a_traceback(self):        # #9423 review (P3): the REST rescue's `except ValueError` arm is the
         # strict-decoding refusal `_issue_view_rest` has carried since #3435, and
         # it was UNPINNED — no seam wrote a bad byte to the open-PR REST fixture,
         # so DELETING the arm left the whole suite green. That matters because
@@ -5525,6 +5533,52 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("VERDICT: INCOMPLETE", out)
         self.assertIn("INCOMPLETE SURFACES", out)
         self.assertIn("issue-absent", out)
+
+    def test_an_absent_issue_names_the_target_not_gh_auth(self):
+        # #9423 review (P3): `_incomplete_remedy` is now the ONE place that
+        # chooses a remedy per cause, so it must not answer an `issue-absent` /
+        # `repo-unresolved` surface with "fix gh auth/network (or rebuild the
+        # fleet board)" — the surface's own note says the target does not exist
+        # here, and neither remedy can change that. Pre-fix the generic sentence
+        # was printed for every cause; it is only a real defect once the function
+        # claims to describe the cause it measured.
+        self.gh_fixtures(open_prs=[])
+        rc, out = self.run_tool(env_extra={"GH_STUB_ISSUE_ABSENT": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertIn("issue-absent", out)
+        # The verdict line now names the TARGET for the absent surface, and says
+        # the generic remedies cannot help — the fact the surface note already
+        # stated. ⛔ This fixture produces the MIXED arm on purpose: with the
+        # issue unreadable, `issue landed` is separately incomplete for its own
+        # (non-target) cause, and the generic remedy is correctly kept for THAT
+        # remainder — so the assertion is that the absent cause is NAMED AND
+        # SCOPED, not that the generic sentence is gone from the line.
+        self.assertIn("a TARGET the tool cannot resolve (issue assignee/holder", out)
+        self.assertIn("re-authenticating cannot change it", out)
+        self.assertIn("and PART is:", out)
+
+    def test_a_rest_open_pr_element_with_a_non_string_state_is_refused(self):
+        # #9423 review (P3): the projection coerces `state`
+        # (`str(...).upper()`), which made `_require_pr_dicts`' non-string refusal
+        # UNREACHABLE on the REST transport — a wire `state` of `123` became the
+        # string `"123"` and was READ as a live, non-terminal PR instead of being
+        # refused. The direction is the safe one (non-terminal ⇒ strong ⇒
+        # COLLISION, never CLEAN), but the documented contract has to hold on BOTH
+        # transports. `_rest_pr_wire_reason` now types `state` before the
+        # normalisation can launder it.
+        self.gh_fixtures(open_prs=[{
+            "number": 9413, "title": "fix(dispatch): unrelated wording", "body": "",
+            "headRefName": "feat/9999-other", "state": "open",
+        }])
+        raw = json.loads((self.gh_dir / "open_prs_rest.json").read_text())
+        raw[0]["state"] = 123
+        (self.gh_dir / "open_prs_rest.json").write_text(json.dumps(raw))
+        rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        self.assertNotIn("VERDICT: CLEAN", out)
+        self.assertIn("non-string 'state' at index 0 (int)", out)
 
     def test_closed_pr_rest_requests_the_projected_fields(self):
         # The REST response nests the branch under `head.ref` while the scanner

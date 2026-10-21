@@ -3108,6 +3108,25 @@ def _rest_pr_wire_reason(element: object, index: int, where: str) -> str | None:
                 "empty value; filling it in would silently drop that test on a "
                 "BLOCKING surface (NOT clean)"
             )
+    # ⛔ `state` IS TYPED HERE, AND IT HAS TO BE (#9423 review, P3). The
+    # projection coerces it (`str(element.get("state") or "").upper()`) so the
+    # dedicated readers get `gh pr list --json`'s GraphQL casing — and that
+    # coercion made `_require_pr_dicts`' `isinstance(pr["state"], str)` refusal
+    # UNREACHABLE on this transport: a truthy non-string wire `state` (`123`,
+    # `["open"]`) became the string `"[OPEN]"`, so a malformed element was READ
+    # as a live, non-terminal PR instead of being refused, and the documented
+    # "blank or non-string state is a REFUSAL" contract held on the GraphQL path
+    # only. The direction here is the safe one (non-terminal ⇒ strong hits ⇒
+    # COLLISION, never CLEAN), which is why it is a P3 and not a fail-open — but a
+    # contract that silently does not apply to one of two transports is how the
+    # two reads start disagreeing.
+    if not isinstance(element.get("state"), str):
+        return (
+            f"{where} returned an element with a non-string 'state' at index "
+            f"{index} ({type(element.get('state')).__name__}) — a coerced state "
+            "would be read as a live PR instead of being refused, and `state` "
+            "is what decides whether a hit is terminal (NOT clean)"
+        )
     head = element.get("head")
     if not isinstance(head, dict):
         return (
@@ -5841,6 +5860,42 @@ def _incomplete_remedy(incomplete: list[Surface]) -> str:
         s for s in incomplete if id(s) not in both_ids and s.truncated
     ]
     generic = "fix gh auth/network (or rebuild the fleet board) and re-run"
+    # ⛔ TWO CAUSES THE GENERIC SENTENCE MISPRISES, AND THEY ARE ANSWERED FROM
+    # THEIR OWN NOTES (#9423 review, P3). An `issue-absent` or
+    # `repo-unresolved` surface says so in its own note — "#{issue} does not
+    # exist in {slug}" / "`{slug}` could not be resolved" — and then the VERDICT
+    # line forty lines below told the reader to re-authenticate and rebuild a
+    # board, which could not change either fact. Pre-existing wording (the old
+    # report said it for every cause), but this function is now the ONE place
+    # that chooses a remedy per cause, so leaving the misnomer here is choosing
+    # it. Neither cause is exhaustion or truncation, so they are partitioned
+    # FIRST and cannot double-count against those arms.
+    absent = [
+        s for s in incomplete
+        if "issue-absent:" in (s.note or "")
+        or "repo-unresolved:" in (s.note or "")
+        or "target-repo-unresolved:" in (s.note or "")
+    ]
+    absent_ids = {id(s) for s in absent}
+    if absent and len(absent) == len(incomplete):
+        return (
+            "a TARGET the tool cannot resolve — "
+            f"{', '.join(s.name for s in absent)} could not be addressed at all. "
+            "Check the number and the repository: this is NOT a read failure, so "
+            "re-authenticating and rebuilding the fleet board cannot change it, "
+            "and \"not found here\" is not \"no in-flight work\" (the run "
+            "correctly refuses to report CLEAN for a target it could not read)"
+        )
+    if absent:
+        named = ", ".join(s.name for s in absent)
+        tail_cause = _incomplete_remedy(
+            [s for s in incomplete if id(s) not in absent_ids]
+        )
+        return (
+            f"PART of this is a TARGET the tool cannot resolve ({named} — check "
+            f"the number and repository; re-authenticating cannot change it), "
+            f"and PART is: {tail_cause}"
+        )
     if not both and not exhausted and not truncated:
         return generic
     budget = (
