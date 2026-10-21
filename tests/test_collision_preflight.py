@@ -5577,6 +5577,26 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("re-authenticating cannot change it", out)
         self.assertIn("and PART is:", out)
 
+    def test_a_verbose_exhaustion_still_yields_the_budget_remedy_when_rest_fails(self):
+        # #9423 review round 11 (P3): the round-10 fix recorded the cause as DATA
+        # on the SUCCESSFUL-rescue branch only. The FAILED-rescue branch is inside
+        # the same `_is_budget_exhaustion` gate — it knows the cause just as well —
+        # but left `_incomplete_remedy` to re-parse a note whose gh error is cut at
+        # 600 chars. The old pin drove 240 chars of chatter there, well inside the
+        # cut, so the >cut case was unpinned on the one branch that could still
+        # misname the cause. Now both branches set `surface.budget_exhausted`.
+        rc, out = self.run_tool(env_extra={
+            "GH_STUB_PR_LIST_VERBOSE_EXHAUSTION": "1",
+            "GH_STUB_OPEN_PR_REST_FAIL": "1",
+        })
+        self.assertEqual(rc, 2, out)
+        self.assertIn("VERDICT: INCOMPLETE", out)
+        # The REST failure is named (so this is not passing on an unrescued run)…
+        self.assertIn("could not connect to api.github.com", out)
+        # …and the remedy still names the BUDGET, not the generic sentence.
+        self.assertIn("GRAPHQL BUDGET EXHAUSTION", out)
+        self.assertNotIn("fix gh auth/network", out)
+
     def test_a_verbose_exhaustion_still_yields_the_budget_remedy(self):
         # ⛔ THE REMEDY MUST NOT DEPEND ON A SIGNATURE SURVIVING TRUNCATION
         # (#9423 review round 10, P3). The surface note embeds the gh error line

@@ -5440,6 +5440,16 @@ def run_preflight(
                     # whenever `gh` chattered past the cut, so the run printed
                     # `fix gh auth/network` for a spent budget on the one branch
                     # that did not carry the cause forward.
+                    # ⛔ AND THE CAUSE IS RECORDED AS DATA HERE TOO (#9423 review
+                    # round 11, P3). The successful-rescue branch sets
+                    # `surface.budget_exhausted`, but this FAILED-rescue branch —
+                    # the other one that knows the cause, since it is inside the
+                    # same `_is_budget_exhaustion` gate — still left the remedy to
+                    # re-parse the note, and the note embeds the gh error after
+                    # `_one_line(..., limit=_REFUSED_READ_NOTE_LIMIT)`'s 600-char
+                    # cut. Both branches that KNOW must say so the same way, or the
+                    # asymmetry just moves the hazard to the rarer path.
+                    surface.budget_exhausted = True
                     refusal = _rest_refusal_note(rest_why, exc)
                     raise SurfaceError(refusal, detail=refusal) from exc
                 via_rest = True
