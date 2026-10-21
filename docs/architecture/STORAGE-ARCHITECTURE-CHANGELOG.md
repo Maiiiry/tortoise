@@ -730,3 +730,76 @@ Also corrected in the guard itself: the `§13.8 q2` retracted literal was pinned
 ⚠️ **The census also read one FALSE POSITIVE as a writer of the map form.** `projection._rebuild_all_replay` was recorded as a re-materializer alongside `cache_projection.relation_statement` and `hosted_backup.restore_graph`; it is not. Its `SET r += $attrs` belongs to the `DirectEdgeCreated` fold, and that event has exactly one producer — `create_direct_edge`, which refuses any `op_type` outside `{IMPL, NAND}` — while its about/structural transfer is a separate BARE `MERGE` (the code says so in place: *"Structural 2b transfers are bare: NO attr SET, no direction/confidence/weight"*), and `create_about_edge` journals no `DirectEdgeCreated` at all, so no about edge can reach the attr fold. **The measured population is therefore 3 originating + 2 re-materializing = 5 writers, with TWO declared false positives** (`sdk.supersede_point` and `projection._rebuild_all_replay`). Each exemption now pins the STATEMENT that makes it one — the about transfer carries no `SET`, and the `SET` the census does see names no `about*` predicate — so an exemption cannot rot into a silent lie, and §13 / §13.8 q2 state the count as 5 (`three of the five`, not `three of the six`).
 
 **Fourth review-cycle correction (same day) — the guard's own provenance claim, and its false-positive exemption.** Three fixes in `tests/test_9397_about_edge_properties.py`, all in the guard rather than the corrected text: (1) *"Two forms write to an edge, and both are in scope"* was **written by an earlier revision of this correction and then withdrawn**, not carried over from the pre-fix document — measured absent at the pre-fix revision — so it is now declared in `RETRACTED_INTRODUCED_HERE`, and a new leg MEASURES the split against the pre-fix revision instead of restating it (a misclassified entry made the guard's own failure message claim a pre-fix presence that never existed). (2) The `sdk.supersede_point` row in `NOT_AN_ABOUT_WRITER` was a **fail-open exemption**: both name-comparison legs skipped it, so a property added on that about edge redded nothing while §13 and §13.8 q2 assert it carries none. The row now declares its expected name set (`<map:$props>`) and is compared like a recorded writer, and the premise is asserted **at the statement** — the about transfer is a bare `MERGE` and the `SET r += $attrs` sits in a query whose patterns name no `about*` predicate. (3) The failure diagnostic now prints the live document a retracted sentence actually survived in, not only its recorded pre-fix home. §13's `create_about_edge` citation is also qualified (`:344` at the pinned revision) the way §11.1's copy already was, so the number reads as a pin rather than as drift.
+
+## §13 — the `aboutObject` headline claim is SCOPED to the files it measured (`#9399`)
+
+The removed sentence and why it went. §13's evidence for the KEEP ruling opened
+with an unqualified claim about *"the primary search path"*, but the command it
+quotes as proof measures exactly three modules — and `tortoise/ranking.py`, which
+holds both product ranking read paths and therefore the reads behind the default
+recall door (`tortoise_recall` → `sdk_method="recall_state"`), is not one of them.
+
+**Removed (verbatim):**
+
+> **The primary search path does NOT read it.** `rg -n 'aboutObject'
+> tortoise/retrieval.py tortoise/search_engine.py tortoise/session_reinjection.py`
+> → **exit 1, zero matches**, case-insensitive. **Hindsight's premise holds for
+> this path.**
+
+The measurement was never wrong; the **scope** was unstated, so the sentence read
+as a whole-product claim and a reader checking only the quoted command concluded
+the opposite of what the section rules on. The design document now states the
+lane the three files bound and names the module and the door outside it;
+`tests/test_9399_search_path_claim_scope.py` holds it there by parsing the file
+list OUT of the sentence and re-running the scan over it, so widening the list or
+reverting the qualification reds.
+
+---
+
+## The capture-path write order — the invariant §9.6 states, now pinned (`#8501`)
+
+**What §9.6 says, and what the code did.** §9.6 records that the capture owns a
+session `:Source`'s version. The code did not: `capture_session` (and hosted
+`_capture_session_impl`) ran extraction — which creates the Points and MERGEs
+their `extractedFrom` links — **before** `_materialize_session_source`, the one
+writer that SETs `contentHash`. So `resolve_source_versions` read an empty hash
+**at link time**, `$v` bound nothing, and `_anchor_on_create` wrote
+`sourceVersion = NULL` on every create-path link. Measured on the pre-fix tree:
+`references` 1/1 anchored, `extractedFrom` 0/1. The consequence is not cosmetic —
+a revised transcript could never mark the claims it had superseded, because no
+claim recorded which version it was read from.
+
+**The invariant, stated so the next lane does not have to re-derive it.** *A
+capture must write its session Source's version BEFORE anything reads it at link
+time.* That is what §9.6 already assumed; it was true in prose and false in code,
+and nothing compared the two.
+
+**What changed.** Both lanes move the MINT + MATERIALIZE half above extraction,
+inside the **same gate** each lane already used (`not session_existed or
+(retry_failed_capture and not no_provider)` / `… and not store_only`), and the
+provenance stamp stays after extraction. Three consequences were handled
+deliberately rather than discovered later:
+
+- **The materializer can now CREATE the stub** (nothing created it yet), so it
+  mints `_link_source`'s create-time shape through the replay-shared
+  `_mint_source_stub` and upgrades it — and the `SourceCreated` record is
+  emitted before the link, so the raw `SET` still has a journal carrier (§17.1).
+- **`_mint_source_stub(now=…)` carries the CAPTURE's instant**, not a fresh clock
+  read: for a keyless capture this mint is the only writer of `ingestedAt`, and
+  its `SourceCreated` record carries `now`. A fresh read would put a later clock
+  on the live node than the replay folds in — a live≠replay divergence on a path
+  that previously had none.
+- **A KEYLESS capture's `:Source` gains four properties** (`title`,
+  `canonicalUrl`, `urlAliases`, `is_episodic`). Pre-fix that lane created the node
+  with only its `SET` properties, because it never reached `_link_source`. The
+  new shape is the stub shape the extracting lane has always had (and
+  `is_episodic` is the `#1486` discriminator), but it IS a behaviour change on
+  that lane, and it is pinned rather than disclosed-away.
+
+**What now prevents a repeat.** `tests/test_8501_capture_path_anchor.py` — the
+anchor must be non-NULL, equal to the Source's stored `contentHash`, and present
+in the Point's own journaled `sourceVersionTransit`; it must survive a
+destructive `rebuild_all()`; a re-capture must neither advance nor drop it; the
+keyless lane's full key set is pinned; and the pre-fix Source shape is pinned
+against the literal set. Registered on the `core` surface with a `durations:`
+weight, because a guard no CI leg selects is a guard that does not run.

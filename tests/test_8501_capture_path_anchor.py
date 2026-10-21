@@ -308,3 +308,56 @@ def test_a_keyless_capture_stamps_its_stub_with_the_capture_instant(prov, monkey
     assert ingested_at == captured_at, (
         "the stub's ingestedAt must be the capture's own instant, not a later "
         f"clock read: ingestedAt={ingested_at!r} capturedAt={captured_at!r}")
+
+
+def test_a_keyless_capture_lands_the_full_stub_shape(prov, monkeypatch):
+    """A capture that extracts NOTHING never reaches ``_link_source``, so before
+    #8501 its session ``:Source`` was created by ``_materialize_session_source``'s
+    bare ``MERGE ... SET`` and carried ONLY those SET properties. The early mint
+    now creates it, so the keyless node gains the stub's create-time shape —
+    ``title``, ``canonicalUrl``, ``urlAliases`` and ``is_episodic``.
+
+    That is the better shape (it is what the extracting lane has always had, and
+    ``is_episodic`` is the #1486 discriminator), but it is a REAL behaviour
+    change on a lane, and the shape pin above only exercises the lane that
+    extracts — where the pre-fix stub came from ``_link_source``, i.e. from this
+    same mint. So this test is the one that can see the difference.
+
+    FAILS ON THE PRE-FIX CODE (measured: dropping the early ``_mint_source_stub``
+    call reds it with exactly those four keys missing), and FAILS IF the keyless
+    lane starts minting a SECOND ``:Source`` instead of the node its capture
+    materializes."""
+    monkeypatch.delenv("TORTOISE_SESSION_LLM_MOCK", raising=False)
+    for k in ("DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+              "OPENAI_API_KEY"):
+        monkeypatch.delenv(k, raising=False)
+    sdk, _events = prov
+
+    res = sdk.capture_session(CONV)
+    assert res["ok"] is True, res
+    assert res["extraction_mode"] == "no-provider", res["extraction_mode"]
+    url = f"session:{res['session_id']}"
+
+    # PRE-CONDITION: this lane really is the keyless one — no Point was created,
+    # so nothing but the early materialization can have shaped this node.
+    points = sdk._get_proj().g.query(
+        "MATCH (s:Source {url:$u})<-[:extractedFrom]-(p:Point) "
+        "RETURN count(p)", params={"u": url}).result_set
+    assert points and points[0][0] == 0, (
+        "precondition: a no-provider capture must create no Point, else this "
+        f"test is not exercising the keyless lane (found {points!r})")
+
+    rows = sdk._get_proj().g.query(
+        "MATCH (s:Source {url:$u}) RETURN keys(s)", params={"u": url}).result_set
+    assert rows, "a keyless capture must still materialize its Source"
+    assert len(rows) == 1, (
+        "a keyless capture minted more than one :Source — the early mint and "
+        "the materializer are addressing different nodes (the "
+        "`resolve_source_key` contract, #8501 review P3)")
+    keys = set(rows[0][0])
+    assert keys == _PRE_FIX_SOURCE_KEYS, (
+        "the keyless capture's Source shape diverged from the stub shape the "
+        f"extracting lane lands — missing={sorted(_PRE_FIX_SOURCE_KEYS - keys)} "
+        f"extra={sorted(keys - _PRE_FIX_SOURCE_KEYS)}. Before #8501 this lane "
+        "carried no title/canonicalUrl/urlAliases/is_episodic at all; the "
+        "change is intended, so this pin (not silence) is what keeps it")
