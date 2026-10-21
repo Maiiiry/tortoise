@@ -72,8 +72,15 @@ measured against `_writers_in_module` rather than assumed:
 
 **So the honest statement is: the census is a regression tripwire over the
 shapes it enumerates, inside `tortoise/`.** A property it does not see is not
-evidence of absence, and this paragraph is the thing that says so. — `tests/test_9397_about_edge_properties.py` pins the two
-synthetic shapes so this bound cannot silently drift back to an absolute.
+evidence of absence, and this paragraph is the thing that says so.
+`test_the_census_bound_is_pinned_as_a_gap_not_an_absence` pins a synthetic
+probe for each of gaps **1-5** (each measured `{}`) beside ONE recorded control,
+so an empty result reads as the shape rather than as a broken probe. Gap **6**
+has NO probe and cannot have one: it is a file-scope gap (`PKG.rglob`), which no
+`_writers_in_module` probe can express — the walk's scope is DISCLOSED here and
+not pinned, and that asymmetry is stated rather than rounded up to "one probe
+per gap". The DOCUMENT wording is pinned by its own leg; neither pin claims to
+block every future absolute, because no test can.
 
 `sdk.supersede_point` and `projection._rebuild_all_replay` — which earlier
 revisions of this file recorded as re-materializers — are NOT. Its `SET r += $attrs` is on the 2a-DIRECT leg,
@@ -255,6 +262,13 @@ WHAT IS PINNED (one entry per test, in file order)
    (never passes silently) when the revision is unreachable.
 19. `test_the_storage_changelog_records_the_correction` — the changelog is where
    a reader learns that a §11.1/§13 claim moved.
+20. `test_the_guard_states_its_own_execution_and_probe_coverage_honestly` —
+   this file's claims about ITSELF, re-derived from the source: the header may
+   not say the suite is network-free while `_ensure_commit` fetches, and it may
+   not claim one probe per gap while gap 6 is disclosed rather than pinned.
+21. `test_the_correction_ledger_numbers_each_round_once` — the ledger's round
+   numbering is unique (it is the ledger's only index), and the fourth round's
+   false record of §13's citation does not come back.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -263,9 +277,17 @@ that the rule keeps stating the measured set and keeps carrying the tension
 record, test 5). Line numbers are not
 asserted — the SYMBOL is authoritative, per the documents' own rule.
 
-Static, stdlib-only, with ONE exception: the provenance leg shells out to `git show` to
-measure a provenance claim about history, and skips when the revision is
-unreachable. No DB, no graph, no network.
+Static and stdlib-only, with one non-static corner: the provenance leg measures a
+claim about HISTORY, so it shells out. Exactly what it runs, because an earlier
+revision of this paragraph said "ONE exception: `git show` … no network" and was
+wrong on both halves: `git cat-file -e` (via `_has_commit`, on every `_git_show`
+call) to test reachability, `git show <rev>:<path>` for the text, and — where the
+rev is not already in the checkout — `git fetch --quiet
+--depth={120,400,1500} origin main` (`_ensure_commit`), which on a shallow CI
+checkout IS a NETWORK call (one per depth, each bounded by a 120 s timeout) and a
+SIDE EFFECT on the checkout under test: it deepens that clone's object database.
+The leg SKIPS, never passes, when the rev stays unreachable. No DB, no graph, no
+server.
 """
 
 from __future__ import annotations
@@ -1578,7 +1600,8 @@ def test_no_unrecorded_property_bearing_about_edge_writer():
     )
 
 
-# ── 4b. the two forms the census was fail-open on (synthetic probes) ───────
+# ── 4b. the write forms and spellings the census was fail-open on (synthetic
+#        probes) ───────────────────────────────────────────────────────────
 
 
 def test_the_census_reads_the_inline_pattern_map_form():
@@ -1624,7 +1647,7 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
     shape 1 is `session_source_migration._move_in` (predicate handed in from
     `MOVABLE_SOURCE_RELS`, which contains `aboutSource`/`aboutDocument`).
     """
-    # Shape 1+n: an UNTYPED binding whose predicate is tested in a WHERE clause.
+    # Gap 2: an UNTYPED binding whose predicate is tested in a WHERE clause.
     # `_PATTERN` needs a typed relationship pattern, so the function is
     # continued before any rule runs. This is already live style in the tree
     # (`WHERE type(r) = 'NAND'` in sdk.py / analyze.py).
@@ -1640,7 +1663,7 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "disclosure must be updated in the same change (found "
         f"{found!r})"
     )
-    # Shape 2: the predicate IS spelled in a typed pattern, but the write is an
+    # Gap 3: the predicate IS spelled in a typed pattern, but the write is an
     # fn-call RHS that `_SET_MAP` (`$|{`) cannot read. The parameter is
     # therefore NOT what makes `_move_in` invisible.
     fn_call_rhs = (
@@ -1667,7 +1690,7 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "the control probe (a readable property-MAP write on a typed about "
         f"pattern) is no longer recorded — the census changed (found {found!r})"
     )
-    # Shape 3: the predicate is a PARAMETER (the `_move_in` shape) — the
+    # Gap 1: the predicate is a PARAMETER (the `_move_in` shape) — the
     # vocabulary is in the caller, so nothing in the body names it.
     parameterised = (
         "def move(g, rel, s, t):\n"
@@ -1679,6 +1702,47 @@ def test_the_census_bound_is_pinned_as_a_gap_not_an_absence():
         "the census now reads a PARAMETERISED predicate — a real widening; "
         "update the documented gap list in the same change (found "
         f"{found!r})"
+    )
+
+    # Gaps 4 and 5, whose probes did not exist when the prose first claimed
+    # they were "measured with a control recorded" — an unbacked provenance
+    # claim, so the probes are here now.
+    # Gap 4: spellings `_PATTERN` does not recognise. Each is a typed about
+    # pattern with a readable write, i.e. exactly what the census claims to
+    # cover, and each is invisible.
+    spellings = {
+        "space before the type colon": (
+            "def link(g, s, t, c):\n"
+            "    g.query('MATCH (s:Point)-[r :aboutObject]->(t) "
+            "SET r.confidence = $c', params={'c': c})\n"
+        ),
+        "space after the opening bracket": (
+            "def link(g, s, t, c):\n"
+            "    g.query('MATCH (s:Point)-[ r:aboutObject]->(t) "
+            "SET r.confidence = $c', params={'c': c})\n"
+        ),
+        "a `]` inside the inline map": (
+            "def link(g, s, t, c):\n"
+            "    g.query('MERGE (s)-[r:aboutObject {tags:[\\'a\\'],"
+            "confidence:$c}]->(t)', params={'c': c})\n"
+        ),
+    }
+    for why, probe in spellings.items():
+        found = _writers_in_module("tortoise/probe.py", probe)
+        assert found == {}, (
+            f"the census now reads this spelling ({why}) — a real widening; "
+            f"the gap list must be updated in the same change (found {found!r})"
+        )
+    # Gap 5: an about-NAMED predicate outside `_ABOUT_REL`'s enumerated seven.
+    off_list = (
+        "def link(g, s, t, c):\n"
+        "    g.query('MATCH (s)-[r:aboutClaim]->(t) SET r.confidence = $c', "
+        "params={'c': c})\n"
+    )
+    found = _writers_in_module("tortoise/probe.py", off_list)
+    assert found == {}, (
+        "the census now reads an `aboutClaim` edge — `_ABOUT_REL` widened, so "
+        f"its comment and the gap list must say so (found {found!r})"
     )
 
 
@@ -1924,4 +1988,121 @@ def test_the_storage_changelog_records_the_correction():
         "STORAGE-ARCHITECTURE-CHANGELOG.md does not record this correction — "
         "the changelog is where a reader learns a §11.1/§13 claim moved, and an "
         "unrecorded correction is the drift #9397 exists to stop"
+    )
+
+
+# ── 8. this file's description of ITSELF ──────────────────────────────────
+#: The retracted self-description: the header claimed the suite made no network
+#: call while `_ensure_commit` fetches `origin main`. Pinned by its own literal,
+#: because a claim about what the suite DOES is exactly the class of claim this
+#: file was written to stop asserting unmeasured — one level up.
+_RETRACTED_NO_NETWORK = "No DB, no graph, no network."
+
+
+def test_the_guard_states_its_own_execution_and_probe_coverage_honestly():
+    """The header's claims about the suite's OWN behaviour are measured here.
+
+    Two of them were false at the `#9403` head, and both were false in the same
+    direction — understating what runs and overstating what is pinned:
+
+    * *"ONE exception: `git show` … No DB, no graph, no network"* — the leg also
+      runs `git cat-file -e`, and `_ensure_commit` runs `git fetch --depth=…
+      origin main`, which on the shallow CI checkout is a network call whose
+      side effect is to DEEPEN the clone under test.
+    * *"pins one synthetic probe per gap below (with a recorded control)"* — the
+      gap list has six entries, the probes cover five, and there is one control.
+
+    Each assertion below re-derives the fact from the SOURCE rather than
+    restating it: the docstring may only claim what `_ensure_commit` and
+    `test_the_census_bound_is_pinned_as_a_gap_not_an_absence` actually do.
+    """
+    src = Path(__file__).read_text(encoding="utf-8")
+    header = _flat(__doc__ or "")
+
+    # The code facts. If these vanish the claims below are being checked
+    # against nothing, which is the failure mode this leg exists to catch.
+    assert '"fetch"' in src and "--depth=" in src, (
+        "`_ensure_commit` no longer fetches `origin main` — this leg's premise "
+        "moved, so re-derive the header's execution claim before trusting it"
+    )
+    assert '"cat-file"' in src, (
+        "`_has_commit` no longer shells out to `git cat-file` — the header's "
+        "execution claim is stale"
+    )
+
+    assert _flat(_RETRACTED_NO_NETWORK) not in header, (
+        f"the header still claims {_RETRACTED_NO_NETWORK!r} while "
+        "`_ensure_commit` runs `git fetch --depth=… origin main` (a network "
+        "call on a shallow checkout, and a side effect on this clone's object "
+        "database)"
+    )
+    assert "git fetch" in header, (
+        "the header does not name the `git fetch` that the provenance leg "
+        "performs when the pre-fix rev is not already present — the suite is "
+        "then not network-free, and a reader of a 'static' suite deserves to "
+        "know before a network-less runner spends the fetch timeouts"
+    )
+
+    # Probe coverage: one probe per gap is NOT what the census leg holds.
+    assert "one synthetic probe per gap" not in header, (
+        "the header claims one synthetic probe per gap, but the gap list has "
+        "SIX entries and the probes cover five (gap 6 is the file-scope gap, "
+        "which no `_writers_in_module` probe can express)"
+    )
+    assert "has NO probe" in header, (
+        "the header no longer states that gap 6 is DISCLOSED rather than "
+        "pinned — the asymmetry is the claim, so it is pinned as one"
+    )
+
+    # The 4b section header counted the forms wrong (two vs the three the
+    # probes cover: inline map, anonymous pattern, allowlist prefilter).
+    # Sliced to the HEADER rather than searched file-wide: this leg's own
+    # message names the retracted wording, so a file-wide needle would match
+    # itself — the self-match that makes a self-description pin vacuous.
+    anchor = src.find("# ── 4b.")
+    assert anchor >= 0, "the 4b section header is gone — this leg measures nothing"
+    section_header = src[anchor : anchor + 160]
+    assert "two forms" not in section_header, (
+        "the 4b section header is back to counting two forms, but the section "
+        "holds probes for THREE write forms"
+    )
+
+
+def test_the_correction_ledger_numbers_each_round_once():
+    """The ledger's only index is its round numbering, so a repeated ordinal
+    makes the current correction unidentifiable — and the FOURTH round's false
+    record of §13's citation must not come back.
+
+    Measured at the `#9403` head: two sections were both titled *"Seventh
+    review-cycle correction"*, and the fourth said §13's `create_about_edge`
+    citation was *"also qualified (`:344` at the pinned revision) the way §11.1's
+    copy already was"* while §13 carries no line number at all. Both are
+    section-scoped here because a file-wide absence check would be satisfied by
+    the later round's correction note quoting the sentence it corrects.
+    """
+    changelog = _doc(STORAGE_CHANGELOG)
+    headings = re.findall(r"^\*\*(\w+) review-cycle correction", changelog, re.M)
+    assert headings, (
+        "no `**<Ordinal> review-cycle correction` heading found in the ledger — "
+        "the rounding scheme moved and this leg measures nothing"
+    )
+    seen: dict[str, int] = {}
+    for ordinal in headings:
+        seen[ordinal] = seen.get(ordinal, 0) + 1
+    repeats = {o: n for o, n in seen.items() if n > 1}
+    assert not repeats, (
+        "the correction ledger numbers a round more than once "
+        f"({repeats}); the round number is the ledger's only index, so a reader "
+        f"cannot tell which entry is current. Headings found: {headings}"
+    )
+
+    fourth = _section(
+        changelog,
+        "**Fourth review-cycle correction",
+        "**Fifth review-cycle correction",
+    )
+    assert "is also qualified" not in _flat(fourth), (
+        "the FOURTH correction again asserts that §13's `create_about_edge` "
+        "citation is qualified with `:344` — measured, §13 asserts the symbol "
+        "only and `:344` appears in §11.1 alone, so the record is false"
     )
