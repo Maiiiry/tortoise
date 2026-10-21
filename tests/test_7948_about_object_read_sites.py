@@ -713,6 +713,32 @@ def _bound_name(node: ast.AST) -> str | None:
     return None
 
 
+def _is_defined_name(tree: ast.Module, dotted: str) -> bool:
+    """Is `dotted`'s LAST name a definition or assignment anywhere in the tree?
+
+    Nested definitions (a function inside a function, a class body) resolve here
+    and nowhere else: `_span` only walks the module's TOP level, which is why a
+    substring fallback was reaching for them. The last-name match is deliberate —
+    `subgraph.py::_collect_raw` and `subgraph.py::Point`-style keys name a symbol,
+    not a path — and it is still an AST fact, not a text match.
+    """
+    name = dotted.rpartition(".")[2]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                return True
+        elif isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                return True
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        ):
+            return True
+    return False
+
+
 def _span(tree: ast.Module, dotted: str) -> tuple[int, int] | None:
     """Resolve `name` or `Class.attr` to its source span, or None."""
     head, _, tail = dotted.partition(".")
@@ -2282,13 +2308,17 @@ def _route_table() -> dict[tuple[str, str], frozenset[str]]:
 #: note above: this is a BOUND, not a proof.
 #:
 #: ⚠️ **Three, and the tighter number is what makes the arm discriminate.** A
-#: uniform budget of 5 was measured to accept **16.5 % of the 418
+#: uniform budget of 5 was measured to accept **170/418 = 40.7 % of the
 #: (row, table-door) pairs** — three substitutions that keep a REAL tool in a
 #: cell were green under it (rows 22/24's reach cells swapped, rows 28/30's REST
-#: doors swapped, and row 28's verb changed). A uniform 3 accepts **15.6 %**, and
-#: all three of those red; the shipped predicate, with the two exceptions below,
-#: accepts 69/418 = **16.5 %**. Every one of the 31 true attributions is within 3
-#: hops except the two named in `_DISTANCE_EXCEPTIONS`.
+#: doors swapped, and row 28's verb changed). A uniform 3 accepts **59/418 =
+#: 14.1 %**, and all three of those red; the shipped predicate, with the two
+#: exceptions below, accepts 69/418 = **16.5 %**. Every one of the 31 true
+#: attributions is within 3 hops except the two named in `_DISTANCE_EXCEPTIONS`.
+#: All three rates share ONE population — the 19 customer-callable rows over the
+#: table's 22 doors — because a rate carried over from a smaller table is what
+#: made an earlier revision of this note read as though the denied budget and the
+#: shipped one were equally tight.
 _DOOR_REACH_HOPS = 3
 
 #: Readers whose door chain is legitimately LONGER than `_DOOR_REACH_HOPS`,
@@ -2510,11 +2540,13 @@ def test_the_door_attribution_refuses_a_door_that_reaches_another_reader():
 #: worst single row. Inputs are the TABLE (whose doors change only when the
 #: document does) rather than the 99-tool registry, so a new tool does not move
 #: these — which is what makes them pinnable.
-#: Re-derived 2026-10-21 when rows 34-37 landed: 63 -> 69. The added
-#: pairs are NEW rows with their own doors (`TortoiseSDK.traverse`,
-#: `TortoiseSDK.ingest`), not a looser relation — no existing row's accepted set
-#: grew, and no existing row gained a door, which is what distinguishes this from
-#: the tripwire's failure mode.
+#: Re-derived 2026-10-21 when rows 34-37 landed: 63 -> 69. The two new SDK doors
+#: (`TortoiseSDK.traverse`, `TortoiseSDK.ingest`) are accepted by the new rows
+#: 36/37 AND by three existing rows (22, 24, 29), so 4 of the 6 added pairs belong
+#: to rows that were already here — which is why this figure and the worst row
+#: (15 -> 17) move together. It is the same relation over a larger door set, not a
+#: looser one: no row's own reach CELL changed, which is what distinguishes this
+#: from the tripwire's failure mode.
 _ACCEPTED_PAIRS_AT_THIS_HEAD = 69
 #: 15 -> 17 on 2026-10-21: the TABLE's door set grew by the two SDK doors the new
 #: call-time rows name, and `_hop_query` (an all-edge walk) legitimately reaches
@@ -3481,15 +3513,18 @@ def test_the_derived_aliases_are_grounded():
 
     An alias table is a hole in a census if its entries are unchecked — the exact
     shape `_NON_LITERAL`'s deleted carrier fallback had. Both halves are resolved
-    from the module's AST: the derived symbol, and the row symbol it stands for.
+    from the module's AST, never from its TEXT: a substring leg accepted
+    `subgraph.py::vector_search`, which is not a symbol in that module at all (it
+    occurs only in a comment, a docstring and an import), and an alias is the
+    exemption `test_every_named_census_site_owns_a_row` honours — so a loose half
+    would silently mute a derived site from the forward census.
     """
     for derived_key, declared_key in sorted(_DERIVED_ALIASES.items()):
         for key in (derived_key, declared_key):
             module, _, symbol = key.partition("::")
             tree = _module_tree(_module_path(module))
-            assert (
-                _span(tree, symbol) is not None
-                or symbol in _module_path(module).read_text(encoding="utf-8")
+            assert _span(tree, symbol) is not None or _is_defined_name(
+                tree, symbol
             ), f"`{key}` does not exist at HEAD — the alias is stale"
 
 def test_the_file_filter_un_sees_nothing():
