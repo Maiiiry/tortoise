@@ -5526,15 +5526,25 @@ def run_preflight(
                 # absence of the key is UNMEASURED, not "closes nothing". This is
                 # the honest half of #9402: recovering the enumeration must not
                 # be mistaken for having proved the negative.
+                # ⛔ THE REFUSED READ GOES FIRST, NOT LAST (#9423 review round 9,
+                # P3). `rest_cause` is the GraphQL error line, and it is what
+                # `_incomplete_remedy` classifies (`_is_budget_exhaustion(s.note)`)
+                # to decide whether the remedy says "budget" or the generic
+                # "fix gh auth/network". The note is truncated at ONE point
+                # (`_one_line(..., limit=...)`), so a signature near the END can
+                # be cut off by verbose gh stderr — and the report then
+                # prescribes a cure for a cause it had just measured. Leading
+                # with the cause means truncation can only ever remove prose
+                # that carries no signature.
                 surface.incomplete(
-                    "closing-references-unmeasured: the open-PR list was answered "
-                    "over REST after the fleet-shared GraphQL budget refused "
-                    "`gh pr list`; `closingIssuesReferences` is GraphQL-only and "
-                    "has NO REST equivalent, so the computed closing-reference "
-                    f"test could not run ({len(prs)} PR(s) WERE read — the "
-                    "title, head-ref and number tests all ran, and any hit from "
-                    "them is reported above) — treat the un-read test as "
-                    f"UNKNOWN, not as 'closes nothing' (refused read: {rest_cause})"
+                    f"closing-references-unmeasured: refused read — {rest_cause} "
+                    "— the open-PR list was then answered over REST; "
+                    "`closingIssuesReferences` is GraphQL-only and has NO REST "
+                    "equivalent, so the computed closing-reference test could not "
+                    f"run ({len(prs)} PR(s) WERE read — the title, head-ref and "
+                    "number tests all ran, and any hit from them is reported "
+                    "above) — treat the un-read test as UNKNOWN, not as "
+                    "'closes nothing'"
                 )
             # ⛔ `incomplete()` writes into `note`, so an unguarded assignment
             # here CLOBBERS the reason the surface is INCOMPLETE — and replaces
@@ -6291,8 +6301,13 @@ def format_report(
         )
         if incomplete:
             lines.append(
+                # "FULLY" for the same reason as the other two summary sites
+                # (#9423 review round 9, P3): a REST-rescued surface WAS read,
+                # only not completely — and this line sits directly beneath a row
+                # that says "N PR(s) WERE read", so the old absolute contradicted
+                # its own row.
                 f"  ALSO INCOMPLETE: {len(incomplete)} surface(s) could not be "
-                f"queried ({', '.join(s.name for s in incomplete)}) — but a "
+                f"FULLY queried ({', '.join(s.name for s in incomplete)}) — but a "
                 "terminal signal above is decisive, so the verdict is LANDED, "
                 "not INCOMPLETE."
             )

@@ -2680,7 +2680,7 @@ class CollisionPreflightTest(unittest.TestCase):
         # And the remedy names the CAUSE: the fleet-shared GraphQL budget, not
         # `gh auth`/a board rebuild (which is #9402's stated defect).
         self.assertIn("GRAPHQL BUDGET EXHAUSTION", out)
-        self.assertIn("graphql budget refused", out.lower())
+        self.assertIn("refused read", out.lower())
         self.assertNotIn("fix gh auth/network", out)
         # ⛔ THE RESET SIGNAL MUST BE ONE THAT CAN SHOW THE REFUSAL (#9423 review,
         # P2). The remedy states — correctly — that
@@ -5567,6 +5567,20 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertIn("re-authenticating cannot change it", out)
         self.assertIn("and PART is:", out)
 
+    def test_the_landed_summary_does_not_deny_the_read_it_reports(self):
+        # #9423 review round 9 (P3): the LANDED branch has its OWN `ALSO
+        # INCOMPLETE` summary, and the previous commit fixed only the COLLISION
+        # and INCOMPLETE sites. It is reachable — a CLOSED issue with the GraphQL
+        # budget spent still rescues the open-PR surface over REST — and it printed
+        # "could not be queried" a few lines under a row saying "N PR(s) WERE
+        # read", i.e. the same contradiction.
+        self.gh_fixtures(open_prs=[], issue=self.issue_payload(state="CLOSED",
+                                                              state_reason="COMPLETED"))
+        _rc, out = self.run_tool(env_extra={"GH_STUB_PR_LIST_RATE_LIMITED": "1"})
+        self.assertIn("VERDICT: LANDED", out)
+        self.assertIn("could not be FULLY queried", out)
+        self.assertNotIn("surface(s) could not be queried", out)
+
     def test_the_summary_does_not_say_a_partially_read_surface_was_unqueryable(self):
         # #9423 review round 8 (P3): with the list rescued over REST, the open-PR
         # surface DID answer — only the computed closing-reference test is
@@ -5587,6 +5601,15 @@ class CollisionPreflightTest(unittest.TestCase):
         self.assertNotIn("surface(s) could not be queried", out)
         # …while the read itself is still reported as evidence.
         self.assertIn("1 PR(s) WERE read", out)
+        # The cause LEADS the note (#9423 review round 9, P3), so the one
+        # truncation point can never cut the signature `_incomplete_remedy`
+        # classifies on: this report's remedy must still name the budget.
+        note = out.split("closing-references-unmeasured:", 1)[1]
+        self.assertLess(
+            note.index("refused read"), note.index("PR(s) WERE read"),
+            "the refused cause must precede the prose that can be truncated",
+        )
+        self.assertIn("GRAPHQL BUDGET EXHAUSTION", out)
 
     def test_a_null_rest_body_is_accepted_and_the_enumeration_still_runs(self):
         # #9423 review round 7 (P3): `body: null` is the REAL REST shape for a PR
