@@ -896,7 +896,7 @@ argument — the table must name every customer-callable surface"*. It has now b
    no symbol at all, and two readers were absent entirely.
 
 What moved, and why it is the last hand pass: the table is now **executable**
-(`tests/test_7948_about_edge_read_sites.py`). It derives the census from the source's AST and reds
+(`tests/test_7948_about_object_read_sites.py`). It derives the census from the source's AST and reds
 when a reader under `tortoise/` is undeclared or a declared symbol does not perform the read, so
 the fifth correction is a red test rather than a fifth audit.
 
@@ -1145,7 +1145,7 @@ subject one level up:
   CamelCase symbol it backtick-quotes must exist in the package, so a reach cell can no longer cite
   a name that was never there.
 
-**The three new arms, and why each is non-vacuous.** `tests/test_7948_about_edge_read_sites.py`
+**The three new arms, and why each is non-vacuous.** `tests/test_7948_about_object_read_sites.py`
 gained `test_the_census_prose_carries_no_line_citations` (reds on the pre-fix document, which
 carried twenty hints across the two passages — four in §13's bullet and sixteen in the sibling
 paragraph, measured with the arm's own `_LINE_HINT`), `test_the_prose_names_every_row_in_the_empty_pattern_class`
@@ -1453,3 +1453,28 @@ the sibling arms already guard (`assert census`, `assert pins`, `assert _EXCLUDE
 number, so the row now marks its figure superseded and sends the reader to §13's table — and
 `test_the_prior_art_points_at_the_table_instead_of_restating_the_count` keeps the pointer there, because
 a restated count is a copy that rots on the next pass.
+
+## The §13 census becomes the SUPERSET one — and the first guard retires (`#9400`, 2026-10-21)
+
+Two branches made the same table executable inside the same hour. `#9398` landed
+`tests/test_7948_about_edge_read_sites.py`, whose table covers **26 sites across 22 rows, 9
+customer-callable, 12 door-reaching**. `#9400` carries the wider pass: **33 sites, 17
+customer-callable, across 20 doors**, deriving the all-edge class the name-based census cannot
+see (`SubgraphExpander._neighbors`, `navigation._hop_query`), the carrier-constant readers
+(`ABOUT_EDGE_TYPES` / `_ABOUT_TYPES`), and the call-time doors whose relationship type is an
+expression rather than a literal. Its symbol set is a **strict superset** — every symbol the
+landed table names is named here, and 36 more — so the two are not alternatives to reconcile but
+one census replacing an earlier, narrower one.
+
+They cannot both stay: each parses §13 in its own row shape (`module.py **symbol**` vs
+`module.py::Symbol`), so the landed guard reads a table it can no longer find and reddens 14
+legs. **The narrower guard is retired and `tests/test_7948_about_object_read_sites.py` keeps the
+table.** Its name appears nowhere else in this file — a guard name in prose is a citation, and a
+citation to a deleted file is rot of the same kind the guards exist to prevent — so the mention
+above is the retirement record itself, not a citation of a live guard.
+
+What did NOT move with the retirement is the measured property finding (`#9397`/`#9403`): the
+`aboutObject` edge is **not** property-free — `confidence` is ORIGINATED by two writers
+(`session_link.link_entity`, `subject_binding.bind_point_subjects`) and `idx` is re-materialized
+in an inline pattern map by `cache_projection.relation_statement`. The wider census changed the
+count, not that measurement, and `tests/test_9397_about_edge_properties.py` still pins it.
