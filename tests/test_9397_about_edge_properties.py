@@ -150,21 +150,34 @@ WHAT IS PINNED (one entry per test, in file order)
    §11.1 correction, for a different link class (a record-projected `references`
    edge carries `idx` too). Scoped to the fact the paragraph establishes: those
    links carry **no `sourceVersion`**.
-5. `test_the_code_still_agrees_with_the_corrected_evidence` — each recorded
+5. `test_the_cheapness_rule_states_the_measured_set_and_records_the_tension`
+   — §11.4 rule 1 is the rule this correction rewrote IN PLACE, and nothing
+   pinned it (`#9403` review: restoring its pre-fix imperative verbatim at the
+   PR head left every leg green). Section-scoped to the RULE, not to §11.4, so
+   it must say `near-bare`, must not re-assert the retracted absolute, must
+   keep the `#1370` tension record journaled through `EntityLinked`, and must
+   keep its `RECORDED, not resolved` qualifier — a guard may not let prose
+   settle a design decision by deleting the words that mark it open.
+6. `test_the_ledger_keep_row_names_both_recorded_properties` — the extractor
+   ledger's KEEP row is the reason a reader takes the layer to be cheap, and it
+   named one of the two measured properties (`confidence`, not the record
+   projection's `idx`). Its RETRACTED wording was pinned; any other route back to
+   the one-name absolute there was not.
+7. `test_the_code_still_agrees_with_the_corrected_evidence` — each recorded
    writer still writes what the documents claim it writes (`confidence` for the
    originating three; the map/inline forms for the re-materializing two, `idx`
    included). If that code is removed, the document has re-rotted in the
    other direction and this reds instead of the doc quietly lying again.
-6. `test_the_named_and_map_form_writer_populations_are_disjoint` — no site is
+8. `test_the_named_and_map_form_writer_populations_are_disjoint` — no site is
    recorded twice, the map population has not shrunk below the shipped sites, no
    exemption is also a recorded writer, every exemption has a pinned statement
    premise, and every row (exemptions included) declares its exact name set.
-7. `test_the_declared_false_positive_premises_hold_at_the_statement` — a
+9. `test_the_declared_false_positive_premises_hold_at_the_statement` — a
    `NOT_AN_ABOUT_WRITER` row is an EXEMPTION, and an exemption nobody compares
    against is a fail-open cell: each premise is asserted at the STATEMENT the
    census attributed the property to (the about transfer carries no `SET`, and
    the `SET` it does see names no `about*` predicate).
-8. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
+10. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
    every property write on an `about*` relationship pattern (named variable or
    anonymous) — named (`SET r.<prop>`), map-assigned (`SET r += $props` /
    `SET r = $p`), or an inline pattern map (`[r:aboutObject {idx:$idx}]`, which
@@ -182,27 +195,27 @@ WHAT IS PINNED (one entry per test, in file order)
    code. The remaining gap is a vocabulary list, and a list cannot be checked
    for a token nobody has written yet. It is NOT a parse failure: test 11 makes
    the census STOP rather than skip.
-9. `test_the_census_reads_the_inline_pattern_map_form` — synthetic probe for the
+11. `test_the_census_reads_the_inline_pattern_map_form` — synthetic probe for the
    inline pattern map, named and anonymous.
-10. `test_the_census_reads_a_writer_that_never_says_about` — synthetic probe for
+12. `test_the_census_reads_a_writer_that_never_says_about` — synthetic probe for
    the allowlist-driven writer whose module never spells `about`.
-11. `test_the_census_fails_closed_on_a_module_it_cannot_parse` — a module
+13. `test_the_census_fails_closed_on_a_module_it_cannot_parse` — a module
    `ast.parse` (or the strict UTF-8 decode) rejects STOPS the census and names
    the file, instead of returning `{}` and reporting every writer inside it as a
    measured absence — the same fail-open shape as the `rg 'aboutObject {'` zero.
-12. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
+14. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
    the binder, **or stops being the fall-through branch** of the
    `TORTOISE_SESSION_EXTRACTOR == "m2"` selection, that sentence becomes false
    while every other test stays green.
-13. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
+15. `test_every_retracted_literal_is_still_findable_where_it_is_allowed_to_live`
    — every RETRACTED literal is findable in the changelog that quotes it, or is
    declared pre-fix-only or introduced-and-retracted inside this PR
    (`RETRACTED_INTRODUCED_HERE`: three absolutes were written by an earlier
    revision of THIS PR, so claiming a pre-fix presence for them would be the
    same unmeasured provenance this file exists to stop). A pin that cannot match
    the pre-fix text protects nothing, and that is not a hypothesis: it shipped.
-14. `test_every_retracted_literal_declares_its_true_provenance` — the
+16. `test_every_retracted_literal_declares_its_true_provenance` — the
    CLASSIFICATION is measured, not merely declared: a literal listed in
    `RETRACTED_INTRODUCED_HERE` must be ABSENT from the pre-fix revision
    (`PRE_FIX_REV`) and every other entry PRESENT there. Without this the label
@@ -210,12 +223,14 @@ WHAT IS PINNED (one entry per test, in file order)
    leg 1 then prints "was live pre-fix" for a sentence this PR wrote, in the
    diagnostic of the guard whose whole subject is unmeasured provenance. Skips
    (never passes silently) when the revision is unreachable.
-15. `test_the_storage_changelog_records_the_correction` — the changelog is where
+17. `test_the_storage_changelog_records_the_correction` — the changelog is where
    a reader learns that a §11.1/§13 claim moved.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
-(that is a design question, recorded, not resolved here). Line numbers are not
+(that is a design question, recorded, not resolved here — what IS pinned is
+that the rule keeps stating the measured set and keeps carrying the tension
+record, test 5). Line numbers are not
 asserted — the SYMBOL is authoritative, per the documents' own rule.
 
 Static, stdlib-only, with ONE exception: test 14 shells out to `git show` to
@@ -245,8 +260,12 @@ STORAGE_CHANGELOG = (
 
 #: The revision the retracted literals' PRE-FIX provenance is measured against —
 #: the last `main` commit before this correction's own documentation edits
-#: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against
-#: (4 failed / 6 passed). "Was live pre-fix" is a claim about HISTORY, so it is
+#: (`#9384`'s merge), i.e. the tree the reviewers measured non-vacuity against.
+#: The reading MOVES with this file and is re-measured at every revision, never
+#: carried forward: 4 failed / 6 passed when it had 10 legs, 6 failed / 8 passed
+#: when it had 16, and **8 failed / 10 passed of the 18 legs at this revision**
+#: (the two `#9403`-review legs — §11.4 rule 1 and the ledger KEEP row — red on
+#: the pre-fix documents too). "Was live pre-fix" is a claim about HISTORY, so it is
 #: checked against history instead of restated: an entry in
 #: `RETRACTED_INTRODUCED_HERE` must be ABSENT here, every other entry PRESENT.
 #: ⛔ NOT derived from `git merge-base HEAD origin/main`: the moment this lands
@@ -304,6 +323,14 @@ RETRACTED: dict[str, tuple[str, str]] = {
         "the entity links stay bare",
         "STORAGE-ARCHITECTURE.md",
     ),
+    #: The IMPERATIVE in §11.4 rule 1, which this PR rewrote to `near-bare` and
+    #: left unpinned (measured: restoring it verbatim at HEAD kept every leg
+    #: green). It is the sharpest instance of the class — a sentence this PR
+    #: CHANGED, so a verbatim revert is exactly what a later tidy-up produces.
+    "§11.4 rule 1's imperative is property-free": (
+        "**Keep entity links property-free.**",
+        "STORAGE-ARCHITECTURE.md",
+    ),
     "§11.1's method paragraph counted the write forms as two": (
         "Two forms write to an edge, and both are in scope",
         "STORAGE-ARCHITECTURE.md",
@@ -344,6 +371,7 @@ RETRACTED_QUOTED_IN: dict[str, Path] = {
         STORAGE_CHANGELOG
     ),
     "§11.3's prose says the links stay bare": STORAGE_CHANGELOG,
+    "§11.4 rule 1's imperative is property-free": STORAGE_CHANGELOG,
     "§11.1's method paragraph counted the write forms as two": STORAGE_CHANGELOG,
     "the corrected claim's own 'exactly one name' absolute": STORAGE_CHANGELOG,
     "§13.8 q2's 'never a second property name'": STORAGE_CHANGELOG,
@@ -1087,6 +1115,111 @@ def test_the_references_paragraph_scopes_property_freedom_to_source_version():
         "`idx` (`cache_projection.py:717`), so 'property-free' is false here "
         "exactly as it was for `aboutObject`. Scope the word: those links carry "
         "**no `sourceVersion`**."
+    )
+
+
+def test_the_cheapness_rule_states_the_measured_set_and_records_the_tension():
+    """§11.4 rule 1 is the ONE rule this PR rewrote in place, and until this leg
+    existed nothing pinned it (`#9403` review, P2):
+
+    * its pre-fix imperative ("Keep entity links property-free") was not in
+      `RETRACTED`, so the revert to the absolute could not red;
+    * §11.4 was not in the corrected-passage pins (they reach §11.1, §13 and
+      §13.8 q2), so a SILENT DELETION of the `#1370` tension record was green
+      too — and that record is the only place the ruling's exception is
+      written down as unresolved.
+
+    Measured (the reviewer's reproduction, re-run here): restoring the pre-fix
+    sentence verbatim at the PR head left every leg green. So the same absolute
+    the correction exists to stop could be re-derived in the rule that gives
+    the cheapness argument its name — the failure mode the changelog itself
+    names ("a correction that fixes one wording and leaves three").
+
+    SECTION-scoped to rule 1, not to §11.4: the section carries four rules, and
+    a whole-section test would stay green on rule 1's revert.
+    """
+    text = _doc(STORAGE)
+    rule = _section(
+        _section(
+            text,
+            "### 11.4 The four rules that keep it cheap",
+            "### 11.5 Fan-out cap",
+        ),
+        # The shared prefix, so the slice still resolves on the PRE-FIX
+        # wording — a start anchor of `near-bare` would raise IndexError there
+        # instead of reding on the claim, and an error is a worse diagnostic
+        # than a named failure for the exact input this leg exists to catch.
+        "1. **Keep entity links",
+        "2. **Cap the fan-out**",
+    )
+    assert "near-bare" in _flat(rule), (
+        "§11.4 rule 1 no longer says the entity links are `near-bare` — the "
+        "measured set is `confidence` on bound links plus the record "
+        "projection's `idx` ordinal, so the rule cannot be stated as "
+        "property-freedom in either wording"
+    )
+    retracted = [
+        literal for literal in ("Keep entity links property-free",)
+        if _flat(literal) in _flat(rule)
+    ]
+    assert not retracted, (
+        f"§11.4 rule 1 states the RETRACTED absolute {retracted} — the claim "
+        "§11.1/§13 retract cannot survive as the rule's own imperative "
+        "(leg 1 pins the same literal file-wide; this names the section)"
+    )
+    assert "#1370" in rule and "EntityLinked" in rule, (
+        "§11.4 rule 1 no longer carries the `#1370` tension record, journaled "
+        "through `EntityLinked` — the binding `confidence` on a bound link is "
+        "the one recorded exception to this rule, and deleting its record "
+        "turns a known, flagged conflict back into a satisfied rule"
+    )
+    assert "RECORDED, not resolved" in rule, (
+        "§11.4 rule 1's tension is no longer marked as RECORDED rather than "
+        "resolved — whether a binding confidence belongs on the link or on "
+        "the claim is an unrecorded design decision (`#9397`), and a guard "
+        "must not let prose settle it by dropping the qualifier"
+    )
+
+
+#: The extractor ledger's KEEP row, located by its first cell (no line numbers).
+LEDGER_KEEP_ROW = "| **Keep the epistemic + entity connection layer** |"
+
+
+def test_the_ledger_keep_row_names_both_recorded_properties():
+    """The `#9397` correction row in the extractor ledger said the edges are
+    *"bare apart from the binder's `confidence`"* — TRUE of the originated set
+    and FALSE as the reason the layer is cheap, because a record-projected
+    `aboutObject` edge also carries `idx` (the second name, written in the third
+    form; `#9403` review called this the weaker half of the same gap).
+
+    The row's RETRACTED wording (`Cheap because edges are **property-free**`) is
+    pinned, so a revert to THAT reds. Any other re-derivation of the one-name
+    absolute in the live ledger was unpinned, which is what this leg closes: the
+    row must name both measured properties.
+    """
+    rows = [
+        line for line in _doc(EXTRACTOR_CHANGELOG).splitlines()
+        if LEDGER_KEEP_ROW in line
+    ]
+    assert len(rows) == 1, (
+        "the extractor ledger's KEEP row is gone or duplicated — "
+        f"found {len(rows)} lines matching {LEDGER_KEEP_ROW!r}"
+    )
+    row = rows[0]
+    for prop in (PROPERTY, SECOND_PROPERTY):
+        assert f"`{prop}`" in row, (
+            f"the ledger's KEEP row does not name `{prop}` — the measured set "
+            "is `confidence` (originated) plus `idx` (re-materialized by "
+            "`cache_projection.relation_statement`), and the row is the reason "
+            "a reader takes the layer to be cheap"
+        )
+    # The RETRACTED reason, not the bare word: the row legitimately NAMES the
+    # withdrawn wording in its own correction note ("the earlier "property-free"
+    # was read from a search that cannot see a `SET r.<prop>` writer"), so a
+    # word-level test would red on the note that records the retraction.
+    assert "Cheap because edges are property-free" not in _flat(row), (
+        "the ledger's KEEP row has re-derived the retracted property-free "
+        "absolute as its reason"
     )
 
 
