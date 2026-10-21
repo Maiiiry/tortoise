@@ -3201,8 +3201,17 @@ surfaces:
   # claim, and the changelog record. `core` is its home for the code diffs that
   # can add a writer or re-rotate the claim (`session_link.py`,
   # `subject_binding.py`, `projection/entities.py`); `tier1` is the
-  # LOAD-BEARING one for the docs-only diff this change IS — a `docs/`-only diff
-  # takes `select()`'s early return and runs `tier1` only (the #8506 precedent).
+  # LOAD-BEARING one for the DOCS diffs this change IS. ⚠️ Measured, because the
+  # first version of this comment asserted the wrong MECHANISM: a
+  # `docs/architecture/STORAGE-ARCHITECTURE.md`-only diff does NOT take
+  # `select()`'s early return — that path is claimed by the `onboarding`
+  # `SOURCE_PATTERNS` entry, so `select()` returns `surfaces=['onboarding'],
+  # full=False, 120 files`; a `docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md`-only
+  # diff DOES take the early return (`surfaces=[]`). The guard is selected in
+  # both cases (measured: `guard_selected=True` for either doc), which is the
+  # property that matters — `tier1` is unconditional in the tier-2 selection and
+  # in the early-return branch, and `core` contributes nothing to `select()`
+  # (it is read by `--integrity` / `classify_test_file`).
   - test_9397_about_edge_properties.py
   - test_falkordb_compat.py
   # #7076: the degraded-fallback snapshot's OWN guard. test_fallback_snapshot.py

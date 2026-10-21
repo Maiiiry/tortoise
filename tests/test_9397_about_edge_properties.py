@@ -32,7 +32,21 @@ parallel-edge ordinal — as an INLINE pattern property, unconditionally; and
 `hosted_backup.restore_graph` the dump's (`SET r = $p`). The measured set is
 therefore `confidence` (originated) plus `idx` (re-materialized): one semantic
 attribute and one identity coordinate, not one property name. **The measured
-population is 3 originating + 2 re-materializing = 5 writers.**
+population is 3 originating + 2 re-materializing = 5 writers the census can
+SEE — and it is blind to a sixth SHIPPED site, which the count must not hide:**
+`session_source_migration._move_in` moves an edge by
+`MERGE ({src})-[r2:`{rel}`]->(new) ON CREATE SET r2 = properties(r)`, i.e. it
+copies the WHOLE property map, and `rel` is handed to it from
+`MOVABLE_SOURCE_RELS` — which contains `aboutSource` and `aboutDocument`. Both
+census rules miss it, and neither is cheaply widenable: the vocabulary is in the
+CALLER, not the writer's body (so "names an about vocabulary in its own body"
+never matches — measured: adding `MOVABLE_SOURCE_RELS` to `_ABOUT_VOCAB` still
+yields `{}`), and `SET r2 = properties(r)` is an fn-call RHS, which `_SET_MAP`
+(`$|{`) structurally cannot read. **So the honest bound is: no writer that
+SPELLS an about vocabulary in its own body, or takes its predicate from an
+allowlist named in `_ABOUT_VOCAB`, can add a property unseen — a predicate
+passed into a helper as a PARAMETER is not covered, and the site above is that
+gap in the shipped tree.**
 
 `sdk.supersede_point` and `projection._rebuild_all_replay` — which earlier
 revisions of this file recorded as re-materializers — are NOT. Its `SET r += $attrs` is on the 2a-DIRECT leg,
@@ -220,9 +234,13 @@ STORAGE_CHANGELOG = (
 #: checked against history instead of restated: an entry in
 #: `RETRACTED_INTRODUCED_HERE` must be ABSENT here, every other entry PRESENT.
 #: ⛔ NOT derived from `git merge-base HEAD origin/main`: the moment this lands
-#: the merge-base IS the corrected tree, and the measurement would invert. CI
-#: checks out with `fetch-depth: 0`, so the rev is reachable there; leg 8 skips
-#: rather than passes if it is not.
+#: the merge-base IS the corrected tree, and the measurement would invert.
+#: ⚠️ The gating CI job checks out at `fetch-depth: 1`, NOT with full history —
+#: this comment claimed `fetch-depth: 0` and was false for the only job that
+#: matters (`python-ci.yml:631`; the one `fetch-depth: 0` is the `changes` job at
+#: `:224`). The rev is made reachable by `_ensure_commit`, which fetches the
+#: `main` ref at a bounded depth; leg 8 then SKIPS rather than passes on a
+#: history it genuinely could not read, and the skip message says so.
 PRE_FIX_REV = "01b5486ec"
 
 #: label → (retracted literal, the live document it was measured in on the
@@ -613,8 +631,61 @@ def _query_call_containing(body: str, needle: str) -> str:
     return ""
 
 
+#: Bounded history depths tried, in order, to make `PRE_FIX_REV` reachable in a
+#: SHALLOW checkout. The gating `test` job in `python-ci.yml` uses a bare
+#: `actions/checkout@v4` (default `fetch-depth: 1`) — only the `changes` job
+#: unshallows (`:224`) — so a bare `git show <rev>` returns nothing there and the
+#: provenance leg would SKIP on every CI run, which `skip-guard.py` does not
+#: treat as a failure (it guards FalkorDB/embedder/module-collection reasons).
+#: ⛔ Fetching the raw sha does NOT work: measured in a `--depth 1` clone,
+#: `git fetch --depth=1 origin 01b5486ec` → *"couldn't find remote ref"* (the
+#: server does not expose arbitrary reachable shas). Fetching the `main` REF at a
+#: bounded depth DOES: measured in the same clone, `git fetch --depth=60 origin
+#: main` makes `01b5486ec` reachable. Depth is raised only until the rev resolves,
+#: so the cost is one shallow branch fetch and the bound is the point at which
+#: `01b5486ec` is genuinely too old to reach — reported by the skip message.
+_SHALLOW_DEPTHS = (120, 400, 1500)
+
+
+def _has_commit(rev: str) -> bool:
+    """True when `rev` resolves to a commit in this checkout's history."""
+    try:
+        done = subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{rev}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return False
+    return done.returncode == 0
+
+
+def _ensure_commit(rev: str) -> bool:
+    """Make `rev` reachable if the checkout is shallow — bounded, best effort."""
+    if _has_commit(rev):
+        return True
+    for depth in _SHALLOW_DEPTHS:
+        try:
+            subprocess.run(
+                [
+                    "git", "-C", str(ROOT), "fetch", "--quiet",
+                    f"--depth={depth}", "origin", "main",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):  # pragma: no cover
+            return False
+        if _has_commit(rev):
+            return True
+    return False
+
+
 def _git_show(rev: str, path: str) -> str | None:
     """`git show <rev>:<path>`, or None where the history is unavailable."""
+    _ensure_commit(rev)
     try:
         done = subprocess.run(
             ["git", "-C", str(ROOT), "show", f"{rev}:{path}"],
@@ -1411,10 +1482,13 @@ def test_every_retracted_literal_declares_its_true_provenance():
         if text is None:
             pytest.skip(
                 f"`git show {PRE_FIX_REV}:docs/architecture/{home}` is not "
-                "reachable in this checkout (shallow clone, no git, or the "
-                "rev was rewritten), so the pre-fix provenance cannot be "
-                "measured here — this leg only SKIPS, it never passes on a "
-                "history it could not read"
+                "reachable even after a bounded fetch of `origin main` "
+                f"(depths {_SHALLOW_DEPTHS}) — no git, an unreachable "
+                "remote, or the rev is older than the deepest bound — so the "
+                "pre-fix provenance cannot be measured here. This leg only "
+                "SKIPS, it never passes on a history it could not read; the "
+                "gap is that this checkout could not supply the history, not "
+                "that the provenance claim is verified"
             )
         pre_fix[home] = _flat(text)
     wrong: list[str] = []
