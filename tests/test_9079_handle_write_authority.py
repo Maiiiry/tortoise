@@ -960,3 +960,91 @@ def test_the_schema_lane_also_authorizes_the_documented_corpus_fixup(
 
     with pytest.raises(DirectCacheWriteRefused):
         proj.g.query("CREATE (n:Point {id:'handle-after-fixup'})")
+
+
+# ── the sibling file's stated evidence is pinned, not just asserted ───────
+def test_the_doors_stated_case_count_matches_what_it_actually_collects():
+    """`test_9079_client_handle_door.py`'s headline numbers are VERIFIED here.
+
+    That file's module docstring states its own case count as evidence that the
+    pins are discriminating ("what this file proves on the pre-fix tree"): a
+    count a reader cannot check is how the docstring came to claim 15 test
+    functions with a 5+7 breakdown while the file had 22 functions and three
+    parametrisations (#9079 review, claim-accuracy — the numbers did not add up
+    and `_dispatch_decided` was listed as a module-level import when it is
+    imported inside a test body).
+
+    RED before the fix: the assertions below reject the previous text, which
+    stated ``15 test functions`` and a breakdown of ``5`` and ``7``. Read the
+    count from pytest's own marks (``pytestmark`` → parametrize argvalues) so a
+    new case or a new parametrisation cannot silently falsify the docstring.
+    """
+    import importlib.util
+    import pathlib
+
+    door_path = pathlib.Path(__file__).with_name("test_9079_client_handle_door.py")
+    spec = importlib.util.spec_from_file_location(
+        "_door_case_count_subject", door_path)
+    assert spec is not None and spec.loader is not None
+    door = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(door)
+
+    functions = {
+        name: value for name, value in vars(door).items()
+        if name.startswith("test_") and callable(value)
+    }
+    sizes = []
+    for func in functions.values():
+        cases = 1
+        for mark in getattr(func, "pytestmark", []):
+            if mark.name == "parametrize":
+                cases *= len(mark.args[1])
+        sizes.append(cases)
+    parametrised = sorted(size for size in sizes if size > 1)
+    total = sum(sizes)
+    doc = door.__doc__ or ""
+
+    assert f"**{total}** cases" in doc, (
+        f"the sibling file collects {total} cases but its docstring does not "
+        f"state that number"
+    )
+    assert f"**{len(functions)}** test functions" in doc, (
+        f"the sibling file defines {len(functions)} test functions but its "
+        f"docstring does not state that number"
+    )
+    import re
+
+    stated = re.search(r"\((\d+), (\d+) and (\d+) parameter\s+sets", doc)
+    assert stated is not None, (
+        "the docstring must state its parametrisation sizes in the same "
+        "`(a, b and c parameter sets)` form this test reads"
+    )
+    assert sorted(int(g) for g in stated.groups()) == parametrised, (
+        "the docstring's parametrisation sizes must be the sizes pytest "
+        f"actually collects ({parametrised}): the extras it states must equal "
+        f"{[size - 1 for size in parametrised]}"
+    )
+    # The module-level import list is the other half of the pre-fix claim: the
+    # names it enumerates must be the ones this module really imports at module
+    # level. `_dispatch_decided` is a TEST-BODY import and was wrongly listed as
+    # a module-level one, so the enumeration is compared to the truth rather than
+    # to a second hand-written list.
+    module_level = door.__dict__
+    for name in ("_client_store_key", "_journal_backed_graphs", "_journal_backed_keys"):
+        assert name in module_level, f"{name} is no longer a module-level import"
+    enumerated = re.search(r"module-level imports\s*\n?\s*\(([^)]*)\)", doc)
+    assert enumerated is not None, (
+        "the docstring must enumerate the module-level imports that fail on "
+        "`origin/main`, in the `module-level imports (...)` form this test reads"
+    )
+    listed = set(re.findall(r"`(_[A-Za-z0-9_]+)`", enumerated.group(1)))
+    assert listed == {
+        "_client_store_key", "_journal_backed_graphs", "_journal_backed_keys"
+    }, (
+        "the enumerated module-level imports must be exactly the names this "
+        f"module really imports at module level (docstring lists {sorted(listed)})"
+    )
+    assert "_dispatch_decided" not in module_level, (
+        "`_dispatch_decided` is imported inside a test body; if it ever becomes "
+        "a module-level import, say so in the docstring and widen `listed` here"
+    )

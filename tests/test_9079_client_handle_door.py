@@ -78,16 +78,21 @@ is only honest if it says where it stops:
     that one channel (stated on ``_JOURNAL_BACKED_KEYS``).
 
 WHAT THIS FILE PROVES ON THE PRE-FIX TREE (stated exactly, #9079 review P3). It
-collects **37** cases under pytest (25 at the first review head: 15 test
-functions, with one parametrisation adding 5 and one adding 7; the review fixes
-add the split-spelling, bytes-graph-name, `close()`, `_NON_MUTATING_HANDLE_METHODS`
-detector and command-target pins, plus the two raw-shape pins). On ``origin/main`` it does
-not report "8 failed / 4 passed": its module-level imports
-(`_client_store_key`, `_journal_backed_graphs`, `_journal_backed_keys`,
-`_dispatch_decided`) do not exist there, so the run is a single collection
-**ImportError** — 0 passed, 0 failed, and the pins cannot execute at all. That is
-a stronger statement than a failure count, and it is the one a reader should
-quote. The four pins added by the last review fix WERE measured on the pre-fix
+collects **37** cases under pytest: **22** test functions, plus the **9**, **2**
+and **4** extra cases its three parametrisations contribute (10, 3 and 5 parameter
+sets — the ``shape``, ``build`` and ``verb`` lists). At the FIRST review head it
+collected 25 instead: 15 test functions, whose two parametrisations then added
+net 4 and 6. The review fixes since added the split-spelling, bytes-graph-name,
+`close()`, `_NON_MUTATING_HANDLE_METHODS` detector and command-target pins, plus
+the two raw-shape pins. On ``origin/main`` it does not report "8 failed / 4
+passed": its TWO-LEVEL import surface fails there — the module-level imports
+(`_client_store_key`, `_journal_backed_graphs`, `_journal_backed_keys`) do not
+exist, so collection dies before any test runs; and `_dispatch_decided`, which is
+imported INSIDE a test body rather than at module level, does not exist either,
+so that pin could not execute even if collection had succeeded. The run is a
+single collection **ImportError** — 0 passed, 0 failed, and the pins cannot
+execute at all. That is a stronger statement than a failure count, and it is the
+one a reader should quote. The four pins added by the last review fix WERE measured on the pre-fix
 tree (the branch head before that fix): both command-target cases failed with
 ``DID NOT RAISE DirectCacheWriteRefused`` / ``census={}`` and both raw-shape
 cases failed on the re-joined statement.
