@@ -46,12 +46,20 @@ THE SAME BLINDNESS, ONE LEVEL DOWN (review cycle on this file's first version)
 A census that reads only `SET r.<prop>` repeats the error: the property-MAP
 form `SET r += $props` / `SET r = $p` is structurally invisible to it, and four
 shipped sites already use that form on an allowlisted `aboutObject` predicate
-(listed above). So the census reads BOTH forms, and an interpolated predicate
-counts as about-bearing when its writer takes it from the shared about /
-predicate vocabulary — including the allowlist itself (`validate_rel_type`,
+(listed above). So the census reads ALL THREE write forms, and an interpolated
+predicate counts as about-bearing when its writer takes it from the shared about
+/ predicate vocabulary — including the allowlist itself (`validate_rel_type`,
 `KNOWN_REL_TYPES`, `_sanitize_label`), because "validated against the whole
 allowlist, which contains `aboutObject`" is exactly how a map-form writer
 names its edge without writing `aboutObject` anywhere.
+
+⚠️ THAT is a heuristic, and the promise it supports is bounded by it: the census
+cannot see a writer whose predicate comes from a vocabulary named nowhere in
+`_ABOUT_VOCAB` (or whose module `_module_in_scope` skips). The two forms that
+ARE provably read — the allowlist path and the inline pattern map — are pinned
+by synthetic probes; the residual gap is a list of names, and a list cannot be
+checked for a token nobody has written yet. Adding a predicate vocabulary is a
+change to `_ABOUT_VOCAB`, not only to the code that uses it.
 
 WHAT IS PINNED
 --------------
@@ -75,9 +83,21 @@ WHAT IS PINNED
    instead of the doc quietly lying again.
 4. `test_no_unrecorded_property_bearing_about_edge_writer` — the census half:
    every relationship-variable property write inside a function that builds an
-   `about*` edge — named (`SET r.<prop>`) or map-assigned (`SET r += $props` /
-   `SET r = $p`) — must be one of the recorded writers. A NEW property-bearing
-   about-edge writer cannot appear, in EITHER form, without being recorded.
+   `about*` edge — named (`SET r.<prop>`), map-assigned (`SET r += $props` /
+   `SET r = $p`), or an inline pattern map (`[r:aboutObject {idx:$idx}]`, which
+   assigns with no `SET` clause at all) — must be one of the recorded writers.
+   ⚠️ **The bound on that promise, stated rather than assumed:** an `about*`
+   edge is recognised by an `about*` LITERAL, or by an INTERPOLATED predicate in
+   a function whose body names one of the `_ABOUT_VOCAB` vocabularies (and, at
+   the file-walk level, in a module `_module_in_scope` admits). A writer that
+   derives its predicate from a vocabulary named NOWHERE in that list is still
+   invisible — so adding a predicate vocabulary, or a new way of naming one, is
+   a change to `_ABOUT_VOCAB` / `_module_in_scope`, not just a change to the
+   code. What IS machine-checked is that the three shipped forms are all read
+   (`test_the_census_reads_the_three_write_forms`) and that the allowlist path
+   is not skipped by the file walk (`test_the_census_reads_a_writer_that_never_
+   says_about`); the remaining gap is a vocabulary list, and a list cannot be
+   checked for a token nobody has written yet.
 5. `test_the_default_ingestion_path_reaches_the_binder` — the corrected text
    says "default-ON, ingestion path"; if `_extract_session_v2` stops calling
    the binder, **or stops being the fall-through branch** of the
@@ -432,7 +452,15 @@ def _module_in_scope(text: str) -> bool:
 
 
 def _about_edge_property_writers() -> dict[tuple[str, str], set[str]]:
-    """{(module, symbol): {property, …}} for every property-bearing about-edge write."""
+    """{(module, symbol): {property, …}} for every property-bearing about-edge write.
+
+    BOUND: an edge counts as `about*` by an `about*` literal in the relationship
+    token, or by INTERPOLATION in a function body that names one of
+    `_ABOUT_VOCAB` (and, above that, in a module `_module_in_scope` admits). A
+    writer that names its predicate some other way is invisible here — the
+    promise is "nothing NEW appears unrecorded among the forms and vocabularies
+    we read", never "nothing can appear".
+    """
     found: dict[tuple[str, str], set[str]] = {}
     for path in sorted(PKG.rglob("*.py")):
         text = path.read_text(encoding="utf-8", errors="replace")
