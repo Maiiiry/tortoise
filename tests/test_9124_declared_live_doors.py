@@ -280,19 +280,23 @@ _MIXED_ARM_DOORS: set[str] = set()
 #: fold. Measured on #9124; this is the "19 writers that journal nothing" class
 #: in the issue's landing path, at the count the source actually holds.
 _NO_JOURNAL = {
-    # #9206 review P2: the capture door appends NOTHING of its own. Everything
-    # it still writes at the handle is its four provenance stamps
-    # (`eventId`/`source_session`/`source_harness`/`ingested_at`, on the minted
-    # points, their operator variants and the session's CONTAINS members) —
-    # recoverable state with no record, so no lane can honestly describe them
-    # (§17.1's ledger names it; #9350 owes them a record). Its two state writes
-    # moved to declared doors (`_stamp_capture_attempt_state` /
-    # `_stamp_entity_link_counters`) and the `:Session` record moved into the
-    # shared writer. ⛔ It sat in `_APPLY_FIRST_DOORS` for one review round
-    # because the census counted `_journal_write_failure_warning(...)` — the
-    # receipt-warning string builder — as an append; with that false commit
-    # point excluded the door reads `no-journal`, which is what the source says.
-    "capture_session",
+    # ⛔ `capture_session` LEFT THIS SET (#9206 → #9349). It was here because it
+    # "reaches the handle with a write-like statement and appends no record" —
+    # and #9349 moved that last reach OUT of the door: every write it still makes
+    # is delegated to a door that is itself on the census surface and declared
+    # (`_stamp_capture_attempt_state`, `_stamp_entity_link_counters`,
+    # `_write_session_and_turns`, `_materialize_session_source`,
+    # `_stamp_capture_provenance`). With no write-like call of its own the census
+    # no longer KEYS it, so an entry here stops naming a function the census
+    # emits — a stale row, which this file's own
+    # `test_the_inventories_hold_no_stale_entry` refuses. The door's remaining
+    # claim ("appends nothing of its own") is pinned in
+    # `test_the_capture_door_is_inventoried_as_appending_no_record`, now as an
+    # ABSENCE from both the surface and every inventory rather than a row.
+    # The warning-string builder (`_journal_write_failure_warning`) that once
+    # bought this door a false `apply-first` lane stays in
+    # `_APPEND_NOT_A_RECORD`, and that test still asserts it is the door's only
+    # pattern-matching call — so the exclusion is still load-bearing.
     "_clear_reliability_cache",
     "_connect_issue_objects",
     "_extract_session_llm",
@@ -4591,28 +4595,43 @@ def test_the_append_exclusions_append_nothing():
 
 
 def test_the_capture_door_is_inventoried_as_appending_no_record():
-    """`capture_session` appends nothing of its own — and the census says so.
+    """`capture_session` writes through DECLARED doors, so it needs no row here.
 
-    #9206 review P2: the door sat in `_APPLY_FIRST_DOORS` because the ONLY call
-    in its body that matches the append pattern is `_journal_write_failure_warning`
-    — the receipt-warning STRING BUILDER (it returns a message; it appends no
-    record). With that false commit point excluded the honest classification is
-    `no-journal`: what remains at the handle is the four provenance stamps
-    (#9350 owes them a record), while the `:Session` record moved into the
-    shared writer and the two state writes became declared doors.
+    #9206 review P2 settled that the door appends nothing of its own: the only
+    append-pattern call in its body is `_journal_write_failure_warning`, the
+    receipt-warning STRING BUILDER, and the `_emit_event` the census once
+    credited was a lambda the CALLEE invoked. #9349 then moved the last
+    write-like reach out of the door entirely — its state writes and stamps are
+    now delegated to doors that are on the census surface and declared — so the
+    census stopped keying `capture_session` at all.
 
-    RED before the fix, twice over: with the exclusion and no inventory move
-    the gate reports the stale `apply-first` row; with the inventory move and no
-    exclusion the same gate reports the door as apply-first. The set of names
-    below is asserted too, so a FUTURE append added to this door (the real fix,
-    #9350) FAILS here instead of slipping under the exclusion.
+    Both halves are pinned, because each one ALONE would read as an accident:
+    the door is absent from the surface AND absent from every inventory, and the
+    doors it delegates its writes to ARE on the surface (so its writes moved
+    rather than vanished). The exclusion below is still load-bearing in the
+    direction that matters: `_journal_write_failure_warning` remains the door's
+    only append-pattern call, so a FUTURE real append (the fix #9350 owes)
+    FAILS here instead of slipping under that exclusion.
     """
     surface = enumerate_handle_surface(SDK_PY.read_text(), str(SDK_PY))
-    fact = surface["TortoiseSDK.capture_session"]
-    assert fact["appends"] == [], fact["appends"]
-    assert _kind(fact) == "no-journal", _kind(fact)
-    assert "capture_session" in _NO_JOURNAL
+    assert "TortoiseSDK.capture_session" not in surface, (
+        "the census keys the capture door again — it has a write-like reach of "
+        "its own, so it needs a lane row and this pin needs re-writing")
+    assert "capture_session" not in _NO_JOURNAL
     assert "capture_session" not in _APPLY_FIRST_DOORS
+    assert "capture_session" not in _all_inventoried(), (
+        "a stale inventory row names a function the census no longer emits — "
+        "`test_the_inventories_hold_no_stale_entry` is the gate that refuses it")
+
+    # …and the writes did not vanish: they moved to doors the census DOES key.
+    delegated = {"_stamp_capture_attempt_state", "_stamp_entity_link_counters",
+                 "_write_session_and_turns", "_materialize_session_source",
+                 "_stamp_capture_provenance"}
+    missing = sorted(name for name in delegated
+                     if not any(key.split(".")[-1] == name for key in surface))
+    assert not missing, (
+        f"{missing} are no longer on the census surface, so the capture door "
+        "has no write-like reach AND no proven home for the ones it lost")
 
     # The exclusion is LOAD-BEARING: re-read the door's body with the pattern
     # alone and name every call it would call an append. Exactly one, and it is
