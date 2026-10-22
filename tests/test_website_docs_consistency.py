@@ -28,18 +28,23 @@ HTML, matching the harness contract of `tests/test_signup_form_safety.py`.
 """
 from __future__ import annotations
 
+import ast
 import re
 import sys
+from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
+from pydantic import ValidationError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:  # tools/ is not an installed package
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.ci_selection import load_manifest, select  # noqa: E402, I001
+# isort order for the first-party block is `tests` < `tools` < `tortoise`; keep it
+# sorted so no `I001` suppression is needed (it lands on the block's first line,
+# so an import added above it is what breaks the suppression).
 from tests._html_links import (  # noqa: E402
     _AnchorHrefParser,
     blog_entry_hrefs,
@@ -47,6 +52,8 @@ from tests._html_links import (  # noqa: E402
     extract_element_ids,
     is_blog_entry,
 )
+from tools.ci_selection import load_manifest, select  # noqa: E402
+from tortoise.commit_schema import Point, point_content_id  # noqa: E402
 
 WEBSITE = REPO_ROOT / "website"
 FUNCTIONS = WEBSITE / "functions"
@@ -64,6 +71,7 @@ DOCS = WEBSITE / "docs.html"
 FAQ = WEBSITE / "faq.html"
 REDIRECTS = WEBSITE / "_redirects"
 SDK = REPO_ROOT / "tortoise" / "sdk.py"
+QUADRATURE = REPO_ROOT / "tortoise" / "quadrature.py"
 
 # Both public pages, for the parametrized guards.
 PAGES = pytest.mark.parametrize("page", [DOCS, FAQ], ids=["docs.html", "faq.html"])
@@ -79,12 +87,144 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _normalise(text: str) -> str:
+    """Collapse a rendered page or a draft line to comparable plain text.
+
+    Tags → space, entities unescaped, whitespace collapsed, and the markdown the
+    drafts use (bold, links, code, list bullets) stripped, so a table row written
+    as markdown can be compared with the same row as the browser sees it. This is
+    the same normalisation shape `tests/e2e/test_legal_pages.py::_clean` uses —
+    kept local because importing that module runs its module-level skip.
+    """
+    text = re.sub(r"<script.*?</script>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_unescape(text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)  # [label](url) → label
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*{1,2}(.+?)\*{1,2}", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _canonical_statuses() -> set[str]:
     src = _read(SDK)
     m = re.search(r"POINT_STATUS_VALUES\s*=\s*frozenset\(\{([^}]*)\}\)", src)
     assert m, "POINT_STATUS_VALUES not found in tortoise/sdk.py — did the definition move?"
     return set(re.findall(r"'([^']+)'", m.group(1)))
 
+
+def _sdk_constant(name: str) -> int:
+    """A module-level integer constant read from `tortoise/sdk.py`.
+
+    Read, never restated: a pin that hardcodes the number the copy states cannot
+    catch the COPY going false when the code moves. Measured at the #9515 review —
+    `_CAPTURE_TURN_CAP = 5000` → `2000` left the FAQ pin green while the page
+    claimed 5,000 characters.
+    """
+    m = re.search(rf"^{re.escape(name)}\s*=\s*(\d+)", _read(SDK), re.MULTILINE)
+    assert m, f"{name} not found at module level in tortoise/sdk.py — did it move?"
+    return int(m.group(1))
+
+
+def _exp_bodies(text: str) -> set[str]:
+    """Every `exp(...)` argument in `text`, compacted for comparison.
+
+    The paren scan is explicit rather than a regex because the IMPL factor nests
+    one (`exp(-w*(ca-cb)**2)`), and a non-nesting pattern silently returns a
+    TRUNCATED body that compares unequal to an identical formula.
+    """
+    bodies: set[str] = set()
+    start = 0
+    while (open_at := text.find("exp(", start)) != -1:
+        depth, idx = 0, open_at + 4
+        while idx < len(text):
+            if text[idx] == "(":
+                depth += 1
+            elif text[idx] == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            idx += 1
+        bodies.add(text[open_at + 4:idx])
+        start = open_at + 4
+    return bodies
+
+
+def _quadrature_exponent(func: str) -> str:
+    """The exponent `tortoise/quadrature.py::<func>` returns, in `_exp_bodies` form.
+
+    Derived so the FORMULA is pinned, not the prose around it: `/docs` states
+    `exp(-w·c_a·c_b)` for NAND and `exp(-w·(c_a−c_b)²)` for IMPL, and swapping
+    either for the other (or for a renamed symbol) reds here. `.` is normalised to
+    `*` because the source multiplies and the page renders a middot.
+    """
+    src = _read(QUADRATURE)
+    m = re.search(
+        rf"^def {re.escape(func)}\(.*?return np\.exp\((.+?)\)\s*$", src, re.M | re.S)
+    assert m, f"{func} not found in tortoise/quadrature.py — did it move?"
+    return re.sub(r"\s+", "", m.group(1))
+
+
+def _page_plain(raw: str) -> str:
+    """`raw` page HTML as comparable plain text, formula renderings normalised.
+
+    `<sup>2</sup>` becomes `**2` BEFORE the tags are stripped: the page writes the
+    IMPL square as an HTML superscript, so a tag-stripping-only pass yields
+    `(ca-cb)2` — a truncated exponent that would read as a mismatch on honest copy.
+    `·` and `−` are the page's multiplication and minus; the source writes `*`/`-`.
+    """
+    return (
+        _normalise(re.sub(r"<sup>2</sup>", "**2", raw))
+        .replace("·", "*")
+        .replace("−", "-")
+    )
+
+
+def _compact_formulas(text: str) -> set[str]:
+    """The `exp(...)` factors stated in `text`, compacted the way `_exp_bodies` reads."""
+    return _exp_bodies(re.sub(r"\s+", "", text))
+
+
+def _relation_factors(
+    raw: str, relations: tuple[str, ...] = ("NAND", "IMPL")
+) -> dict[str, set[str]]:
+    """The factor stated in the CLAUSE that names each relation, per relation.
+
+    A page-wide set of `exp(...)` bodies is BLIND TO A SWAP: both bodies being
+    present is invariant under exchanging them, so a page reading
+    "NAND is a joint-truth penalty — exp(-w·(c_a−c_b)²)" stayed green while the
+    formula pin claimed to make a swap falsifiable (measured at the #9515 review).
+    Each relation's factor is therefore read only from the text after its NAME, up
+    to the next relation name, so the number is bound to the edge type it belongs
+    to and an exchange of the two reds. It also stops a formula restated in an
+    unrelated card from keeping the pin green after the card drops it.
+    """
+    names = [r.upper() for r in relations]
+    plain = _page_plain(raw)
+    boundary = re.compile(r"\b(?:" + "|".join(names) + r")\b", re.I)
+    hits = [(m.start(), m.end(), m.group(0).upper()) for m in boundary.finditer(plain)]
+    out: dict[str, set[str]] = {name: set() for name in names}
+    for idx, (_, end, name) in enumerate(hits):
+        if name not in out:
+            continue
+        stop = hits[idx + 1][0] if idx + 1 < len(hits) else len(plain)
+        out[name] |= _compact_formulas(plain[end:stop])
+    return out
+
+
+def _stated_factors(raw: str) -> dict[str, str]:
+    """Each `<code>exp(...)</code>` on the page, keyed by its DERIVED factor form.
+
+    Maps `-w*ca*cb` back to the page's own rendering
+    (`exp(-w&middot;c<sub>a</sub>&middot;c<sub>b</sub>)`), so a test can mutate the
+    page exactly the way a wrong edit would and show the pin reds.
+    """
+    out: dict[str, str] = {}
+    for m in re.finditer(r"<code>(exp\(.*?)</code>", raw, re.S):
+        forms = _compact_formulas(_page_plain(m.group(1)))
+        assert len(forms) == 1, f"could not derive one factor from {m.group(1)!r}"
+        out.setdefault(forms.pop(), m.group(1))
+    return out
 
 # ── Point status vocabulary ──────────────────────────────────────────────────
 
@@ -99,6 +239,125 @@ def test_sdk_status_vocabulary_is_what_the_pins_below_assume() -> None:
         "outdated",
         "archived",
     }
+
+
+def test_docs_states_the_formulas_quadrature_actually_computes() -> None:
+    """/docs' mechanism card must state the FACTORS the engine computes, per edge type.
+
+    The card's prose is pinned above, but prose is rewordable and a formula is
+    not: `tortoise/quadrature.py` returns `np.exp(-w * ca * cb)` for NAND and
+    `np.exp(-w * (ca - cb) ** 2)` for IMPL, and /docs renders both. Comparing the
+    two DERIVED (never restated) makes a wrong factor falsifiable — replacing the
+    NAND factor on the page with IMPL's left the prose pin green (measured at the
+    #9515 review: `joint-truth penalty` survives a wrong formula) — and editing
+    `quadrature.py` itself reds the page that describes it.
+
+    The factors are bound to the relation that NAMES them, because a page-wide SET
+    of bodies is invariant under a swap: `NAND — exp(-w·(c_a−c_b)²)` is materially
+    wrong and stayed green under the set-only version of this pin (measured at the
+    same review). The positive control at the end executes that swap.
+    """
+    nand = _quadrature_exponent("phi_nand")
+    impl = _quadrature_exponent("phi_impl")
+    assert nand != impl, (
+        "phi_nand and phi_impl return the same factor — the two edge types are no "
+        "longer different constraints, and /docs says they are"
+    )
+    raw = _read(DOCS)
+    factors = _relation_factors(raw)
+    for func, relation, exponent in (
+        ("phi_nand", "NAND", nand),
+        ("phi_impl", "IMPL", impl),
+    ):
+        other = impl if relation == "NAND" else nand
+        assert exponent in factors[relation], (
+            f"website/docs.html does not state exp({exponent}) in the clause that "
+            f"names {relation}, which is what tortoise/quadrature.py::{func} "
+            f"computes. The card's prose alone cannot catch a wrong formula: it is "
+            f"pinned as words, and words survive a swap."
+        )
+        assert other not in factors[relation], (
+            f"website/docs.html states exp({other}) in the clause that names "
+            f"{relation} — the two factors are attached to the wrong edge types. "
+            f"{relation} must state exp({exponent})."
+        )
+
+    # POSITIVE CONTROL — the mutation this pin exists to catch actually reds it.
+    # Without this the guard could regress to a set membership check and stay
+    # green on a swapped page, which is the defect the #9515 review found.
+    rendered = _stated_factors(raw)
+    missing = {nand, impl} - set(rendered)
+    assert not missing, (
+        f"website/docs.html does not render exp(...) for {sorted(missing)} in a "
+        f"<code> element, so the swap control below cannot run"
+    )
+    assert raw.count(rendered[nand]) == 1 and raw.count(rendered[impl]) == 1, (
+        "the two factors are not each stated exactly once on /docs, so the swap "
+        "control is ambiguous"
+    )
+    swapped = (
+        raw.replace(rendered[nand], "\x00NAND-FACTOR\x00")
+        .replace(rendered[impl], rendered[nand])
+        .replace("\x00NAND-FACTOR\x00", rendered[impl])
+    )
+    red = _relation_factors(swapped)
+    assert nand not in red["NAND"] and impl in red["NAND"], (
+        "the factor pin is blind to a swap: exchanging the NAND and IMPL factors "
+        "on /docs did not red the clause-to-relation binding, so the pin cannot "
+        "catch the defect its docstring names"
+    )
+
+
+def _extraction_write_calls() -> list[ast.Call]:
+    """Every `create_point(...)` call inside `SDK._extract_session_v2`.
+
+    Parsed rather than grepped: the extraction path's sourcing claim is about the
+    DOOR it writes through, and a regex over the file would also match the
+    advisory `sdk.create_point` mentioned in a neighbouring docstring.
+    """
+    tree = ast.parse(_read(SDK))
+    out: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_extract_session_v2":
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "create_point"
+                ):
+                    out.append(sub)
+    return out
+
+
+def test_the_extraction_write_path_sources_every_extracted_point() -> None:
+    """The evidence under the FAQ's "every extracted claim carries the source".
+
+    `Point.source_ref` (`tortoise/commit_schema.py`, pinned below) governs the
+    COMMIT payload. The extraction path does not go through it — it writes with
+    `sdk.create_point`, whose contract is advisory (`no_source`, #8171) — so the
+    commit-schema pin cannot carry the FAQ's sentence on its own. What makes the
+    sentence true is the write itself: `_extract_session_v2` passes
+    `extractedFrom=f"session:{session_id}"`, and `create_point` wires that edge.
+    Dropping the keyword left every website pin green while the published claim
+    went false (measured at the #9515 review).
+    """
+    calls = _extraction_write_calls()
+    assert calls, (
+        "no create_point(...) call found inside tortoise/sdk.py::_extract_session_v2 "
+        "— the extraction write path moved or was renamed; this pin must be "
+        "re-anchored, not deleted"
+    )
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords if k.arg}
+        assert "extractedFrom" in kw, (
+            f"the extraction write at tortoise/sdk.py:{call.lineno} does not pass "
+            f"extractedFrom — an extracted point would then carry no link to the "
+            f"session it was drawn from, which is what website/faq.html promises"
+        )
+        assert "session:" in ast.unparse(kw["extractedFrom"]), (
+            f"the extraction write at tortoise/sdk.py:{call.lineno} no longer links "
+            f"the extracted point to a `session:` Source"
+        )
 
 
 def test_docs_lists_every_canonical_point_status() -> None:
@@ -165,6 +424,217 @@ def test_both_pages_name_expectation_propagation(page: Path) -> None:
     )
 
 
+# ── #9510: a published claim must be true of the path it names ────────────────
+
+
+def test_commit_schema_requires_a_source_on_every_extracted_claim() -> None:
+    """The evidence under the FAQ's narrowed traceability sentence.
+
+    `website/faq.html` claims traceability for *extracted* claims only. That is
+    true because the extraction contract REQUIRES a source: `Point.source_ref` is
+    `Field(min_length=1)` with no default, so an extracted Point cannot validate
+    without one, and `""` is refused too.
+
+    It is deliberately NOT claimed for *every* claim. `sdk.create_point` accepts a
+    fresh claim with no source and no provenance and returns
+    `advisories: [{code: 'no_source'}]` — advisory only, nothing is refused, and
+    `audit`'s `missing_sourceKind` check exists precisely because unsourced claims
+    occur ("PROVENANCE ADVISORY (#8171)", tortoise/sdk.py). The pre-fix sentence
+    spread the commit-path requirement over a door that does not enforce it — the
+    same defect class #9510 exists to remove.
+    """
+    content = "the production port is 16379"
+    base = {
+        "id": point_content_id(content),
+        "content": content,
+        "pointKind": "statement",
+        "reason": "NEW",
+        "confidence": 0.5,
+        "c_cal": 0.5,
+    }
+    assert base["id"].startswith("pt_")
+    with pytest.raises(ValidationError):
+        Point.model_validate(base)
+    with pytest.raises(ValidationError):
+        Point.model_validate({**base, "source_ref": ""})
+    sourced = Point.model_validate({**base, "source_ref": "doc:runbook"})
+    assert sourced.source_ref == "doc:runbook"
+
+
+def test_faq_ties_only_extracted_claims_to_their_source() -> None:
+    """The FAQ may not universalise the commit path's source requirement.
+
+    The scoped sentence is pinned so it cannot drift back, and the UNIVERSAL is
+    pinned ABSENT — as a CLASS, not as one string, because the false universal has
+    never had a single fixed phrasing. What shipped on `origin/main` before this
+    ruling was "Your source stays, verbatim and authoritative … the source is never
+    rewritten" (removed by #9517; the capture-shaping test below pins that wording
+    against reintroduction). "every claim is tied to the source it was drawn from"
+    was this PR's own interim draft (`a5eff2b2d`), never copy that shipped on main —
+    an earlier version of this docstring called it the pre-fix wording, which was
+    wrong and is exactly why the detector matches the quantifier + requirement
+    predicate + source noun instead of one sentence.
+    """
+    text = _normalise(_read(FAQ))
+    assert "every extracted claim carries the source it was drawn from" in text
+    # A SMELL DETECTOR, NOT A PROOF. It catches the SHAPE of the defect wherever it
+    # is written — quantifier + requirement predicate + source noun — which is what
+    # survives a rephrasing; it cannot decide the general case, and the general
+    # case is a REVIEW judgement, not a lexical one.
+    #
+    # Deliberately NOT widened toward "proof". Doing that was tried: scanning the
+    # whole sentence for a source noun reds the page's own true thesis ("Every
+    # claim's score is recomputed whenever its source is superseded"), and a
+    # negation window wide enough to accept "It is not required that every claim
+    # carry a source" also swallows the affirmative "Not only do all claims carry
+    # a source". A guard that reds TRUE copy is worse than a narrow one: the first
+    # person it blocks weakens or deletes it, and we lose the pin entirely.
+    #
+    # What IS load-bearing, all found by mutation:
+    #  * the qualifier is what makes the shipped sentence true, so a quantifier
+    #    whose intervening words include "extracted" is the LEGITIMATE form;
+    #  * the lookahead starts at the claim noun. A single `[^.]{0,120}` tail would
+    #    span a comma-joined coordinate ("every extracted claim …, and all such
+    #    claims must carry a source") and absorb the offender into the legitimate
+    #    match, filtering both away;
+    #  * the quantifier-to-noun span is 12 words — at 4, "every newly created and
+    #    separately stored claim must carry a source" slipped through;
+    #  * a requirement predicate must follow the noun. Requiring a predicate (and
+    #    excluding a bare "is") is what keeps true sentences such as "Every
+    #    claim's score is recomputed whenever its source is superseded" green;
+    #  * any negation anywhere in the sentence SKIPS it, so the honest "No claim
+    #    lacks a source" and "Every claim need not carry a source" stay green.
+    #    The cost is that emphatic affirmatives starting "Not only …" are missed;
+    #    that is an accepted, stated limitation, not an oversight;
+    #  * BOTH the match and the lookahead are case-insensitive — "All claims carry
+    #    a Source" is the same overclaim in title case, which is exactly how an
+    #    FAQ question heading is written.
+    quantifier = re.compile(
+        r"\b(every|all|each|any)\b((?:\s+\w+){0,12}\s+)(?:claims?|points?|beliefs?)\b", re.I
+    )
+    predicate = re.compile(
+        r"\b(?:carry|carries|need|needs|require|requires|must|have|has|tie|tied|"
+        r"trace|traced|traceable|record|records|keep|keeps)\b",
+        re.I,
+    )
+    negation = re.compile(r"\b(?:not|no|never|without|lacks?)|n't\b", re.I)
+    offenders = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if negation.search(sentence):
+            continue  # honest negations and emphatic affirmatives: out of scope
+        for m in quantifier.finditer(sentence):
+            if "extracted" in m.group(2).lower():
+                continue  # the scoped form: this is the shipped, true statement
+            tail = sentence[m.end() : m.end() + 120]
+            if not predicate.search(tail):
+                continue  # no requirement predicate: not this defect
+            if re.search(
+                r"\b(?:sourc|traceabl|traced|origin|provenance|came from|where it came)",
+                tail,
+                re.I,
+            ):
+                offenders.append(sentence[m.start() : m.end() + 120].strip())
+    assert not offenders, (
+        "faq.html universalised the source requirement again: "
+        f"{offenders}. Scope it to extracted claims (the commit contract requires "
+        "source_ref, but sdk.create_point does not — it returns a no_source "
+        "advisory, #8171)."
+    )
+
+
+#: Formula-level mechanism vocabulary. `faq.html`'s own note above the TOC rules it
+#: out ("Keep mechanism prose here to the minimum needed to answer an objection");
+#: the account belongs on `/docs`, which the FAQ defers to.
+_MECHANISM_MARKERS = (
+    "joint-truth penalty",
+    "difference coupling",
+    "own weight and direction",
+    "exp(-w",
+)
+
+
+def _mechanism_hits(text: str) -> list[str]:
+    """The formula-level mechanism phrases present in ``text``."""
+    return [marker for marker in _MECHANISM_MARKERS if marker in text]
+
+
+def test_the_belief_mechanism_is_documented_on_docs_first() -> None:
+    """`faq.html`'s own maintainer note forbids mechanism prose on that page.
+
+    The note (in the source above the TOC) reads: "The full technical account of
+    the belief model lives on /docs ... Update /docs first and let this page
+    follow. Keep mechanism prose here to the minimum needed to answer an
+    objection."
+
+    Measured history, so the premise of the guard is not a guess: `origin/main`'s
+    `faq.html` named neither relation (`grep -c "NAND\\|IMPL"` → 0) while
+    `docs.html` already carried a NAND/IMPL account on its Confidence (EP) card.
+    What this change adds is DEPTH, not location — the formula-level account
+    (`tortoise/quadrature.py`: NAND is a joint-truth penalty, IMPL a difference
+    coupling) is now on /docs, and the FAQ answer that used to stand alone
+    defers to it. Both halves are asserted, and both are false on the pre-fix
+    tree, so this test fails on the defect it guards: /docs carries the
+    mechanism, and the FAQ points at /docs for it.
+
+    The FAQ keeps ONE mechanism sentence — the one that answers the objection
+    (mutual vs directed contradiction). It is pinned so the exception the note
+    allows cannot widen into an account, and `_mechanism_hits` is exercised on a
+    sample that DOES contain the formula-level vocabulary, so the refusal below
+    is a live detector rather than a `not in` on strings the file never held.
+    """
+    note = re.sub(r"\s+", " ", _read(FAQ))
+    assert "Keep mechanism prose here to the minimum" in note, (
+        "faq.html's maintainer note is gone — this test enforces a rule the file "
+        "states. Re-anchor it here or retire both deliberately."
+    )
+    docs, faq = _normalise(_read(DOCS)), _normalise(_read(FAQ))
+    for mechanism in (
+        "joint-truth penalty",
+        "toward the source's level",
+        "own weight and direction",
+    ):
+        assert mechanism in docs, (
+            f"website/docs.html no longer states {mechanism!r}. The mechanism account "
+            f"belongs on /docs: the FAQ defers to it ('Update /docs first and let "
+            f"this page follow') and must not be the only page carrying it."
+        )
+    assert "what each relation does to a score" in faq, (
+        "website/faq.html no longer points at /docs for the mechanism. The deferral "
+        "is the half that keeps mechanism prose off this page — its own note says "
+        "'Update /docs first and let this page follow'."
+    )
+    # The objection-level contradiction sentence is the one mechanism paragraph the
+    # note permits (it answers "does a contradiction delete the losing belief?");
+    # pinned so the permitted exception cannot quietly grow.
+    assert (
+        "on both sides for a mutual contradiction, on the target only for a directed one"
+        in faq
+    ), (
+        "website/faq.html lost (or reworded) the objection-level contradiction "
+        "sentence. If it moved to /docs, update this pin deliberately: it is the only "
+        "mechanism sentence the page's own note allows."
+    )
+    assert _mechanism_hits(faq) == [], (
+        f"website/faq.html restates the mechanism ({_mechanism_hits(faq)}). Update "
+        f"/docs first and keep this page to the objection-level claim — that is the "
+        f"file's own maintainer note."
+    )
+    sample = _normalise(
+        "<p>A <strong>NAND</strong> is a joint-truth penalty and carries its own "
+        "weight and direction; an <strong>IMPL</strong> is a difference coupling: "
+        "<code>exp(-w&middot;c<sub>a</sub>&middot;c<sub>b</sub>)</code>.</p>"
+    )
+    assert _mechanism_hits(sample) == [
+        "joint-truth penalty",
+        "difference coupling",
+        "own weight and direction",
+        "exp(-w",
+    ], (
+        "the formula-level detector no longer fires on mechanism vocabulary, so the "
+        "assertion above proves nothing — this sample must hit it."
+    )
+
+
 # ── Ontology citation hygiene ────────────────────────────────────────────────
 
 
@@ -209,6 +679,146 @@ def test_faq_cites_the_real_paper_title() -> None:
         "website/faq.html names the study but gives no URL — the reader cannot verify "
         "the figures the page stakes its claims on."
     )
+
+
+#: The per-turn capture window, derived from the clipper's own constant so the
+#: FAQ cannot outrun what the store keeps (#9517).
+_CAPTURE_TURN_CAP = re.compile(r"^_CAPTURE_TURN_CAP\s*=\s*(\d+)", re.MULTILINE)
+
+
+def _capture_turn_cap() -> int:
+    """How many code points of a captured turn are actually stored (`sdk.py`).
+
+    Derived, not restated: `_clip_capture_turn_content` cuts every over-cap turn
+    to this many code points and appends the truncation marker, so a docs claim
+    about what "the source" retains is bounded by this number, and a change to
+    the constant must red the FAQ rather than silently falsify it.
+    """
+    src = _read(SDK)
+    m = _CAPTURE_TURN_CAP.search(src)
+    assert m, (
+        "_CAPTURE_TURN_CAP not found in tortoise/sdk.py — did the capture "
+        "window move? The FAQ's source-retention answers are bound to it."
+    )
+    return int(m.group(1))
+
+
+def _faq_answer(anchor: str) -> str:
+    """The FAQ answer under ``id="<anchor>"``, up to the next question.
+
+    Scoped for the same reason `_privacy_section` is: an unscoped `in text` pin is
+    satisfied by whichever answer happens to carry the phrase. Measured twice —
+    #9517 found a retention promise that outlived the capture window, and the
+    #9515 review found the `truncat` stem matching an unrelated sentence about
+    *truncated neighbourhoods* while the source-text answer itself could drop the
+    marker claim entirely and stay green.
+
+    One definition on purpose: #9517 and #9515 each grew their own copy, and a
+    module-scope redefinition silently shadows the earlier one (#9515 review).
+    """
+    html = _read(FAQ)
+    marker = f'id="{anchor}"'
+    start = html.find(marker)
+    assert start != -1, f"website/faq.html lost the #{anchor} heading"
+    nxt = html.find("<h3", start + len(marker))
+    return html[start : nxt if nxt != -1 else len(html)]
+
+
+def test_the_faq_source_retention_answers_disclose_the_capture_window() -> None:
+    """#9517 ISSUE 2: a retention promise may not outrun what the store keeps.
+
+    The two answers below promised the whole captured source is kept and
+    "still there to search directly", while the capture path stores at most
+    `_CAPTURE_TURN_CAP` (5,000) code points per turn, appends a truncation marker
+    carrying the original length, and redacts credential-shaped spans before the
+    write (#4911). For a long captured turn the tail is simply not in the store,
+    so an unbounded "the raw material is still there" is false — and no page in
+    `website/` disclosed the window at all.
+
+    The window is read out of `tortoise/sdk.py`, so raising the cap without
+    updating the copy, or wording the promise past the cap, is a red test.
+    """
+    window = f"{_capture_turn_cap():,}"
+    for anchor in ("source-text", "missed"):
+        answer = _faq_answer(anchor)
+        assert window in answer, (
+            f"website/faq.html#{anchor} promises the source is kept without "
+            f"disclosing that a captured turn is stored clipped at {window} "
+            "characters (tortoise/sdk.py::_CAPTURE_TURN_CAP). Scope the "
+            "retention claim to what the store guarantees (#9517)."
+        )
+        assert "marker" in answer.lower(), (
+            f"website/faq.html#{anchor} discloses the {window}-character window "
+            "but not that a clipped turn is marked with its original length — "
+            "the marker is what makes the stored turn honest to a reader."
+        )
+
+
+#: #9510's ruling names each of these FAQ passages by anchor, quotes the
+#: self-undercutting clause it forbids, and states the positive statement that
+#: replaces it. The pair is the ruling's, not a taste judgement — which is why it
+#: is a bounded per-anchor table rather than a phrasing blacklist that would rot.
+_RULING_REWRITES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    # A2 — "a different retrieval signal" framed Tortoise as a better index;
+    # the ruling's rewrite is typed, weighted constraints **computed over**,
+    # and the cognitive-layer-for-agents positioning.
+    "not-just-rag": (
+        ("a different retrieval signal",),
+        ("computed over", "reasoning, memory and learning"),
+    ),
+    # A4 — "not as evidence that this graph works" undercuts the very graph the
+    # answer is describing; the rewrite names what the study measured and what
+    # Tortoise computes over.
+    "source-text": (
+        ("not as evidence that this graph works",),
+        ("computes over typed relations",),
+    ),
+    # A10 — "the graph itself is not the differentiator" is correct but empty;
+    # the rewrite is "a graph *stores* relationships; Tortoise *computes* over
+    # them". A11's problem span was three clauses, and the first ("an alpha,
+    # single-maintainer reimplementation that is not a competitor product")
+    # survived three review rounds because nothing bound it: it is the premise
+    # the removed "bolt-on-able rather than out of reach" conclusion was drawn
+    # from, so keeping it keeps the self-undercut (#9517 review 5).
+    "different": (
+        ("not the differentiator", "single-maintainer reimplementation"),
+        ("<em>computes</em> over them",),
+    ),
+}
+
+
+def test_the_rulings_named_faq_rewrites_are_the_ones_that_shipped() -> None:
+    """#9517 review 3: the ruling's A2/A4/A10 passages must not survive verbatim.
+
+    #9510 forbids negative self-review on customer-facing copy, and its
+    "Inventory and disposition" table names each of these three passages by
+    anchor with the clause to remove and the positive statement to put in its
+    place. The PR that implements the ruling rewrote seven of the twelve FAQ
+    items, left these three standing, and its body then asserted the FAQ was
+    the whole exposure — so the surviving passages are what a reader sees while
+    the PR says otherwise.
+
+    A4 is the sharp one: "do not read this study as evidence that this graph
+    works" sits in the same paragraph the PR edits, and it hands the reader the
+    argument against the product on the page that argues for it.
+    """
+    for anchor, (forbidden, required) in _RULING_REWRITES.items():
+        answer = _faq_answer(anchor)
+        for phrase in forbidden:
+            assert phrase not in answer, (
+                f"website/faq.html#{anchor} still carries {phrase!r}. #9510's "
+                "inventory disposes of that clause — a surface that volunteers "
+                "its own weak points hands the reader the argument against us "
+                "— and #9517's own body claimed the FAQ was clean against the "
+                "ruling, so the passage cannot stay here unrewritten."
+            )
+        for phrase in required:
+            assert phrase in answer, (
+                f"website/faq.html#{anchor} does not carry the positive "
+                f"statement {phrase!r} that replaces the ruled-out clause. "
+                "Deleting the self-undercut without stating what Tortoise "
+                "actually does leaves the answer shorter, not stronger."
+            )
 
 
 @PAGES
@@ -468,9 +1078,15 @@ def _offers_blog_entry(page: Path) -> bool:
 # leaves the public surface, that is a decision someone must take deliberately,
 # not a page that quietly disappears from coverage.
 _IN_SCOPE_AT_3950 = frozenset({
-    "aviso-privacidad.html", "contact.html", "docs.html", "dpa.html", "faq.html", "index.html",
+    "contact.html", "docs.html", "dpa.html", "faq.html", "index.html",
     "license.html", "privacy.html", "product.html", "security.html",
     "self-hosted.html", "tos.html",
+    # ⚠️ `aviso-privacidad.html` LEFT this set in #9486: the Spanish LFPDPPP
+    # notice was RETIRED because the controller's jurisdiction of residence is
+    # the United Kingdom — the document had no basis. Its route 301s to
+    # `/privacy`, which is the privacy notice. Removing it from this pin is the
+    # deliberate decision the comment above requires, not a page quietly
+    # disappearing from coverage.
     # ⚠️ `signup.html` LEFT this set in #4054: the page (the `/auth` screen)
     # moved to the app project at `website/apps/dashboard/public/signup.html`,
     # so it is no longer a page `website/` serves and no longer this guard's
@@ -646,7 +1262,8 @@ def test_every_in_scope_page_is_selectable_by_ci() -> None:
     surface at all, so a PR touching ONLY that page never runs this file — the
     guard silently stops covering the page it was written for. That is the
     #1349/#3332 silent-drop class, and it bit this guard on arrival: 5 of the 12
-    in-scope pages (`security`, `tos`, `license`, `dpa`, `aviso-privacidad`) were
+    in-scope pages (`security`, `tos`, `license`, `dpa`, `aviso-privacidad` — the
+    last has since been retired, #9486) were
     absent from the `onboarding` entry, so `--changed-files website/tos.html`
     selected `surfaces=[]`.
 
@@ -986,8 +1603,8 @@ def test_product_hero_offers_the_blog() -> None:
 
     The owner's complaint is "cannot find the blog", so a link at the bottom of a
     630vh scroll narrative is a weak answer on the one page that matters. The
-    hero already carries a secondary-link row (`Browse the docs -> . Design FAQ ->`,
-    `website/product.html:332`) that is clickable from first paint (`.beat.pe-on`
+    hero already carries a secondary-link row (`Browse the docs -> . GitHub repo ->`)
+    in `#beat-hero` that is clickable from first paint (`.beat.pe-on`
     on the `i === 0` beat), so the blog goes there — no new CSS, and no change to
     the #1288 login-only top menu.
 
@@ -1328,8 +1945,11 @@ def test_the_declared_limit_helper_fires_on_the_constructs_it_names() -> None:
 # `noindex` keeps it out of the BLOG guard's scope, not out of this one.
 # `investors.html` was ADDED (#8568, 2026-10-13): the investor one-pager, forked
 # from it. Same class of document, same reasoning — `noindex`, covered here.
+# `aviso-privacidad.html` was REMOVED (#9486): the file is deleted, so it is
+# no longer a page the id guard has a subject in — `/aviso-privacidad` now
+# 301s to `/privacy`.
 _ALL_WEBSITE_PAGES_AT_3436 = frozenset({
-    "404.html", "aviso-privacidad.html", "contact.html", "design-partners-intro.html",
+    "404.html", "contact.html", "design-partners-intro.html",
     "docs.html", "dpa.html", "faq.html",
     "index.html", "investors.html", "invite-accept.html", "license.html", "privacy.html",
     "product.html", "security.html", "self-hosted.html",
@@ -1488,6 +2108,90 @@ def test_privacy_does_not_leave_session_deletion_backups_undisclosed() -> None:
     )
 
 
+def _draft_history_rows(draft_path: Path, heading: str) -> dict[str, tuple[str, str]]:
+    """`{version: (date, normalised summary)}` from a draft's markdown table."""
+    draft = draft_path.read_text(encoding="utf-8")
+    start = draft.lower().rfind(heading)
+    assert start != -1, f"{draft_path.name} lost its '{heading}' table"
+    rows: dict[str, tuple[str, str]] = {}
+    for line in draft[start:].splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or set(stripped) <= set("|-: "):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if len(cells) < 3 or cells[0].lower() == "version":
+            continue  # separator or header
+        rows[cells[0]] = (cells[1], _normalise(cells[2]))
+    return rows
+
+
+def _rendered_history_rows(render_path: Path) -> dict[str, tuple[str, str]]:
+    """`{version: (date, normalised summary)}` from the page's history table.
+
+    Parsed from the document rather than substring-matched: a containment check
+    passes when a draft row merely STARTS the same way, which is exactly how a row
+    can lose the sentence that makes it complete and stay green.
+    """
+    html = render_path.read_text(encoding="utf-8")
+    body = re.search(r"<tbody>(.*?)</tbody>", html, re.S)
+    assert body, f"{render_path.name} has no history table body"
+    rows: dict[str, tuple[str, str]] = {}
+    for tr in re.findall(r"<tr>(.*?)</tr>", body.group(1), re.S):
+        cells = [_normalise(td) for td in re.findall(r"<td>(.*?)</td>", tr, re.S)]
+        if len(cells) >= 3:
+            rows[cells[0]] = (cells[1], cells[2])
+    return rows
+
+
+def test_each_draft_history_row_mirrors_its_rendered_page() -> None:
+    """A draft's revision-history table and the page's must be the SAME table.
+
+    `test_draft_to_render_fidelity` (e2e) deliberately skips table rows ("changelog
+    structure — build-resolved"), so nothing else compares them. This pins the two
+    sides as parsed tables — the version SET in both directions and the summary per
+    version — because a one-directional containment check cannot see a row that
+    lost a sentence, a row the draft is missing, or a row the render is missing.
+
+    The 1.0 row's date may still be the deploy placeholder (`[Effective date: …]`):
+    that exemption covers the DATE CELL only, never the row, so its summary is
+    still compared.
+    """
+    cases = (
+        (WEBSITE.parent / "docs" / "drafts" / "2026-08-08-657-privacy-draft.md",
+         "document history / revisions", PRIVACY),
+        (WEBSITE.parent / "docs" / "drafts" / "2026-08-08-657-tos-draft.md",
+         "revision history", WEBSITE / "tos.html"),
+    )
+    for draft_path, heading, render_path in cases:
+        draft_rows = _draft_history_rows(draft_path, heading)
+        render_rows = _rendered_history_rows(render_path)
+        assert draft_rows, f"{draft_path.name} has no history rows to mirror"
+        assert set(draft_rows) == set(render_rows), (
+            f"{draft_path.name} and {render_path.name} list different versions: "
+            f"draft-only {sorted(set(draft_rows) - set(render_rows))}, "
+            f"page-only {sorted(set(render_rows) - set(draft_rows))}"
+        )
+        for version, (date, summary) in draft_rows.items():
+            r_date, r_summary = render_rows[version]
+            # A bracketed date is an unresolved deploy placeholder. Only v1.0 may
+            # still carry one; any OTHER version with one is a row that stopped
+            # being real, and a resolved date is compared for every version.
+            if date.startswith("["):
+                assert version == "1.0", (
+                    f"{draft_path.name}: v{version} still has the deploy placeholder "
+                    f"{date!r} — only the initial 1.0 row may"
+                )
+            else:
+                assert date == r_date, (
+                    f"{draft_path.name}: v{version} dated {date!r} but "
+                    f"{render_path.name} says {r_date!r}"
+                )
+            assert summary == r_summary, (
+                f"{draft_path.name}: v{version} the two texts differ.\n"
+                f"  draft: {summary}\n  page : {r_summary}"
+            )
+
+
 def test_privacy_draft_mirrors_the_session_recording_retention() -> None:
     """The canonical doc requires the draft and the published page to move together.
 
@@ -1498,7 +2202,25 @@ def test_privacy_draft_mirrors_the_session_recording_retention() -> None:
     """
     draft = _read(REPO_ROOT / "docs" / "drafts" / "2026-08-08-657-privacy-draft.md")
     assert "**Session recordings.**" in draft
-    assert "**Current version:** 1.2" in draft
+    # The version is READ from the render, not re-typed here: a hand-maintained
+    # second copy of the version number goes stale on every bump and forces a
+    # test edit that asserts nothing about the document.
+    m = re.search(r"<p><strong>Current version:</strong>\s*([0-9.]+)</p>", _read(PRIVACY))
+    assert m, "privacy.html lost its 'Current version' line"
+    # The draft carries the number TWICE (the §15 line and a `**Version:**` line in
+    # its header) and neither is compared by the history-table test, so both are
+    # pinned here against the render's single source of truth.
+    meta = re.search(r'<span class="label">Version</span>\s*<span class="value">([0-9.]+)</span>', _read(PRIVACY))
+    assert meta, "privacy.html lost its meta Version badge"
+    assert meta.group(1) == m.group(1), (
+        f"privacy.html's meta badge says {meta.group(1)} but §15 says {m.group(1)}"
+    )
+    assert f"**Version:** {m.group(1)}" in draft, (
+        "the privacy draft's header version no longer mirrors the rendered policy"
+    )
+    assert f"**Current version:** {m.group(1)}" in draft, (
+        "the privacy draft's version no longer mirrors the rendered policy — the "
+        "draft and the page move together (docs/retention-and-deletion.md)")
 
 
 def _privacy_section(heading: str) -> str:
@@ -1538,3 +2260,66 @@ def test_privacy_establishes_the_basis_that_6_cites() -> None:
         "§4 must state the purpose for session recordings, which §6 cites"
     )
     assert "legitimate interests (Art. 6(1)(f)):" in section
+
+
+def test_faq_source_answer_states_the_capture_shaping() -> None:
+    """The FAQ may not call the stored source "verbatim" or "never rewritten".
+
+    The stored turn is shaped once, on the way in: `_CAPTURE_TURN_CAP` (read from
+    `tortoise/sdk.py`, not restated here) routes every writer through
+    `_clip_capture_turn_content`, which cuts to the cap AND appends a marker
+    carrying the true original length ("no cut is silent"), and
+    `_redact_turn_contents` replaces credential-shaped spans in place (#4911) —
+    both before the write. So the absolute "the source is never rewritten" is
+    false of the shipped capture path, and this page is the one that has to say
+    what actually happens instead (#9510 review, #9517 carries the same fix).
+
+    Extraction's own honesty claim is separate and stays pinned: extraction is
+    additive, and every EXTRACTED claim carries its source. The scoping to
+    "extracted" is deliberate — `sdk.create_point` takes an unsourced claim and
+    only advises (`PROVENANCE ADVISORY`, #8171).
+    """
+    # `"verbatim evidence"` never shipped on `origin/main`, but it DID exist in this
+    # branch at 5a6c8fa86 ("verbatim evidence underneath") and was the defect this
+    # test's own cycle removed, so it is pinned against reintroduction, not against
+    # history.
+    text = _normalise(_read(FAQ))
+    answer = _normalise(_faq_answer("source-text"))
+    for refuted in (
+        "verbatim and authoritative",
+        "the source is never rewritten",
+        "verbatim evidence",
+        "kept verbatim",
+    ):
+        assert refuted not in text, (
+            f"website/faq.html restates {refuted!r}, which is false of the shipped "
+            f"capture path (5000-character clip with a truncation marker, plus "
+            f"credential redaction, both applied before the write)."
+        )
+    # The NUMBER is DERIVED from `_CAPTURE_TURN_CAP`, never restated: hardcoding
+    # 5,000 here left this test green when the constant moved to 2,000 and the
+    # page went on claiming 5,000 characters (measured at the #9515 review). The
+    # other two are pinned as STEMS, not sentences — a future editor rewording
+    # "credential-shaped spans are redacted" to "credentials are redacted" has
+    # not broken anything, and a pin that reds true copy gets deleted by the
+    # first person it blocks.
+    cap = _sdk_constant("_CAPTURE_TURN_CAP")
+    assert f"{cap:,} characters" in answer, (
+        f"faq.html's source-text answer no longer states the capture window "
+        f"({cap:,} characters, `_CAPTURE_TURN_CAP` in tortoise/sdk.py)."
+    )
+    assert "original length" in answer.lower(), (
+        "faq.html's source-text answer no longer says a cut turn is marked with its "
+        "original length — that is what `_capture_truncation_marker` writes, and it is "
+        "what makes the cut non-silent. Scoped to this answer on purpose: the old "
+        "`truncat` stem was satisfied by an unrelated sentence about truncated "
+        "neighbourhoods, so it never pinned this claim at all (measured at the #9515 "
+        "review)."
+    )
+    assert "redact" in answer.lower(), (
+        "faq.html's source-text answer no longer says credential-shaped spans are "
+        "redacted (_redact_turn_contents, #4911)"
+    )
+    assert "every extracted claim carries the source it was drawn from" in answer, (
+        "the scoped traceability claim was dropped along with the false universal"
+    )

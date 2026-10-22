@@ -4253,6 +4253,28 @@ class _EntityHandlers:
         # #133: needs_extraction — explicit signal for --upgrade-all discovery.
         # coalesce-null sentinel: None default so partial updates preserve.
         nx = ev.get("needs_extraction")
+        # #5140 P1: the clause below DROPS a demotion instead of applying it
+        # (see its comment — the same statement is the replay fold, so it must
+        # stay total). Dropping a value the caller supplied in silence is the
+        # #2795 "a declaration rots into a mystery" class, so name it. The read
+        # is gated on the ONLY demoting value, so the fingerprint path pays
+        # nothing: `document_kind` is `'transcript'` on ~no document write.
+        if ev.get("document_kind") == "transcript":
+            # ⛔ EVERY node the MERGE can reach, through the ONE reader — not
+            # `rows[0]` of an inline query. A first-row read here reproduced the
+            # very defect review cycle 4 removed from the guard: with a
+            # non-metered sibling listed first the advisory went missing, so a
+            # dropped demotion went back to being silent (#5140 cycle 5).
+            from tortoise.quota import is_metered_document_kind, stored_source_document_kinds
+            _metered_dks = [k for k in stored_source_document_kinds(self.g, did)
+                            if is_metered_document_kind(k)]
+            if _metered_dks:
+                logger.warning(
+                    "#5140: `document_kind='transcript'` on %s DROPPED — the "
+                    "node is a metered document (documentKind=%r) and its "
+                    "genre cannot be demoted out of the `documents` cap. "
+                    "Delete the document and re-ingest it if it really is a "
+                    "transcript.", did, _metered_dks[0])
         # #5422: the document's contentHash — the version anchor on the
         # extraction path. None (absent key, or a metadata-only re-emit) is
         # the preserve sentinel: the clause below must never clear an anchor
@@ -4373,7 +4395,38 @@ class _EntityHandlers:
             # (topics/summary/sessionId/eventId/needs_extraction); on a
             # re-write that OMITS the kind the middle term preserves the
             # stored value (#125 coalesce semantics).
-            "    s.documentKind=coalesce($dk, s.documentKind, ''), "
+            #
+            # ⛔ #5140 P1 (review cycle 2): this clause is what made the
+            # `documents` meter escapable from THIS writer too. `documentKind`
+            # is the METER key (`quota.DOCUMENT_METER_PREDICATE`), and the
+            # plain coalesce OVERWROTE an existing document's genre with
+            # whatever `$dk` carried — `EventAPI.add_document(<doc id>,
+            # document_kind='transcript')` and `_doc_write(frontmatter
+            # type='transcript', <doc id>)` (the `/v1/index/docs`
+            # re-index path) both demoted a metered document to `transcript`
+            # and dropped it out of the cap: MEASURED, 3 seeded documents,
+            # meter 3 -> 2 -> 1, one call each. A metered document therefore
+            # KEEPS its genre: `$dk` may ADD a kind where none is stored, and
+            # RETARGET one metered genre to another (report -> brief — both
+            # are counted), but it cannot move the node out of the metered
+            # class. Enforced in THIS clause rather than in the Python caller
+            # because the same statement is the REPLAY fold: a journal that
+            # already holds a pre-guard demotion must re-materialise to the
+            # metered genre, not abort the rebuild (a raise here would make
+            # `rebuild_all` fail on an existing log). The PRODUCERS that take a
+            # genre from a TENANT (`EventAPI.add_document`, `_doc_write`)
+            # REFUSE BEFORE the journal append
+            # (`quota.refuse_document_writer_demotion`), and the two `:Source`
+            # surfaces (`create_source`/`update_entity`) raise
+            # (`sdk._refuse_document_kind_demotion`) — neither is replay, and a
+            # silent no-op would leave the caller believing it wrote. So a LIVE
+            # write reaches this CASE only when nothing metered is stored.
+            "    s.documentKind=CASE "
+            "        WHEN s.documentKind IS NOT NULL "
+            "             AND s.documentKind <> 'transcript' "
+            "             AND $dk = 'transcript' "
+            "        THEN s.documentKind "
+            "        ELSE coalesce($dk, s.documentKind, '') END, "
             "    s.format=coalesce($fmt, s.format), "
             "    s.topics=coalesce($topics, s.topics, []), "
             "    s.summary=coalesce($summary, s.summary, ''), "
@@ -4691,21 +4744,21 @@ class _EntityHandlers:
         `ingestedAt`, which the record — not the fold — is the authority for.
 
         That agreement holds for the doors that STAMP ``ts`` on the record they
-        fold (`EventAPI._emit`), not for every door. TWO doors have the opposite
-        shape, and each mints the envelope ``ts`` a SECOND time — so both are
+        fold (`EventAPI._emit`), not for every door. TWO doors had the opposite
+        shape, and each minted the envelope ``ts`` a SECOND time — so both are
         named here rather than the one this contract used to exempt:
 
         * `TortoiseSDK._apply_and_journal` appends through `_emit_event`, which
-          mints ``ts`` on a COPY of the record, then folds the caller's own
+          minted ``ts`` on a COPY of the record, and then folded the caller's own
           dict;
         * `TortoiseSDK._create_entity` (the public ``create_entity`` /
           ``create_event`` — the ``tortoise_create_entity`` /
-          ``tortoise_create_event`` tools) folds the caller's event at
-          ``proj.apply`` and journals it AFTER the fold, so the record it folds
-          has no ``ts`` to read (``ts`` is a reserved ENVELOPE prop, stripped at
-          prop intake) and `_emit_event` mints one at append time.
+          ``tortoise_create_event`` tools) folded the caller's event at
+          ``proj.apply`` and journaled it AFTER the fold, so the record it
+          folded had no ``ts`` to read (``ts`` is a reserved ENVELOPE prop,
+          stripped at prop intake) and `_emit_event` minted one at append time.
 
-        A caller setting ``objectType='Document'`` through either door stamps
+        A caller setting ``objectType='Document'`` through either door stamped
         the write clock live and the envelope ``ts`` on replay; measured through
         ``create_event(objectType='Document')`` — live ``ingestedAt``
         ``…56.356835`` vs rebuilt ``…56.421082`` — the #5024 divergence class, on
@@ -4720,10 +4773,19 @@ class _EntityHandlers:
         stamps ``event["createdAt"]`` before the append so the record and the
         fold carry one instant), and ``_emit_event(recorded_ts=…)`` is the
         parameter `retract_point` uses for this purpose; `_journal_record_payload`
-        shares only the payload-KEY rule and would not close it. Filed as #9419
-        rather than taken here: it moves the journal bytes of every
-        ``EventRecorded`` that funnel emits, a different blast radius from this
-        clause.
+        shares only the payload-KEY rule and would not close it.
+
+        ✅ ``_create_entity`` IS FIXED (#9419): it now stamps ``event["ts"]``
+        before ``proj.apply`` and passes that same instant as
+        ``_emit_event(recorded_ts=…)``, so this fold reads one clock and live ≡
+        rebuilt (``test_document_source_ingested_at_5140.py`` pins it).
+        ✅ ``_apply_and_journal`` IS FIXED TOO (#9434): it stamps ``event["ts"]``
+        before its append and hands the same instant to ``_emit_event`` through
+        ``_journal_entity_event(recorded_ts=…)``, so the dict it folds after the
+        append carries the record's own instant instead of none. Both halves are
+        pinned in ``test_document_source_ingested_at_5140.py``; neither door has
+        an in-repo producer that sets ``objectType`` today, so this is a residual
+        closed, not a live defect fixed.
         """
         # #4524: the ON MATCH embedding write below can be a SILENT no-op on
         # the embedded engine — a ``vecf32`` overwrite of an existing vector is
@@ -4803,16 +4865,20 @@ class _EntityHandlers:
             # the field means when Tortoise FIRST saw this source). The value is
             # the record's own `ts` when it carries a USABLE one — deterministic
             # on replay — falling back to the write clock only for a record that
-            # states none. Not every live door states one, and ALL THREE are
-            # latent rather than live today (no in-repo producer sets
-            # `objectType` on any of them): the miner's own envelope carries no
-            # `ts`; `_apply_and_journal` folds the caller's dict rather than the
-            # envelope its append minted; and `_create_entity` (behind
-            # `create_entity`/`create_event`) folds BEFORE it journals, so the
-            # append's `ts` never reaches the fold (sdk.py counts the journal's
-            # three live append doors; #9419 carries the live-vs-rebuild delta).
-            # For any of them the fallback is what keeps `ingestedAt` REQUIRED
-            # rather than NULL, and the value is not replay-deterministic.
+            # states none. Not every live door states one, and the one still
+            # remaining is latent rather than live today (no in-repo producer
+            # sets `objectType` on it): the miner's own envelope carries no
+            # `ts`. The TWO doors that used to head this list are FIXED and
+            # named so a census does not read them as still-broken —
+            # `_apply_and_journal` (#9434) now stamps `ts` before its append and
+            # folds a dict that carries the record's own instant, and
+            # `_create_entity` (behind `create_entity` / `create_event`) folded
+            # BEFORE it journals, so the append's `ts` never reached the fold —
+            # FIXED in #9419: it now stamps `ts` before the fold and hands the
+            # same instant to `_emit_event`.
+            # For the remaining door the fallback is what keeps `ingestedAt`
+            # REQUIRED rather than NULL, and the value is not
+            # replay-deterministic.
             # "Usable" is `_usable_instant` — the policy `_journal_instant`
             # wraps, and the form to copy. It is a choice made HERE, not a
             # guarantee inherited from the file: `valid_to` (the
@@ -5452,8 +5518,11 @@ class _EntityHandlers:
             # `version`, `externalId`) are suppressed for a record that
             # COMPLETES a stub instead of creating a Source (`$stub_completion`,
             # set only by `sdk._materialize_session_source`). Its live node was
-            # created by the M2 `_link_source` stub, which writes NONE of the
-            # three — so an ON CREATE arm that wrote them would make a replay
+            # created by a stub MINT, and no mint writes any of the three —
+            # `_link_source` on every non-capture path, or, since #8501, that
+            # same `_mint_source_stub` called by `_materialize_session_source`
+            # itself (the capture path mints the stub it completes). So an ON
+            # CREATE arm that wrote them would make a replay
             # GAIN `id`/`version=1`/`externalId=''` the live node never had, and
             # (worse) restart a version ordinal for a writer that does not
             # advance one. `NULL` is the removal/no-op value, so the property

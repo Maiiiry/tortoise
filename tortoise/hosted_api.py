@@ -8375,11 +8375,26 @@ def _graph_unavailable() -> HTTPException:
     the request may be retried. The code is body-only today — no client maps it yet (the REST
     write lane is consumed by agents/SDKs, which treat any 5xx as retryable).
 
-    #3718 (read half): the SIX read handlers now submit their per-request SDK
-    construction here too (``list_points``, ``get_point``, ``dream_health``,
-    ``list_sessions``, ``get_session_detail``, ``org_info``), so this body is
-    reachable on the READ routes as well — including the dashboard's Overview
-    reads (``GET /v1/team``, ``/v1/sessions``, ``/v1/points``). That is NOT the
+    #3718 (read half): the READ handlers now submit their per-request SDK
+    construction here too, so this body is reachable on the READ routes as well
+    — including the dashboard's Overview reads (``GET /v1/team``,
+    ``/v1/sessions``, ``/v1/points``) and the PRIMARY read path,
+    ``GET /v1/search``. Do not re-enumerate the routes here, and do not read any
+    single comment as the inventory: it goes stale on every slice (this
+    docstring itself carried a six-route count that the next batch falsified).
+    The inventory of this body's reachability is the SEAM itself — EVERY
+    ``_graph_offload`` call site (plus ``_data_sdk_offloaded``, which routes
+    through it), whatever callable it submits. ``_graph_offload`` passes
+    ``unavailable=_graph_unavailable`` unconditionally, so a quota count
+    (``_check_org_limit``), a gate resolution or a graph listing that is
+    refused emits this same body — not only ``_make_sdk`` opens. The
+    declared sets in ``tests/test_read_routes_loop_responsiveness.py`` record
+    the #3718 construction CONVERSIONS, not this pool's consumer list, and no
+    comment enumerates that list — enumerate the seam instead. The sets are
+    wrong in BOTH directions: some bodies that submit here are in none of them,
+    and some members never submit here at all. ``monitoring.py``'s block says
+    the same and disclaims ownership too.
+    That is NOT the
     "dashboard renders a 503 on the auth lane" case above: those routes now
     carry this body, and they carry it fail-CLOSED rather than degrading to
     their ``#1591`` empty shape (see ``org_info`` / ``list_sessions`` /
@@ -8490,9 +8505,11 @@ async def _capture_session_probe_off_loop(org: dict, session_id: str):
     ``asyncio.to_thread`` and the dream pools throughout).
 
     Leg 72 of the same profile — the SDK open in the extraction-estimate quota
-    block a few lines below (``count_org_usage``) — is deliberately NOT folded
-    in: the required #4282 collision pre-flight returned COLLISION, so that leg
-    is skipped in this unit and declared residual by the #4625 guard.
+    block a few lines below (``count_org_usage``) — was declared a residual in
+    this unit because the required #4282 collision pre-flight returned
+    COLLISION at the time. It is now CLOSED: that block reuses the ``sdk``
+    returned here (rather than re-resolving tenancy) and reads the count
+    through ``_graph_offload``, so this wrapper's SDK is consumed by both legs.
     """
     sdk = await _data_sdk_offloaded(org)
 
@@ -9715,7 +9732,25 @@ async def search(q: str, limit: int = Query(10, ge=1, le=100), org: dict = Depen
     _status_on = _read_status_enabled()
     _residency_on = _residency_enabled()
     status_out: dict | None = {} if (_status_on or _residency_on) else None
-    sdk = _data_sdk(org)
+    # #3718 (construction half of #4660, second batch): the SDK is BUILT off the
+    # loop, not just used off it. In embedded mode `_make_sdk` probes the
+    # keepalive anchor (`_anchor_usable`) and may eagerly connect with the
+    # socket held, so the inline construction froze the loop on this handler's
+    # FIRST statement even though the query below was already off-loaded. Same
+    # `_data_sdk_offloaded` twin the other read routes use — it returns the
+    # identical SDK, so only WHERE the call runs changes.
+    #
+    # OVERRIDES: the "a busy pool degrades like a broken store" reading — a
+    # `graph`-pool capacity refusal (bound miss / saturated backlog) is not a
+    # store condition, so it stays the hard retryable 503 `graph_unavailable`.
+    # Rendering `{"results": [], "count": 0}` because OUR pool was busy is the
+    # clean-empty-for-a-store-we-could-not-reach shape #3892 forbids. With the
+    # read-status/residency flag ON, a broken store keeps its documented
+    # `status: degraded` arm instead; with both flags off, `tortoise_fts_query`
+    # re-raises and this route's own 500 arm answers, exactly as before. A
+    # domain error from `_data_sdk` itself propagates unchanged either way.
+    # Relayed to #3718 (issuecomment-6330213773).
+    sdk = await _data_sdk_offloaded(org)
     try:
         # #1676 (launch capacity): tortoise_fts_query is CPU-blocking — the
         # query encode (sdk.py model.encode, ~10-50ms for bge-small) runs
@@ -9781,7 +9816,9 @@ async def topic_summary(
     - disputed pairs: NAND-connected where both have variance > 0.02
     """
     _require_scope(org, "graphs:read", "topic_summary")
-    sdk = _data_sdk(org)
+    # #3718 (construction half of #4660, second batch): built off the loop — see
+    # the `search` handler for the full rationale and the `OVERRIDES:` line.
+    sdk = await _data_sdk_offloaded(org)
     try:
         # #1676 (launch capacity): topic_summarize is CPU-blocking (EP
         # classification + neighborhood traversal) — offload to a worker
@@ -13847,9 +13884,39 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
     if (not session_existed or retry_failed_capture) and not store_only:
         est = _session_extraction_estimate(windowed)
         from tortoise.quota import count_org_usage
-        sdk_org = _data_sdk(org)
+        # #4625 leg 72: this read is a SYNC full-graph FalkorDB count, and the
+        # SDK it needs was itself resolved with `_data_sdk(org)` — tenancy
+        # resolution plus, for a graph-bound key, `_assert_graph_owned`'s
+        # ownership query. Both used to run INLINE here, so every non-replay
+        # capture THAT EXTRACTS parked the single event loop on a cold or large
+        # graph (the #3718/#2988 class this file already off-loads everywhere
+        # else). The store-only lanes (keyless #3892, extraction disabled
+        # #4258) never reach this block — `store_only` skips the estimate — so
+        # they were never exposed to this leg.
+        # `sdk` is the SDK the #4625 leg-62 probe opened OFF-LOOP above —
+        # equivalent to what `_data_sdk(org)` builds for this org (same graph,
+        # same actor/record-tenant binds already applied), NOT a cached one:
+        # `_data_sdk` is not memoised (`_make_sdk` mints a fresh
+        # `TortoiseSDK` per call), so using this one removes a redundant
+        # construction and a redundant tenancy resolution rather than
+        # preserving an identity invariant. The read rides `_graph_offload`,
+        # and the `org_info` twin (`:9883-9885`) already off-loads this same
+        # count.
+        #
+        # The bound covers the WAIT, not the scan: a miss abandons the await and
+        # the worker keeps holding a graph-pool slot until the count returns
+        # (CPython #87185 — `wait_for` cancels the await, not the thread). That
+        # is strictly better than today's unbounded loop block, and it is the
+        # house posture for every graph read here, but it is a trade-off worth
+        # naming: `count_org_usage("points")` is a full-node scan, so on a very
+        # large graph several abandoned counts can occupy the graph pool that
+        # every read route shares. A miss surfaces as the house 503
+        # `graph_unavailable` — never a silently uncovered quota gate and never
+        # a hung request.
         try:
-            count = count_org_usage(org["org_id"], "points", sdk=sdk_org)
+            count = await _graph_offload(
+                lambda: count_org_usage(org["org_id"], "points", sdk=sdk),
+                op="count_org_usage")
         except QuotaCheckError as e:
             raise HTTPException(status_code=500, detail=f"Quota check failed: {e}")  # noqa: B904
         max_points = org.get("max_points")
@@ -14115,6 +14182,80 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
     _turn_texts = _capture_write["turn_texts"]
     _capture_redactions = _capture_write["redacted_total"]
 
+    # ⛔ #8501 — MATCH THE SDK LANE: the mint + the session-Source
+    # MATERIALIZATION run BEFORE extraction, not after it. `s.contentHash` is
+    # the version anchor a derived Point records at link time
+    # (`resolve_source_versions` → `r.sourceVersion`, #5256). Extraction is
+    # what creates those Points and `_materialize_session_source` is what SETS
+    # `contentHash`, so while it ran afterwards the session Source was still an
+    # empty-hash stub when every `extractedFrom` link was MERGEd — `$v` bound
+    # nothing and every captured Point was written unanchored, so a revised
+    # transcript could never mark its Points stale (the #5199/#5038 currency
+    # read). Measured on the pre-fix tree: `references` 1/1 anchored,
+    # `extractedFrom` 0/1.
+    #
+    # The ordering cannot be repaired afterwards: `sourceVersion` is
+    # `ON CREATE` only (#5199) and the replay value is the Point's own journaled
+    # `sourceVersionTransit` snapshot, so a post-pass re-stamp would be an
+    # unjournalled second write that a rebuild drops (#9206/#9079).
+    #
+    # ⚠️ The SDK lane (`capture_session`) and this one are documented
+    # byte-parity (#4014/#1727); the anchor is part of that parity, so fixing
+    # one without the other would DIVERGE them.
+    #
+    # Only the MINT + MATERIALIZE half moves — the provenance STAMPS need
+    # `extracted`, so they stay below and read the `event_id` bound here.
+    _capture_source_warnings: list[str] = []
+    # #8501: the mint's two failure shapes are DISTINCT and now live in two
+    # blocks — a RAISE (warned here) and a create that returns no id (warned by
+    # the stamp block below). Without this flag a raise would also hit that
+    # block's "returned no id/eventId" arm and report a shape that did not
+    # happen.
+    _capture_mint_failed = False
+    if not session_existed or (retry_failed_capture and not store_only):
+        try:
+            event = sdk.create_event(
+                f"session_{session_id}",
+                "sessionCaptured",
+                _server_id=_session_capture_event_id(session_id),
+                startedAt=now,
+                endedAt=now,
+                sessionId=session_id,
+                is_episodic=True,
+            )
+            event_id = event.get("id") or event.get("eventId")
+            minted_event = bool(event_id)
+        except Exception:
+            import logging
+            logging.getLogger("tortoise.api").exception(
+                "session Event creation failed (non-fatal)")
+            # P1 #1529 (D4): a missing Event is visible, never indistinguishable
+            # from a clean capture.
+            _capture_mint_failed = True
+            _capture_source_warnings.append(
+                "sessionCaptured Event write failed (non-fatal)")
+        # #1352: materialize the typed session `:Source` (capture metadata +
+        # sessionId + capturedAt + eventId) and wire
+        # (Source)-[:references]->(sessionCaptured Event) — parity with
+        # sdk.capture_session via the shared `_materialize_session_source`.
+        # P1 #1529 (D4): non-fatal, surfaced as an additive warning — never a
+        # 500 after writes.
+        try:
+            # #4911: off the event loop. The helper scrubs every turn it is
+            # handed (5,000 chars PER TURN, but the turn count is the caller's);
+            # the derivation alone measured ~0.8 s for a legal-maximum
+            # 500x5,000 session and the scrub pushed that to ~7 s of CPU that
+            # would otherwise block every other request on this loop.
+            await _run_off_loop(
+                _CAPTURE_EXECUTOR, sdk._materialize_session_source,
+                session_id, event_id, now, body.conversation)
+        except Exception:
+            import logging
+            logging.getLogger("tortoise.api").exception(
+                "session Source materialization failed (non-fatal)")
+            _capture_source_warnings.append(
+                "session Source materialization failed (non-fatal)")
+
     # #1727 Slice 2 (T2-P2c): idempotent re-POST — the Session already
     # existed, so the LLM extraction is SKIPPED (M2/v2-minted points are not
     # deterministically keyed; re-running would mint fresh nodes). The turn
@@ -14323,6 +14464,10 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
     # unset warnings). Mirrors sdk.capture_session's unconditional read.
     extraction_errors = list(meta.get("errors") or [])
     extraction_warnings = list(meta.get("warnings") or [])
+    # #8501: the mint/materialize half now runs BEFORE extraction, so its
+    # additive warnings are collected separately and folded into the same
+    # fail-closed surface (never a silent drop).
+    extraction_warnings.extend(_capture_source_warnings)
     if not session_existed or retry_failed_capture:
         # #2444: partial-extraction failures are the product's live error surface —
         # surface them to Sentry (when enabled) with org/session context so an
@@ -14384,19 +14529,12 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
         # nothing to stamp, while re-minting re-journals EventRecorded and
         # refreshes startedAt on every call. Byte-parity with
         # sdk.capture_session.
+        # #8501: the MINT and the Source MATERIALIZATION already ran in phase 1,
+        # BEFORE extraction — that ordering is what lets each extracted Point
+        # read the session Source's `contentHash` and record it as
+        # `sourceVersion`. What is left here is the STAMP half.
         try:
-            event = sdk.create_event(
-                f"session_{session_id}",
-                "sessionCaptured",
-                _server_id=_session_capture_event_id(session_id),
-                startedAt=now,
-                endedAt=now,
-                sessionId=session_id,
-                is_episodic=True,
-            )
-            event_id = event.get("id") or event.get("eventId")
             if event_id:
-                minted_event = True
                 # W5 (#2104, S1): the provenance stamp now carries the full
                 # write provenance (source_session / source_harness /
                 # ingested_at) alongside the ontology-compliant eventId —
@@ -14545,45 +14683,27 @@ async def _capture_session_impl(body: SessionRequest, request: Request | None,
                         what="hosted capture retry-heal provenance stamp",
                         params={"sid": session_id},
                     )
-            else:
+            elif not _capture_mint_failed:
                 # P1 #1529 (D4): create_event returning no id/eventId silently
                 # skips stamping — surface as an additive warning.
+                # #8501: NOT when the mint RAISED — phase 1 already reported
+                # that, and "returned no id" would name a shape that did not
+                # happen (one failure, one warning).
                 extraction_warnings.append(
                     "sessionCaptured Event write returned no id/eventId — "
                     "extracted points not stamped")
         except Exception:
             import logging
+            # #8501: THIS BLOCK IS THE STAMP HALF ONLY — the mint moved to
+            # phase 1 and reports its own failure there, so naming an "Event
+            # write" here would both mislabel a stamp failure and collapse the
+            # two shapes the split exists to keep distinct.
             logging.getLogger("tortoise.api").exception(
-                "session Event creation failed (non-fatal)")
-            # P1 #1529 (D4): a missing Event is visible, never indistinguishable
+                "session provenance stamp failed (non-fatal)")
+            # P1 #1529 (D4): a missing stamp is visible, never indistinguishable
             # from a clean capture.
             extraction_warnings.append(
-                "sessionCaptured Event write failed (non-fatal)")
-
-        # #1352: the extraction projection auto-created a document-typed Source
-        # stub at `session:{id}` (default sourceKind in _link_source) — the
-        # ontology v3.6 §4.6 session source kind is agentSession. Materialize the
-        # typed Source (capture metadata + sessionId + capturedAt + eventId) and
-        # wire (Source)-[:references]->(sessionCaptured Event) — parity with the
-        # SDK capture path via the shared sdk._materialize_session_source helper.
-        # P1 #1529 (D4): a Source materialization failure is non-fatal and
-        # surfaced as an additive warning — never a 500 after writes.
-        try:
-            # #4911: off the event loop. The helper now scrubs every turn it is
-            # handed (bounded at 5,000 chars PER TURN, but the turn count is the
-            # caller's), and the pre-existing derivation alone measured ~0.8 s
-            # for a legal-maximum 500x5,000 session — the scrub pushed that to
-            # ~7 s of CPU that would otherwise block every other request on this
-            # loop. Non-fatal either way, same as the surrounding wrap.
-            await _run_off_loop(
-                _CAPTURE_EXECUTOR, sdk._materialize_session_source,
-                session_id, event_id, now, body.conversation)
-        except Exception:
-            import logging
-            logging.getLogger("tortoise.api").exception(
-                "session Source materialization failed (non-fatal)")
-            extraction_warnings.append(
-                "session Source materialization failed (non-fatal)")
+                "sessionCaptured provenance stamp failed (non-fatal)")
 
     # Log audit event — P1 #1529 (D4): a committed capture must never 500
     # over audit bookkeeping (log-only wrap). The MCP tool path has no HTTP
@@ -15910,11 +16030,33 @@ def _execute_commit_writes(sdk: TortoiseSDK, payload: CommitPayload, plan):  # n
     # mints as a violation — the same class #5082 closed for `sourceKind` here.
     # `$now` is this commit's own instant, the transaction-time value §4.6 asks
     # for; `coalesce` keeps an instant a prior writer recorded.
+    # #5140 (P1 finding 7 — the FOURTH writer): `documentKind` is the `documents`
+    # METER key (`quota.DOCUMENT_METER_PREDICATE`), and this MERGE overwrote it
+    # on MATCH. `doc_id` is fully caller-computable —
+    # `doc_<sha256(f'{session_id}:{captured_at}')>` from two request-body fields
+    # (commit_schema.CommitPayload) — so a tenant could seed a metered document
+    # `:Source` at that url and then demote it with one commit, freeing a
+    # `documents` slot per call. MEASURED on the pre-fix statement: a
+    # `documentKind='report'` Source at the derived id became `'transcript'`.
+    # The genre is therefore CLAMPED in the same statement, exactly as
+    # `entities.py::_upsert_document`'s clause does: a transcript MINT,
+    # a repeat write on a transcript, and a node with no genre all still land
+    # `'transcript'`; an existing METERED document keeps the genre it had, and a
+    # pre-existing demotion is not re-applied. This is the same
+    # never-overwrite discipline the `sourceKind`/`ingestedAt` `coalesce` calls
+    # on this statement already follow (#5082, #5140 P2 finding 5) — the genre
+    # is simply not coalesced because `'transcript'` must stay writable on a
+    # node that has none.
     proj.g.query(
         "MERGE (s:Source {url:$did}) "
         "SET s.id=coalesce(s.id, $did), "
         "    s.sourceKind=coalesce(s.sourceKind, 'document'), "
-        "    s.documentKind='transcript', s.title=$title, s.summary=$summary, "
+        "    s.documentKind=CASE "
+        "        WHEN s.documentKind IS NOT NULL "
+        "             AND s.documentKind <> 'transcript' "
+        "        THEN s.documentKind "
+        "        ELSE 'transcript' END, "
+        "    s.title=$title, s.summary=$summary, "
         "    s.story_arc=$arc, s.sessionId=$sid, s.eventId=$eid, "
         "    s.sourcePath=$srcpath, s.is_episodic=true, "
         "    s.ingestedAt=coalesce(s.ingestedAt, $now), "
@@ -28175,9 +28317,19 @@ async def session_context(org: dict = Depends(get_current_org_gated)):  # noqa: 
     injection payload as local users.
     """
     _require_scope(org, "graphs:read", "session_context")
-    sdk = _data_sdk(org)
+    # #3718: BOTH the construction and the round trip were inline here. Building
+    # the SDK on the loop froze it on the handler's first statement (embedded
+    # `_make_sdk` probes the anchor and may eagerly connect with the socket
+    # held), and `session_context()` — a whole digest read — then ran on the
+    # loop too. `GET /v1/context` is the memory digest every HOSTED agent
+    # session-start hook reads (a local/embedded hook calls
+    # `TortoiseSDK.session_context()` directly — `tortoise/__main__.py:3013`), so
+    # that stall was on the hot path. Construction rides
+    # `_data_sdk_offloaded` (the #3773 twin); the read rides the house
+    # `asyncio.to_thread` pattern, so the error mapping below is unchanged.
+    sdk = await _data_sdk_offloaded(org)
     try:
-        return sdk.session_context()
+        return await asyncio.to_thread(sdk.session_context)
     except Exception:
         # #750.5: never leak internals to the client — log, return generic.
         logging.getLogger("tortoise.api").exception("session_context failed")
@@ -28467,9 +28619,12 @@ async def issue_insight(title: str, body: str | None = None,
     review c85) and out-of-range values 500'd instead of 422-ing.
     """
     _require_scope(org, "graphs:read", "issue_insight")
-    sdk = _data_sdk(org)
+    # #3718: same shape as `session_context` — the construction AND the
+    # `issue_insight()` read (a semantic + graph pass) were both on the loop.
+    sdk = await _data_sdk_offloaded(org)
     try:
-        return sdk.issue_insight(title=title, body=body, repo=repo, limit=limit)
+        return await asyncio.to_thread(
+            sdk.issue_insight, title=title, body=body, repo=repo, limit=limit)
     except Exception:
         logging.getLogger("tortoise.api").exception("issue_insight failed")
         raise HTTPException(status_code=500, detail="Insight unavailable")  # noqa: B904
