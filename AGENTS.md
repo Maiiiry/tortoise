@@ -474,7 +474,7 @@ for three sends to one pane that were recorded as `OK` and never consumed.
 | `tortoise/` | Python SDK, EP engine, MCP server, connectors |
 | `tests/` | Test suite (pytest) |
 | `graph-scripts/` | Historical graph operations (pricing decisions, migrations, audit) |
-| `scripts/` → `$AGENT_INFRA_PATH/scripts` | Agent-infra shared scripts (symlink) |
+| `scripts/` → `$AGENT_INFRA_PATH/scripts` | Agent-infra shared scripts (symlink). ⛔ The symlink is COMMITTED as one host's absolute path (`git cat-file -p HEAD:scripts`), so in a fresh worktree it may dangle and `scripts/admin-merge.sh` — the mandated merge path — may not resolve. Check with `uv run python tools/link_scripts.py`, repair with `--apply` (#9327) |
 | `tools/` | In-repo tooling — e.g. `collision_preflight.py` (pre-dispatch in-flight-work check, #3061) and `who_is_on.py` / `who-is-on.sh` (the "who is on #N?" verb + stranded-work inventory, #4256) |
 | `config/` | YAML configs (routing, pipelines) |
 | `docs/` | Architecture, ontology, legal, strategy docs |
