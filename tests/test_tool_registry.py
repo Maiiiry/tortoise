@@ -1097,7 +1097,9 @@ class TestCapabilityModel:
         invariant the name list stood for — both directions, any `http_policy`.
         The rogue probes below prove it can still fire."""
         from tool_surface_capabilities import (
-            RiskProbe, exemption_set_violations, served_registry,
+            RiskProbe,
+            exemption_set_violations,
+            served_registry,
         )
 
         from tortoise.tool_registry import _maint, _ro, _rw

@@ -82,16 +82,22 @@ class ToolDefinition:
     annotations: ToolAnnotations  # readOnlyHint, destructiveHint, idempotentHint
     http_policy: bool            # True = exposed on HTTP surfaces
     sdk_method: str              # Attribute name on TortoiseSDK, e.g. "create_point"
+    risk: str                    # THE declaration (#4122): read|maintenance|write|
+                                 # destructive|admin. `writes`, `readOnlyHint` and
+                                 # `idempotentHint` are derived from it — never
+                                 # hand-set, so they cannot contradict it.
+                                 # ⛔ REQUIRED, deliberately no default: a defaulted
+                                 # `"read"` is the fail-open that PRODUCED #4122
+                                 # (nobody decided `packs_list` was read-only — the
+                                 # default did), and no guard can tell "declared
+                                 # read" from "forgot to declare". Omission is a
+                                 # TypeError at import instead.
     handler_override: Optional[Callable] = None  # For raw-Cypher REST ops  # noqa: UP045
     rest_spec: Optional[RestSpec] = None         # For SDK-backed REST ops  # noqa: UP045
     group: str = "memory"        # Curation group (#523): memory|reasoning|graph|sessions|sources|journal|admin|onboarding
     hosted_only: bool = False    # #1935: register ONLY on the hosted surface
                                  # (deployment-gated — e.g. tortoise_pack_install;
                                  # self-host uses filesystem packs dir + CLI)
-    risk: str = "read"           # THE declaration (#4122): read|maintenance|write|
-                                 # destructive|admin. `writes`, `readOnlyHint` and
-                                 # `idempotentHint` are derived from it — never
-                                 # hand-set, so they cannot contradict it.
     retired_use_instead: Optional[str] = None  # noqa: UP045  # #3883: non-None ONLY
                                  # on a retired entry — the call that replaces this name.
 

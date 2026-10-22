@@ -15,14 +15,20 @@ of that ruling is this file: *"A test that fails if any tool's `readOnlyHint` ev
 disagrees with `risk == read`, and if `writes` ever disagrees with
 `risk in {write, destructive, admin}`."*
 
-Falsifiability: every assertion here is paired with a probe that feeds the
-predicate a violation and proves it fires (`test_*_can_fail`). An assertion that
-survives its own bug is dead.
+Falsifiability: an assertion that survives its own bug is dead, so none of these
+are value-sweeps alone — every criterion-3 assertion also builds an entry through
+the CONSTRUCTOR with a deliberately wrong hand-set annotation and proves the
+derivation corrected it (`test_read_only_hint_is_derived_from_risk`,
+`test_writes_is_derived_from_risk`), or feeds a guard a `RiskProbe` violation and
+proves it fires (`test_exemption_set_can_fail`). Delete the derivation in
+`__post_init__` (or restore `writes` as a field) and this file reds.
 """
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import inspect
 import pathlib
 
 import pytest
@@ -60,16 +66,85 @@ class _Stub:
 # ── The invariant (criterion 3) ───────────────────────────────────
 
 def test_every_served_entry_declares_a_known_risk():
-    """Criterion 1: `risk` is declared on every registry entry."""
+    """Criterion 1: `risk` is DECLARED on every registry entry, with a known value.
+
+    A *defaulted* `risk` could not tell "declared `read`" from "forgot to
+    declare" — the exact human error behind #4122 (nobody decided
+    `packs_list` was read-only; the default did) — so the declaration half is
+    pinned twice, at both places the omission could reappear:
+
+    * `risk` is a REQUIRED field → a forgotten declaration is a `TypeError` at
+      import (`test_a_forgotten_risk_is_a_type_error`);
+    * every `ToolDefinition(...)` in the registry passes `risk=` explicitly
+      (AST walk below), so re-adding a default cannot reopen the hole silently.
+
+    The census assertion is the value half: an unknown value is a hard error in
+    `__post_init__`.
+    """
     served = _served()
     assert len(served) == 99, f"served census moved ({len(served)}) — re-derive, do not widen"
     for entry in served:
         assert entry.risk in RISK_LEVELS, (
             f"{entry.name}: risk={entry.risk!r} is not one of {RISK_LEVELS}")
 
+    # The DECLARATION half, mechanically: no construction site may omit `risk=`.
+    tree = ast.parse(pathlib.Path(registry_module.__file__).read_text())
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", getattr(node.func, "attr", None)) == "ToolDefinition"
+    ]
+    assert len(calls) == 99, (
+        f"AST walk found {len(calls)} `ToolDefinition(...)` calls, expected 99 — the "
+        f"pin below would be vacuous")
+    missing = [node.lineno for node in calls
+               if "risk" not in {kw.arg for kw in node.keywords}]
+    assert not missing, (
+        f"`ToolDefinition(...)` at line(s) {missing} omits `risk=` — an undeclared "
+        f"entry would silently inherit the default (#4122)")
+
+
+def test_a_forgotten_risk_is_a_type_error():
+    """The omission path is CLOSED at the constructor (#4122 review, fail-open
+    default): `risk` carries no default, so an entry that forgets to classify
+    itself cannot be built at all — never silently derived as `read`
+    (`writes=False` + `readOnlyHint=True`, the #4122 shape)."""
+    field = next(f for f in dataclasses.fields(ToolDefinition) if f.name == "risk")
+    assert field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING, (
+        "`risk` grew a default again — that default is the #4122 fail-open")
+    with pytest.raises(TypeError, match="risk"):
+        ToolDefinition(
+            name="tortoise_probe_no_risk", id="surface.probe.no_risk",
+            description="probe", annotations=ToolAnnotations(readOnlyHint=True),
+            http_policy=True, sdk_method="create_point",
+        )
+
 
 def test_read_only_hint_is_derived_from_risk():
-    """Criterion 3a: readOnlyHint agrees with `risk == "read"`, both directions."""
+    """Criterion 3a: `readOnlyHint` is DERIVED from `risk == "read"`, in BOTH
+    directions — and the served census agrees with the derivation.
+
+    The registry sweep alone is a CENSUS PIN, not the criterion: every entry's
+    hand-set annotation already agrees with its `risk` today, so the sweep alone
+    would stay green if the derivation in `__post_init__` were deleted. What
+    makes this the criterion is the constructor half below — an entry handed a
+    DELIBERATELY WRONG `readOnlyHint` must come back corrected, for every value
+    of `risk` and in both directions (a `read` entry handed `False` → `True`,
+    a non-read entry handed `True` → `False`).
+    """
+    for risk in RISK_LEVELS:
+        for hand_set in (True, False):
+            entry = ToolDefinition(
+                name=f"tortoise_probe_ro_{risk}_{hand_set}",
+                id=f"surface.probe.ro_{risk}_{hand_set}".lower(),
+                description="probe",
+                annotations=ToolAnnotations(readOnlyHint=hand_set),
+                http_policy=True, sdk_method="query", risk=risk,
+            )
+            assert entry.annotations.readOnlyHint is (risk == "read"), (
+                f"risk={risk!r} handed readOnlyHint={hand_set}: the derivation did "
+                f"NOT correct it — readOnlyHint is a second declaration again")
+
     for entry in _served():
         assert entry.annotations.readOnlyHint is (entry.risk == "read"), (
             f"{entry.name}: readOnlyHint={entry.annotations.readOnlyHint} but "
@@ -77,7 +152,31 @@ def test_read_only_hint_is_derived_from_risk():
 
 
 def test_writes_is_derived_from_risk():
-    """Criterion 3b: `writes` agrees with `risk in {write, destructive, admin}`."""
+    """Criterion 3b: `writes` is a DERIVED property over `risk in WRITE_RISKS`,
+    not a second declaration a lane can set.
+
+    Asserting the served value only would compare the property against itself
+    (the point `tests/test_tool_registry.py` makes about keying on the hint), so
+    the root fix is pinned structurally: `writes` must not be a dataclass field,
+    must be a `property`, and must flip on `risk` alone for every level. A lane
+    that re-adds `writes: bool = False` — restoring the two independent
+    declarations #4122 is about — reds here.
+    """
+    assert "writes" not in {f.name for f in dataclasses.fields(ToolDefinition)}, (
+        "`writes` is a storable dataclass field again — that is the SECOND "
+        "declaration #4122 removed; it can disagree with `risk`")
+    assert isinstance(inspect.getattr_static(ToolDefinition, "writes"), property), (
+        "`writes` is no longer the derived property over `risk in WRITE_RISKS`")
+
+    for risk in RISK_LEVELS:
+        entry = ToolDefinition(
+            name=f"tortoise_probe_writes_{risk}", id=f"surface.probe.writes_{risk}",
+            description="probe", annotations=ToolAnnotations(),
+            http_policy=True, sdk_method="query", risk=risk,
+        )
+        assert entry.writes is (risk in WRITE_RISKS), (
+            f"risk={risk!r} derived writes={entry.writes} — not DERIVED from risk")
+
     for entry in _served():
         assert entry.writes is (entry.risk in WRITE_RISKS), (
             f"{entry.name}: writes={entry.writes} but risk={entry.risk!r}")
