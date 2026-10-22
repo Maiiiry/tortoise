@@ -1239,7 +1239,11 @@ class TestInvestorsProgressCopy:
 # prove that rewrite happened, and neither can catch the other:
 #
 #   1. `tests/e2e/test_legal_pages.py` — `PRODUCT_ROOT_MARKER`, read by the
-#      local-emulation canary and by six assertions on the served root.
+#      local-emulation canary and by the served-root assertions inside
+#      `_assert_serves_product` (raw body: an attribute does not survive
+#      `_clean()`'s tag stripping). No count is stated on purpose — every add
+#      or retirement would re-stale the number (#3950); the shape is pinned by
+#      `test_every_marker_read_goes_through_the_raw_body_helper` below.
 #   2. `.github/workflows/deploy-pages.yml` — the post-deploy DNS preflight
 #      greps the served root and only then exports `TORTISE_HOST_CHECK=1`.
 #
@@ -1313,6 +1317,52 @@ def _root_element(product_html: str) -> str:
     match = re.search(r"<html\b[^>]*>", product_html, re.I)
     assert match, "website/product.html has no <html> open tag"
     return match.group(0)
+
+
+RAW_BODY_HELPER = "_assert_serves_product"
+EMULATION_CANARY = "_tortoise_emulated_locally"
+
+
+def _marker_read_sites(src: str) -> list[tuple[str, int]]:
+    """Every READ of `PRODUCT_ROOT_MARKER`, as `(enclosing function, line)`.
+
+    `ast` rather than a regex: the constant's name also appears in the error
+    message below itself and in comments, which a text scan cannot tell from a
+    read.
+    """
+
+    class _Reads(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+            self.reads: list[tuple[str, int]] = []
+
+        def _visit_function(self, node: ast.AST) -> None:
+            self.stack.append(getattr(node, "name", "<lambda>"))
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_FunctionDef = _visit_function  # type: ignore[assignment]
+        visit_AsyncFunctionDef = _visit_function  # type: ignore[assignment]
+
+        def visit_Name(self, node: ast.Name) -> None:
+            if node.id == "PRODUCT_ROOT_MARKER" and isinstance(node.ctx, ast.Load):
+                self.reads.append((self.stack[-1] if self.stack else "<module>", node.lineno))
+
+    visitor = _Reads()
+    visitor.visit(ast.parse(src))
+    return visitor.reads
+
+
+def _asserted_expressions(src: str, function: str) -> list[str]:
+    """The unparsed test expression of every `assert` inside `function`."""
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function:
+            return [
+                ast.unparse(child.test)
+                for child in ast.walk(node)
+                if isinstance(child, ast.Assert)
+            ]
+    return []
 
 
 class TestProductRootMarkerContract:
@@ -1394,5 +1444,45 @@ class TestProductRootMarkerContract:
             "it. The NameError is swallowed by the canary's bare except, so "
             "TORTISE_EMULATED is False on every local run and the tortoise-host "
             "tests skip regardless of the marker. Define the marker first.")
+
+    def test_every_marker_read_goes_through_the_raw_body_helper(self):
+        """One shape for every served-root read: the RAW body, via one helper.
+
+        The marker is a structural ATTRIBUTE, and `_clean()` strips tags — so
+        an assertion written the old way (``PRODUCT_ROOT_MARKER in
+        _clean(body)``, which is what PR #9652 had to rewrite at two sites) can
+        never pass, and a copy of it added later would silently red the
+        post-deploy suite on a correct page. This pins the SHAPE rather than a
+        count, so adding or retiring a served-root assertion does not re-stale
+        it (#3950); only reverting to a `_clean()`d or ad-hoc read does.
+        """
+        src = LEGAL_PAGES_E2E.read_text(encoding="utf-8")
+        reads = _marker_read_sites(src)
+        assert reads, (
+            "no read of PRODUCT_ROOT_MARKER found in "
+            "tests/e2e/test_legal_pages.py — this gate's subject moved")
+        offenders = [
+            (fn, line) for fn, line in reads
+            if fn not in (RAW_BODY_HELPER, EMULATION_CANARY)
+        ]
+        assert not offenders, (
+            "PRODUCT_ROOT_MARKER is read outside "
+            f"{RAW_BODY_HELPER}()/{EMULATION_CANARY}() at "
+            + ", ".join(f"line {line} (in {fn}())" for fn, line in offenders)
+            + ". The marker is a structural attribute on <html>, and `_clean()` "
+            "strips tags, so an assertion that cleans the body first can never "
+            "match — it reds the served-root suite on a correct page and needs "
+            "a rewrite the next time it lands (PR #9652 rewrote two). Read the "
+            "raw document through `_assert_serves_product(body, where)`.")
+
+        asserted = _asserted_expressions(src, RAW_BODY_HELPER)
+        assert asserted, (
+            f"`{RAW_BODY_HELPER}` in tests/e2e/test_legal_pages.py contains no "
+            "assert — the served-root contract has no subject left")
+        assert "PRODUCT_ROOT_MARKER in body" in asserted, (
+            f"`{RAW_BODY_HELPER}` no longer asserts `PRODUCT_ROOT_MARKER in "
+            f"body` (found: {asserted!r}). It must read the RAW document — "
+            "`_clean(body)` strips the attribute off the <html> element, so the "
+            "assertion could never match.")
 
 
