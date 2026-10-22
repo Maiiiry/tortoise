@@ -63,4 +63,16 @@ UPDATE public.blog_posts
        author_image_url = 'https://tortoise.premiselabs.co/blog/author-daniel-ospina.jpg'
  WHERE author = 'Tortoise team';
 
+-- Second pass: posts that ALREADY carried the byline but never had an avatar
+-- (they were written after the name was set and before the column existed, so
+-- the guard above skips them and they would render name-only — a byline with
+-- an avatar on 4 posts and none on 2). Guarded on `author = 'Daniel Ospina'
+-- AND author_image_url IS NULL`, so a post with a deliberately different
+-- author, or one whose image is set, is still untouched. Idempotent: a re-run
+-- matches nothing.
+UPDATE public.blog_posts
+   SET author_image_url = 'https://tortoise.premiselabs.co/blog/author-daniel-ospina.jpg'
+ WHERE author = 'Daniel Ospina'
+   AND author_image_url IS NULL;
+
 ALTER TABLE public.blog_posts ENABLE TRIGGER blog_posts_set_updated_at;
