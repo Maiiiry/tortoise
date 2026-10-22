@@ -79,9 +79,12 @@
 --     FK below is ON DELETE CASCADE), so a tenant's narrative dies with the
 --     tenant. The append-only journal guarantee is untouched: this table is not
 --     the journal.
---   * SESSION deletion: the record's own delete path (`SessionDeleted`, emitted
---     by `hosted_api._delete_session_sync`) removes the session row, its turns
---     and its `session:` Source stub — so the narrative row must go with them.
+--   * SESSION deletion: the record's own delete path
+--     (`hosted_api._delete_session_sync`) journals one `EntityMutated`
+--     (`op=delete`) per removed turn Point AND one `SessionDeleted`, whose
+--     declared mutation removes the session row and the `session:` Source stub
+--     (the turns go with their own records) — so the narrative row must go with
+--     them.
 --     It does, explicitly: `record_projection._narrative_statements` emits a
 --     DELETE for `SessionDeleted` (the table has no `node_identity` parent for
 --     a companion-delete template, so it carries its own statement). A narrative

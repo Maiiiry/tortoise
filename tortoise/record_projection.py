@@ -1821,10 +1821,14 @@ def _narrative_statements(
         return []
 
     # A DELETED SESSION TAKES ITS NARRATIVE WITH IT. The record's own delete path
-    # (`hosted_api._delete_session_sync`) emits `SessionDeleted`, whose declared
-    # mutation removes the session row, its turns and its `session:` Source
-    # stub; this table is not a node table (no `node_identity` parent), so it
-    # cannot ride `companion_deletes` and carries its own statement. Without it
+    # (`hosted_api._delete_session_sync`) emits, in one journal segment, one
+    # `EntityMutated` (`op=delete`) per removed turn Point PLUS one
+    # `SessionDeleted`; `SessionDeleted`'s declared mutation removes the session
+    # row and the `session:` Source stub (the turns go with their own records,
+    # `delete_ops={"delete"}`). This table is not a node table (no
+    # `node_identity` parent), so it cannot ride `companion_deletes` and carries
+    # its own statement — attached to `SessionDeleted` because that is the
+    # record that means "this session no longer exists". Without it
     # §9.4's verbatim path would serve the text of a session the graph no longer
     # has, and a same-id re-capture would inherit the deleted incarnation's
     # narrative. Journal order still decides: a narrative record arriving AFTER

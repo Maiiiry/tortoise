@@ -334,9 +334,10 @@ for the same input” cost §9.1 rejects one level up — and two copies of the 
 suffix-shape rule `sdk._capture_turn_ids` applies (`{session}_t<all digits>`), so D7's “raw turn text
 comes back” is measured against the record's own turn rows.
 
-**Deletion follows the record's own delete path.** `SessionDeleted` (emitted by
-`hosted_api._delete_session_sync`) removes the session row, its turns and its `session:` Source stub,
-so the projection emits the matching `DELETE` for `session_narrative` — the table is not a node table
+**Deletion follows the record's own delete path.** `hosted_api._delete_session_sync` journals one
+`EntityMutated` (`op=delete`) per removed turn Point plus one `SessionDeleted`, whose declared
+mutation removes the session row and the `session:` Source stub, so the projection emits the matching
+`DELETE` for `session_narrative` — the table is not a node table
 and carries its own statement rather than a `companion_deletes` template. Tenant erasure is the other
 path (organizations → graphs → this table, `ON DELETE CASCADE`).
 

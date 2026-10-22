@@ -307,18 +307,23 @@ def source_narrative(conn: Any, *, org_id: str, graph_id: str,
     session's narrative + turns. This is the record-sourced arm of that fetch:
     with the graph destroyed the *link* still resolves, because it is a column
     on the record's own `source` row rather than an edge in the cache.
+
+    ⚠️ The lookup probes `node_key`, NOT `url`. For a `:Source` the canonical key
+    IS the url (`(label, key)` = `Source -> url`, and `_upsert_statement` writes
+    `node_key = <that key>`), so both columns hold the same string while only
+    `node_key` is indexed (`PRIMARY KEY (org_id, graph_id, node_key)`; there is
+    no index on `url`). `url = %s` would resolve against the tenant prefix and
+    filter the tenant's whole source set on §9.4's answer-time path.
     """
     if not url:
         raise RecordReadError("source_narrative needs a source url")
-    rows: list[Any] = []
-    if url:
-        cursor = _cursor(conn)
-        cursor.execute(
-            "SELECT session_id FROM public.source "
-            "WHERE org_id = %s AND graph_id = %s AND url = %s",
-            (org_id, graph_id, url),
-        )
-        rows = _rows(cursor)
+    cursor = _cursor(conn)
+    cursor.execute(
+        "SELECT session_id FROM public.source "
+        "WHERE org_id = %s AND graph_id = %s AND node_key = %s",
+        (org_id, graph_id, url),
+    )
+    rows = _rows(cursor)
     if not rows or not isinstance(rows[0][0], str) or not rows[0][0].strip():
         return None
     return session_text(conn, org_id=org_id, graph_id=graph_id,

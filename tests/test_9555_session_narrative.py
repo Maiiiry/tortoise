@@ -396,11 +396,13 @@ def test_a_count_larger_than_the_column_accepts_is_an_absence_not_an_overflow():
 
 
 def test_a_deleted_session_takes_its_narrative_with_it():
-    """The record's own delete path (`SessionDeleted`, emitted by
-    `hosted_api._delete_session_sync`) removes the session row, its turns and its
-    `session:` Source stub — so the narrative row must go too, or §9.4's verbatim
-    path serves text for a session the graph no longer has and a same-id
-    re-capture inherits the deleted incarnation's narrative."""
+    """The record's own delete path (`hosted_api._delete_session_sync`) journals
+    one `EntityMutated` (`op=delete`) per removed turn Point plus one
+    `SessionDeleted`, whose declared mutation removes the session row and its
+    `session:` Source stub. The narrative row must go with them — it is keyed on
+    `session_id` alone, so a survivor would be served by §9.4's verbatim path for
+    a session the graph no longer has, and a same-id re-capture would inherit the
+    deleted incarnation's narrative."""
     statements = rp.mutations_for({"type": "SessionDeleted", "id": "s1"},
                                  org_id=ORG, graph_id=GRAPH)
     deletes = [s for s in statements
