@@ -1170,6 +1170,17 @@ class _EntityHandlers:
         # reason `_stub` (the Event stub discriminator) is in `_SUBJECT_HANDLED`
         # / `_OBJECT_HANDLED`, and it is not a declared node prop.
         "_stub_completion",
+        # #9451: the SIBLING discriminator on the same `SourceCreated` record, and
+        # for the same reason it belongs here — a payload key that decides replay
+        # behaviour is server-managed, not a node property. Only
+        # `sdk._materialize_session_source` (this version) sets it; it says "the
+        # record's `ingestedAt` is the instant the live write STORED, read back
+        # from the node", which is what licenses `_upsert_source`'s ON MATCH arm
+        # to apply that value. A record written before #9451 carries no marker, so
+        # the arm stays the no-op it always was for those lines (a legacy `now`
+        # must not start MOVING an instant the pre-fix replay reproduced
+        # faithfully — #9451 review round 3, ISSUE 2).
+        "_ingestedAtStored",
         # journal meta keys (epic #900 T3, §4.2 cycle-16/17): the SDK's
         # _emit_event style-3 lines carry event_id/ts/initiated_by (+agent_id
         # on api._emit) + corrects — structural, never node properties. One
@@ -2809,8 +2820,16 @@ class _EntityHandlers:
         # #7369: `session_id` is the Session MERGE key (`MERGE (s:Session
         # {id:$sid})`), reached from `PointAdded.contains_session` off the raw
         # journal envelope — an unwritable one aborts after the wipe.
-        from tortoise.projection import _log_identity_skip, _writable_id
-        if not _writable_id(session_id):
+        #
+        # #9553 review P2: the gate is `_writable_container_id`, which adds the
+        # BLANK refusal to `_writable_id` — measured, because an indexed graph
+        # cannot match a whitespace-only key at all, so this method would both
+        # mint a DUPLICATE `:Session` and land no edge (see that predicate's
+        # docstring). The record projection refuses the same ids, and the two
+        # gates are pinned equal, so a whitespace-only `contains_session` is
+        # dropped by BOTH routes instead of by one.
+        from tortoise.projection import _log_identity_skip, _writable_container_id
+        if not _writable_container_id(session_id):
             _log_identity_skip("Session", session_id, "id (MERGE key)")
             return
         # #7951 R2-P2: mirror `_link_source`'s pre-delete gate. A `CONTAINS`
@@ -4253,6 +4272,28 @@ class _EntityHandlers:
         # #133: needs_extraction — explicit signal for --upgrade-all discovery.
         # coalesce-null sentinel: None default so partial updates preserve.
         nx = ev.get("needs_extraction")
+        # #5140 P1: the clause below DROPS a demotion instead of applying it
+        # (see its comment — the same statement is the replay fold, so it must
+        # stay total). Dropping a value the caller supplied in silence is the
+        # #2795 "a declaration rots into a mystery" class, so name it. The read
+        # is gated on the ONLY demoting value, so the fingerprint path pays
+        # nothing: `document_kind` is `'transcript'` on ~no document write.
+        if ev.get("document_kind") == "transcript":
+            # ⛔ EVERY node the MERGE can reach, through the ONE reader — not
+            # `rows[0]` of an inline query. A first-row read here reproduced the
+            # very defect review cycle 4 removed from the guard: with a
+            # non-metered sibling listed first the advisory went missing, so a
+            # dropped demotion went back to being silent (#5140 cycle 5).
+            from tortoise.quota import is_metered_document_kind, stored_source_document_kinds
+            _metered_dks = [k for k in stored_source_document_kinds(self.g, did)
+                            if is_metered_document_kind(k)]
+            if _metered_dks:
+                logger.warning(
+                    "#5140: `document_kind='transcript'` on %s DROPPED — the "
+                    "node is a metered document (documentKind=%r) and its "
+                    "genre cannot be demoted out of the `documents` cap. "
+                    "Delete the document and re-ingest it if it really is a "
+                    "transcript.", did, _metered_dks[0])
         # #5422: the document's contentHash — the version anchor on the
         # extraction path. None (absent key, or a metadata-only re-emit) is
         # the preserve sentinel: the clause below must never clear an anchor
@@ -4373,7 +4414,38 @@ class _EntityHandlers:
             # (topics/summary/sessionId/eventId/needs_extraction); on a
             # re-write that OMITS the kind the middle term preserves the
             # stored value (#125 coalesce semantics).
-            "    s.documentKind=coalesce($dk, s.documentKind, ''), "
+            #
+            # ⛔ #5140 P1 (review cycle 2): this clause is what made the
+            # `documents` meter escapable from THIS writer too. `documentKind`
+            # is the METER key (`quota.DOCUMENT_METER_PREDICATE`), and the
+            # plain coalesce OVERWROTE an existing document's genre with
+            # whatever `$dk` carried — `EventAPI.add_document(<doc id>,
+            # document_kind='transcript')` and `_doc_write(frontmatter
+            # type='transcript', <doc id>)` (the `/v1/index/docs`
+            # re-index path) both demoted a metered document to `transcript`
+            # and dropped it out of the cap: MEASURED, 3 seeded documents,
+            # meter 3 -> 2 -> 1, one call each. A metered document therefore
+            # KEEPS its genre: `$dk` may ADD a kind where none is stored, and
+            # RETARGET one metered genre to another (report -> brief — both
+            # are counted), but it cannot move the node out of the metered
+            # class. Enforced in THIS clause rather than in the Python caller
+            # because the same statement is the REPLAY fold: a journal that
+            # already holds a pre-guard demotion must re-materialise to the
+            # metered genre, not abort the rebuild (a raise here would make
+            # `rebuild_all` fail on an existing log). The PRODUCERS that take a
+            # genre from a TENANT (`EventAPI.add_document`, `_doc_write`)
+            # REFUSE BEFORE the journal append
+            # (`quota.refuse_document_writer_demotion`), and the two `:Source`
+            # surfaces (`create_source`/`update_entity`) raise
+            # (`sdk._refuse_document_kind_demotion`) — neither is replay, and a
+            # silent no-op would leave the caller believing it wrote. So a LIVE
+            # write reaches this CASE only when nothing metered is stored.
+            "    s.documentKind=CASE "
+            "        WHEN s.documentKind IS NOT NULL "
+            "             AND s.documentKind <> 'transcript' "
+            "             AND $dk = 'transcript' "
+            "        THEN s.documentKind "
+            "        ELSE coalesce($dk, s.documentKind, '') END, "
             "    s.format=coalesce($fmt, s.format), "
             "    s.topics=coalesce($topics, s.topics, []), "
             "    s.summary=coalesce($summary, s.summary, ''), "
@@ -4696,7 +4768,7 @@ class _EntityHandlers:
         named here rather than the one this contract used to exempt:
 
         * `TortoiseSDK._apply_and_journal` appends through `_emit_event`, which
-          mints ``ts`` on a COPY of the record, then folds the caller's own
+          minted ``ts`` on a COPY of the record, and then folded the caller's own
           dict;
         * `TortoiseSDK._create_entity` (the public ``create_entity`` /
           ``create_event`` — the ``tortoise_create_entity`` /
@@ -4726,11 +4798,13 @@ class _EntityHandlers:
         before ``proj.apply`` and passes that same instant as
         ``_emit_event(recorded_ts=…)``, so this fold reads one clock and live ≡
         rebuilt (``test_document_source_ingested_at_5140.py`` pins it).
-        ``_apply_and_journal`` remains the OPEN half — **`#9434`** carries it, and
-        the divergence above is still that door's, not this contract's.
-        (Split out of `#9419` on its own scope: that door is APPEND-FIRST, so
-        stamping its record's `ts` moves the funnel's ordering contract rather
-        than a single dict field.)
+        ✅ ``_apply_and_journal`` IS FIXED TOO (#9434): it stamps ``event["ts"]``
+        before its append and hands the same instant to ``_emit_event`` through
+        ``_journal_entity_event(recorded_ts=…)``, so the dict it folds after the
+        append carries the record's own instant instead of none. Both halves are
+        pinned in ``test_document_source_ingested_at_5140.py``; neither door has
+        an in-repo producer that sets ``objectType`` today, so this is a residual
+        closed, not a live defect fixed.
         """
         # #4524: the ON MATCH embedding write below can be a SILENT no-op on
         # the embedded engine — a ``vecf32`` overwrite of an existing vector is
@@ -4810,17 +4884,18 @@ class _EntityHandlers:
             # the field means when Tortoise FIRST saw this source). The value is
             # the record's own `ts` when it carries a USABLE one — deterministic
             # on replay — falling back to the write clock only for a record that
-            # states none. Not every live door states one, and all of the
-            # remaining ones are latent rather than live today (no in-repo
-            # producer sets `objectType` on any of them): the miner's own
-            # envelope carries no `ts`, and `_apply_and_journal` folds the
-            # caller's dict rather than the envelope its append minted
-            # (#9434 carries that one). The
-            # third door, `_create_entity` (behind `create_entity` /
-            # `create_event`), folded BEFORE it journals, so the append's `ts`
-            # never reached the fold — FIXED in #9419: it now stamps `ts`
-            # before the fold and hands the same instant to `_emit_event`.
-            # For the remaining two the fallback is what keeps `ingestedAt`
+            # states none. Not every live door states one, and the one still
+            # remaining is latent rather than live today (no in-repo producer
+            # sets `objectType` on it): the miner's own envelope carries no
+            # `ts`. The TWO doors that used to head this list are FIXED and
+            # named so a census does not read them as still-broken —
+            # `_apply_and_journal` (#9434) now stamps `ts` before its append and
+            # folds a dict that carries the record's own instant, and
+            # `_create_entity` (behind `create_entity` / `create_event`) folded
+            # BEFORE it journals, so the append's `ts` never reached the fold —
+            # FIXED in #9419: it now stamps `ts` before the fold and hands the
+            # same instant to `_emit_event`.
+            # For the remaining door the fallback is what keeps `ingestedAt`
             # REQUIRED rather than NULL, and the value is not
             # replay-deterministic.
             # "Usable" is `_usable_instant` — the policy `_journal_instant`
@@ -5462,8 +5537,11 @@ class _EntityHandlers:
             # `version`, `externalId`) are suppressed for a record that
             # COMPLETES a stub instead of creating a Source (`$stub_completion`,
             # set only by `sdk._materialize_session_source`). Its live node was
-            # created by the M2 `_link_source` stub, which writes NONE of the
-            # three — so an ON CREATE arm that wrote them would make a replay
+            # created by a stub MINT, and no mint writes any of the three —
+            # `_link_source` on every non-capture path, or, since #8501, that
+            # same `_mint_source_stub` called by `_materialize_session_source`
+            # itself (the capture path mints the stub it completes). So an ON
+            # CREATE arm that wrote them would make a replay
             # GAIN `id`/`version=1`/`externalId=''` the live node never had, and
             # (worse) restart a version ordinal for a writer that does not
             # advance one. `NULL` is the removal/no-op value, so the property
@@ -5602,6 +5680,46 @@ class _EntityHandlers:
             "                     WHEN s.contentHash IS NULL OR s.contentHash <> $hash "
             "                     THEN coalesce($updatedAt, $now) "
             "                     ELSE coalesce(s.updatedAt, $updatedAt) END, "
+            # #9451: the RECORDED ingest instant, applied on the arm that has a
+            # node to land on. The capture writer keeps its `coalesce(s.ingestedAt,
+            # $now)` live SET (#398's never-overwrite contract) but now states in
+            # its `SourceCreated` payload the instant it READ BACK from the node —
+            # the earlier writer's when the stub already existed. This clause did
+            # not exist, so on the arm where the node is present when the record
+            # folds (`rebuild()`, whose per-record replay re-mints the stub from a
+            # `PointAdded` record at the REPLAY clock first) the node kept a
+            # replay-clock value while live held the recorded one. Measured on a
+            # stub minted earlier by `create_point(session_id=…)`: live
+            # `...468430` vs rebuilt `...471988` — the recovery path silently
+            # re-ordering session Sources in the recency computation.
+            #
+            # ⛔ GATED ON `$stub_completion`, exactly like `version` above, and for
+            # the same reason in the other direction: this writer's live ON MATCH
+            # never touches `ingestedAt`, so an UNGATED clause would make a
+            # replayed `create_source`/index record (whose live write preserved
+            # the node's first instant) OVERWRITE it, i.e. trade one
+            # live≠replay divergence for another. `coalesce($ingestedAt, …)` keeps
+            # a legacy/foreign capture record without the key a no-op.
+            # `ingestedAt` does not test `s.contentHash`, so its position inside
+            # this clause is free of the #8870/#7362 write-order rule (only items
+            # that READ the hash must precede the guarded write, which stays LAST).
+            #
+            # ⛔ ALSO GATED ON `$ingestedAtStored` (#9451 review round 3,
+            # ISSUE 2), and that second gate is load-bearing: `$stub_completion`
+            # alone is true on PRE-#9451 capture records too, whose `ingestedAt`
+            # is the capture clock the live write never stored. Applying one of
+            # those would MOVE a node the pre-fix replay reproduced faithfully —
+            # shape: `create_source("session:S1")` created the node at T0 and
+            # journaled it, a pre-change capture completed it (record states
+            # `now`), live keeps T0 via the coalesce, and pre-fix both engines
+            # replayed T0 = live. With only the `$stub_completion` gate the
+            # replay would land the never-stored `now` and manufacture the exact
+            # live≠replay divergence this issue exists to remove. The marker is
+            # set by the ONE producer that journals what the write stored, so a
+            # legacy line stays a no-op.
+            "           s.ingestedAt = CASE WHEN $stub_completion AND $ingestedAtStored "
+            "                             THEN coalesce($ingestedAt, s.ingestedAt) "
+            "                             ELSE s.ingestedAt END, "
             "           s.sourcePath = coalesce($sp, s.sourcePath), "
             # #3644: the window start moves ONLY on the same hash-diff gate as
             # `version`/`updatedAt` — a create/stub-completion (stored hash
@@ -5693,6 +5811,13 @@ class _EntityHandlers:
                 # `_SOURCE_CAPTURE_REPLAY_PROPS`). Read as a parameter, never
                 # persisted — `_META_KEYS` keeps it off the node.
                 "stub_completion": bool(ev.get("_stub_completion")),
+                # #9451: the record states the instant the live write STORED
+                # (`sdk._materialize_session_source` reads it back off the node),
+                # rather than the capture clock. Absent on every record written
+                # before that change — `bool(None)` is False, so those keep the
+                # pre-#9451 behaviour on the ON MATCH arm instead of being moved
+                # onto a `now` the live write never stored.
+                "ingestedAtStored": bool(ev.get("_ingestedAtStored")),
                 "ext": ev.get("externalId", ""),
                 "fmt": ev.get("format"),
                 "sp": ev.get("source_path"),

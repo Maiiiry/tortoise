@@ -143,7 +143,14 @@ from .projection import _ANNOTATOR_PROPS as _ANNOTATOR_PROP_NAMES
 from .projection import _ENTITY_ID_PROP  # #3998: the write's own Source predicate
 from .projection import is_missing_graph_error  # #2163: absent-graph family == success
 from .graph_ops import counts_capture_ops, phased  # #3359: per-capture graph-op accounting
-from .quota import MAX_EXTRACTIONS_PER_TURN, MAX_SESSION_TURNS
+from .quota import (
+    DOCUMENT_METER_PREDICATE,
+    MAX_EXTRACTIONS_PER_TURN,
+    MAX_SESSION_TURNS,
+    is_metered_document_kind,
+    refuse_document_writer_demotion,  # #5140: the document writers' loud refusal
+    stored_source_document_kinds,     # #5140: ONE reader of the meter key
+)
 from .canonical import derive_batch_id
 # #4911: the ONE credential scrubber for stored turn text. Stdlib-only module
 # (no `tortoise` imports), so this adds no import-cycle risk to this hot module.
@@ -156,6 +163,13 @@ register_kind("diary")
 register_kind("checkpoint-item")
 register_kind("option")    # used by file_decision (#133)
 register_kind("evidence")  # used by file_decision (#133)
+# #6671: `criterion` is a DECIDE_PART_KINDS member (the decide rubric's
+# criteria axis: options/criteria/findings) and was the ONE decide-part kind
+# missing from this block — so a criterion write from the decide flow
+# (`graph-scripts/decide.py`, `tortoise decide`; NOT `file_decision`, which
+# writes decision/option/evidence only) warned "Unrecognized pointKind" while
+# the SDK itself already treated it as a decision part.
+register_kind("criterion")
 
 # Valid status values for Point nodes (used by update_point status validation)
 # #432: claim lifecycle vocabulary — draft → live → retracted → superseded
@@ -3840,6 +3854,18 @@ def _sanitize_props(props: dict, *, reject_id: bool = False,
             "'_stub_completion' is a server-managed capture-completion "
             "discriminator and cannot be set via props."
         )
+    # #9451: the sibling key on the same `SourceCreated` record. It states that
+    # the record's `ingestedAt` is the instant the write STORED (not the capture
+    # clock), which is what licenses the fold's ON MATCH arm to apply it — so a
+    # caller able to set it could move a `:Source`'s `ingestedAt` on replay, i.e.
+    # out of the recency/decay ordering, and the key rides the journal so every
+    # rebuild would restore it. Same class and same hard-reject as
+    # `_stub_completion` above; the ONE producer never re-enters this intake.
+    if "_ingestedAtStored" in props:
+        raise ValueError(
+            "'_ingestedAtStored' is a server-managed journal discriminator and "
+            "cannot be set via props."
+        )
     # #7951 (review round 5): `credibility` is NOT a generic prop — it is the
     # author's declared WORD, a documented input of `create_point` /
     # `mitigate_operator`, which validate it and run the authored-assertion
@@ -3961,6 +3987,122 @@ def _sanitize_props(props: dict, *, reject_id: bool = False,
 # because the SHARED projection writer (`_upsert_point_props`) is the door every
 # write reaches and it needs the same rule (#8006). `create_point`,
 # `update_point` and `update_entity` still call it here, under this name.
+
+
+def _refuse_document_kind_demotion(stored_kinds, props, *, surface: str,
+                                   none_demotes: bool = False) -> None:
+    """#5140 P1: `documentKind` is the documenthood/METER key, not metadata.
+
+    THE DEFECT THIS CLOSES. The `documents` cap counts
+    ``MATCH (s:Source) WHERE s.documentKind IS NOT NULL AND
+    s.documentKind <> 'transcript'`` (`quota.DOCUMENT_METER_PREDICATE`) — that
+    predicate is what decides whether a node is a document at all (the #5013
+    Q-S2 ruling, Option B). Under D10 a document IS a `:Source` keyed
+    ``url = <doc id>``, which is the node `create_source`/`update_entity` merge
+    by `url`/`id`, and `documentKind` is caller-settable on both surfaces
+    (`_SOURCE_EXTRA_PROPS` on the passthrough, `_SOURCE_NODE_PROPS` on the
+    generic entity surface). So ONE caller call rewrote an existing document's
+    genre to `transcript` and the meter dropped out from under it — repeatable
+    per document, so the cap did not hold. MEASURED before this guard, 3 seeded
+    document Sources: meter 3 -> 2 via
+    ``create_source(did, 'document', documentKind='transcript')``, then 2 -> 1
+    via ``update_entity(did, documentKind='transcript')``.
+
+    THE RULE. A write may SET a genre where none is stored (promotion — that is
+    how a document `:Source` is minted through these surfaces) and may retarget
+    one metered genre to another (`report` -> `brief`, both metered), but a
+    caller surface may not move a metered document OUT of the metered class
+    (`None` / `'transcript'`). Demotion is the escape; the forgery direction
+    (`documentKind` added to a provenance Source) only over-counts — it fails
+    closed — and is deliberately left alone.
+
+    Both spellings are refused on a METERED document, for DIFFERENT reasons —
+    stated truthfully because the earlier wording claimed a mechanism the code
+    did not implement. The camelCase `documentKind` is the key the meter reads,
+    so refusing a demotion through it is the demotion guard itself (a promotion
+    or a metered -> metered retarget still lands). One asymmetry belongs with
+    it: `documentKind=None` is a REFUSAL on `update_entity` (its write is
+    `SET n += $p`, where a null REMOVES the property) and a NO-OP on
+    `create_source` (the passthrough skips null values, so nothing is written)
+    — hence `none_demotes`. The snake_case
+    `document_kind` is INERT as a node property (no reader in the tree reads
+    `s.document_kind`; the meter reads `s.documentKind`), so it cannot demote by
+    itself — it is refused for EVERY value, because the only thing a snake
+    write can do on a document is put the genre on the node in a SECOND place,
+    one of them the one every reader ignores: the `raw_state`/`rawState`
+    ambiguity class (`_SOURCE_HANDLED`'s "the state in TWO places" note), and a
+    `DocumentCreated` payload carrying it DOES reach the genre via
+    `_upsert_document`'s `$dk`. One home for the genre, and it is
+    `documentKind`.
+
+    ⛔ That last point was the review-cycle-3 defect and it is why the rule is
+    "refuse the whole SPELLING on a document" rather than "refuse the demoting
+    VALUE": the value-scoped rule ADMITTED `document_kind='brief'` on a
+    metered document (creating exactly the second home this docstring refuses)
+    while REFUSING `document_kind=None`, the one snake write that cannot
+    demote and is the cleanup of that second home. The predicate was inverted
+    against its own stated purpose in both directions. The refusal is scoped to
+    a METERED document because that is where the genre already has a home; on a
+    non-document `:Source` the property is inert and a promotion is how a
+    document is minted through these surfaces at all.
+
+    Deliberately NOT in `_DOC_RETIRED_KEYS`: `documentKind` is LIVE (D10 §4.4,
+    the genre axis) and a member there is SCRUBBED off every document. On the
+    caller surfaces it is refused LOUDLY rather than dropped, because a silent
+    no-op would leave the caller believing it wrote. (The DOCUMENT writer,
+    `_upsert_document`, instead DROPS a demotion inside its own clause: the
+    same statement is the journal replay fold, so it must stay total and must
+    not abort a rebuild over a pre-guard record. Its PRODUCERS —
+    `EventAPI.add_document` and `sdk._doc_write` — refuse loudly before the
+    journal append, via `quota.refuse_document_writer_demotion`, so the drop
+    is reached only by a REPLAY. `create_source`/`update_entity` are never
+    replay, so they raise here.)
+    """
+    incoming = [(k, props[k]) for k in ("documentKind", "document_kind")
+                if k in props]
+    if not incoming:
+        return
+    # ⛔ FAIL CLOSED over EVERY node the write can reach: `update_entity` writes
+    # `MATCH (n:Source {key:$id}) SET n += $p`, which applies to ALL matching
+    # nodes, so one non-metered sibling must not be able to answer for a metered
+    # one (#5140 review cycle 4 reproduced exactly that: meter 1 -> 0).
+    metered = [k for k in stored_kinds if is_metered_document_kind(k)]
+    if not metered:
+        # Nothing metered stored to demote: a fresh node, a transcript, or a
+        # non-document `:Source`. Setting/promoting the genre is allowed.
+        return
+    stored_kind = metered[0]
+    for key, value in incoming:
+        if key == "document_kind":
+            # The WHOLE spelling, whatever its value — see the docstring.
+            raise ValueError(
+                f"`document_kind={value!r}` cannot be written to a metered "
+                f"document (stored documentKind={stored_kind!r}): the genre "
+                f"lives in `documentKind` ONLY, and `document_kind` is an "
+                f"inert second spelling that no reader reads. Write "
+                f"`documentKind`, which carries the demotion rule (#5140)."
+            )
+        if is_metered_document_kind(value):
+            continue
+        if value is None and not none_demotes:
+            # `None` is PRESERVE on a passthrough that skips null values
+            # (`_persist_extra_props`: "None values are excluded — Cypher null
+            # semantics in SET maps are unreliable"), so it writes nothing and
+            # is not a demotion. On a `SET n += $p` surface it REMOVES the
+            # property, which is, and the caller passes `none_demotes=True`.
+            continue
+        raise ValueError(
+            f"`{key}={value!r}` would move this :Source out of the metered "
+            f"`documents` set (stored documentKind={stored_kind!r}; the "
+            f"`documents` cap counts "
+            f"`{DOCUMENT_METER_PREDICATE}`). `documentKind` is the "
+            f"documenthood key, not metadata: it cannot be demoted to "
+            f"`transcript`/empty through `{surface}` (#5140 — metering a node "
+            f"a caller can un-meter is not a cap). Retarget among metered "
+            f"genres is allowed (`report` -> `brief`). To drop a document's "
+            f"metering, delete the document; to record that a source became "
+            f"unavailable, use `create_source(..., raw_state=...)`."
+        )
 
 
 def _coerce_props(props: dict) -> dict:
@@ -7675,7 +7817,8 @@ class TortoiseSDK:
                 ),
             )
 
-    def _journal_entity_event(self, event: dict) -> bool | None:
+    def _journal_entity_event(self, event: dict, *,
+                              recorded_ts: str | None = None) -> bool | None:
         """Append a canonical entity record to the journal (the WRITE half).
 
         The emission half of :meth:`_apply_and_journal`; split out so a
@@ -7684,6 +7827,12 @@ class TortoiseSDK:
         COMMIT POINT of a live write, so this runs BEFORE the fold. No-ops for
         a non-entity record type, a missing id, or an unconfigured journal —
         ``_emit_event`` owns the last case.
+
+        ``recorded_ts`` is the envelope instant the door ALREADY decided (#9434):
+        a door that stamps ``event["ts"]`` before folding hands the SAME value
+        here, so the record's envelope ``ts`` and the value the fold read are ONE
+        clock read. ``None`` (every pre-#9434 caller) keeps ``_emit_event``'s own
+        mint — this parameter changes nothing for them.
 
         ⛔ This is for a LIVE write. A REPLAY engine must never call it: the
         record being folded came FROM the journal, so journalling it again
@@ -7702,8 +7851,13 @@ class TortoiseSDK:
         # gate its cache write on — never a delta of `_journal_write_failures`,
         # which a CONCURRENT writer can inflate (#5612). Existing callers
         # ignored the return and are unaffected by its arrival.
+        # `recorded_ts` rides the ARGUMENT, never the payload: it is a
+        # `_JOURNAL_ENVELOPE_KEYS` member, so `_journal_record_payload` strips a
+        # caller-authored one — which is also why the door that stamps `ts` must
+        # hand the instant over explicitly rather than expect it to travel.
         return self._emit_event(
-            type_, id=id_, **_journal_record_payload(event))
+            type_, id=id_, recorded_ts=recorded_ts,
+            **_journal_record_payload(event))
 
     def _apply_and_journal(self, proj, event: dict, *,
                            journal: bool = True) -> None:
@@ -7777,8 +7931,67 @@ class TortoiseSDK:
                     and event.get("createdAt") is None):
                 from .ids import now_iso
                 event["createdAt"] = now_iso()
+            # (#9434) The `ts` half of the same VALUE-SYNTHESIS rule, and the
+            # other door `entities._event_plain_merge` names. This door appends
+            # through `_emit_event`, which minted the envelope `ts` on a COPY of
+            # the record — and it then folds the CALLER's dict, which carries no
+            # `ts` at all (`ts` is a reserved ENVELOPE prop). So any fold-level
+            # field stamped from the record's own instant took the FOLD clock
+            # live and the APPEND clock on replay: `_upsert_event` reads
+            # `record_ts=event.get("ts")` → `None` → `_event_plain_merge`'s
+            # document `:Source` `ingestedAt` (#5140) fell back to `_now_iso()`.
+            # Measured pre-fix on this door, one `objectType='Document'`
+            # record: live `…26.948766` vs rebuilt `…26.925052` — the #5024
+            # `derived = replay(journal)` class, on that field. Stamping HERE,
+            # before the append, makes the value the fold reads and the value
+            # the envelope carries ONE instant, and #9419 did the same on
+            # `_create_entity` (which folds first, so its divergence ran the
+            # other way).
+            #
+            # It does NOT move the ordering contract: the append is still the
+            # commit point, and a failed append still skips the fold. Only WHEN
+            # the instant is read changes, from inside the append to just before
+            # it — the shape the `createdAt` synthesis above already uses.
+            #
+            # `ts` is a reserved ENVELOPE name and neither side stores it: it is
+            # in `_META_KEYS`, so `_persist_extra_props` cannot put it on a node
+            # (`skip = _META_KEYS | handled_keys`), and `_journal_record_payload`
+            # drops it from the payload for the same reason. So live and replay
+            # both see a record-carried instant, and neither grows a `ts` prop —
+            # which matters MORE here than on `_create_entity`, because the dict
+            # this door stamps is the CALLER's own.
+            #
+            # Gated on is-None (not key-absence) exactly like `createdAt`: a
+            # producer that hands over a record read back off the journal keeps
+            # its recorded instant verbatim.
+            #
+            # ⛔ THE HAND-OFF IS THE DICT'S OWN `ts`, NOT WHAT THIS CALL MINTED
+            # (a #9445 review P1 this block used to get wrong). On the non-None
+            # branch the dict ALREADY carries an instant, and handing over
+            # `None` there made `_emit_event` mint a FRESH one while the fold
+            # read the dict's — two clocks on exactly the field this block
+            # exists to close, which also made the comment above false of the
+            # RECORD (it held for the node only). `ts` is stripped from the
+            # payload by `_journal_record_payload`, so nothing else carries the
+            # instant to `_emit_event`: the value the envelope gets and the value
+            # the fold reads must be ONE read on EVERY branch.
+            #
+            # Two shapes reach the non-None branch, and both need the same
+            # hand-off: (1) a producer handing over a record it read back off
+            # the journal (the case the sentence above names), and (2) a RETRY
+            # of the same dict after a failed append — `_emit_event` is
+            # best-effort, this door stamps the CALLER's dict in place, so
+            # attempt 1 leaves `ts=T1` behind; attempt 2 must journal T1, not
+            # re-mint a T2 the fold never read. (`createdAt` just above is
+            # retry-safe for a different reason — it travels in the PAYLOAD;
+            # `ts` deliberately does not.)
+            if (event.get("type") in _JOURNALED_ENTITY_EVENT_TYPES
+                    and event.get("ts") is None):
+                from .ids import now_iso
+                event["ts"] = now_iso()
+            _record_ts = event.get("ts")
             _failures_before = self._journal_write_failures
-            self._journal_entity_event(event)
+            self._journal_entity_event(event, recorded_ts=_record_ts)
             if self._journal_write_failures > _failures_before:
                 # Append failed → not committed → do not fold (contract).
                 # `_emit_event` already logged at ERROR and incremented
@@ -9729,6 +9942,97 @@ class TortoiseSDK:
         )
         _capture_redactions = _capture_write["redacted_total"]
 
+        # ⛔ #8501 — THE SESSION-SOURCE MATERIALIZATION RUNS **BEFORE**
+        # EXTRACTION, NOT AFTER IT. `s.contentHash` IS the version anchor a
+        # derived Point records at link time (`resolve_source_versions` →
+        # `r.sourceVersion`, #5256). Extraction is what creates those Points,
+        # and `_materialize_session_source` is what SETS `contentHash` — so
+        # while it ran AFTER extraction the session Source was still the
+        # empty-hash stub when every `extractedFrom` link was MERGEd: `$v`
+        # bound nothing and every point of every capture was written
+        # unanchored (measured on the pre-fix tree: `references` 1/1 anchored,
+        # `extractedFrom` 0/1 — so a revised transcript could never mark its
+        # Points stale, which is the whole #5199/#5038 currency read).
+        #
+        # The ordering cannot be repaired afterwards, and that is why it is
+        # fixed HERE rather than by a post-pass: `sourceVersion` is `ON CREATE`
+        # only (#5199), and the replay value is the Point's OWN journaled
+        # `sourceVersionTransit` snapshot — a re-stamp after the fact would be
+        # an unjournalled second write that a rebuild drops (#9206/#9079).
+        # Materializing first makes the ordinary link-time read return the
+        # version, so the anchor lands in the same snapshot every other
+        # create-path Point uses.
+        #
+        # Only the MINT + MATERIALIZE half moves: the provenance STAMPS below
+        # need `extracted`, so they stay after extraction and read `event_id`
+        # bound here.
+        _capture_source_warnings: list[str] = []
+        # #8501: the mint's two failure shapes are DISTINCT and now live in two
+        # blocks — a RAISE (warned here) and a create that returns no id (warned
+        # by the stamp block below). Without this flag a raise would also hit
+        # that block's "returned no id/eventId" arm and report a shape that did
+        # not happen.
+        _capture_mint_failed = False
+        event_id: str | None = None
+        if not session_existed or (retry_failed_capture and not no_provider):
+            # W5 Phase F (#2104): the mint uses the DETERMINISTIC id derived
+            # from session_id (_server_id channel — the server-only explicit-id
+            # convention, mirroring the explicit ``is_episodic`` param) so two
+            # concurrent FRESH-session captures of the same session_id
+            # (per-thread SDKs / two POSTs — the #1727 TOCTOU: both observe
+            # session_existed=False) MERGE onto ONE Event node instead of
+            # minting two fresh-ULID Events. The Event projection MERGEs on
+            # eventId, so the second concurrent writer's create is an
+            # idempotent no-op.
+            try:
+                event = self.create_event(
+                    f"session_{session_id}", "sessionCaptured",
+                    _server_id=_session_capture_event_id(session_id),
+                    startedAt=now, endedAt=now, sessionId=session_id,
+                    is_episodic=True,
+                )
+                event_id = event.get("id") or event.get("eventId") or None
+            except Exception as e:
+                # Non-fatal — mirrors hosted behavior, but surface the failure
+                # so silent event-log loss is visible (#721). P1 #1529 (D4):
+                # an additive warning entry — never indistinguishable from a
+                # clean capture.
+                _logger.warning(
+                    "capture_session: sessionCaptured Event/EventRecorded write "
+                    "failed (non-fatal) for session %s: %s", session_id, e,
+                    exc_info=True,
+                )
+                _capture_mint_failed = True
+                _capture_source_warnings.append(
+                    f"sessionCaptured Event write failed: {type(e).__name__}: {e}")
+            # #1352: the extraction projection auto-created a document-typed
+            # Source stub at `session:{id}` (default sourceKind in _link_source)
+            # — the ontology v3.6 §4.6 session source kind is agentSession.
+            # Materialize the typed Source (capture metadata + sessionId +
+            # capturedAt + eventId) and wire (Source)-[:references]->(sessionCaptured
+            # Event). W5 Phase F (#2104, review r1): runs ONLY on a genuine
+            # capture — inside the mint gate (hosted #1727 parity) — a REPLAY
+            # must not re-SET the first capture's Source capturedAt/contentHash
+            # (a replay is a true no-op). Still runs when the mint itself
+            # failed: the Source upgrade is independent of the Event write's
+            # health; the references edge is skipped when no Event landed
+            # (event_id None).
+            # P1 #1529 (D4): a Source materialization failure is non-fatal and
+            # surfaced as an additive warning — never a raw exception after
+            # partial writes.
+            try:
+                self._materialize_session_source(
+                    session_id, event_id, now, conversation)
+            except Exception as e:
+                _logger.warning(
+                    "capture_session: session Source materialization failed "
+                    "(non-fatal) for session %s: %s", session_id, e,
+                    exc_info=True,
+                )
+                _capture_source_warnings.append(
+                    f"session Source materialization failed: "
+                    f"{type(e).__name__}: {e}")
+
         # M2 LLM extraction over the whole conversation (#822) — replaces the
         # regex decision/claim loop (removed as a product path). Shared with
         # the hosted copy so the two stay in sync.
@@ -9816,6 +10120,10 @@ class TortoiseSDK:
         # P1 #1529: the fail-closed assembly consumes the shared contract.
         extraction_errors = list(meta.get("errors") or [])
         extraction_warnings = list(meta.get("warnings") or [])
+        # #8501: the mint/materialize half now runs BEFORE extraction, so its
+        # additive warnings are collected separately and folded into the same
+        # fail-closed surface (never a silent drop).
+        extraction_warnings.extend(_capture_source_warnings)
 
         # Ontology episodic model (v3.1 §4.5/§3.2): Event node + the point's
         # eventId provenance property. #1417: provenance is the point's
@@ -9823,7 +10131,8 @@ class TortoiseSDK:
         # reserves aboutEvent for "What Event this describes"). Stamp each
         # extracted point's provenance surface; aboutEvent stays clean for
         # content (B3's event slot).
-        event_id: str | None = None
+        # #8501: `event_id` is bound by the phase-1 mint ABOVE (before
+        # extraction); the stamp block below reuses it.
         # W5 Phase F (#2104, indicator 8 — hosted #1727 byte-parity): the
         # sessionCaptured Event mint + provenance stamp run ONLY on a genuine
         # capture — a REPLAY of an existing session_id SKIPS them, exactly
@@ -9865,24 +10174,12 @@ class TortoiseSDK:
             # provenance stamp + typed-Source upgrade they need. The prior
             # failed attempt's Event node exists; the deterministic id makes
             # this a convergent no-op-create + refresh.
+            # #8501: the MINT and the Source MATERIALIZATION already ran in
+            # phase 1, BEFORE extraction (see `_capture_source_warnings`
+            # above) — that ordering is what lets each extracted Point read the
+            # session Source's `contentHash` and record it as `sourceVersion`.
+            # What is left here is the STAMP half, which needs `extracted`.
             try:
-                # W5 Phase F (#2104): the mint uses the DETERMINISTIC id
-                # derived from session_id (_server_id channel — the
-                # server-only explicit-id convention, mirroring the explicit
-                # ``is_episodic`` param) so two concurrent FRESH-session
-                # captures of the same session_id (per-thread SDKs / two
-                # POSTs — the #1727 TOCTOU: both observe
-                # session_existed=False) MERGE onto ONE Event node instead of
-                # minting two fresh-ULID Events. The Event projection MERGEs
-                # on eventId, so the second concurrent writer's create is an
-                # idempotent no-op.
-                event = self.create_event(
-                    f"session_{session_id}", "sessionCaptured",
-                    _server_id=_session_capture_event_id(session_id),
-                    startedAt=now, endedAt=now, sessionId=session_id,
-                    is_episodic=True,
-                )
-                event_id = event.get("id") or event.get("eventId")
                 if event_id:
                     # W5 (#2104, S1): the SDK mirror stamps the full write
                     # provenance alongside the ontology-compliant eventId —
@@ -10082,9 +10379,12 @@ class TortoiseSDK:
                             what="capture retry-heal provenance stamp",
                             params={"sid": session_id},
                         )
-                else:
+                elif not _capture_mint_failed:
                     # P1 #1529 (D4): create_event returning no id/eventId
                     # silently skips stamping — surface as an additive warning.
+                    # #8501: NOT when the mint RAISED — phase 1 already
+                    # reported that, and "returned no id" would name a shape
+                    # that did not happen (one failure, one warning).
                     _logger.warning(
                         "capture_session: sessionCaptured Event write returned "
                         "no id/eventId for session %s — extracted points not "
@@ -10095,43 +10395,20 @@ class TortoiseSDK:
                         "sessionCaptured Event write returned no id/eventId — "
                         "extracted points not stamped")
             except Exception as e:
-                # Non-fatal — mirrors hosted behavior, but surface the failure
-                # so silent event-log loss is visible (#721). P1 #1529 (D4):
-                # also append an additive warnings entry (never
-                # indistinguishable from a clean capture).
+                # Non-fatal — surface the failure so silent provenance loss is
+                # visible (#721). P1 #1529 (D4): an additive warnings entry,
+                # never indistinguishable from a clean capture.
+                # #8501: THIS BLOCK IS THE STAMP HALF ONLY — the mint moved to
+                # phase 1 and reports its own failure there, so naming an
+                # "Event write" here would both mislabel a stamp failure and
+                # collapse the two shapes the split exists to keep distinct.
                 _logger.warning(
-                    "capture_session: sessionCaptured Event/EventRecorded write "
-                    "failed (non-fatal) for session %s: %s", session_id, e,
-                    exc_info=True,
-                )
-                extraction_warnings.append(
-                    f"sessionCaptured Event write failed: {type(e).__name__}: {e}")
-            # #1352: the extraction projection auto-created a document-typed
-            # Source stub at `session:{id}` (default sourceKind in _link_source)
-            # — the ontology v3.6 §4.6 session source kind is agentSession.
-            # Materialize the typed Source (capture metadata + sessionId +
-            # capturedAt + eventId) and wire (Source)-[:references]->(sessionCaptured
-            # Event). W5 Phase F (#2104, review r1): runs ONLY on a genuine
-            # capture — inside the mint gate (hosted #1727 parity) — a REPLAY
-            # must not re-SET the first capture's Source capturedAt/contentHash
-            # (a replay is a true no-op). Still runs when the mint itself
-            # failed: the Source upgrade is independent of the Event write's
-            # health; the references edge is skipped when no Event landed
-            # (event_id None).
-            # P1 #1529 (D4): a Source materialization failure is non-fatal and
-            # surfaced as an additive warning — never a raw exception after
-            # partial writes.
-            try:
-                self._materialize_session_source(
-                    session_id, event_id, now, conversation)
-            except Exception as e:
-                _logger.warning(
-                    "capture_session: session Source materialization failed "
+                    "capture_session: sessionCaptured provenance stamp failed "
                     "(non-fatal) for session %s: %s", session_id, e,
                     exc_info=True,
                 )
                 extraction_warnings.append(
-                    f"session Source materialization failed: "
+                    f"sessionCaptured provenance stamp failed: "
                     f"{type(e).__name__}: {e}")
 
         # #3664 / #1727 Slice 2 (Task 12) — SDK-parity entity-linking pass.
@@ -10820,10 +11097,17 @@ class TortoiseSDK:
         entities/points it references exist (ordering contract) — ``pt_`` refs
         → the canonical ``supersede()`` (CORRECTS + outdated + edge transfer);
         entity refs → an ``ObjectSuperseded`` event (id-style, journaled with
-        full provenance) + the ``_fold_object_superseded`` status fold. Every
-        fold miss/skip/failure is surfaced through the shared meta
-        ``warnings`` channel — supersession application is best-effort and
-        never a silent drop (and never fails capture).
+        full provenance) + the ``_fold_object_superseded`` status fold. Fold
+        misses/skips/failures are surfaced through the shared meta
+        ``warnings`` channel under the BOUNDED contract of #5654: the first
+        ``commit_ops._MAX_SUPERSESSION_WARNS`` (20) per-record warnings are
+        appended verbatim; any beyond that budget are counted but NOT
+        appended individually — the call then closes with ONE summary entry
+        carrying the batch size, the true warning total and the withheld
+        count. An over-budget batch therefore stays SIZED, but a past-budget
+        skip is not individually identified (and the write is unaffected:
+        every record is still attempted). Supersession application is
+        best-effort and never fails capture.
 
         Returns ``(extracted, meta)`` (#1530 D8 — shared contract, P1
         consumes it): ``extracted`` is the same [{id, kind, text}] contract
@@ -11453,8 +11737,14 @@ class TortoiseSDK:
         # #2164: supersessions — client-derived records (the deterministic
         # channel for the Object status fold; §6b parity). pt_ → supersede()
         # CORRECTS; entity-level → ObjectSuperseded + fold. Runs after points/
-        # entities exist (ordering contract). Warnings ride meta — never a
-        # silent drop. Best-effort — never fail capture (hosted §6b rule).
+        # entities exist (ordering contract). Warnings ride meta under the
+        # helper's BOUNDED #5654 contract: the first
+        # ``_MAX_SUPERSESSION_WARNS`` (20) per-record warns land in
+        # meta["warnings"] individually, the remainder are counted and
+        # reported in ONE summary entry (batch size + true warning total +
+        # withheld count) — so nothing is dropped from the WRITE, but past
+        # the budget a skip is not named individually. Best-effort — never
+        # fail capture (hosted §6b rule).
         try:
             from tortoise.commit_ops import (
                 apply_supersessions,
@@ -11631,6 +11921,30 @@ class TortoiseSDK:
             "s.summary=$sum",
             "s.topics=$topics",
             f"s.{SOURCE_SEARCH_TEXT_FIELD}=coalesce($st, s.{SOURCE_SEARCH_TEXT_FIELD})",
+            # ⛔ THIS STAYS A `coalesce` — #398's NEVER-OVERWRITE CONTRACT, and
+            # #9451's fix is in the RECORD, not here. `ingestedAt` means "when
+            # Tortoise FIRST saw this source" (`_upsert_document`'s note below,
+            # entities.py), and a writer never moves an instant another writer
+            # already recorded. The bug was never the coalesce: it was that the
+            # `SourceCreated` record further down stated `now` — a value this
+            # write does NOT store when the stub already existed. So on a
+            # PRE-EXISTING stub (minted by `_link_source`/`_mint_source_stub`
+            # via `create_point(session_id=...)`, the hosted commit path's
+            # `create_source`, the #4125 reconciler — a mint journals NO
+            # ingestion, so nothing carries its instant) the live node held the
+            # EARLIER instant while the record carried the capture's, and
+            # `_upsert_source`'s ON CREATE arm reads the RECORDED value (#5024):
+            # `rebuild_all()` folded a value the live write never wrote, so
+            # `derived == replay(journal)` (#5024/#5097/#8501) was FALSE for the
+            # field and a recovery silently re-ordered session Sources in the
+            # recency computation.
+            #
+            # The fix: the RETURN below reads back the instant this SET leaves on
+            # the node and the record carries THAT (the same "the payload carries
+            # the values the WRITE STORED" rule `validFrom`/`is_episodic` already
+            # follow), and `_upsert_source`'s ON MATCH arm applies it under the
+            # `$stub_completion` gate so the record also lands on the arm where
+            # the node already exists at fold time.
             "s.ingestedAt=coalesce(s.ingestedAt, $now)",
         ]
         if event_id:
@@ -11641,13 +11955,71 @@ class TortoiseSDK:
         # must NOT move but must not DESTROY on replay either (see the carrier
         # note below). Read back from the node the write just completed, in the
         # same statement, so the values are the ones it holds.
+        #
+        # ⛔ #8501 — THIS WRITER CAN NOW RUN **FIRST**, so it must be able to
+        # mint the stub it upgrades. `capture_session` calls it BEFORE
+        # extraction (that ordering is what gives the extracted Points a
+        # `contentHash` to record as `sourceVersion`), i.e. before any Point has
+        # created the `session:{id}` stub, so its MERGE is now often the CREATE
+        # rather than an upgrade of `_link_source`'s node. The ON CREATE arm
+        # below therefore reproduces that stub's create-time shape EXACTLY —
+        # `sourceKind`, `title=url`, `canonicalUrl`, `urlAliases`, empty
+        # `contentHash`, `ingestedAt` (`projection/edges.py::_mint_source_stub`
+        # is the replay-shared twin of this shape) — and the SET clauses then
+        # upgrade it. Running earlier must not change the node a capture lands:
+        # `test_capture_path_source_shape_is_unchanged_by_the_early_materialization`
+        # pins the resulting property set against the pre-#8501 shape.
+        from .projection.edges import _mint_source_stub
+        # `now` is the CAPTURE's instant, not a fresh clock read: for a capture
+        # that mints no Point this is the only writer of `ingestedAt` on the arm
+        # where the mint CREATES the stub, and the `SourceCreated` record below
+        # states `now` on that arm — the SET coalesces into `$now`, so the
+        # read-back it journals is this same value. (#9451: on a PRE-EXISTING
+        # stub the mint's ON MATCH leaves `ingestedAt` alone and the SET's
+        # `coalesce` KEEPS the earlier writer's instant, so the record carries
+        # THAT, not `now` — the mint's clock is inert there.) A fresh clock here
+        # would make the live node on the create arm disagree with the replayed
+        # one (#8501).
+        #
+        # ⛔ THE RETURNED KEY IS USED, NEVER DISCARDED (#8501 review P3).
+        # `_mint_source_stub`'s contract is explicit — callers MUST address
+        # their subsequent MATCH/MERGE by the key it returns, because a URL
+        # VARIANT resolves (through the SHARED `resolve_source_key`) to the node
+        # its canonical identity already names. Addressing the raw spelling
+        # afterwards would leave the mint and this SET on two different nodes,
+        # i.e. exactly the duplicate `:Source` that resolution exists to
+        # prevent. For a `session:` ref the two are provably equal today
+        # (`normalize_source_url` returns a non-network identity unchanged, so
+        # `resolve_source_key` can only resolve `session:<id>` to itself) —
+        # which is why the contract is honoured LITERALLY here instead of
+        # re-derived by the next reader. `or url` covers the one case the mint
+        # returns ``None`` (an unwritable MERGE key: nothing was minted, so the
+        # MERGE below must keep addressing the key it always did).
+        source_key = _mint_source_stub(
+            proj.g, url, "agentSession", now=now) or url
+        params["url"] = source_key
         _rows = proj.g.query(
             "MERGE (s:Source {url:$url}) SET " + ", ".join(set_clauses)
-            + " RETURN s.validFrom, s.is_episodic",
+            # `s.ingestedAt` is the THIRD read-back, for the same reason as the
+            # other two: #9451 — the record must state the instant this write
+            # STORED, which is the earlier writer's when the stub pre-existed
+            # (`s.ingestedAt=coalesce(s.ingestedAt, $now)` keeps it), not `now`.
+            + " RETURN s.validFrom, s.is_episodic, s.ingestedAt",
             params=params,
         ).result_set
         prior_valid_from = _rows[0][0] if _rows else None
         prior_is_episodic = _rows[0][1] if _rows else None
+        # `now` only as a fallback for a MERGE that returned no row (nothing was
+        # written, so there is no stored value to state); every real write leaves
+        # a non-null instant because the SET above coalesces into `$now`.
+        #
+        # ⛔ AN EXPLICIT NULL TEST, NOT `or` (#9451 review round 2, P2): a node
+        # holding `ingestedAt=''` is FALSY but NON-NULL, and the live SET's
+        # `coalesce` KEEPS it — so `... or now` would state an instant the write
+        # did not store and hand `rebuild_all()` a `now` the live node never had,
+        # the very divergence this issue closes, on that one state.
+        _stored = _rows[0][2] if _rows else None
+        stored_ingested_at = now if _stored is None else _stored
         # ⛔ §17.1 ORDER (#9206 review P1): THE RECORD IS APPENDED HERE, BEFORE
         # the `link_source_to_event` write below — not after it (where it used to
         # sit), and BEFORE the record's own explanatory block explains why it is
@@ -11674,16 +12046,29 @@ class TortoiseSDK:
         # "precedes both writes" wording literally would file this door under
         # the journal-first lane, which its order does not earn.
         self._emit_event(
-            "SourceCreated", id=url,
-            url=url,
+            "SourceCreated", id=source_key,
+            url=source_key,
             sourceKind="agentSession",
             contentHash=content_hash,
             title=None,
-            ingestedAt=now,
+            ingestedAt=stored_ingested_at,
             updatedAt=now,
             validFrom=prior_valid_from,
             is_episodic=prior_is_episodic,
             _stub_completion=True,
+            # #9451: the record's `ingestedAt` above is the instant this write
+            # STORED (read back from the node), not the capture clock. This
+            # marker is what tells the two apart at FOLD time: a record written
+            # before #9451 carries `_stub_completion` but no marker and states a
+            # `now` the live write never stored on a pre-existing stub, so the
+            # ON MATCH arm leaves the node alone for those lines exactly as it
+            # did before this change (a legacy record must not start MOVING a
+            # value the pre-fix replay reproduced faithfully). Server-managed:
+            # refused as a caller key by `_sanitize_props` / `create_source` /
+            # MCP, listed in `_META_KEYS` so it never reaches a `:Source`, and
+            # in `record_projection._RECORD_ONLY_KEYS` so it never enters a
+            # record's props tail.
+            _ingestedAtStored=True,
             **{SOURCE_SEARCH_TEXT_FIELD: search_text},
             sessionId=session_id,
             capturedAt=now,
@@ -11694,7 +12079,7 @@ class TortoiseSDK:
         if event_id:
             # Anchored ON CREATE by the shared derivation writer (#5199).
             # AFTER the record on purpose — see the order note above.
-            proj.link_source_to_event(url, event_id)
+            proj.link_source_to_event(source_key, event_id)
         # ⛔ WHY THAT RECORD EXISTS AT ALL — THE RAW MERGE ABOVE NEEDS A JOURNAL
         # CARRIER (lane L5 #5097, gate item 2). It is a raw graph SET on the
         # capture path, and the rule for those is ALREADY recorded on this lane
@@ -11727,7 +12112,9 @@ class TortoiseSDK:
         #   * `_stub_completion=True` — THIS RECORD COMPLETES A STUB, IT DOES NOT
         #     CREATE A SOURCE (`_upsert_source` reads it as `$stub_completion`).
         #     It suppresses the ON CREATE arm's three CREATOR-ONLY defaults, which
-        #     the live node never has (the M2 `_link_source` stub created it):
+        #     the live node never has — the stub mint never sets them, whether it
+        #     was `_link_source` (any non-capture path) or the `_mint_source_stub`
+        #     call above (the capture path since #8501):
         #     `id`, `version=1` and `externalId=''`. Without it a `rebuild_all` —
         #     which folds `SourceCreated` in pass 1b, BEFORE pass 2 mints the stub
         #     — recovered a session `:Source` carrying a version ordinal this
@@ -11746,15 +12133,55 @@ class TortoiseSDK:
         #   * `updatedAt` carries the instant the write stamped, so the fold's
         #     stub-completion arm reproduces it instead of the replay clock.
         #
-        # ⚠️ `ingestedAt` is emitted too, but it is a KNOWN RESIDUAL and is not
-        # claimed as faithful: the stub this write completes is created by the
-        # M2 `_link_source` projection write, whose `ingestedAt` is minted from
-        # the clock at ITS write, and `_upsert_source`'s ON MATCH arm has no
-        # `ingestedAt` clause at all (only ON CREATE reads the recorded value).
-        # So a rebuilt session Source keeps a replay-clock ingest stamp. That
-        # is the same unjournaled-writer class one writer upstream, not
-        # something this record can fix; the recorded value is emitted anyway so
-        # the ON CREATE path (no stub) is faithful.
+        #   * `ingestedAt` carries `stored_ingested_at` — the instant READ BACK
+        #     from the node the SET just wrote — not `now`. On the lane where this
+        #     door's own mint CREATES the stub, the two are the same value (the
+        #     mint is `_mint_source_stub(..., now=now)`, and the SET coalesces
+        #     into `$now`), which is what
+        #     `test_a_keyless_capture_stamps_its_stub_with_the_capture_instant`
+        #     and
+        #     `test_the_extracting_lane_stamps_its_stub_with_the_capture_instant`
+        #     pin. On a PRE-EXISTING stub they DIFFER: the live SET's `coalesce`
+        #     keeps the earlier writer's instant (#398's never-overwrite contract
+        #     — `ingestedAt` means when Tortoise FIRST saw this source), so a
+        #     record stating `now` journals a value the write never wrote (#9451).
+        #     `_upsert_source`'s ON CREATE arm reads the recorded value (#5024)
+        #     and its ON MATCH arm applies it under the `$stub_completion AND
+        #     $ingestedAtStored` gate, so for a record written BY THIS VERSION
+        #     both replay engines reproduce the node's value on both arms —
+        #     pinned by `tests/test_9451_pre_existing_stub_ingest_instant.py`
+        #     (whole-bag live vs after `rebuild_all()` AND after `rebuild()`,
+        #     mutation-measured red on the pre-#9451 tree).
+        #
+        #     ⛔ THE RESIDUAL THAT REMAINS, stated rather than implied and
+        #     engine by engine (#9451 review rounds 3-4): a `SourceCreated` line
+        #     written BEFORE this change states `now`, which the live write never
+        #     stored on a pre-existing stub — and no record can correct that,
+        #     because the instant the mint chose was never journaled. Those lines
+        #     carry `_stub_completion` but NOT `_ingestedAtStored`, so the ON
+        #     MATCH arm leaves the node's `ingestedAt` alone for them, exactly as
+        #     it did before this change. The consequence, engine by engine: on
+        #     `rebuild_all()` the ON CREATE arm still applies the recorded `now`
+        #     in the shape where this record is the node's CREATOR (pass 1b folds
+        #     it before pass 2 mints the stub) — so those rebuilt nodes are still
+        #     not the LIVE node's value; on `rebuild()` such a node keeps the
+        #     replay clock the re-minted stub was given, as it did before. In the
+        #     other legacy shape — the node was created by a JOURNALLED earlier
+        #     write (`create_source`'s own `SourceCreated` at T0) and a pre-#9451
+        #     capture merely completed it — the ON MATCH arm being a NO-OP is
+        #     what keeps `rebuild()`/`rebuild_all()` FAITHFUL to the live T0
+        #     (#9451 review round 3, ISSUE 2: applying the legacy record's
+        #     never-stored `now` there would have turned a faithful recovery into
+        #     a divergence, so the marker — not just `$stub_completion` — is what
+        #     the clause is gated on; pinned by
+        #     `test_a_legacy_capture_record_does_not_move_a_journalled_instant`).
+        #     Convergence for the CREATOR shape needs a MIGRATION or a fresh
+        #     faithful record — NOT a plain re-capture, because `capture_session`
+        #     short-circuits an already-captured session ("session already
+        #     captured (same session_id) — no new extraction") and journals no
+        #     `SourceCreated` for it at all. What #9451 closes is the DOOR: every
+        #     capture that REACHES this writer from this version onward journals
+        #     the instant it stored, on either arm.
 
     # ── Update / Delete consolidation (epic #888 W2, PR #912) ─────────
     # One update()/delete() for Points AND entities. The legacy methods
@@ -21487,6 +21914,16 @@ class TortoiseSDK:
         try:
             rows = self._get_proj().g.query(
                 "MATCH (n:Point) WHERE n.ep_dirty = true "
+                # #9275: an id-LESS dirty :Point is excluded at the source —
+                # `_dirty_roots` is a set of ids the rest of the lifecycle
+                # MATCHes on, so a NULL id would hydrate as `None` and rejoin
+                # every downstream ordering (`dream_window`'s dirty-root sort,
+                # `_unsweepable_dirty_roots`) as a second id TYPE. It is also
+                # unreachable by construction: no pass can affect it (it can
+                # identify no factor participant) and no sweep can clear its
+                # flag, so mirroring it would only pin the mirror. Same
+                # posture as `analyze.py`'s keyless-legacy-node handling.
+                "AND n.id IS NOT NULL "
                 "AND NOT coalesce(n.status, 'live') IN $terminal "
                 "AND coalesce(n.outdated, false) = false "
                 "RETURN n.id",
@@ -21671,7 +22108,12 @@ class TortoiseSDK:
         if not candidates:
             return set()
         proj = self._get_proj()
-        ids = sorted(candidates)
+        # #9275: `key=str` — these are ids the engine returned and the caller's
+        # graph may carry a non-string one (`set_point_baseline(42, …)` is a
+        # supported, measured shape), so a bare `sorted()` is the same
+        # mixed-type ordering crash the affected-claim path no longer has. The
+        # order is only for a deterministic `$ids` batch.
+        ids = sorted(candidates, key=str)
         # The classification is :Point-only, exactly like the rest of the dirty
         # lifecycle (`_mark_dirty`'s persist, `_hydrate_dirty_roots`,
         # `_prune_nonexistent_dirty_roots` all anchor `MATCH (n:Point)`).
@@ -24588,7 +25030,25 @@ class TortoiseSDK:
           * ``n.pointKind`` NULL-or-an-evidence-kind — absent kind is
             evidence by the repo's own resolution (``backfill_v25`` fills
             'statement'; EP reads no kind at all), so a legacy kind-less
-            Point is gated like the statement it is. NORMALISED first — case
+            Point is gated like the statement it is. #9592: an EMPTY-after-
+            normalisation kind is in that SAME arm, because it means the same
+            thing to the consumer — no kind at all. It used to fall into the
+            string arm and fail membership, so an empty kind was a CONSUMED
+            claim with no prior while an absent kind was demanded (measured:
+            the gate answered ``[]``, ``calibrate_summary()`` said
+            uncalibrated, and a ``require_calibration=True`` run stamped the
+            node anyway) — the fail-open shape #7478 exists to prevent, and an
+            internal disagreement between the audit and the gate (#9063).
+            "Empty" means empty AFTER the normalisation below, so a
+            whitespace-only kind out of the SAME family
+            (``_KIND_WHITESPACE_CHARS``: space, tab, LF, VT, FF, CR, NBSP) is
+            covered too. The family's DECLARED BOUNDARY is unchanged and still
+            holds here: a kind padded with Unicode whitespace OUTSIDE it (em
+            space, ideographic space, ZWSP, BOM…) normalises to itself, so it
+            is still neither empty nor a member and stays ungated — the
+            pre-existing residual recorded at ``_KIND_WHITESPACE_CHARS`` and
+            filed as #9287, not a coverage claim of this arm.
+            NORMALISED first — case
             and surrounding whitespace — because the write path accepts an
             unrecognised kind VERBATIM with only a warning
             (``create_point('Statement', ...)``, ``' statement'``) and EP reads
@@ -24636,30 +25096,53 @@ class TortoiseSDK:
         disagree (measured) — so it can never consume the
         ``limit=1`` probe's budget. It is excluded because no caller can name it
         to ``set_point_baseline`` and the run cannot survive it anyway: EP keys
-        claims on ``id``, so an id-less ``:Point`` wired as an operator claim
-        DIES the run with a ``TypeError`` during ordering — nothing is ever
-        stamped on it (#9275). Sorted (``key=str``, so a numeric id cannot raise
+        claims on ``id``, so an id-less claim wired to an operator makes the pass
+        REFUSE with ``UnaddressableClaimError`` before the refusing pass stamps
+        anything (#9275 — fixed there; it used to die in the ordering with a bare
+        ``TypeError``; a multi-batch ``dream_window``/``dream_all`` pass may have
+        committed an earlier batch) — nothing is ever stamped on such a node.
+        Sorted
+        (``key=str``, so a numeric id cannot raise
         on a mixed list) for a deterministic message.
         """
         if ids is not None and not ids:
             return []
         proj = self._get_proj()
         kinds = ", ".join(f"'{k}'" for k in _CALIBRATION_EVIDENCE_KINDS)
+        # #9592: an EMPTY-after-normalisation kind is ABSENT, not a
+        # non-evidence kind: EP reads no kind at all, so a node whose kind is
+        # '' (or whitespace-only within the normalised family) is a consumed
+        # claim exactly like the kind-less legacy Point — the "absence is
+        # evidence" rule this predicate already carries. It is folded into the
+        # SAME membership list rather than added as an ``OR`` arm, so the
+        # widening costs one LIST ENTRY: the query text keeps ONE
+        # ``replace()`` chain and the engine evaluates the normalisation once
+        # per row (an ``OR {kind_norm} = ''`` arm interpolates the chain a
+        # SECOND time — measured +58% on the ``limit=1`` existence probe every
+        # scoped EP surface pays, 6.5 ms vs 4.1 ms at 2,000 Points). Inside the
+        # ``typeof = 'string'`` guard the normalised value is never NULL, so
+        # ``x = '' OR x IN [...]`` and ``x IN ['', ...]`` are the same
+        # predicate.
+        kind_norm = f"toLower({_strip_whitespace('n.pointKind')})"
         where = (
             f"(n.is_operator IS NULL OR n.is_operator = false) "
             f"AND (n.pointKind IS NULL "
             f"     OR (toLower(typeof(n.pointKind)) = 'string' "
-            f"         AND toLower({_strip_whitespace('n.pointKind')}) "
-            f"             IN [{kinds}])) "
+            f"         AND {kind_norm} IN ['', {kinds}])) "
             f"AND {_live_only('n.status')} "
             "AND (n.baseline_set IS NULL OR n.baseline_set <> true "
             "     OR n.ep_alpha IS NULL OR n.ep_beta IS NULL) "
-            # A hand-written / imported graph can hold an id-less :Point (no
-            # repo writer mints one). No caller can name it to
-            # ``set_point_baseline``, and an id-less participating claim crashes
-            # the run DURING ORDERING, after the batches have stamped the other
-            # nodes — so the run is not fail-closed, but nothing is ever stamped
-            # ON IT (no id to key) (#9275) — so it must never be reported — and
+            # A hand-written / imported graph can hold an id-less epistemic
+            # node (a :Point has no writer that mints one; an :Event has a
+            # LEGITIMATE id-less identity — ``session_indexer`` mints
+            # ``(:Event {eventId})``). No caller can name one to
+            # ``set_point_baseline``, and an id-less participating claim makes EP
+            # REFUSE the run before the refusing pass computes or stamps anything
+            # (``UnaddressableClaimError``, #9275 — it used to crash in the
+            # ordering AFTER the batches had stamped the other nodes), so
+            # no POSTERIOR is ever stamped on it — a graph-wide trivial stamp
+            # (``dream_all``) still writes its ``lastDreamedAt``, the residual
+            # #9275 records — so it must never be reported — and
             # the filter belongs HERE, in the WHERE clause, not only in the
             # Python post-pass: ``limit=1`` is applied by the engine BEFORE the
             # post-pass, so a single id-less row would consume the existence
@@ -27100,7 +27583,9 @@ class TortoiseSDK:
         # arm appends ONE further entry for the same ``fts`` leg AFTER them —
         # because that is when it ran. The two entries are not a duplicate
         # claim: the chain's entry has no ``mechanism`` key (the shipped
-        # scorer's rows), the arm's carries ``mechanism="bm25"``.
+        # scorer's rows), the arm's carries ``mechanism="bm25"`` — or, when it
+        # declines because the corpus is wider than the cap, ``declined=True``
+        # with no ``mechanism`` at all (it produced no rows to attribute).
         #
         # (f) the arm does NOT run when a later lexical pass will REPLACE the
         # slot it writes. ``_search_keys_prf_expansion`` (A4) and
@@ -27174,7 +27659,11 @@ class TortoiseSDK:
             # same holds when the corpus is WIDER than the cap: the leg
             # declines its windowed ranking and returns [], because the shipped
             # leg answered over the whole label and a first-N-ids window can
-            # only lose matches (the leg records ``degraded=True`` + a warning).
+            # only lose matches. The leg records ``declined=True`` + a warning,
+            # and deliberately NOT ``degraded``: the read is complete, and that
+            # flag is aggregated into the read's recorded status, so carrying a
+            # leg-local decline there relabelled every read on a large store as
+            # impaired memory (#8488 follow-up).
             # ``meter=False``: the shipped leg already counted the lexical
             # slot in the tally; this is the same slot scored differently, not
             # a second leg.
@@ -27761,10 +28250,16 @@ class TortoiseSDK:
                 # runs, and the snapshot keeps a deliberately LEAN projection
                 # (``fallback_snapshot._SNAPSHOT_QUERY`` — no session column),
                 # so a degraded hit still carries ``sessionId == ""`` and
-                # renders ``[session ?]``. Widening that cached corpus is the
+                # renders ``[session ?]``. #8658's four verbatim-provenance
+                # columns (``quote`` / ``source_turn_id`` / ``span_start`` /
+                # ``span_end``) are read here, so a DEGRADED hit carries none of
+                # them either and Slice A's own-source leg stays inert on that
+                # tier (``retrieval._is_own_source`` returns False on its empty
+                # quote). Widening that cached corpus is the
                 # same separate, policy-governed change
                 # ``search_provenance_enabled`` already declares for
-                # provenance — a declared boundary, not an oversight of #3804.
+                # provenance — a declared boundary, not an oversight of #3804
+                # or of #8658.
                 #
                 # R17 (``tests/test_assembly_sdk.py``): naming these rows is a
                 # DELIBERATE content change, so the assembly goldens were
@@ -27773,12 +28268,21 @@ class TortoiseSDK:
                 # #3804 is that record.
                 _prov = search_provenance_enabled()
                 _prov_cols = ", n.extractedFrom, n.createdAt" if _prov else ""
+                # #8658: the verbatim provenance columns Slice A (#2683) and the
+                # #2684 span surface key on. Read UNCONDITIONALLY (they are
+                # plain row properties of a Point — no extra join, no policy
+                # flag: they are what a distilled claim's source anchor IS), and
+                # folded into the hit PRESENT-ONLY, so an unprovenanced hit is
+                # byte-identical. Placed AFTER ``_prov_cols`` so the #3837
+                # provenance indices above never shift.
+                _prov_q = 9 if _prov else 7   # first #8658 column index
                 rows = graph.query(
                     "MATCH (n:Point) WHERE n.id IN $ids "
                     "OPTIONAL MATCH (sess:Session)-[:CONTAINS]->(n) "
                     "RETURN n.id, n.content, n.pointKind, "
                     "       coalesce(n.has_answer, false), n.sessionId, "
-                    "       n.session_id, sess.id" + _prov_cols,
+                    "       n.session_id, sess.id" + _prov_cols
+                    + ", n.quote, n.source_turn_id, n.span_start, n.span_end",
                     params={"ids": result_ids},
                 ).result_set
                 # A Point contained by MORE THAN ONE :Session yields one row
@@ -27800,11 +28304,30 @@ class TortoiseSDK:
                         "has_answer": bool(row[3]),
                         "sessionId": (row[4] or "") if len(row) > 4 else "",
                         # #3804: the snake spelling ``create_point(
-                        # session_id=…)`` writes — read here as the second
+                        # session_id=… )`` writes — read here as the second
                         # explicit identity source, never emitted raw (the
                         # wire key stays camel ``sessionId``).
                         "session_id": (row[5] or "") if len(row) > 5 else "",
                     }
+                    # #8658: verbatim provenance — PRESENT-ONLY, exactly like
+                    # the row's other optional fields. A falsy ``at``-style
+                    # empty quote and a null ``source_turn_id`` (FalkorDB
+                    # drops null props, #2949) mean the Point carries no
+                    # verbatim anchor, so NO key is added and the hit renders
+                    # / packages exactly as it did before. ``span_start == 0``
+                    # is a real address — presence, never truthiness.
+                    _quote = (row[_prov_q] or "") if len(row) > _prov_q else ""
+                    if _quote:
+                        entity_data[pid]["quote"] = _quote
+                    _turn = (row[_prov_q + 1]
+                             if len(row) > _prov_q + 1 else None)
+                    if _turn is not None and _turn != "":
+                        entity_data[pid]["source_turn_id"] = _turn
+                    for _off, _key in ((2, "span_start"), (3, "span_end")):
+                        if len(row) > _prov_q + _off:
+                            _v = row[_prov_q + _off]
+                            if _v is not None:
+                                entity_data[pid][_key] = _v
                     if _prov:
                         # Provenance (#3837): the Source/document ref and the
                         # capture time — additive, read ONLY when the flag is
@@ -28121,6 +28644,13 @@ class TortoiseSDK:
                 source_path=cap_source_path,
                 # A5 (#2070): stored evidence mark (additive in to_dict).
                 has_answer=pt.get("has_answer", False),
+                # #8658: the Point's verbatim provenance when the fetch found
+                # it — absent keys ⇒ the dataclass defaults ⇒ ``to_dict`` emits
+                # nothing, so an unprovenanced hit is byte-identical.
+                quote=pt.get("quote", ""),
+                source_turn_id=pt.get("source_turn_id"),
+                span_start=pt.get("span_start"),
+                span_end=pt.get("span_end"),
                 # Provenance (#3837): present only when the flag fetched it;
                 # SearchResult.to_dict emits the block only when set.
                 source_ref=pt.get("source_ref"),
@@ -31930,6 +32460,26 @@ class TortoiseSDK:
                     "`rebuild_all` to scrub them.", id_val, len(_denied), _denied)
         return _props
 
+    def _stored_source_document_kinds(self, g, id_val: str):
+        """EVERY `documentKind` the write below could overwrite (a list).
+
+        #5140: resolves with the SAME key discipline as the write (primary key
+        then secondary — `_source_reachable_by`'s rule and its #5196 rationale),
+        so a url-only STUB cannot hide a stored genre from the guard the way it
+        once hid its identity from the `:Source` allowlist.
+
+        A LIST, not one kind: `update_entity`'s write is
+        `MATCH (n:Source {key:$id}) SET n += $p`, which applies to EVERY
+        matching node, so the guard must answer for all of them (fail closed)
+        rather than for whichever row the engine happens to return first.
+
+        The reader itself lives in `quota.stored_source_document_kinds` because
+        the DOCUMENT writers (`EventAPI.add_document`, `_doc_write` below) read
+        the meter key too and cannot import the SDK; one reader, one key
+        discipline (#5140 review cycles 3-4).
+        """
+        return stored_source_document_kinds(g, id_val)
+
     def _source_reachable_by(self, g, id_val: str) -> int:
         """Count the `:Source` nodes the WRITE below would reach for `id_val`.
 
@@ -32104,6 +32654,17 @@ class TortoiseSDK:
             # itself satisfied.
             _is_source = self._source_reachable_by(self._get_proj().g, id_val)
             if _is_source:
+                # #5140 P1: the `documents` METER KEY (#1726 predicate) cannot
+                # be demoted through the generic entity surface either — it
+                # merges the SAME `:Source` node `create_source` does, so a
+                # guard on one door and not the other is decoration (#5135's
+                # third-door lesson). Presence-tested first for the same reason
+                # as the `create_source` call above.
+                if "documentKind" in props or "document_kind" in props:
+                    _refuse_document_kind_demotion(
+                        self._stored_source_document_kinds(
+                            self._get_proj().g, id_val),
+                        props, surface="update_entity", none_demotes=True)
                 _managed = sorted(k for k in props if k in _SOURCE_SERVER_MANAGED_PROPS)
                 if _managed:
                     # #3998: the STATE and the merge TOKEN are refused through the
@@ -34808,6 +35369,20 @@ class TortoiseSDK:
             "suppress_embedding": True,
             "topics": topics,
         }
+        # #5140 P1 (review cycle 3): the DOCUMENT writer may not demote an
+        # existing document out of the metered `documents` set. `doc_kind`
+        # comes from a TENANT-CONTROLLED file's frontmatter `type:`, and the id
+        # is DERIVED from the path (`derive_document_id`), so editing one line
+        # of one file and re-indexing reached the SAME `:Source` and rewrote
+        # its genre — the resume fast-skip is keyed on (size, mtime), so an
+        # edited file is WRITTEN, not skipped. Runs BEFORE the journal append
+        # (`_emit_event` is the commit point), so a refusal leaves nothing to
+        # replay. The fold's CASE clause would drop the value silently; this
+        # refuses it loudly, because `/v1/index/docs` reporting a document as
+        # re-indexed while the graph kept the old genre is exactly the
+        # silent-no-op the SDK guards refuse (#5140 review cycle 3).
+        refuse_document_writer_demotion(
+            proj.g, doc_id, ev["document_kind"], surface="_doc_write")
         if frontmatter.get("domain") is not None:
             ev["domain"] = str(frontmatter["domain"])
         # ── #5475 (residual): ``document_kind`` comes from FRONTMATTER ──
@@ -35873,6 +36448,17 @@ class TortoiseSDK:
                 "discriminator and cannot be set via props — it is set only "
                 "by the session-capture writer (#5097)."
             )
+        # #9451: its sibling on the same record — `True` declares the record's
+        # `ingestedAt` to be the instant the write STORED, which the fold's ON
+        # MATCH arm then applies. Same class: a forged key moves a `:Source`'s
+        # `ingestedAt` on every replay. Same hard-reject; the ONE producer is
+        # the session-capture writer's own `_emit_event` call.
+        if "_ingestedAtStored" in props:
+            raise ValueError(
+                "'_ingestedAtStored' is a server-managed journal discriminator "
+                "and cannot be set via props — it is set only by the "
+                "session-capture writer (#9451)."
+            )
         # #3998 (D30): the LOUD half of the payload guard. The guarantee itself
         # is the CLOSED :Source property surface in `projection/entities.py`
         # (`_SOURCE_EXTRA_PROPS`), which is the only form that can hold — a
@@ -35947,6 +36533,20 @@ class TortoiseSDK:
         for _emit_name in (*_RESERVED_ENVELOPE_PROPS, *_RESERVED_EMIT_CALL_PROPS,
                            *_RESERVED_ACTOR_PROPS):
             ev.pop(_emit_name, None)
+        # #5140 P1: the documents METER KEY is not caller-writable IN THE
+        # DEMOTION DIRECTION. Runs BEFORE the journal append below, so a
+        # refused write leaves no record to replay.
+        # ⛔ The PRESENCE test is hoisted out of the helper on purpose: the
+        # stored-kind read is a graph round trip (plus `_resolve_source_url`'s
+        # own), and `documentKind` is absent on essentially every producer
+        # (`_index_source_merge` calls this per file), so an unconditional
+        # lookup would put 2-3 queries on the hottest `:Source` write path and
+        # a new pre-write failure mode — for a key nobody supplied.
+        if "documentKind" in ev or "document_kind" in ev:
+            _refuse_document_kind_demotion(
+                self._stored_source_document_kinds(
+                    self._get_proj().g, self._resolve_source_url(url)),
+                ev, surface="create_source")
         if is_episodic is not None:
             # #1488: server-managed quota discriminator — explicit param only
             # (mirrors create_point). The props passthrough is rejected above.
@@ -37123,20 +37723,30 @@ class TortoiseSDK:
                 ⚠️ The alias is NOT equivalent to ``"Source"`` for the caller:
                 it also selects the DERIVATION relation, so the link takes the
                 optional ``sourceVersion`` anchor described below, while
-                ``"Source"`` means referential containment and stays
-                property-free. Pass ``"Document"`` when the link's meaning is
+                ``"Source"`` means referential containment and carries no
+                ``sourceVersion``. Pass ``"Document"`` when the link's meaning is
                 "this target was read from that source".
             source_kind: sourceKind to set on auto-created Source (default: "document")
 
         Anchor (#5199): a DERIVATION link (``Event`` | ``Document``) records the
         source version its target was read from as an optional ``sourceVersion``,
         read HERE from the source's own ``contentHash`` so no caller passes it and
-        this signature is unchanged. Written ``ON CREATE`` only. ``Object`` links
-        stay property-free. See ``docs/architecture/STORAGE-ARCHITECTURE.md`` §9.6.
+        this signature is unchanged. Written ``ON CREATE`` only. ``Object``
+        (identity/mention) and ``Source`` (containment) links carry no
+        ``sourceVersion`` — the ruling scopes the claim to the ANCHOR, not to a
+        general emptiness claim on those edges, so do not restate it as "these
+        links are property-free". See ``docs/architecture/STORAGE-ARCHITECTURE.md``
+        §9.6.
 
         Raises:
             ValueError: if entity_label is not one of Source, Event, Object
                 (Action was dissolved in Ontology v3.0).
+
+        A ``Source`` target that resolves to the SAME node as ``source_url``
+        writes NO ``references`` self-loop (#5151): since D10 a document is a
+        ``:Source``, so equal keys collapse source and entity onto one node, and
+        the guard lives in the projection writer where the edge is written — the
+        ``:Source`` itself is still merged, unchanged.
         """
         proj = self._get_proj()
         # ── #5475 (residual): the SECOND writer of ``sourceKind`` ──

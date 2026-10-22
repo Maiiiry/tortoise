@@ -13,12 +13,14 @@ Covers plan checks #1-#10 (T7 of docs/plans/2026-08-08-657-legal-pages-plan.md):
       half only. /signin and /welcome are NOT in either set: both redirect to
       /auth, which is already covered.
   #5  company-host redirects, split by ORIGIN (#4054): the tortoise-only pages
-      (docs, FAQ, security, self-hosted, the 5 legal pages, aviso-privacidad,
-      signin) 301 → the exact tortoise host URL (canonical consolidation,
-      2026-08-17); the app-only pages (auth, signup, welcome, invite-accept)
+      (docs, FAQ, security, self-hosted, the 4 legal pages, signin) 301 → the
+      exact tortoise host URL (canonical consolidation, 2026-08-17); the
+      app-only pages (auth, signup, welcome, invite-accept)
       301 → app.premiselabs.co on EVERY host, because this project no longer
       holds their assets. Dev/preview keep the tortoise-only pass-through
-      (200), and the tortoise-host copies 200 (gated).
+      (200), and the tortoise-host copies 200 (gated). `aviso-privacidad` was
+      RETIRED in #9486 and now 301s to `/privacy` on every host — it is no
+      longer a canonical-consolidation subject, and its hop has its own test.
   #6  middleware root rewrites — tortoise.* → product marker,
       premiselabs.co → index marker (gated)
   #7  same-viewport acceptance (.legal-accept vs .providers + #btn-submit at
@@ -151,6 +153,32 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # noqa: 
 # ── Tortoise-host check contract (cycle-4 P2-1). ───────────────────────────
 TORTISE_HOST_CHECK = os.environ.get("TORTISE_HOST_CHECK") == "1"
 
+# ── Product-root marker (cycle-4 P2-2; re-cut by PR #9652). ───────────────
+# The tortoise host serves `website/product.html` at `/` (the
+# `functions/_middleware.ts` rewrite), so this marker is how the suite proves
+# the rewrite happened. It is deliberately STRUCTURAL — an attribute on the
+# page's `<html>` element, not marketing copy.
+#
+# ⛔ This constant is a CI CONTRACT with TWO other surfaces; move all three or
+# none:
+#   1. `.github/workflows/deploy-pages.yml` — the `verify-legal` DNS preflight
+#      greps the served root for this exact string before exporting
+#      `TORTISE_HOST_CHECK=1`. Its miss branch is a `::warning::`, so a stale
+#      marker SKIPS the tortoise-host half of this suite (green), it does not
+#      red it.
+#   2. `tests/test_website_static.py::TestProductRootMarkerContract` — pinned so
+#      the two strings cannot drift, the marker still occurs in the committed
+#      page, and it stays structural.
+# The pin used to be the hero `<h1>` ("Agent memory that"); PR #8597 and PR
+# #9652 each had to move it, and a hero rewrite is what would break it next.
+# Attribute markers are stripped by `_clean()`, so read the RAW document when
+# asserting it (see `_assert_serves_product`).
+#
+# ⛔ Bound BEFORE `TORTISE_EMULATED` below: that module-level call reads this
+# name, and its own bare `except Exception` would swallow the resulting
+# NameError into a constant `False` (canary silently dead on every local run).
+PRODUCT_ROOT_MARKER = 'data-page="product"'
+
 # ── Third-party external-link crawl gate (cycle-8 P1, #747 CI) ────────────
 # The crawl fetches unauthenticated third-party hrefs (github.com/LICENSE,
 # etc.). From shared CI runner IPs those hosts rate-limit aggressively (429
@@ -163,6 +191,26 @@ EXTERNAL_CRAWL_SKIP = pytest.mark.skipif(
     "third-party fetches from shared runner IPs are rate-limit flaky) — "
     "run locally for the full crawl",
 )
+
+
+def _assert_serves_product(body: str, where: str) -> None:
+    """The served document is `product.html` — asserted on the RAW body.
+
+    The marker is a structural attribute on the root element
+    (`data-page="product"`), so a hero rewrite cannot move it; `_clean()`
+    strips tags and therefore strips attributes too, which is why this reads
+    `body` rather than the cleaned text.
+
+    The message names both causes on purpose: a stale marker reported as
+    "middleware rewrite broken" blames the wrong file for a copy edit
+    (PR #9652 review, P1).
+    """
+    assert PRODUCT_ROOT_MARKER in body, (
+        f"{where}: the root document is not product.html — marker "
+        f"{PRODUCT_ROOT_MARKER!r} is absent. Either the middleware rewrite is "
+        "broken, or website/product.html's identity moved (then move the "
+        "marker in PRODUCT_ROOT_MARKER, the deploy-pages.yml preflight and "
+        "tests/test_website_static.py::TestProductRootMarkerContract).")
 
 
 def _tortoise_emulated_locally() -> bool:
@@ -219,8 +267,6 @@ PRIVACY_DRAFT = DRAFTS_DIR / "2026-08-08-657-privacy-draft.md"
 
 LEGAL_PAGES = ("/privacy", "/tos", "/license", "/dpa", "/security")
 FOOTER_LINK_HREFS = ("/privacy", "/tos", "/license", "/dpa", "/security")
-PRODUCT_ROOT_MARKER = "Agent memory that"
-PRODUCT_ROOT_MARKER_LOWER = PRODUCT_ROOT_MARKER.lower()
 FOOTER_SELECTOR = "footer, .legal-footer, .footer"
 # The ABSOLUTE canonical Pricing Page URL (reviewer P2): the relative
 # '/#pricing-section' form breaks on premiselabs.co, where '/' serves index.html
@@ -250,7 +296,11 @@ PINNED_CANONICAL = {
     "eligibility": "you must be at least 18 years old",
     "carve-outs": "statutory/gdpr liability, fraud, and willful misconduct are not capped by this limitation of liability section",
     "fees": "we may charge fees for the service based on a combination of subscription, usage-based (metered), and/or per-seat pricing, as defined by the pricing tiers published on the pricing page",
-    "art27": "we are not currently established in the eu/eea. if we become subject to gdpr art. 27, we will designate and disclose an eu representative here.",
+    # Qualified to "EU GDPR Art. 27" in #9486: the policy now DEFINES "the GDPR"
+    # as the UK GDPR (plus the EU GDPR where relevant), so an unqualified
+    # "GDPR Art. 27" would read as UK GDPR Art. 27 — which requires a UK
+    # representative, not an EU one.
+    "art27": "we are not currently established in the eu/eea. if we become subject to eu gdpr art. 27, we will designate and disclose an eu representative here.",
     "consent-banner": "you can give or withdraw consent at any time via the consent banner",
     "repo-state": "no analytics tools are currently deployed",
     "posthog-processor": "posthog is a data processor; data is stored in the united states",
@@ -712,7 +762,7 @@ def test_tortoise_host_footer_half(page: Page) -> None:
     resp = page.request.get(TORTISE_HOST + "/", headers={"Host": spoof}, timeout=15_000)
     assert resp.status == 200, f"tortoise host root returned {resp.status}"
     body = resp.text()
-    assert PRODUCT_ROOT_MARKER in body, "tortoise root does not serve product.html"
+    _assert_serves_product(body, "tortoise host root (footer half)")
     _footer_links_present(body)
 
 
@@ -751,7 +801,7 @@ def test_tortoise_root_links_to_the_blog(page: Page) -> None:
     resp = page.request.get(TORTISE_HOST + "/", headers={"Host": spoof}, timeout=15_000)
     assert resp.status == 200, f"tortoise host root returned {resp.status}"
     body = resp.text()
-    assert PRODUCT_ROOT_MARKER in body, "tortoise root does not serve product.html"
+    _assert_serves_product(body, "tortoise host root (blog entry point)")
     assert _has_blog_entry(body), (
         "tortoise.premiselabs.co/ carries no /blog entry point (#3950) — this is the "
         "exact page the owner reported as unreachable. It must offer the blog in the "
@@ -768,9 +818,10 @@ def test_company_host_legal_pages_redirect_to_tortoise(page: Page) -> None:
     """UNCONDITIONAL consolidation half (#5, 2026-08-17), split by ORIGIN in
     #4054.
 
-    TORTOISE_ONLY (docs, FAQ, security, self-hosted, the 5 legal pages,
-    aviso-privacidad, signin, design-partners-intro, investors) is canonical on
-    tortoise.premiselabs.co.
+    TORTOISE_ONLY (docs, FAQ, security, self-hosted, the 4 legal pages,
+    signin, design-partners-intro, investors) is canonical on
+    tortoise.premiselabs.co. `aviso-privacidad` was retired in #9486 (it now
+    301s to /privacy — `test_retired_aviso_redirects_to_privacy`).
     APP_ONLY (auth, signup, welcome, invite-accept) moved to the APP origin —
     the BFF and the three pages it serves live in the `tortoise-dashboard`
     project — so those 301 to app.premiselabs.co, NOT to the tortoise host.
@@ -785,8 +836,12 @@ def test_company_host_legal_pages_redirect_to_tortoise(page: Page) -> None:
     /auth, which then lands on the app origin.
     """
     prod_company = urlsplit(BASE_URL).hostname == "premiselabs.co"
+    # `/aviso-privacidad` LEFT this tuple in #9486: the Spanish LFPDPPP notice was
+    # retired (the controller is UK-resident), so the route 301s to `/privacy`
+    # rather than to the tortoise host — `test_retired_aviso_redirects_to_privacy`
+    # pins that hop instead.
     tortoise_only = ("/docs", "/faq", "/security", "/self-hosted", "/privacy",
-                     "/tos", "/license", "/dpa", "/aviso-privacidad", "/signin",
+                     "/tos", "/license", "/dpa", "/signin",
                      "/design-partners-intro", "/investors")
     app_only = ("/auth", "/signup", "/welcome", "/invite-accept")
 
@@ -821,6 +876,66 @@ def test_company_host_legal_pages_redirect_to_tortoise(page: Page) -> None:
             )
 
 
+def test_retired_aviso_redirects_to_privacy(page: Page) -> None:
+    """#9486: the Spanish LFPDPPP notice is RETIRED — every URL shape 301s to
+    /privacy, and none 404s.
+
+    The controller's jurisdiction of residence is the United Kingdom, so a
+    Mexican LFPDPPP notice has no basis (and asserting one alongside a UK GDPR
+    policy is a false statement, not a harmless extra). The file is gone, but a
+    retired legal route still has inbound links in archived copies of the site,
+    search results and old contract correspondence — so all THREE shapes are
+    pinned. `/aviso-privacidad/` and `/aviso-privacidad.html` were separately
+    reachable URLs before the retirement, and pinning only the bare path would
+    let either of them start returning a 404 unnoticed.
+
+    The FIRST hop is asserted on every host; the terminal hop is gated by
+    TORTISE_HOST_CHECK on a production company-host run, because following the
+    chain lands on the tortoise host (see the in-test comment).
+    """
+    prod_company = urlsplit(BASE_URL).hostname == "premiselabs.co"
+    # On the COMPANY host the middleware normalizes the `.html` away and strips
+    # the trailing slash, so all three shapes consolidate to this ONE canonical
+    # path; on every other host it passes through and `_redirects` answers each
+    # shape separately.
+    consolidated = TORTISE_HOST + "/aviso-privacidad"
+    # Exact accepted first hops — a bare `endswith("/privacy")` would also accept
+    # `https://anything.example/privacy`.
+    privacy_hops = {"/privacy", TORTISE_HOST + "/privacy"}
+    for path in ("/aviso-privacidad", "/aviso-privacidad/", "/aviso-privacidad.html"):
+        r = page.request.get(BASE_URL + path, timeout=15_000, max_redirects=0)
+        assert r.status == 301, f"{path} on {BASE_URL} → {r.status} (expected a 301)"
+        location = r.headers.get("location") or ""
+        # TWO legitimate first hops, and the assertion accepts exactly those two
+        # rather than "anything that ends in /privacy":
+        #   · the `_redirects` rule answered → lands on /privacy;
+        #   · the company host consolidated to the canonical host first (the
+        #     middleware's canonical-host entry is deliberately KEPT) → the
+        #     canonical PATH, whose own next hop is /privacy.
+        assert location in privacy_hops or location == consolidated, (
+            f"{path} redirects to {location!r} — expected one of "
+            f"{sorted(privacy_hops)} or {consolidated}"
+        )
+        # …and the chain terminates on the actual policy, not a loop or a 404.
+        # FOLLOWING the chain crosses into the tortoise host on a production run,
+        # which is exactly what TORTISE_HOST_CHECK owns (#1151/#1190: an
+        # unguarded tortoise-host assertion reds verify-legal on every deploy
+        # whose DNS has not propagated). The first-hop half above stays
+        # unconditional — its accepted targets are constants.
+        if prod_company and not TORTISE_HOST_CHECK:
+            continue
+        final = page.request.get(BASE_URL + path, timeout=15_000)
+        assert final.status == 200, f"{path} resolved to {final.status}, not 200"
+        final_url = urlsplit(final.url)
+        assert final_url.path.rstrip("/") == "/privacy", (
+            f"{path} terminated at {final.url!r} — expected the PATH /privacy "
+            f"(a suffix match would also accept https://anywhere.example/privacy)"
+        )
+        assert "Privacy Policy" in final.text(), (
+            f"{path} does not land on the Privacy Policy"
+        )
+
+
 @TORTOISE_HOST_SKIP
 def test_cross_host_privacy_and_tos_200(page: Page) -> None:
     """The canonical host (tortoise.premiselabs.co) serves the legal pages
@@ -846,8 +961,7 @@ def test_middleware_root_rewrites(page: Page) -> None:
     t_spoof = t_host if t_host.startswith("tortoise.") else "tortoise.premiselabs.co"
     r = page.request.get(TORTISE_HOST + "/", headers={"Host": t_spoof}, timeout=15_000)
     assert r.status == 200
-    assert PRODUCT_ROOT_MARKER_LOWER in _clean(r.text()), \
-        "tortoise root marker missing (middleware rewrite broken)"
+    _assert_serves_product(r.text(), "tortoise root (middleware rewrite)")
 
     b_host = urlsplit(BASE_URL).hostname or "premiselabs.co"
     b_spoof = b_host if b_host.endswith("premiselabs.co") else "premiselabs.co"
@@ -879,8 +993,7 @@ def test_product_served_on_tortoise_host(page: Page) -> None:
     t_spoof = t_host if t_host.startswith("tortoise.") else "tortoise.premiselabs.co"
     r_t = page.request.get(TORTISE_HOST + "/", headers={"Host": t_spoof}, timeout=15_000)
     assert r_t.status == 200
-    assert PRODUCT_ROOT_MARKER_LOWER in _clean(r_t.text()), \
-        "tortoise root must still serve the product page"
+    _assert_serves_product(r_t.text(), "tortoise root (product page served)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1130,7 +1243,7 @@ def test_crawl_tortoise_root_serves_product(page: Page) -> None:
     resp = page.request.get(TORTISE_HOST + "/", headers={"Host": spoof}, timeout=15_000)
     assert resp.status == 200, f"tortoise root → {resp.status}"
     body = resp.text()
-    assert PRODUCT_ROOT_MARKER in body
+    _assert_serves_product(body, "tortoise root (crawl)")
     _footer_links_present(body)
 
 

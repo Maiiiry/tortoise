@@ -273,6 +273,15 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     "test_event_provenance.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])'],
     "test_entity_key_expansion.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])',
                                       r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],  # #2518 entity-key expansion: module live-FalkorDB probe (DELIBERATE_URI) + per-test docker force
+    # #8658: the product hit's provenance keys. Module-level live-FalkorDB probe
+    # (set + save/restore in `finally` at import, so nothing leaks — the raw-site
+    # restoration guard is satisfied; DELIBERATE_URI because the probe IS what
+    # asserts the docker/FTS lane is reachable, and a URI-less run would prove
+    # nothing about a read path that only exists there) + a per-test
+    # `monkeypatch.setenv` fresh-graph fixture (setenv IS the test input — each
+    # test gets its OWN graph, auto-restored at teardown).
+    "test_8658_product_hit_provenance.py": [r'os\.environ(?:\["TORTOISE_DB_URI"\]\s*=|\.pop\(\s*["\']TORTOISE_DB_URI["\']|del\s+os\.environ\[["\']TORTOISE_DB_URI["\']\])',
+                                              r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'],
     # C6 #2520: time-aware query expansion — module-level live-FalkorDB probe
     # (set + restore) + per-test fresh-graph fixture (the test_coverage_loop
     # pattern; the monkeypatch.setenv auto-restores).
@@ -662,6 +671,15 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # (#9089 review) — and, had ruff allowed it, this row winning would have
     # silently RE-WIDENED the exemption `main` narrowed. Removing it changes no
     # exemption: `main`'s row covers the site.
+    # #5052/#7871: the claim pilot's CLI contract test delenvs the store URI (and
+    # the hosted URL) to exercise the UNSET-STORE REFUSAL — `main acquire` must
+    # return rc 2 ("cannot answer") rather than let the SDK fall back to a default
+    # target, where an empty read is indistinguishable from "nobody holds this".
+    # DELIBERATE_EMBEDDED_LANE: no graph is ever reached — the tool refuses BEFORE
+    # any query — so nothing rides the URI and no docker-half coverage is claimed.
+    # The `monkeypatch` arg is function-scoped and auto-restores (no lane leak).
+    "test_work_claim.py": [
+        r'monkeypatch\.delenv\(\s*"TORTOISE_DB_URI"'],
 }
 
 # Carve-out TEST-MODULE stems (Task 5 wires these into TEST_NO_REDIRECT_STEMS;

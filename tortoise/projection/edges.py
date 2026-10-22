@@ -124,7 +124,9 @@ def _mint_subject_stub(g, name: str) -> None:
     )
 
 
-def _mint_source_stub(g, url: str, source_kind: str | None = None) -> str | None:
+def _mint_source_stub(
+    g, url: str, source_kind: str | None = None, now: str | None = None,
+) -> str | None:
     """MERGE the Source stub _link_source creates — single create path for live
     + replay (mirror _link_source's ON CREATE exactly: title=url, empty
     contentHash, ingestedAt now; session: refs carry is_episodic=true so the
@@ -146,6 +148,15 @@ def _mint_source_stub(g, url: str, source_kind: str | None = None) -> str | None
     correct, and the eval ingest lane (which never materializes session sources)
     stops mislabelling every session Source as a document. Callers that know
     better still pass it explicitly.
+
+    ``now`` (#8501) is the capture's OWN instant. The capture path calls this
+    stub mint FIRST now (before extraction), so for a capture that creates no
+    Point this mint is the ONLY writer of ``ingestedAt`` — and its twin
+    ``SourceCreated`` record carries the capture's instant. Minting from
+    ``_now_iso()`` there would put a LATER clock on the live node than the
+    replay folds in, a live≠replay divergence on a path (a keyless capture) that
+    previously had none. ``None`` keeps the historical clock read for every
+    other caller.
     """
     if source_kind is None:
         source_kind = "agentSession" if str(url).startswith("session:") else "document"
@@ -159,7 +170,7 @@ def _mint_source_stub(g, url: str, source_kind: str | None = None) -> str | None
         return None
     canonical = normalize_source_url(key)
     params = {"url": key, "raw_url": url, "cu": canonical,
-              "sk": source_kind, "now": _now_iso()}
+              "sk": source_kind, "now": now or _now_iso()}
     ep_clause = ""
     if str(key).startswith("session:"):
         params["ep"] = True
@@ -404,8 +415,8 @@ def about_document_target_reason(label: str | None,
 # `Object` is deliberately ABSENT. Every in-repo writer of a Source→Object
 # `references` link is identity/mention — a connector artifact whose Source `url`
 # IS the artifact — so a version there would be a non-answer, not a stale mark.
-# Referential-containment links (Source→Source) stay property-free: a `"Source"`
-# caller lands in the property-free branch below, and the in-repo containment
+# Referential-containment links (Source→Source) carry no `sourceVersion`: a "Source"
+# caller lands in the un-anchored branch below, and the in-repo containment
 # writers (the session→external MERGE in `hosted_api.py`) write them outside this
 # method. `references` is in NEITHER `STRUCTURAL_REL_LABELS` nor
 # `DERIVABLE_STRUCTURAL_RELS`, so this anchor adds nothing to the replay surface.
@@ -2001,9 +2012,50 @@ class _EdgeHandlers:
         (``entity_label`` in ``_DERIVATION_REFERENCES_LABELS``) records the version
         it was read from as ``sourceVersion`` — the source's current
         ``contentHash``, read HERE so that no caller passes it and the public SDK
-        signature is unchanged. Identity/mention links (``Object``) stay
-        property-free. Written ``ON CREATE`` only: a re-link must NOT advance the
-        recorded version, or staleness would silently read as current.
+        signature is unchanged. Identity/mention links (``Object``) carry no
+        ``sourceVersion`` — this writer sets no property on them at all (the
+        non-derivation branch is a bare ``MERGE``), which is why nothing here
+        needs a version anchor. Written ``ON CREATE`` only:
+        a re-link must NOT advance the recorded version, or staleness would
+        silently read as current.
+
+        ⛔ NO SELF-LOOP (#5151). A source and a ``Source`` entity are the SAME
+        ``:Source`` node when their keys are equal, so the edge would be
+        ``(:Source {url:'X'})-[:references]->(:Source {url:'X'})`` — a node
+        referencing itself, which states nothing (ONTOLOGY §3.4's ``references``
+        is source→entity containment/derivation). Before D10 the two sides were
+        different LABELS and equal keys could not degenerate; D10 made a document
+        a ``:Source``, which made it reachable. The guard is HERE, not in the
+        callers, because a caller-side ``if ref and ref != did`` is defeated by
+        two things a caller cannot see:
+
+        * key RESOLUTION — ``resolve_source_key`` maps a URL variant
+          (``…/a/?utm_source=x``) onto the node stored as ``…/a``, so the raw
+          spellings differ while the RESOLVED key equals the entity id (measured:
+          the caller-side guard passes it through and the edge is a self-loop);
+        * the next caller — every new ``Source``→``Source`` writer would have to
+          re-derive the same rule, and #5140 showed what a misplaced guard costs
+          in the other direction: the *legacy* no-``source_url`` path silently
+          minted no edge at all, repaired by re-pointing ``get_provenance_chain``'s
+          reader.
+
+        SCOPE, precisely: only the ``references`` MERGE is suppressed. The
+        ``:Source`` MERGE above still runs (every property it sets, including the
+        ``sourceKind``/``canonicalUrl``/``urlAliases`` bookkeeping, is unchanged),
+        because collapsing source and entity onto one node leaves the NODE right
+        and only the EDGE degenerate — the same suppression shape as
+        ``_upsert_document``'s and ``session_source_migration``'s. Nothing is
+        dropped that a reader needs: the node IS its own provenance, which is what
+        ``get_provenance_chain`` already serves for the collapsed path, and live
+        and replay now agree (a journaled ``DocumentCreated`` whose ``source_url``
+        equals its document id no longer mints a self-loop on ``rebuild_all``).
+
+        ⚠️ Deliberately NOT narrowed to "``references`` is a Source→Source
+        predicate": its target set is legitimately ``Event`` | ``Object`` |
+        ``Source`` (docs/ONTOLOGY.md §3.4), so a Source-only declaration would
+        reject legal links. The degenerate class is SAME-NODE, not same-label —
+        which is why the guard tests identity and the ``Event``/``Object`` labels
+        (where an equal ``id`` string addresses a DIFFERENT node) are untouched.
 
         Raises:
             ValueError: if entity_label is not one of Source, Event, Object
@@ -2017,7 +2069,8 @@ class _EdgeHandlers:
         # derivation link and would silently stop being anchored (caught by
         # ``test_document_link_records_the_version_read``). Anchoring by the
         # remapped label instead would wrongly stamp every ``Source -> Source``
-        # referential-containment link, which the model keeps property-free.
+        # referential-containment link, which the model leaves without a
+        # ``sourceVersion`` anchor.
         _is_derivation = entity_label in _DERIVATION_REFERENCES_LABELS
         if entity_label == "Document":
             # D10: :Document is retired — a document is a :Source. Kept as a
@@ -2058,6 +2111,21 @@ class _EdgeHandlers:
         # D10: a document is a :Source, and a Source resolves by ``url`` (not
         # ``id``) — the same identity key the label moved with.
         key_clause = "{url:$eid}" if entity_label == "Source" else "{id:$eid}"
+        # #5151: the self-loop guard, at the CHOKE POINT (read this method's
+        # docstring paragraph "NO SELF-LOOP" for why not in the caller). Both
+        # endpoints of a ``Source`` entity MATCH are ``{url: …}``-keyed, and ``url``
+        # is single-valued, so ``key == entity_id`` IS node identity here — no
+        # second read, no race. Scoped to ``Source`` because for
+        # ``Event``/``Object`` the target is matched on ``{id: …}`` under a
+        # DIFFERENT label, so an equal string addresses a distinct node and the
+        # edge is legitimate.
+        # Deliberately NOT logged: there is no link to lose (source and entity are
+        # one node), so this is the ordinary case, not a degraded one — a warning
+        # here would fire on every collapsed-provenance write and train readers to
+        # ignore it, the direction `_count_about_out`'s ``wired`` count errs away
+        # from for the same reason.
+        if entity_label == "Source" and key == entity_id:
+            return
         if _is_derivation:
             self.g.query(
                 f"MATCH (s:Source {{url:$url}}), (e:{entity_label} {key_clause}) "
@@ -2083,8 +2151,8 @@ class _EdgeHandlers:
         and ``graph-scripts/backfill_references.py`` are not provenance writers and are
         not auto-anchored; nor are the CONTAINMENT writers — the session->external
         link in ``hosted_api.py`` and the connector ``Source``->``Object`` link in
-        ``projection/entities.py`` — which are deliberately left property-free; see
-        ``STORAGE-ARCHITECTURE.md`` §9.6).
+        ``projection/entities.py`` — which are deliberately left without a
+        ``sourceVersion`` anchor; see ``STORAGE-ARCHITECTURE.md`` §9.6).
 
         ``source_key`` is passed through AS the Source key — callers pass the same
         value they used for the Source MERGE, so this adds no new resolution step.

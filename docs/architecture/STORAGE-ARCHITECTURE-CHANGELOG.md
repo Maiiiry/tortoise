@@ -247,10 +247,20 @@ revision, which is what this file is for.
 - `STORAGE-ARCHITECTURE.md:1335` — | §17.3 the residency router | `#7953` ✅ built 2026-10-13 | a residency miss is not an insufficiency: fetch from the truth store, never escalate a tier, never surface an absence. Decidabl…
 - `STORAGE-ARCHITECTURE.md:1336` — | §17.4 the two-store cost model | `#7954` | price both stores (Postgres compute + disk and FalkorDB RAM) plus the blended total §5–§6 omit |
 - `STORAGE-ARCHITECTURE.md:1337` — | §17 the five gaps | `#7951` (17.1) · `#7952` (17.2) · `#7953` (17.3) · `#7954` (17.4) · `#7955` (17.5) · `#7967` (the surface map) | what the record/cache split still needs: a write-pat…
+- `tests/test_7948_about_object_read_sites.py` · `tests/_about_call_time_census.py` — **ONE derivation, ONE register for the empty-pattern class (2026-10-22, `#9493`).** The `#9400` remerge left the class derived twice: the guard's own `_EXCLUDED_UNTYPED` (bracket-only, module-keyed, nine entries) beside `tests/_about_call_time_census.py`'s `EMPTY_PATTERN` (both spellings, symbol-keyed, nineteen entries), and the two disagreed on 24 of their 26 key spellings while §13 called the support register *"the guard's `EMPTY_PATTERN` register (nineteen members today)"* — wrong twice — and this changelog's fifth-pass row named the other. Measured before the fold: every site the guard's derivation found is found by the support derivation (24 symbol keys over the same 36 sites), and the support derivation sees what the guard's could not — the bracket-less `(n)--()` member that was live and undeclared while only the bracketed form derived. The guard's duplicate derivation, its register and its two arms are deleted; the comprehension rule (a pattern comprehension enumerates the edges it walks, so its bracket is a read whatever clause introduces it) moved into `_is_empty_pattern_read`, and the `_in_pattern_comprehension` predicate moved with it so the literal classifier and the empty-pattern walk share ONE definition. The whole-package derivation is unchanged by the move (24 entries / 36 sites, measured before and after, and again on this tree after `#9503`'s `AnnAssign` attribution landed), and a walk split across string parts still enters the census through the consumer the resolver follows. **Ten `EMPTY_PATTERN` entries went with the fold as dead:** the backup family, the graph export, the delete preview, the replay, the v2.5 backfill, the operator promotion and the hub-degree count are §13 ROWS since the third and fifth passes, and an entry beside a row makes opposite claims at once — `test_no_empty_pattern_entry_is_also_a_row` reds any regrowth, `test_no_empty_pattern_entry_outlives_its_site` still holds the stale direction, and `test_a_comprehension_only_walk_derives` pins the moved rule on a synthetic source. §13 now names the one register and where it lives.
+- `tests/_about_call_time_census.py` · `tests/test_7948_about_object_read_sites.py` — **the folded register's REASONS are checked against their code, and the file gate admits a part-assembled walk (2026-10-22, `#9493`).** Three repairs to the fold's VERIFICATION; the derivation itself is measured unchanged (24 symbols / 36 sites, 20 named, 11 call-time, before and after). (1) **An entry is now `(file, symbol, why, facts)`** and `test_every_empty_pattern_entry_states_a_true_fact` asserts each fact inside the symbol's own span — plus the body of any module-level constant that span NAMES, because three entries live in a query constant their body executes (`_DEGREE`, `_OUT_TYPES`/`_IN_TYPES`). Before this arm the prose was the register's only record of *why* and nothing read it: retyping `session_source_migration._OUT_TYPES` from `(old:Source {url:$u})` to `(old)`, or dropping `:Subject` from `sdk.provenance`, made the walk start observing an `aboutObject` edge while all 35 arms stayed green. Both mutations now red naming that symbol. (2) **Two of the nine reasons were FALSE about their own code** and are re-derived with the rest: `hosted_api._load_commit_graph_state` does not *"rewire every edge type it finds"* — its one untyped bracket is followed by `WHERE type(r) IN ['IMPL','NAND']` (type-restricted) and its docstring states the state is computed in memory, nothing written; `projection/entities._materialize_connector_source` does not *"rewire the node's edges by type"* — it is a degree COUNT, `size([(old)-[x]-(y) | x])`, anchored on a `:Source`. §13's enumeration of the legal grounds gains the third one an entry actually rests on — a structural degree/existence test that returns no edge (`domain_validators.validate_chain_integrity`'s `AND NOT (n)--()`, whose source IS a `Point`) — which a two-ground sentence did not admit. (3) **`_may_traverse_every_type` admitted only the one-literal spelling**: measured, `"MATCH (n)-" + "[r]->(m)"` and `"MATCH (n)-[r]" + "->(m)"` both returned `False` while `"MATCH (n)-[x]->(m)"` returned `True`, so the module was dropped before the resolver — which folds `ast.BinOp/Add` and DOES derive the site — ran; latent on today's corpus, which is why `test_the_file_filter_un_sees_nothing` cannot see it. `_SPLIT_TRAVERSAL` admits both, anchored on a bracket that opens with a NAME and carries no comma or quote followed by the `-` every Cypher traversal puts after its `]` — the unanchored form admitted 61 extra modules for a byte-identical derivation, this one admits 17. Four properties that lost their fixtures with the retired guard's case table are pinned while here: `_SITE_ALIASES` is grounded on BOTH halves (the row key in §13, the target in `_empty_pattern_sites()`), a part-assembled walk is DERIVED (not merely admitted), `[r*1..2]` and `[r {idx:0}]` name no type while `MERGE`/`CREATE` are writes for this class, and one symbol may own two sites (`mining.verify_no_auto_wire`,
+`session_source_migration._rel_types`).
+- `tests/test_7948_about_object_read_sites.py` — **the count arm reads EVERY statement, and every literal bracket is classified (2026-10-21, `#7948`).** Two fail-opens, each now pinned by a fixture that asserts the RULE rather than the document's current wording. (1) §13 states the customer-callable figure **twice** — `TWELVE of them are CUSTOMER-CALLABLE` at the head of the section and `TWELVE customer-callable read sites` in the blast-radius sentence — and the guard `search`ed once, so the second copy was read by nothing: rewriting it to `FIFTEEN customer-callable read sites` left all thirteen arms green, the identical "hand copy with no reader" shape the DOOR figure in that same sentence was fixed for. Both figures are now collected with `finditer` and compared as SETS (`{27}` / `{12}`), the shape the sibling §13.8 arm already used, and a fixture states the figure twice in both shapes so a first-match reader reds. (2) `_reads_literally` classified only the FIRST `aboutObject` bracket in a string literal, so a query shaped write-then-read (`… MERGE (p)-[:aboutObject]->(o) WITH p MATCH (x)-[:aboutObject]->(y) …`) was skipped whole on the `MERGE` and its read entered neither the census nor any row check — while `test_no_read_site_lacks_a_row` promised "every read clause that names the edge". Every bracket is now classified; the fixture pins the four orderings, and under the pre-fix rule the write-then-read case is red.
+- `STORAGE-ARCHITECTURE.md:1353/1348/1388` — **the wording §13 no longer carries (2026-10-21, `#7948`).** Three change-history clauses left the design section and are recorded here: row 2's reach cell no longer says *"the door this table was missing"* (the row states what the Point signal is for); the moving-ref paragraph no longer recounts that the head-relative figure *"was written down as 60 and measured 62 one merge later"* (it states the rule: a figure pinned to a branch tip has no pin, re-measure with the command and quote the sha); and the line-number sentence no longer narrates that *"the lines had all rotted"* (it states the rule: the symbol is authoritative, the line is a convenience). `_CHANGE_NARRATION` in `tests/test_extractor_v4_citation_rot.py` gained the matching arms — `this|that|the <section-word> was missing`, `was written down as`, `had all rotted` — with those three sentences as `must_flag` fixtures, because the guard had reported the design documents clean while all three sat in §13.
+- `STORAGE-ARCHITECTURE.md:1344-1382` — **FIFTH PASS 2026-10-21 (`#7948`): 33 sites, SEVENTEEN customer-callable, TWENTY DERIVED doors — and the untyped-walk class stops being a hand pass.** Rows 24–27 were added by applying §13's declared rule (*an unfiltered walk reads the edge without naming it*), and every later reader applied the same rule and got a different count, because nothing recorded where the rule STOPPED. The fifth pass is what made that visible: **six all-edge reads were missing, and the sharpest two were a customer door the ruling's own argument needs** — `hosted_backup._DUMP_EDGE_PAGE_QUERY` (every edge paged out as data into the per-org encrypted backup, behind `POST /v1/backups`) and the three whole-graph counts that verify a dump and gate its restore (`_COUNT_ALL_EDGES_QUERY` behind `POST /v1/backups`, where its only consumer `dump_graph` runs; `restore_graph` and `_restore_copy_settled` behind `POST /v1/backups/restore`), plus `sdk.TortoiseSDK.backfill_v25` (an all-edge count handed back as `report["edge_count"]`, behind SDK `backfill_v25` and MCP `tortoise_backfill_v25`) and the write-side `sdk.TortoiseSDK._promote_incident_operators` (every incident operator edge, target swept over all four epistemic labels — `Object` included). ⚠️ **The backup rows are not a marginal addition:** §13's `#4240` durability bullet is about THIS edge class, and the backup IS the durability mechanism, so *would a `SET`-free derive change what the customer can restore?* was answerable only from a site the table did not carry. **The class is now derived from the tree instead of restated by hand**: `tests/test_7948_about_object_read_sites.py` censuses every relationship bracket carrying no type at all, in a read clause — keyed on `module.py::symbol`, so a new walk beside a row reds — and requires each site to own a row or appear in `_EXCLUDED_UNTYPED` **with the code fact that earns it present in that walk's own clause** (a fact in an earlier clause of the same query counts only when it binds a variable the walk uses), and, from the other side, still present in the symbol's span — `test_every_stated_exclusion_is_still_true` (a downstream `type(r) IN […]` restriction, or endpoints sitting outside every `aboutObject` triple — `Point`/`Event`/`Session` → `Object`, per `session_link.ENTITY_LINKED_TRIPLES`; `STRUCTURAL_REL_LABELS` carries the target half). An exclusion cannot be a claim and cannot silently stop being true: remove the constraint and the site reds as an unowned read. `_NON_LITERAL` carries the six new rows' pins. Counts moved in §13, §13's blast-radius sentence and §13.8 (both documents), and §13.8's enumeration now names all seventeen.
+- `STORAGE-ARCHITECTURE.md:1344-1380` — **FOURTH PASS 2026-10-21 (`#7948`): 27 sites, TWELVE customer-callable, and the blast-radius figure is now SIXTEEN DERIVED doors — the declared CLASS, applied to the code, found two more readers that are not customer doors at all.** The first three passes each asked *which customer surface reaches this edge?*; this one asked the question §13 actually declares — *which code reads every edge?* — and the answer is two readers no customer path touches and no grep can find: `subgraph._CYPHER_HUB_DEGREE` (`MATCH (o)-[r]-()`, an unfiltered incident-edge COUNT feeding the `#3011` engine's `hub_degree`, reach **eval harness**) and `definite_description_backfill.CENSUS_QUERY` (an unlabelled inbound-edge count whose own docstring says a referent is an Object if *anything* points at it, `aboutObject` included, reach **ops audit**). Both count what they walk, so a `SET`-free derive silently changes the number they report — the identical argument that put rows 3, 22, 24 and 25 in the table — and both are carried by `_NON_LITERAL` pins, because neither names the edge. Row 1's MCP door was also wrong in the reach cell: `tortoise_search` defaults `entity_type="point"` and forwards it unchanged, so `order_by="graph"` alone lands on `_fetch_point_signals`, not on row 1's `_fetch_event_signals` — the same defect the second pass corrected on the SDK side (`suggest_entry_points`), left uncorrected on the MCP side. ⚠️ **And the blast-radius DOOR figure was a hand-count that nothing read**: it said *twelve* while the 12 customer-callable reach cells name **sixteen** distinct door identifiers, the folding rule was applied inconsistently (graph-ordered `search`/`tortoise_fts_query` folded into one door, the three `dry_run` delete tools left as three), and *"TWELVE sites behind those twelve doors, because `recall_state` alone reads the edge on FOUR code paths"* requires doors to be fewer than sites while asserting they are equal. At that pass both documents stated SIXTEEN and stated the rule (*a door is one independently callable entry point, counted once per site that reaches it* — ⚠️ a rule since RETRACTED: it yields cell occurrences, not distinct doors), and `tests/test_7948_about_object_read_sites.py` derived the total and the per-kind breakdown (then nine MCP tools, five SDK methods, two REST routes) from the reach cells. ⚠️ These figures are SUPERSEDED — the census now carries THIRTY-SEVEN rows / NINETEEN customer-callable sites / TWENTY-TWO distinct doors, and the present counts live in §13 and §13.8 of the two design documents. Three fail-opens in the guard were closed with it: the census pattern was bounded by a 60-character window, so the six-member `about*` alternation `ranking.ABOUT_EDGE_TYPES` uses was invisible to BOTH the census and the row check (it is now bounded by the bracketed string and anchored on Cypher's dash-delimited relationship form, which also refuses a JSON payload that merely contains the word); the door test parsed only the strict ``REST `VERB path` `` form, so row 5's `hosted REST (`/v1/…/topic`)` never reached the route check (row 5 now writes the real route, and an unparseable `/v1/…` door reds); and `_rows()` asserted no uniqueness, so a duplicated row raised the stated count without adding a reader (row numbers and `(module, symbol)` pairs are now unique).
+- `STORAGE-ARCHITECTURE.md:1344-1380` — **THIRD PASS 2026-10-21 (`#7948`): 25 sites, TWELVE customer-callable, twelve doors — two more all-edge walks behind customer doors, found by reviewing the guard's own rule against the code.** Row 22 asserts the inclusion rule is universal (*an unfiltered `MATCH (n)-[r]->(m)` reads the edge without naming it*), and applied to the code that rule found two readers the table did not carry: `mcp_server._preview_delete_edges` — the delete BLAST RADIUS, `MATCH (a)-[r]-(b) WHERE ID(a) IN $nids OR ID(b) IN $nids`, matching every incident edge and reporting `type(r)` per edge, behind three registered `dry_run` tools (`tortoise_delete`, `tortoise_delete_point`, `tortoise_delete_entity`) — and `hosted_api._export_graph_snapshot`, the org graph export, `MATCH (a)-[r]->(b) … type(r) …`, behind `GET /v1/organizations/{org_id}/export`. Both are customer-callable and both would silently lose `aboutObject` rows from what they report or ship if the edge were derived, which is exactly the argument row 21 (`_preview_supersede`) already rests on — so neither could be classed as transport and left out. The guard carries both as `_NON_LITERAL` rows pinning the consuming query INSIDE the reader's span, and its door test now resolves a REST door (the row writes `REST` beside the route, e.g. `GET /v1/organizations/{org_id}/export`) against the actual `@app.<verb>(path)` routes in `hosted_api.py`, so a customer-callable row cannot name a door that does not exist while REST-only reach stays expressible. ⚠️ Still a lower bound in one direction, and it is recorded on `#9418`: a NEW carrier-constant reader or a new unfiltered walk is invisible to the census until a row is added by hand, because the census sees only literal `aboutObject` brackets. The count itself is asserted, and so is every row's read.
 - `STORAGE-ARCHITECTURE.md:1339` — Filed from this document — the tracking issue and its current state are named on each bullet:
 - `STORAGE-ARCHITECTURE.md:1341` — - `aboutObject` as a stored edge vs a derived join — `#7948` (OPEN) — the measurement is DONE (research brief, 2026-09-23) and the answer is SPLIT, which decides it.
 - `STORAGE-ARCHITECTURE.md:1363` — ⇒ The comparable's conclusion does NOT transfer. Their justification was "recall never touched them" — false here. Deleting the edge would silently break four customer-callable surfaces. …
 - `STORAGE-ARCHITECTURE.md:1369` — ⚠️ The derived design is what CREATES a fan-out problem. Hindsight's join needed a `LATERAL LIMIT per_entity_limit` (default 200) and a timeout that drops the entire entity arm. A join on…
+- `STORAGE-ARCHITECTURE.md:1344-1380` — **CORRECTED AGAIN 2026-10-20, second pass (`#7948`): 23 sites, TEN customer-callable, EIGHT doors — and the census is now keyed on `module.py::symbol`, not on the module.** Three readers were still missing, and every one of them sat INSIDE a module the table already named, which is exactly the drift a module-level census cannot see: `navigation._hop_query` (the second all-edge walk, behind MCP `tortoise_entity_profile` and `tortoise_traverse` — the same inclusion rule that makes `SubgraphExpander._neighbors` a row), `mcp_server._preview_supersede` (the supersede dry run, matching every `SUPERSEDE_STRUCTURAL_RELS` member), and `projection.FalkorProjection._rebuild_all_replay` (the replay delete-leg, matching a run-time rel name gated on `DERIVABLE_STRUCTURAL_RELS`). Row 1's SDK door was also wrong: `suggest_entry_points` hardcodes `entity_type="point"` and cannot reach `_fetch_event_signals`, so the door is `tortoise_fts_query(entity_type="event", order_by="graph")`. The guard was tightened in four places to make those failures red rather than latent: the census resolves the enclosing SYMBOL of every literal read; every carrier/computed row pins its CONSUMING line inside its own span (row 20 was the last row decided by a bare constant mention); carrier constants are resolved through the reader's IMPORT, so a constant that leaves `aboutObject` cannot pass; and the spelled counts go past `TWENTY`.
+- `STORAGE-ARCHITECTURE.md:1344-1380` — **REPLACED 2026-10-20 (`#7948`): the `aboutObject` read-site enumeration was prose and had rotted, so it is now EXECUTABLE.** Removed: the `| # | site | … |` table whose rows cited `file.py:NNNN` (the lines had all moved; two named symbols — `topic_summarize`, `collect_slices` — did not read the edge at all, and row 4 named no symbol), the prefixed count *"ELEVEN read sites, and FOUR of them are CUSTOMER-CALLABLE"*, and *"And 36 test files assert the edge at the pin"*. What was wrong underneath, measured at `26aff163c`: **the customer-callable count was five doors / eight sites, not four**, because the whole state-recall path was missing — `recall_state` alone reads the edge on four paths (`StateRanker._fetch_point_signals` literal; `StateRanker._fetch_object_signals`, `TortoiseSDK._state_related_objects` and `TortoiseSDK._state_related_points` through `about*` alternation CONSTANTS, which no grep can see) — and `session_schema.audit_session_retrofit`, `projection/edges._count_about_out` were unnamed. Replaced by rows keyed on `module.py::symbol` (20 sites at that pass) + `tests/test_7948_about_object_read_sites.py`, which resolves every row against the code, re-runs the census, and asserts both counts equal the table. **The ruling is unchanged: KEEP the stored edges, deferred to post-launch.**
 - `STORAGE-ARCHITECTURE.md:1374` — - Fan-out caps — `#5010` (CLOSED `COMPLETED`) — nothing in our write path bounds how many edges one entity accumulates (`config/ci-surfaces.yml` at 123, `durations map` at 111, `the admin…
 - `STORAGE-ARCHITECTURE.md:1375` — - ⭐ NEW (2026-09-24) — the unindexed embeddings (V3, §12.1b). MEASURED ON THE LIVE GRAPH AND FILED: `#4997` — the measurement half is CLOSED `COMPLETED`; the unindexed-embeddings defect i…
 
@@ -692,6 +702,8 @@ that was itself a heading cannot collide with this file's own outline.
   - ✅ The canonical id contract (`#7955`). The stable key is fixed per label — `:Point` → `id` (minted by `tortoise/ids.py::ulid()`), `:Event` → `eventId`, `:Subject`/`:Object` → `name`, `:So…
   - ⛔ CORRECTION TO §17.5 AS WRITTEN — `baseline_source` is NOT unconditionally DERIVED; `baseline_set` is DERIVED, but not as a record column. When an author sets the prior (`baseline_source…
 
+---
+
 ## §13 — the `aboutObject` headline claim is SCOPED to the files it measured (`#9399`)
 
 The removed sentence and why it went. §13's evidence for the KEEP ruling opened
@@ -714,3 +726,850 @@ lane the three files bound and names the module and the door outside it;
 `tests/test_9399_search_path_claim_scope.py` holds it there by parsing the file
 list OUT of the sentence and re-running the scan over it, so widening the list or
 reverting the qualification reds.
+
+---
+
+### 2026-10-20 — `#9397`: §11.1 and §13 said the `aboutObject` edge carries **no** property — it carries `confidence`
+
+**What was recorded.** §11.1 (*"Our `aboutObject` links are **property-free** … a full-repo search for a property-bearing edge finds **none**"*) and §13 (*"**no** `aboutObject` edge carries **any property** … we lose nothing semantically by deriving later"*), plus the same fact in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 question 2 and in this ledger's `aboutObject` decision row. ⚠️ **The retraction had to reach §11.1's estimate footnote and §11.3 too**, which stated it in a third wording a reader reaches twenty lines below the correction: the cost footnote rested on *"from the measured property-free finding"*, §11.3's table called the rows *"**property-free rows**"*, and §11.3's prose said *"the entity links stay bare"*. A correction that fixes one wording and leaves three is how the same absolute gets re-derived.
+
+**Why it was wrong, and why the method hid it.** The evidence was a search for a Cypher **property MAP** (`rg -n 'aboutObject \{'`) → 0 matches. A property written by a **`SET` clause on a relationship variable** never matches that pattern, so the search could not see the writer, and a zero from a search that cannot match the writer was recorded as a measured absence. Two shipped sites originate one; three further paths re-materialize it — and one of those three is the replay fold, `projection/entities._fold_entity_linked_reason`, so "originating" here means *writes it first*, not *writes it in the named form*: the named form is shared by both classes (two originate, one re-materializes), while a fourth suspect, `sdk.supersede_point`, does NOT write it at all: see the review-cycle correction at the end of this entry):
+
+| site | what it writes |
+|---|---|
+| `tortoise/session_link.py` — `link_entity` | `MERGE (s)-[r:{edge_type}]->(t) SET r.confidence=$conf`; `edge_type` **defaults to `aboutObject`** |
+| `tortoise/subject_binding.py` — `bind_point_subjects` | `SET r.confidence=$conf` on an already-present about edge; the `object` slot role binds via `aboutObject` (reached from `_extract_session_v2` on the default ingestion path) |
+| `tortoise/projection/entities.py` — `_fold_entity_linked_reason` | the **replay fold** re-SETs it, so the property is journaled — `live == rebuild` |
+
+The property is asserted by a shipped test (`tests/test_subject_binding_1370.py::test_binder_reports_already_present_and_sets_confidence`, reading `r.confidence` off a `(Point)-[:aboutObject]->(Object)` edge), so this was never an obscure branch.
+
+**What changed.** §11.1 states the measured property set (exactly one name — `confidence` — on bound entity links only; the extractor/indexer links that are the bulk of the rows are genuinely bare, so the **cost** conclusion stands) and §13 narrows *"we lose nothing semantically by deriving later"* to *"we lose one recorded attribute"*. **The KEEP ruling and its deferral to post-launch are unchanged** — if anything the finding strengthens keeping the edge. §11.4 rule 1 is now recorded as **in tension** with `#1370` rather than as satisfied: whether a binding confidence belongs on the link or on the claim is an unrecorded design decision, flagged, not resolved here.
+
+**What now prevents a repeat.** `tests/test_9397_about_edge_properties.py` — the retracted absolute sentences must not reappear; the corrected text must name the writers and the property; each recorded writer must still write it; and a **census over relationship-variable property writes** — the named `SET r.<prop>` form, the property-MAP `SET r += $props` form and an inline pattern map — reds if a NEW property-bearing `about*` writer appears without being recorded. ⚠️ **That promise is bounded and the bound is stated, not assumed:** an about edge is recognised by an `about*` literal or by a predicate interpolated from a vocabulary named in the census's `_ABOUT_VOCAB` (the predicate allowlist included), so a NEW predicate vocabulary has to be added there in the same change. The lesson is stated for the next reader: *re-derive a property claim from the WRITER CENSUS, not from a grep whose pattern cannot match the writer.*
+
+**Review-cycle correction (same day) — the first census reproduced the original error one level down, and the retraction was incomplete.** Two blocking findings, both real:
+
+- The census matched only the **named** form `SET r.<prop>`. The **property-MAP** form `SET r += $props` / `SET r = $p` was invisible to it — the same class of blindness as the `aboutObject {` grep — and three shipped sites already use it on an allowlisted `aboutObject` predicate: `cache_projection.relation_statement` (the record-layer projection; the `public.relation` row carries `confidence`), `projection._rebuild_all_replay` (rebuilding it from the journal), and `hosted_backup.restore_graph` (`SET r = $p` over the dump's stored edge properties). A fourth, `sdk.supersede_point`, was recorded here too until the next review cycle showed that its `SET r += $attrs` is on the `IMPL|NAND` leg and its about transfer is **bare** — a census FALSE POSITIVE, not a re-materialization. So "**three** shipped sites" was an incomplete enumeration at the very revision that calls it measured. The census now reads **both** forms, and its about-vocabulary includes the predicate allowlist (`validate_rel_type` / `KNOWN_REL_TYPES` / `_sanitize_label`) — because taking the predicate from the allowlist that contains `aboutObject` is exactly how a map-form writer names its edge without writing `aboutObject` anywhere. Measured against the tree: the population goes from 3 to **6** (3 originated + 3 re-materialized; a seventh candidate is a declared false positive — see below), and the property set stays **one semantic attribute** — the map-form writers re-materialize `confidence` from the record row, the journal event or the dump, and add no second attribute (the third review-cycle correction below finds the one further NAME the record projection writes).
+- The retracted "property-free" wording survived in **§11.3's table row** (*"property-free rows"*) and in **§11's estimate footnote** (*"the measured property-free finding"*) — twenty lines below the corrected §11.1, where a reader would take it as current. Both now state the measured property set, and both literals are pinned as retracted.
+
+Also corrected in the guard itself: the `§13.8 q2` retracted literal was pinned **unbolded** while the document bolds it, so it matched nothing and would have passed a verbatim revert (dead entry). And the corrected-passage pin was whole-FILE, so it could not red on one section's silent revert — it is now section-scoped (§11.1, §13, §13.8 q2), the `test_entity_attachment_brief_claims.py` precedent (`#8639` review).
+
+**Second review-cycle correction (same day) — a THIRD write form, and a second property name.** The correction above replaced *"property-free"* with *"The property set is exactly one name — `confidence`"*, and that is still an absolute one form short. A property can be set in three forms, not two: `SET r.<prop>`, the property-MAP `SET r += $props`, and an **inline pattern map** `MERGE (s)-[r:TYPE {name:$v}]->(t)` — which appears in NO `SET` clause, so both rules in the census were blind to it. `cache_projection.relation_statement` ships it: `MERGE (src)-[r:{rel.rel_type} {idx:$idx}]->(tgt) SET r += $props` (`cache_projection.py:717` — at HEAD), over a predicate taken from `validate_rel_type`'s allowlist, which contains every `about*` predicate (`security.py:85` — at HEAD; `:77-78` at the pinned revision, where the about entries sit), on a relation row the projection builds for `EntityLinked` (`record_projection.py:732` — at HEAD; the module does not exist at the pin). So a **record-projected** about edge carries `idx` — the positional ordinal of `public.relation.idx` (`supabase/migrations/20261012000003_record_epistemic.sql:175` — at HEAD; the migration does not exist at the pin), a position and not a claim attribute — and §11.1/§13 now state the measured set as `confidence` (originated, three sites) **plus `idx`** (re-materialized, one site) with the placement-column and `props` tail named. `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 q2 no longer says *"never a second property name"*. Both retracted phrasings — *"The property set is exactly one name — `confidence`"* and *"never a second property name"* — are pinned in `tests/test_9397_about_edge_properties.py`, which now reads **all three** forms and asserts that `relation_statement` is seen writing `idx`. Its module prefilter was also fail-open: it skipped any file without the literal word "about", which is the very word the allowlist-driven map writer does not contain, so the widened vocabulary could never reach the modules it was widened for. ⚠️ **The row it added for `sdk.supersede_point` was a FALSE POSITIVE, removed the same day:** a whole-function census cannot tell which edge a `SET` lands on, and this function's `SET r += $attrs` is on the `IMPL|NAND` leg (`MATCH (old:Point {id:$old_id})-[r:IMPL|NAND]->(t)`) while its about edge is transferred by a bare `MERGE (new)-[:{rel}]->(t)` with no `SET`. On an about edge it writes nothing — it **drops** the binder's `confidence` (`#9417`, filed from this correction). The population is 6, not 7; the guard keeps the row as a declared false positive (`NOT_AN_ABOUT_WRITER`) so it stays visible without being counted, and it now compares every recorded writer's **name set** so a second property at an existing site cannot slip past. A **third** stale absolute survived in the same section: §11.1's method paragraph still said *"Two forms write to an edge, and both are in scope"* while the paragraph above it documented the inline form — it now says three forms / all three, and the discarded phrasing is pinned as retracted.
+
+**Third review-cycle correction (same day) — two surviving wordings, one stale citation, and a census that skipped what it could not read.** Three P3s, none touching the ruling, all in the evidence layer:
+
+- **A stale `file:line` cited as current.** §13 and §13.8 q2 said `create_about_edge` (`projection/edges.py:344`) unqualified. `:344` was the definition **at the `c79ba1cf2` pin**; at HEAD the definition is `projection/edges.py:1447`, and `:344` is a `#:` comment block that *mentions* the symbol — which is why the number read as plausible to anyone who checked it. Both copies now cite the **symbol** only, per this document set's own rule that line numbers are not asserted; §11.1's copy keeps `:344` because it carries the `at the pinned revision` qualifier, which is what makes it true. Pinned by `test_the_corrected_passages_carry_no_bare_edges_line_citation`, whose matcher is itself proved live against the pre-fix spelling.
+- **The same absolute survived in §9.6, above the §11.1 correction, for a different link class.** §9.6 said identity/mention (`Object`) and referential-containment (`Source → Source`) `references` links *"stay **property-free**"* — the wording this entry retracts for `aboutObject`. It is retracted here as an **absolute**, not because those links carry a property today: no writer that MINTS an identity/mention or containment `references` link stamps anything on it (`projection/edges.py`'s non-derivation branch is a bare `MERGE`; so are `projection/entities.py`'s identity/mention connector link and `hosted_api.py`'s session→external containment; and so is `graph-scripts/backfill_references.py`, which mints BOTH classes — its docstring declares the `aboutEvent`/`aboutDocument` derivation rows beside the identity ones — with a bare `MERGE`, being an ops script outside the provenance writers, so its derivation rows are not auto-anchored either; `session_source_migration._move_out` only re-points an edge with `ON CREATE SET r2 = properties(r)`, so it copies attrs on create and never mints one). `cache_projection.relation_statement` does stamp `{idx:$idx}` + `SET r += $props`, but only for record-projected `public.relation` rows, and no record kind emits a `references` relation (`EntityLinked` is about*-only; `DirectEdgeCreated` is IMPL/NAND; `DirectEdgeRepoint` is IMPL/NAND plus the `SUPERSEDE_STRUCTURAL_RELS` transfer, which excludes `references`) — so the reached-for reason in the first version of this entry was wrong even though its conclusion was right. The FACT §9.6 establishes is narrower: those links carry **no `sourceVersion`**, and the wording now says exactly that. The retraction reaches the prose that CITES it too — the public SDK's `link_source_to_entity` docstring (`tortoise/sdk.py`, both the `"Source"`/containment paragraph and the `Object` anchor paragraph), the two `Object`-reads-`unknown` passages in `tortoise/search_engine.py::read_reference_currency_links`, and the two in `tools/source_currency.py` all said "property-free" and now scope the claim to the anchor — as does the ruling's own record in `tests/test_source_version_references_5199.py`'s module docstring (its assertions were already true: they read `r.sourceVersion`, which is the narrow fact). Pinned section-scoped by `test_the_references_paragraph_scopes_property_freedom_to_source_version` (the `RETRACTED` list is about `aboutObject` wording, so this claim needs its own leg — and the changelog thesis applies verbatim: a correction that fixes one wording and leaves three is how the same absolute gets re-derived), with the pin-index entry pinned by `test_the_pin_index_entry_for_the_9_6_retraction_states_no_measured_distance` and the six cited production sites by `test_the_retracted_references_absolute_is_gone_from_production_docstrings`.
+- **The census failed OPEN on a module it could not parse.** `_writers_in_module` returned its (empty or partial) finding on `SyntaxError`, so a module `ast.parse` rejects was censused as *"writes no property on any about edge"* — mechanically the `rg 'aboutObject {'` defect, one level down — and the promise's stated bound (a list of vocabulary NAMES) did not cover it, so a reader was told the only gap was a token nobody had written yet. It now raises `UnparsableModule` naming the file, and the strict per-module read (`test_the_code_still_agrees_with_the_corrected_evidence`, leg 7; `test_the_declared_false_positive_premises_hold_at_the_statement`, leg 9) is UTF-8 like the census's (it read `errors="replace"`, so a byte-compromised module would have been censused as different text than the leg that parses it). Pinned by `test_the_census_fails_closed_on_a_module_it_cannot_parse`, red on the pre-fix `return found`.
+
+⚠️ **The census also read one FALSE POSITIVE as a writer of the map form.** `projection._rebuild_all_replay` was recorded as a re-materializer alongside `cache_projection.relation_statement` and `hosted_backup.restore_graph`; it is not. Its `SET r += $attrs` belongs to the `DirectEdgeCreated` fold, and that event has exactly one producer — `create_direct_edge`, which refuses any `op_type` outside `{IMPL, NAND}` — while its about/structural transfer is a separate BARE `MERGE` (the code says so in place: *"Structural 2b transfers are bare: NO attr SET, no direction/confidence/weight"*), and `create_about_edge` journals no `DirectEdgeCreated` at all, so no about edge can reach the attr fold. **The measured population is therefore 5 writers — 3 in the named form (`SET r.<prop>`) and 2 by property MAP, which is the axis the census reads; on the causal axis they split 2 originating + 3 re-materializing** — with TWO declared false positives (`sdk.supersede_point` and `projection._rebuild_all_replay`). Each exemption now pins the STATEMENT that makes it one — the about transfer carries no `SET`, and the `SET` the census does see names no `about*` predicate — so an exemption cannot rot into a silent lie, and §13 states the count as 5 (`three of the five`, not `three of the six`).
+
+**Fourth review-cycle correction (same day) — the guard's own provenance claim, and its false-positive exemption.** Three fixes in `tests/test_9397_about_edge_properties.py`, all in the guard rather than the corrected text: (1) *"Two forms write to an edge, and both are in scope"* was **written by an earlier revision of this correction and then withdrawn**, not carried over from the pre-fix document — measured absent at the pre-fix revision — so it is now declared in `RETRACTED_INTRODUCED_HERE`, and a new leg MEASURES the split against the pre-fix revision instead of restating it (a misclassified entry made the guard's own failure message claim a pre-fix presence that never existed). (2) The `sdk.supersede_point` row in `NOT_AN_ABOUT_WRITER` was a **fail-open exemption**: both name-comparison legs skipped it, so a property added on that about edge redded nothing while §13 and §13.8 q2 assert it carries none. The row now declares its expected name set (`<map:$props>`) and is compared like a recorded writer, and the premise is asserted **at the statement** — the about transfer is a bare `MERGE` and the `SET r += $attrs` sits in a query whose patterns name no `about*` predicate. (3) The failure diagnostic now prints the live document a retracted sentence actually survived in, not only its recorded pre-fix home. §13's `create_about_edge` citation was reduced to the SYMBOL only — §11.1's copy is the one that keeps `:344` under its `at the pinned revision` qualifier, so there the number reads as a pin rather than as drift. ⚠️ This clause first claimed §13's copy was ALSO *qualified*: it is not (measured at HEAD — `grep -n 344` finds `:344` only in §11.1), which is the third correction's state, not this one's.
+
+**Fifth review-cycle correction (same day) — one count, three stated versions of it; and the census is blind to a shipped sixth site.** Two P1s and a count defect, all in the evidence layer. The KEEP ruling, its deferral and the *one semantic attribute + one identity coordinate* finding are unchanged.
+
+- **The entry stated the population three times and no test compared any of them.** *"the population goes from 3 to **6**"* (second correction), *"The population is 6, not 7"* (second correction's tail), and *"3 originating + 2 re-materializing = 5 writers"* (§13 and this ledger). Each was right when written — the 6 became 5 when `projection._rebuild_all_replay` was reclassified as a false positive — but a reader arriving at any single sentence cannot tell which is current, and deleting the current one changes no test. **The count is now stated in exactly one form in every document: 5 census-VISIBLE writers — 3 in the named write form and 2 by property MAP, which is the axis the census reads; on the causal axis those same 5 split 2 originating + 3 re-materializing, because the replay fold re-produces the property rather than originating it (round 10) — with two declared false positives, plus one known-INVISIBLE shipped site named below.** The earlier numbers in this entry stay as the revision history that produced that sentence; they are not current claims.
+- **The census cannot see a shipped sixth site, and the documents now say so instead of implying there is none.** `session_source_migration._move_in` moves an edge with `MERGE ({src})-[r2:`{rel}`]->(new) ON CREATE SET r2 = properties(r)` — it copies the WHOLE property map — over a predicate handed in from `MOVABLE_SOURCE_RELS`, which contains `aboutSource` and `aboutDocument`. ⚠️ **The first version of this correction stated the bound as "no writer that SPELLS an about vocabulary … can add a property unseen", and that was itself false — measured three escape shapes against `_writers_in_module`, not one:** (1) the predicate as a PARAMETER (`_move_in`; adding `MOVABLE_SOURCE_RELS` to `_ABOUT_VOCAB` still yields `{}` for that module); (2) an UNTYPED binding tested with `WHERE type(r) = 'about…'` — `_PATTERN` needs a typed relationship pattern, so the function is continued before any rule runs (measured `{}`; already live style in `sdk.py`/`analyze.py` as `WHERE type(r) = 'NAND'`); (3) an fn-call RHS `SET r = properties(x)` **even with the about predicate spelled in a typed pattern** (measured `{}`, while the same writer with `SET r = $p` is recorded) — so the parameter is NOT what makes `_move_in` invisible. **§11.1, §13 and the guard's module docstring now state the bound the CODE enforces** (typed pattern or interpolated from `_ABOUT_VOCAB`, AND one of `SET var.<prop>` / `SET var (+=|=) $map/{…}` / inline pattern map), §11.1's method paragraph **still opened with "Three forms write a property to an edge, and all three are in scope" — an absolute this same entry contradicts — so that sentence is now rewritten** (it says the census *reads* three write forms and then states the gap list), and the old wording is pinned as retracted, and `test_the_census_bound_is_pinned_as_a_gap_not_an_absence` pins both remaining synthetic shapes plus a control so the bound cannot drift back into an absence claim **in the code** — the PROSE is pinned separately by `test_the_documents_state_the_bound_as_a_detector_not_a_proof`, because measured without it, deleting the bound paragraphs or inserting a fresh absolute left all 16 legs green.
+- **The provenance leg could never run in CI, and its comment claimed the opposite.** `PRE_FIX_REV` was justified with *"CI checks out with `fetch-depth: 0`, so the rev is reachable there"*. Measured: the gating `test` job (`python-ci.yml:631`) is a bare `actions/checkout@v4` (default `fetch-depth: 1`); the only `fetch-depth: 0` is the `changes` job at `:224`. So `git show` returned nothing on every CI run and leg 8 SKIPPED — silent-green, since `skip-guard.py` guards only FalkorDB/embedder/module-collection reasons. ⛔ **The obvious fix does not work, and this is measured, not assumed:** in a `--depth 1` clone, `git fetch --depth=1 origin 01b5486ec` → *"couldn't find remote ref"* (the server does not expose arbitrary reachable shas), so fetching the raw sha would have been a second false claim. Fetching the `main` REF at a bounded depth does work — `git fetch --depth=60 origin main` makes `01b5486ec` reachable in the same clone. `_ensure_commit` now does exactly that, raising the depth only until the rev resolves (`_SHALLOW_DEPTHS = (120, 400, 1500)`), so the leg actually runs in CI; the remaining skip states that this checkout could not supply the history and that it never passes on a history it could not read.
+- **Three `cache_projection.py:717` — at HEAD citations were added unqualified**, while both documents declare (`STORAGE-ARCHITECTURE.md:18`, `EXTRACTOR-V4-ARCHITECTURE.md:16`) that every `file.py:NNNN` reference is pinned to `c79ba1cf2` — and `tortoise/cache_projection.py` does not exist at that commit (measured: `git show c79ba1cf2:tortoise/cache_projection.py` → *"exists on disk, but not in 'c79ba1cf2'"*). All three now carry an explicit `at HEAD` qualifier. The companion guard's matcher (`_EDGES_LINE_CITE`) covers only `edges.py:<n>`, so it does not enforce this for other modules; stated here rather than left implied.
+- **The selection rationale in `config/ci-surfaces.yml` named the wrong mechanism.** It claimed a `docs/`-only diff *"takes `select()`'s early return and runs `tier1` only"*. Measured with the committed manifest: `select(['docs/architecture/STORAGE-ARCHITECTURE.md'], 'pull_request', manifest)` → `surfaces=['onboarding'], full=False, 121 files` (the `onboarding` SOURCE_PATTERNS entry claims that path, so the early return never fires; the count is re-measured **at this head**, and it is one higher than the reading this bullet first recorded because the change added a `tier1` row and `tier1` is unconditional in the tier-2 pool — re-run `--changed-files` after any `tier1` addition rather than carrying either number forward); `select(['docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md'], …)` → `surfaces=[]` and DOES take it. The guard is selected in both cases (`guard_selected=True`, measured at this head with `tools/ci_selection.py`), which is the property the entry exists to record; the comment now states the measured path instead of the assumed one.
+- **The corrected-passage pin covers 2 of the 5 recorded writers.** `test_the_corrected_passages_name_the_property_bearing_class` requires only `link_entity` and `bind_point_subjects` per section, so the other three can vanish from §11.1 / §13 / §13.8 q2 with every leg green (measured: deleting `hosted_backup.restore_graph` and the *"3 originating + 2 re-materializing = 5 writers"* sentence from §13 → 14 passed, 1 skipped). ⚠️ Left as a stated gap rather than fixed here: the pin iterates the retracted literals properly but not the corrected writer set, and widening it to all five symbols is a guard change that deserves its own leg and its own review rather than a sixth pass inside this correction.
+
+**Sixth review-cycle correction (same day) — the completeness claim was falsified a third time, so it is gone.** Round 5 replaced one absolute with a "bound the code enforces"; round 6 measured **four more escapes inside the conjunction that bound required**, and the sentence it was pinned by did not pin it at all. The resolution is structural rather than a fifth wording:
+
+- **The census is now described as a DETECTOR, not a PROOF of absence** — in §11.1, §13 and the guard's module docstring — and the gap list is explicitly NON-EXHAUSTIVE. The escapes measured in round 6, each `{}` against `_writers_in_module` with a recorded control: whitespace before the relationship-type colon (`[r :aboutObject]`), whitespace after `[` (`[ r:aboutObject]`), a `]` inside an inline map (`{tags:["a"],confidence:$c}` truncates `_PATTERN`'s `[^\]]{0,120}` span), and an `aboutClaim` edge — because `_ABOUT_REL` enumerates seven names, `about(Subject|Object|Event|Point|Document|Action|Source)`, while the guard's own comment claimed the `about*` prefix. That comment now names the enumerated set and says an `aboutClaim` edge is unseen.
+- **The census's FILE SCOPE was undeclared while the documents presented it as the replacement for a full-repo grep.** The walk is `PKG.rglob("*.py")` over `tortoise/`; the retracted evidence was a *full-repo* search, and `tools/longmem_eval/` and `graph-scripts/` already hold `aboutObject`/`aboutSubject` writes (none currently property-bearing). The scope is now stated next to the other gaps.
+- **The pin did not pin the bound it was named for.** Measured: deleting both bound paragraphs from §11.1/§13, inserting a fresh absolute into §13, replacing the module docstring with an absolute, or emptying `__doc__` all left **16 passed**. `test_the_documents_state_the_bound_as_a_detector_not_a_proof` now asserts the detector wording is present in `__doc__` and, SECTION-scoped, in each of §11.1 and §13, that the retracted absolutes are absent, and it was mutation-checked: replacing the marker and restoring the old sentence reds it, and restoring the document greens it. A third `{}` probe covers the parameterised-predicate shape (`_move_in`), which had been described in prose but never measured by a test.
+- **Two provenance statements in this entry were false and are corrected**: it said §11.1's method paragraph *no longer* opened with "all three forms … are in scope" while that sentence was still there verbatim (it is now genuinely rewritten and the old wording is pinned as retracted), and it said §13 / **§13.8 q2** state the count as 5 when §13.8 q2 states no count at all (`grep` → 0 for `five`), so only §13 does.
+
+The lesson this entry keeps re-learning, now recorded in the guard itself: **a guard that cannot be shown to red is not evidence.** Each of the three completeness claims here was plausible, internally consistent, and false; the only thing that caught them was measuring the claim against the code and mutating the pin to watch it fail.
+
+**Seventh review-cycle correction (same day, a different claim from the sixth) — the one rule this correction rewrote in place was pinned by nothing.** One P2 from the `#9403` review, plus the weaker half of the same gap. No factual claim moved: the ruling, the measured property set, the five-writer population and its bound are unchanged.
+
+- **§11.4 rule 1's own imperative was unpinned, so a verbatim revert of a sentence this PR changed stayed green.** The rule was rewritten from *"**Keep entity links property-free.**"* to *"Keep entity links near-bare"* plus the recorded `#1370` tension, and it was in **neither** place a guard reaches: not in the retracted list (so a revert to the absolute could not red), and not in the corrected-passage pins (§11.1, §13, §13.8 q2), so a **silent deletion of the tension record** — the only place the ruling's exception is written down as unresolved — was green too. **Measured, not inferred:** restoring the pre-fix sentence verbatim at the PR head left every leg green. This is the sharpest instance of the class the entry above describes, because it is not a carried-over wording but a sentence this PR itself changed. The pre-fix imperative is now a `RETRACTED` entry (quoted here, where the retracted text is allowed to live), and `test_the_cheapness_rule_states_the_measured_set_and_records_the_tension` pins §11.4 rule 1 **section-scoped to the rule**, positively: it must say `near-bare`, it must carry the `#1370` tension journaled through `EntityLinked`, and it must keep the `RECORDED, not resolved` qualifier — a guard must not let prose settle a design decision by dropping the words that mark it open.
+- **The extractor ledger's KEEP row named one of the two measured properties.** *"Cheap because edges are bare apart from the binder's `confidence`"* is true of the ORIGINATED set and false as the reason the layer is cheap: a record-projected `aboutObject` edge also carries `idx`, in the third write form. The row now names both, and `test_the_ledger_keep_row_names_both_recorded_properties` pins it — the row's retracted wording was already pinned, so a revert to THAT red, but any other re-derivation of the one-name absolute in the live ledger was not.
+
+**Eighth review-cycle correction (same day, a second pass on the seventh) — the pin's own claim, and two probes that were asserted but never written.** Round 7 mutation-tested the pin instead of reading it, and found the same defect one level up again, plus a stale count and two unbacked measurements.
+
+- **The documents claimed a red the guard cannot produce.** §11.1 said the guard *"pins both the shapes it reads and the gap list above"*, §13 said *"the guard pins it"*, and the module docstring said the probes stop the bound *"drifting back to an absolute"*. Measured: deleting the entire enumerated gap list from both paragraphs left **16 passed, 1 skipped**, and inserting a freshly-worded completeness absolute into §11.1 — *"This census enumerates every way an about edge can acquire a property, so no property can be added unseen"* — also stayed green. **The CLAIMS are deleted, not re-pinned.** The text now says only what was measured: the gap list is what was measured and is not guaranteed complete, and no test is claimed to block a future absolute, because none can. This is the entry's own lesson applied to itself — a process claim the instrument cannot back is the thing being corrected, so it does not get re-narrated.
+- **The marker assertion was a file-wide `count() >= 2` presented as section-scoped**, so deleting §11.1's copy while §13 kept two occurrences stayed green — the same scoping defect `_section`'s own docstring names (`#8639`). It now slices §11.1 and §13 via `CORRECTED_SECTIONS`; mutation-checked individually, deleting either section's copy alone reds it.
+- **Two gap categories claimed "measured `{}` with a control recorded" when neither probe existed.** Gaps 4 (spellings `_PATTERN` does not recognise: whitespace before the relationship-type colon, whitespace after `[`, a `]` inside an inline map) and 5 (an `aboutClaim` edge, outside `_ABOUT_REL`'s seven enumerated names) were prose only — `grep` found no probe, no control, no fixture. Both now have probes in `test_the_census_bound_is_pinned_as_a_gap_not_an_absence`, so the sentence describes the file rather than the reviewer's terminal.
+- **A fourth stale count, and a numbering contradiction.** Three places still said the leg pins "two synthetic shapes" while it asserted more, and the probe comments were numbered `1+n / 2 / 3` against the docstring's gap list `1 / 2 / 3`, so a maintainer mapping a probe to a documented gap got the wrong pairing. The comments now use the docstring's numbering, and **no probe COUNT is stated anywhere** — a count in prose is a claim the code outgrows silently, which is exactly how this defect kept returning. Gap 6 (writers outside `tortoise/`) is stated as unprobeable from inside the walk rather than counted among the pinned ones.
+**Ninth review-cycle correction (same day, a different claim from the eighth) — the remaining unmeasured claims and three fail-open cells in the new legs.** Fresh-context review of the seventh correction found the pinning pattern repeating its own defect one level up. No ruling, no measured property name and no census population changed; what changed is that the text and the legs now state only what was measured.
+
+- **§11.4 rule 1 still carried the retracted absolute at POPULATION scale, in a spelling no pin knew.** The rule was rewritten to `near-bare` but kept *"turns 27,310 **bare rows** into 27,310 rows you must maintain and index"* — which asserts the whole population is bare, forty lines after §11.1 says a record-projected edge is not. Measured: the leg was green with that clause live, and its only absence check was the retracted imperative. The clause now says the rows are *bare apart from the projection's `idx` ordinal*, and the leg carries a population-absolute list (`bare rows`, `carry no properties`, `property free`) — mutation-checked: restoring the clause, or inserting a freshly worded in-rule absolute, now reds.
+- **§11.1's *"the extractor/indexer links that are the bulk of the rows are genuinely bare"* was an unmeasured population claim, and the document contradicted it.** The binder ORIGINATES `confidence` on every object link it decides BOUND, and it runs on the default ingestion path (§13's own sentence) — while `docs_miner`'s `link_entity` calls pass none, and `sdk._connect_issue_objects` does not call `link_entity` at all (it calls `create_about_edge`, a bare `MERGE`). Neither the share nor the absolute was measured. The clause now states the shape (bare = unbound; the binder's bound links carry one) and says the SHARE is not measured here, so the cost estimate rests on the row shape, not on a bare-row count.
+- **A closure the same sentence calls open.** §13 said *"The measured set is therefore `confidence` … plus `idx`"* after acknowledging the record row's placement columns and open-set `props` tail; the §11.1 estimate footnote and `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 q2 (`the one name beyond confidence`) closed it the same way, and the ledger's KEEP row presented the two names as the whole exception. All four now say the NAMED set, with the map writers' names stated as not statically bounded — matching what the guard can actually see (`EXPECTED_NAMES[relation_statement]` is a `<map:$props>` sentinel for exactly that reason). The KEEP-row leg also asserts the open-set qualifier, so a closed reading reds.
+- **Two counts in the guard's own prose were stale.** The module docstring said *"four shipped sites already use that form on an allowlisted `aboutObject` predicate"* — two do, and two more are the declared false positives (the population is 5 writers, not 7); `_ABOUT_VOCAB`'s comment said the same thing as *"3 writers → exactly 7"*, which conflates ROWS with WRITERS. Both corrected; §11.4 rule 1 also called the `#1370` attribute a *"weight"* where the code sets `confidence` (and no about-edge writer writes `weight`).
+- **Three fail-open cells closed, and one diagnostic fixed.** `_flat` — the normaliser every retracted literal is matched through — treated a hyphen as significant, so *"property free"* (the form a person types) matched nothing: measured green when §11.1's lead-in was rewritten that way. It now normalises a hyphen to a space. The §11.4 leg pinned only the qualifier vocabulary while its name claimed the measured set — it now asserts both property names. The ledger-row leg's docstring claimed it closed *"any other route back to the one-name absolute"*, which was false; it now states exactly what it closes (a deleted name, the retracted phrase, four closed-count spellings) and says the rest is a detector's residual. `_section` also raised a bare `ValueError` when an anchor moved, which reads as a broken test rather than a rotted guarantee; it now fails with the anchor named.
+- **A false record of a past fix.** The fourth correction said §13's `create_about_edge` citation *"is also qualified (`:344` at the pinned revision) the way §11.1's copy already was"*. Measured at HEAD, `:344` appears only in §11.1 (§13 asserts the symbol only, which is the THIRD correction's state). The clause is corrected in place rather than left to read as the latest record of what shipped.
+
+**Tenth review-cycle correction (a fresh-context review of `#9403`'s head, P1 × 2 and P2 × 5) — two unmeasured population claims written INTO the correction, a misclassified writer, and four claims that could not go red.** No ruling, no writer and no measured property name changed; what changed is that the corrected text states only what was measured, and every sentence this round touched now has a leg that reds without it.
+
+- **§13 and §13.8 q2 stated an unmeasured population SHARE, in the same commit whose §11.1 withdraws it.** §13 said *"so most entity links are two ids and nothing else"* and §13.8 q2 said *"The structural door stays open **for most links**"*, while §11.1 says in as many words that *"Which SHARE of the rows is bare is not measured here"* — so two live documents disagreed about whether a majority-share fact had been measured. Measured while all three sentences were live: every leg green. Both now state the SHAPE (an **unbound** link is two ids), and `test_the_corrected_passages_name_the_property_bearing_class` rejects the share spellings (`most entity links`, `most links`, `mostly stays open`, `bulk of the rows` …) in §11.1, §13 and §13.8 q2. Mutation-checked: restoring either sentence reds.
+- **§11.4 rule 1 still asserted the population absolute in the round-9 spelling.** Round 9 replaced *"bare rows"* with *"rows that are bare apart from the projection's `idx` ordinal"* — which asserts the whole population is bare except one ordinal, ten lines before the same rule records that a **bound** link carries `confidence`. Green while live, because the pin's list could not see the new spelling. The clause now names the row's shape (two ids; plus the binder's `confidence` on a bound link and the projection's `idx` ordinal on a record-projected edge), and `bare apart from` is in the leg's population-absolute list. Mutation-checked: restoring the round-9 clause reds.
+- **The writer classification conflated the causal axis with the write-form axis, so the count's composition was false.** `projection/entities._fold_entity_linked_reason` was filed as an **originating** writer, while §13.8 q2 in the same PR calls it *"reproduced by … the replay fold"* — the definition this document uses to classify `cache_projection.relation_statement` and `hosted_backup.restore_graph` as RE-MATERIALIZING. §13's *"The ORIGINATED property set is exactly one name — `confidence` — and it is written in two forms"* compounded it: every originating writer uses the NAMED form, and the map form belongs to the re-materializing class in the next sentence. The split is now stated on BOTH axes — 5 census-visible writers = 3 named-form + 2 property-MAP (what the census reads), and on the causal axis 2 originating + 3 re-materializing — and `test_the_writer_classification_separates_the_causal_axis_from_the_write_form` pins it plus the retracted form count. Mutation-checked: refiling the fold as an originator, restoring the two-form count, or reverting the composition reds.
+- **The guard's own provenance comment carried a stale leg count, one paragraph below the rule that forbids it.** It said *"9 failed / 10 passed of the 19 legs at this revision"*; the file collected 21 legs and the pre-fix split was 10 failed / 11 passed. This is the round-8 failure mode (*"a count in prose is a claim the code outgrows silently"*) reproduced in the comment that declares it eliminated. The comment now says how to RE-MEASURE the split instead of quoting one, and `test_the_guard_states_its_own_execution_and_probe_coverage_honestly` reds on a numeric leg count anywhere in the header block. Mutation-checked: restoring the sentence reds.
+- **The extractor ledger's KEEP row did not RENDER.** It carried 2 opening and 3 closing parentheses and an odd count of `**` markers, so its emphasis span broke and a stray `)` appeared mid-sentence — in the row a reader uses to decide the layer is cheap, and past every substring assertion the KEEP-row leg made (markdownlint's emphasis checks do not run inside a table cell). Balanced now, and the leg asserts paren and `**` balance. Mutation-checked: unbalanced again reds.
+- **Three citations in this entry were unqualified, and one is false at the declared pin.** The entry's own round-5 rule is that a number not true at the pin carries `at HEAD`; `security.py:85`, `record_projection.py:732` and `20261012000003_record_epistemic.sql:175` were bare, and at `c79ba1cf2` the first lands on `"INFORMED_BY", "PRODUCES"` (the about allowlist is at `:77-78`) while the other two do not exist. All three are qualified, and `test_the_correction_changelog_qualifies_its_line_citations` applies the rule to the paragraph that makes the citations. Mutation-checked: dropping one qualifier reds — the first version of that leg was VACUOUS, because a flat character window let a neighbour's `— at HEAD` qualify a bare citation beside it; the window now stops at the next citation.
+- **A CI fix, not a review finding.** The required `docs` check failed on a NEW markdownlint finding this PR introduced: the `§13 — the aboutObject headline claim is SCOPED…` heading was pressed against the preceding `---` with no blank line (MD022). One blank line added; the finding was authored here, so the baseline snapshot was not regenerated (`#7435` / `#7534`).
+- **Merged from a concurrent lane on this branch, and reconciled rather than stacked.** That lane re-measured the provenance reading (`10 failed / 11 passed`, obtained by swapping ALL FOUR live documents for their `01b5486ec` versions — a PARTIAL swap measures something else), and corrected §11.1's claim that `sdk._connect_issue_objects` calls `link_entity`: it does not, it calls `create_about_edge` (`sdk.py:20193` at the pinned revision), which emits the bare `MERGE`. Both are kept. The COUNT is not: two legs landed in the same merge, so the number was stale on arrival — which is exactly the argument for the instruction (the swap) over the number, and why the reading now lives here, in the ledger, where it is history rather than a claim about the current file.
+
+**Eleventh review-cycle correction (fresh-context review of the tenth round's own fixes, P1 × 2 and P2 × 6) — the closed pair survived in the cost argument, an exemption checked one of its two statements, and this entry's own citation rule was broken by three of its citations.** No ruling and no measured property name changed.
+
+- **The two-name enumeration survived in the three passages a reader uses to DECIDE about the migration.** §11.3's table row, §11.3's prose and §11.4 rule 1 all said "two ids, plus the binder's `confidence` on a *bound* link and the projection's `idx` ordinal" — a CLOSED pair — while §11.1's own footnote says the record-map writers' further attributes are an open set and §13 says the same. A record-projected about edge carries the row's placement columns (`RelationUpsert.attrs`: direction, confidence, weight, label, batch_id, source_version — `tortoise/record_projection.py`) and the open `props` tail beside `idx`. All three now state the open set, and §11.4's leg requires `placement columns`, `props` and `open set` in the rule.
+- **`_rebuild_all_replay`'s exemption was checked against ONE of its two `SET r += $attrs` statements.** `_query_call_containing` returned the FIRST match, so the structural-repoint fold (`projection/__init__.py:15782`) — the leg's actual subject, since `#9417` would touch exactly that shape — was never inspected, and a property reaching an about edge there stayed green. The helper is now `_query_calls_containing` (plural, EVERY match, each asserted), plus the exemption's second premise is pinned: the statement is gated on a fixed attribute vocabulary (`if k in (…)` / `if attrs:`), so a structural descriptor carrying none of those keys writes nothing on the edge its interpolated `etype` names. Mutation-checked: an `aboutObject` predicate in the SECOND statement reds.
+- **The ledger's KEEP row counted "two recorded properties" and conceded the open set in the same sentence.** Two names plus an open set is not two properties. The count is gone, and `two recorded properties` / `exactly two properties` join the leg's rejected spellings.
+- **Three citations were presented as current while false at the declared pin, and the pin could not see one of them.** The `record_epistemic.sql:175` citation appears twice in §11.3/§13 and `cache_projection.py:717` once in this entry, all bare; at `c79ba1cf2` that migration and `cache_projection`'s current line are not what the numbers say, and in one case the file does not exist. The qualifier window also ran PAST the paragraph break, so a later bullet's "— at HEAD" qualified a bare citation in an earlier line. All three carry `at HEAD`, and `_unqualified_line_citations` now bounds its window at the newline as well as at the next citation.
+- **§11.4 rule 1 claimed an ABSENCE its instrument cannot answer.** "no about-edge writer in the census writes `weight`" is unanswerable for the two property-MAP writers, which the census records only as the `<map:$props>` sentinel — the exact defect this PR exists to stop (a zero from a pattern that cannot match the writer). Scoped: no NAMED-form writer writes `weight`; the map-form writers copy the record row's whole attribute set, and `public.relation` HAS a `weight` column, so a `weight` on a record-projected about edge is not excluded.
+- **§13's one-line summary re-conflated the axes.** "`confidence` (originated, three sites)" — only TWO sites originate it; the third writes it in the named form and re-materializes it. The summary now says so, and the classification leg rejects the phrase.
+- **Change narration in the live design documents.** "the earlier *exactly one name* reading…", "an earlier revision of this correction counted it", "every completeness claim written here has been falsified by a shape the next reviewer measured" — process history, which the 2026-10-15 design-language pass removed from these documents and which this entry is the home for. Removed from §11.1/§13; the statements they carried survive here and in the round records above.
+- **A pre-existing defect filed, not silently carried** (this PR's scope guard says the product code is untouched): four comments in `tortoise/projection/edges.py` still assert the retracted "`property-free`" absolute, one of them cross-referencing §9.6 — which now says the opposite. Filed as `#9450`.
+
+**Twelfth review-cycle correction (fresh-context review of the eleventh round's fixes, P3 × 2) — the exemption was documented as one fold when the code carries two, and the guard's own pin list was one entry short.** No ruling, no writer and no measured property name changed; what changed is that the design documents now name the protection that actually carries the second `SET`, and that the file's prose inventory is enforced against the file.
+
+- **`_rebuild_all_replay`'s exemption was documented by the WRONG fold, in both design documents.** §13 said the replay's `SET r += $attrs` "belongs to the `DirectEdgeCreated` fold, whose only producer (`create_direct_edge`) refuses any `op_type` outside `{IMPL, NAND}`", and §13.8 q2 said "**each** of whose `SET r += $attrs` is on an `IMPL|NAND` leg". The function carries **two** such statements (`projection/__init__.py:15437` and `:15785` at HEAD): the `DirectEdgeCreated` fold, and the structural-`DirectEdgeRepoint` fold — whose `etype` is validated by `validate_rel_type` and therefore **can be `aboutObject`**, since `supersede_point` emits `DirectEdgeRepoint` over `SUPERSEDE_STRUCTURAL_RELS`. The operative protection in the repoint fold is the empty-`attrs` gate over a fixed attribute vocabulary (structural descriptors carry none of `direction`/`confidence`/`weight`/`label`/`batch_id`), **not** the producer restriction, which does not reach it. `DirectEdgeRepoint` appeared in **neither** document (`grep -n DirectEdgeRepoint docs/architecture/*.md` → 0 at the eleventh head), so the fold `#9417` would change was the one the documents did not describe. Both now name both folds and both protections, and the exemption leg pins the two-fold mechanism section-scoped (§13, §13.8 q2). Mutation-checked: restoring the retracted single-fold sentence at §13 reds.
+- **The exemption's SECOND premise was asserted function-wide, so it was satisfied by the other fold's gate.** `re.search(r"if k in \(|if attrs:", body)` over the whole function passed on the creation fold's `if attrs:` and said nothing about the repoint fold — the same "function-wide text union" leg 9's own docstring rejects for the about-literal half, one level down. It is now `_setter_gate_premises`: each `SET` statement is walked to its OWN enclosing `if` and to the assignment that builds the map it writes, and the map must be built from a fixed literal attribute vocabulary (a ceiling, `FALSE_POSITIVE_ATTR_VOCAB`). A constant gate (`if True:`) is rejected explicitly — a gate that can never be false is not a gate — and the leg carries a synthetic two-fold probe in which only the first fold is gated, asserting the rule reds there and passes when both are. Mutation-checked: `if True:` on the repoint fold reds (the function-wide search this replaced stayed green).
+- **The guard's `WHAT IS PINNED` list claimed "one entry per test, in file order" and was one entry short and out of order.** It listed 24 entries for 25 tests, and the omitted leg (`test_the_unmeasured_share_retraction_is_pinned`) is the **2nd** in the file, so every later entry described the wrong test — and the last entry described the 7th. The merge is where it went stale: two parents carried 24 tests each but *different* sets, and the resolution unioned them without re-deriving either count. The list is now one entry per test **in file order**, and its dedicated leg (`test_the_pin_index_names_every_leg`) re-derives the coverage, the uniqueness AND the order from `def test_` instead of trusting the prose — the same class round 8 declared eliminated, in the artifact that declares it. Mutation-checked: deleting an entry, duplicating one, or reordering one reds.
+- **A CI-configuration count, corrected by measurement, and a duplicate row removed.** The `durations` row's tail still said "over ALL **24** tests"; the merge union made it 25, and this round's added leg makes 26 — and the merge left the row TWICE (both lanes had edited it), so the surviving row is single, states 26, and retires the restated seconds in favour of how to re-derive them. The same cycle removed a 19.5 s O(n²) in the exemption leg (it called `ast.get_source_segment` for every call in a 16k-line module; the line index is now built once), which is the reading's real cause and not a property of the assertions.
+
+---
+
+## The capture-path write order — the invariant §9.6 states, now pinned (`#8501`)
+
+**What §9.6 says, and what the code did.** §9.6 records that the capture owns a
+session `:Source`'s version. The code did not: `capture_session` (and hosted
+`_capture_session_impl`) ran extraction — which creates the Points and MERGEs
+their `extractedFrom` links — **before** `_materialize_session_source`, the one
+writer that SETs `contentHash`. So `resolve_source_versions` read an empty hash
+**at link time**, `$v` bound nothing, and `_anchor_on_create` wrote
+`sourceVersion = NULL` on every create-path link. Measured on the pre-fix tree:
+`references` 1/1 anchored, `extractedFrom` 0/1. The consequence is not cosmetic —
+a revised transcript could never mark the claims it had superseded, because no
+claim recorded which version it was read from.
+
+**The invariant, stated so the next lane does not have to re-derive it.** *A
+capture must write its session Source's version BEFORE anything reads it at link
+time.* That is what §9.6 already assumed; it was true in prose and false in code,
+and nothing compared the two.
+
+**What changed.** Both lanes move the MINT + MATERIALIZE half above extraction,
+inside the **same gate** each lane already used (`not session_existed or
+(retry_failed_capture and not no_provider)` / `… and not store_only`), and the
+provenance stamp stays after extraction. Three consequences were handled
+deliberately rather than discovered later:
+
+- **The materializer can now CREATE the stub** (nothing created it yet), so it
+  mints `_link_source`'s create-time shape through the replay-shared
+  `_mint_source_stub` and upgrades it — and the `SourceCreated` record is
+  emitted before the link, so the raw `SET` still has a journal carrier (§17.1).
+- **`_mint_source_stub(now=…)` carries the CAPTURE's instant**, not a fresh clock
+  read: for a keyless capture this mint is the only writer of `ingestedAt`, and
+  its `SourceCreated` record carries `now`. A fresh read would put a later clock
+  on the live node than the replay folds in — a live≠replay divergence on a path
+  that previously had none.
+- **A KEYLESS capture's `:Source` gains four properties** (`title`,
+  `canonicalUrl`, `urlAliases`, `is_episodic`). Pre-fix that lane created the node
+  with only its `SET` properties, because it never reached `_link_source`. The
+  new shape is the stub shape the extracting lane has always had (and
+  `is_episodic` is the `#1486` discriminator), but it IS a behaviour change on
+  that lane, and it is pinned rather than disclosed-away.
+
+**What now prevents a repeat.** `tests/test_8501_capture_path_anchor.py` — the
+anchor must be non-NULL, equal to the Source's stored `contentHash`, and present
+in the Point's own journaled `sourceVersionTransit`; it must survive a
+destructive `rebuild_all()`; a re-capture must neither advance nor drop it; the
+keyless lane's full key set is pinned; and the pre-fix Source shape is pinned
+against the literal set. Registered on the `core` surface with a `durations:`
+weight, because a guard no CI leg selects is a guard that does not run.
+
+## §13's `aboutObject` read-site table — the fourth correction, and the end of the hand audit (2026-10-20, `#7948`)
+
+The design document's §13 table is the **whole evidence base** for the KEEP ruling on
+`aboutObject` (owner, 2026-09-23), and the document says so itself: *"⚠️ The count is the whole
+argument — the table must name every customer-callable surface"*. It has now been corrected
+**four** times, each by hand, each finding a different part of it wrong:
+
+1. the issue body (`#7948`) — the first eleven-site envelope;
+2. review finding `B2.7` (`REVIEW-CONSOLIDATED-2026-09-23.md`) — three further readers, two of
+   them under-classed as non-customer-callable;
+3. the `#7956` erratum on `B2.7` — that finding was itself incomplete (the customer-callable
+   count was four, not two);
+4. **this one** — two rows cited symbols that exist but **do not read the edge**, one row named
+   no symbol at all, and two readers were absent entirely.
+
+What moved, and why it is the last hand pass: the table is now **executable**
+(`tests/test_7948_about_object_read_sites.py`). It derives the census from the source's AST and reds
+when a reader under `tortoise/` is undeclared or a declared symbol does not perform the read, so
+the fifth correction is a red test rather than a fifth audit.
+
+- **Row 8 cited `collect_slices`** — which orchestrates the connected-assembly read and never
+  traverses the edge. The reads are in **`spine_rows`** (Object→Points and Object→Events, both inside
+  `docker_walker_port`) — the symbol is what the arm resolves; no line number is offered here, per the
+  rule stated below. A re-verifier following the row found no
+  traversal and could only conclude the row was wrong.
+- **Row 9 cited `build_subgraph`** — the Cypher is the module constants `_CYPHER_ABOUT` /
+  `_CYPHER_SIBLINGS`, executed by **`_collect_raw`** at `subgraph.py:439`/`:440`.
+- **Row 4 named no symbol at all** (`search(order_by="graph")` is a door, not a site), so its two
+  degree-centrality readers could not be re-verified by anyone. They are
+  **`GraphRanker._fetch_event_signals`** (`ranking.py:703`) and
+  **`StateRanker._fetch_point_signals`** (`ranking.py:1018`).
+- **New row 12 — `_EdgeHandlers._count_about_out`** (`projection/edges.py:1871`). It is the
+  link-verification predicate: `resolve_about_link` asks "did this record leave the Event joined to
+  anything". ⚠️ Reachable only on the **DEFENSIVE** `how: "name"` replay path — no released version
+  and no `origin/main` writes that form — so it cannot fire on data written today.
+- **New row 13 — `session_schema.audit_session_retrofit`** (`session_schema.py:663`), the retrofit
+  audit's recorded-vs-live edge counter, split across two `WITH` stages so the session-origin and
+  turn-Point-origin counts do not cross-multiply.
+- **Row 2's symbol was the SDK door, not the reader.** `topic_summarize` is the entry point; the
+  read is in **`_retrieve_topic_neighborhood`** (`topic_summarization.py:141`, `edge_type` at
+  `:185`).
+- **The count moved eleven → fifteen, and the customer-callable count did not move: four.** The
+  correction is entirely in the non-callable tail, which is where three hand audits kept losing
+  sites.
+- **Line numbers are gone from the table, deliberately.** They were pinned to `c79ba1cf2` and every
+  one of them had rotted; the documents' own rule is *"the symbol name is authoritative, the line
+  number is a convenience"*. Dropping the convenience removes a whole rot class instead of
+  re-pinning it. The test asserts symbols and census membership, never line numbers — a line
+  assertion would red on every unrelated edit, which is a different way to be dead.
+- **The test-file count was restated with its measurement.** `rg -l aboutObject tests/` → **59**
+  at `26aff163c` (36 at the pin; 41 recorded by the `#7956` pass at `1e5fc00ca`). All three count
+  files that **mention** the edge, which is the only thing a grep can measure — the sentence said
+  *"assert"*, which overstated what was behind the number.
+- **The sibling passage in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 was corrected in the same pass** (its
+  `assembly.py:573`/`:789`/`:809` pointer, its `:NNNN` citations and its test-file count), because
+  a repair that fixes one copy and leaves the other is how this drift survived the previous three.
+
+### Follow-up, same day — the FIFTH correction, and the first one the census could not have made (`PR #9398` review)
+
+The section above called itself "the last hand pass" and was **wrong within hours**: the review of
+that PR found the newly-written census blind in a whole class, and the claim it guards therefore
+still false. The review is the reason the count below moved in the direction that matters.
+
+- **The census could only see a string LITERAL.** It parsed `ast.Constant` and nothing else, so a
+  reader that builds the relationship name at runtime was invisible — and five of them exist:
+  `StateRanker._fetch_object_signals` (`ranking.py:1066`, `"|".join(ABOUT_EDGE_TYPES)`),
+  `TortoiseSDK._state_related_objects` / `_state_related_points` (`sdk.py`, no line hint — it
+  builds `"MATCH (n)-[a:" + self._ABOUT_TYPES + "]…"`, and the numbers this entry originally
+  shipped with were already wrong by a few lines when written), `supersede_point`
+  (`sdk.py:13559`) and `_preview_supersede` (`mcp_server.py:6804`), both looping over
+  `SUPERSEDE_STRUCTURAL_RELS`.
+  Worse, the table and the census **agreed perfectly** on the 13 sites the literal scan could see,
+  and that agreement was circular: both were blind in the same place. Adding rows alone would have
+  left a sixth hand pass guaranteed, so the fix is the derivation, not the list.
+- **The derivation is now one level through the expression**: `+`-concatenation, `JoinedStr`
+  (f-strings, including ones with no placeholders — the old scan skipped those outright),
+  `"|".join(CONSTANT)`, `for rel in CONSTANT` loop variables, class attributes (`self._ABOUT_TYPES`),
+  and constants **imported** from another module (resolved only when the name is unique package-wide,
+  so an ambiguous name is a reported gap rather than a guess).
+- **That un-blinded a site the earlier table had written off as un-derivable.**
+  `_retrieve_topic_neighborhood` (`topic_summarization.py:211`) builds `edge_type` from a conditional
+  and interpolates it into an f-string; the literal scan could not follow it and the row was listed
+  as one of "the two no census can find". It is now derived, so `UN_DERIVABLE` is down to **one**
+  entry: `SubgraphExpander._neighbors`, whose `MATCH (n)-[r]->(m)` names no type anywhere.
+- **The count moved fifteen → twenty, and the customer-callable count moved four → SIX.** New row 14
+  (`_state_related_objects`, `_state_related_points` — MCP `tortoise_recall` through `recall_state`)
+  and new row 16 (`_preview_supersede` — the `tortoise_supersede` dry-run preview) are both
+  **customer-callable**; row 15 (`supersede_point`) is the read on the write path that row 12's
+  precedent already admits. Row 4 gains its third reader, `_fetch_object_signals`. ⚠️ **The
+  customer-callable number is the one the KEEP ruling rests on, so a correction that raises it (and
+  was invisible to four hand passes) is the most important line in this entry.**
+- **The completeness arm now pairs files with symbols POSITIONALLY.** It used to build a
+  cross-product of a row's backticked files × its symbols, so a row citing files A,B and symbols
+  X,Y "declared" all four pairs — harmless while every row is single-file, and exactly wrong the
+  moment a row cites two files (the shape the table invites). Pairing symbols to the file token that
+  precedes them is mechanical and exact.
+- **The anti-vacuity floors were lowered, deliberately.** They sat at today's exact census (13 sites
+  / 13 rows), so deleting a reader *and* its row — a legitimate contraction — failed with a message
+  claiming the parser had broken. They are now floors (~10) that only catch "found nothing".
+- **The guard is registered in `config/ci-surfaces.yml`** (`core`, with a `durations` row). Without
+  that it was invisible to `tools/ci_selection.py --integrity` (a required, merge-gating job) AND
+  selected into no CI leg at all — the instrument that exists because nothing executable checked the
+  table would itself have run nowhere.
+- **A mechanism test pins the derivation** on synthetic sources (literal, `+`-concat, f-string,
+  `"|".join(TUPLE)`, `for rel in TUPLE`, and a `MERGE` writer that must NOT count), so the resolver
+  cannot regress to literal-only without a red.
+
+### Follow-up, same day — the SIXTH correction: the counts are now asserted, and the coverage claim stopped overreaching (`PR #9398`, second review)
+
+Two findings, both in what §13 **asserts about** the guard rather than in the guard's derivation. The
+fifth-correction entry above calls the customer-callable number *"the most important line in this
+entry"* — and that line was the one thing in §13 nothing checked.
+
+- **§13 claimed the guard's coverage was complete except for ONE shape; the guard documents two.**
+  The document said *"The one shape it cannot see is an empty relationship pattern"*, while the guard's
+  own `WHAT THE CENSUS CANNOT SEE` lists a second blind class: a relationship name **assembled entirely
+  at call time** (a function argument, a dict lookup, a value stored on an instance at construction),
+  which the resolver follows one level deep and then leaves as a gap. Such a reader derives nothing and
+  the table can stay short with five tests green — the same silent-omission class this whole entry
+  exists to end, sitting one paragraph away from a claim that the guard would have caught it. §13 now
+  states both shapes and states the guarantee as what it is: *a reader that NAMES the edge — literally,
+  or through a constant the resolver can follow*.
+- **⚠️ The count was guarded by a `>= 4` floor while the table declares SIX.** §13 calls the number
+  *"the whole argument"* and the ruling rests on it, yet a demotion of two `reach` cells — the `#7956`
+  erratum's exact direction, and the one that matters — left every arm green while the headline still
+  said SIX. Worse, §13 contained the contradiction already: a later sentence listed four customer-callable
+  surfaces and said *"are four of them"*, three paragraphs under a headline saying SIX. The new
+  `test_the_prose_counts_match_the_table` reads the numerals **out of the sentences that state them**
+  (`TWENTY read sites`, `SIX of them are CUSTOMER-CALLABLE`, and any later *"are N of them"* restatement)
+  and compares each to the table — the `reach`-column count for the customer-callable numerals, and
+  `census ∪ UN_DERIVABLE` for the site count (as the mechanism stood then — the seventh entry below
+  splits the units, because those two numerals counted different things). Only the numeral is read, never the prose around it, so the
+  sentences stay free to be rewritten as long as they stay true. Non-vacuity is measured, not assumed:
+  the arm reds on the previous revision of §13 (it reads `four` against six declared rows) and reds again
+  when a `reach` cell is demoted with the prose left alone.
+- **The two sentences were corrected to match**: the customer-callable enumeration now names all six
+  (`belief_timeline`, `topic_summarize`, `recall_subgraph`, `search(order_by="graph")`, `recall_state`,
+  the `tortoise_supersede` dry-run preview) and says *six*, and the customer-callable count is no longer
+  described in the guard's docstring as "not asserted beyond a floor" — that paragraph is what permitted
+  the stale headline in the first place.
+
+### Follow-up, same day — the SEVENTH correction: the class was ONE example, and the headline mixed two units (`PR #9398`, third review)
+
+The sixth entry closed the blind classes it knew about and asserted the counts they produced. The
+review of *that* state found both halves still wrong in the same direction — a reader the table did
+not name, and a number that read as a count of something it did not count.
+
+- **⚠️ The empty-pattern shape was declared as ONE example, and the class had three further
+  members.** §13 said *"an empty relationship pattern (`MATCH (n)-[r]->(m)`, row 3)"*, and
+  `UN_DERIVABLE` held a single entry (`SubgraphExpander._neighbors`). But the shape is not a
+  symbol — it is a **class**: any query whose relationship pattern names no type walks every type,
+  `aboutObject` included. Three live members were absent, one of them **customer-callable**:
+  `navigation._hop_query` — the per-hop query behind `entityProfile` and `tortoise_traverse` (MCP
+  `tortoise_entity_profile`, and `tortoise_traverse`), which emits `-[r]->` and `<-[r]-` and returns
+  `type(r)` verbatim — and the backfill census `CENSUS_QUERY`
+  (`definite_description_backfill.census_rows`, diagnostic), while `_preview_supersede` was a row
+  for a different reason entirely. **The guard could not see any of them**: `navigation.py` carries
+  no `aboutObject` literal and no rel constant, so no derivation parsed it, and the single
+  hand-declared entry covered only `_neighbors`. Six arms stayed green over a customer-callable
+  reader — a PASS about a false artifact, which is the failure mode this whole instrument exists to
+  end.
+- **The class is now derived by its own shape walk** (`_is_empty_pattern_read`: a bracketed
+  traversal with no `:` under a reading clause, docstrings excluded because they only quote Cypher),
+  and every derived member must be either a §13 row or a named `EMPTY_PATTERN` entry saying why it
+  is not an `aboutObject` read for a referent (eighteen such members today, from graph export and
+  edge counts to delete/repoint sweeps). A **new** member of the class now reds instead of shipping:
+  declaring one example by name was how this survived four passes. New rows **17** (`_hop_query`,
+  customer-callable) and **18** (`census_rows`, diagnostic).
+- **⚠️ The headline's numerals were compared against the wrong units.** *"TWENTY read sites, and SIX
+  of them are CUSTOMER-CALLABLE"*: TWENTY counted backticked **symbols**, SIX counted **rows**, and
+  the six customer-callable rows carried **nine** symbols — so "of them" was false by three, and the
+  arm baked the mismatch in by comparing each numeral to a different set. §13 now states
+  **TWENTY-TWO read sites across EIGHTEEN rows, and SEVEN of those rows (ten sites) are
+  CUSTOMER-CALLABLE**, and `test_the_prose_counts_match_the_table` checks four numerals, each
+  against the set its own noun names.
+- **The sibling copy in `EXTRACTOR-V4-ARCHITECTURE.md` §13.8 stopped restating the counts.** It
+  asserted an unguarded *"SIX sites are customer-callable"* and *"four customer-callable sites DO"*,
+  plus a "TWENTY-site table" pointer, and nothing executed any of them (the citation guard resolves
+  symbols, not counts) — so the two documents agreed on numbers neither checked, which is the
+  circular agreement this changelog diagnoses one level down. Both numerals and the table-size
+  pointer are now a reference to §13, and the name-invisible enumeration gained
+  `navigation._hop_query`.
+- **A rotted `file.py:NNNN` citation was fixed in the passage this PR already rewrote.**
+  `_connect_issue_objects` was cited as `sdk.py:20154` — a line inside `_cross_lens_pool`'s Cypher.
+  It sat three paragraphs below the sentence explaining that line numbers were dropped *because*
+  they had rotted. ⚠️ **The first fix of that citation shipped a new number, and the number was
+  wrong too** (`34896`, which is a different function at every head it was checked against) — the
+  fix for a rotten line number was a rotten line number, which is the argument for the rule rather
+  than an exception to it. The citation is now **symbol-only** (`sdk.py`, no `:NNNN`), the same form
+  §13's headline states, and the third review's remaining line hints in `EXTRACTOR-V4-ARCHITECTURE.md`
+  were dropped the same way — see the ninth entry below.
+- **`_MIN_CUSTOMER_CALLABLE`'s comment stated a wrong delta** (*"the table now declares three
+  more"*: four → six is two). A comment making a numeric claim inside a file whose whole subject is
+  numeric claims is not cosmetic.
+
+### Follow-up, same day — the EIGHTH correction: the shape that can only be DECLARED now has its members (`PR #9398`, third review, remaining half)
+
+The seventh entry below turned the empty-pattern shape into a derived class and closed it. The
+review's other half was still open, and it is the half no derivation can reach:
+
+- **§13 said the call-time-name class was covered — and then said it had *"no member today"*, which
+  was false.** A relationship name assembled entirely from a value computed at call time (a dict
+  lookup, an instance attribute) resolves to nothing, so no census can find it; the document
+  therefore has to name it. Two about\*-specific readers of exactly that shape are live:
+  `session_link.link_entity` — the **existence pre-probe** before minting an `about*` edge, whose
+  `edge_type` **defaults to `"aboutObject"` and whose every capture-path caller takes the default** —
+  and `subject_binding.bind_point_subjects`, the **re-probe** after a refused link, whose
+  `edge_type` comes from `_ROLE_TARGET["object"]`. Both read the edge on the write path, which row
+  12's precedent (`_count_about_out`) already admits as a row.
+- **One of the two was resolvable all along.** The resolver now follows **function-parameter
+  defaults**, so `link_entity`'s pre-probe is DERIVED (row 19) instead of hand-declared and the
+  class statement is no longer a matter of trust for that member. The other is a genuine dict lookup
+  and stays un-derivable: `bind_point_subjects` is **row 20** and is registered in the guard's
+  `UNDERIVABLE_CALL_TIME`.
+- **The declaration is now checked in both directions**, which is what makes it a class rather than
+  an example: every registered member must be a §13 row (the previous revision declared the class
+  and named nobody) and must still be un-derivable (if the resolver learns to follow it, the entry is
+  stale and reds). The mechanism arm gained the parameter-default case, so the new derivation shape
+  is pinned on synthetic sources like the other five.
+- **The count moved twenty-two → TWENTY-FOUR sites on eighteen → TWENTY rows.** The
+  customer-callable count is unchanged (**seven rows, ten sites**) — both new readers are on the
+  default-ON write path, not customer doors. The headline's four numerals and their units are
+  asserted, so the count and the table cannot drift apart.
+
+### Also corrected: "no `aboutObject` edge carries ANY property" was false (`#1370`)
+
+The §13 sentence that closes the *structural door* argument — *"no `aboutObject` edge carries any
+property, so we lose nothing semantically by deriving later"* — has been false since `#1370`:
+`session_link.link_entity` sets `r.confidence` when a binding confidence is supplied, and
+`projection/entities.py`'s replay fold restores it (a test asserts it on an `aboutObject` edge). The
+supporting measurement was a literal grep (`rg 'aboutObject \{'` → 0), and it was blind in exactly
+the class the census exists to fix: the relationship name there is a **variable**. The claim is now
+scoped to what the code actually does — the binding confidence rides the edge — in §13 and in
+`EXTRACTOR-V4-ARCHITECTURE.md` §13.8; `#9403` later refined it again (the record projection also
+stamps `idx`, and the census sees properties without being a proof of absence), and §11's ruling
+wording is flagged as predating `#1370` rather than silently rewritten — reopening a ruling is a
+decision, not a copy-edit. (Surfaced by the earlier reviews of this PR; the third review's scope did
+not include it.)
+
+### Follow-up, same day — the NINTH correction: the line-number hints are gone, and three prose claims are now checked (`PR #9398`, fourth review)
+
+The fourth review found nothing wrong with the census or the KEEP ruling. All three of its findings
+were **prose that a machine could have caught and no machine was catching**, which is this PR's own
+subject one level up:
+
+- **The line hints were still there, in the one paragraph that says they are not the authority.** The
+  §13.8 passage in `EXTRACTOR-V4-ARCHITECTURE.md` opened with *"These line numbers are the convenience,
+  not the authority"* while carrying fifteen `file.py:NNNN` hints — and six of them pointed at
+  unrelated code **at the PR head and at `origin/main`** (the reviewer measured each as a symbol
+  grep vs a `sed -n 'Np'`, the two-command comparison the paragraph itself invites). §13 had already
+  dropped its line numbers for exactly this reason, and the passage is inside the same argument, so
+  the numbers are now **gone, not re-measured**: the paragraph resolves **symbols** only, and the
+  sentence says why. The re-measure route was rejected because the last time this set was "fixed"
+  by re-measuring, the new number was wrong too (the `_connect_issue_objects` entry above).
+- **§13's empty-pattern class named two rows and has three.** *"an empty relationship pattern
+  (`MATCH (n)-[r]->(m)`, rows 3 and 17)"* — row 18 (`definite_description_backfill.census_rows`,
+  `OPTIONAL MATCH (o)<-[r]-()`) is the same class, and the guard's own docstring says so. Now
+  *rows 3, 17 and 18*, and **the sentence is asserted against the derived class**: a new member, or
+  a row dropped from the sentence, reds.
+- **Row 7's `reach` cell cited a symbol that does not exist.** `QueryOptions` appears nowhere in the
+  package (`grep -rn --include=*.py QueryOptions tortoise/` → 0 hits); the flag is a keyword
+  parameter of `tortoise_fts_query`. Corrected, and the `reach` column gained an arm: every
+  CamelCase symbol it backtick-quotes must exist in the package, so a reach cell can no longer cite
+  a name that was never there.
+
+**The three new arms, and why each is non-vacuous.** `tests/test_7948_about_object_read_sites.py`
+gained `test_the_census_prose_carries_no_line_citations` (reds on the pre-fix document, which
+carried twenty hints across the two passages — four in §13's bullet and sixteen in the sibling
+paragraph, measured with the arm's own `_LINE_HINT`), `test_the_prose_names_every_row_in_the_empty_pattern_class`
+(reds on *rows 3 and 17*, naming the missing row 18 by deriving it), and
+`test_the_reach_column_names_only_symbols_that_exist` (reds on `QueryOptions`). The lesson the three
+share: the guard resolved the `site` column and nothing else, so the prose around the table could
+carry a stale number, an under-counted class and a non-existent symbol while every arm stayed green
+— a **PASS about a false artifact**, which is the failure mode this whole instrument exists to end.
+
+### Follow-up, same day — the TENTH correction: the chronology now arrives at the headline, and a digit rewrite stays checkable (`PR #9398`, fifth review)
+
+The fifth review again found no defect in the census, the derivation or the KEEP ruling: the rows,
+the four numerals and the declared classes all reconciled at that head. Its three findings were the
+narrower kind — **a claim that disagreed with a claim next to it, a citation that had already
+rotted, and a documented capability that could not be reached** — and the first two share a shape
+worth naming: both were **prose asserting a fact about prose**, which no arm was reading.
+
+- **§13's chronology stopped two sites short of its own headline.** The headline stated
+  **TWENTY-FOUR read sites across TWENTY rows**; the three paragraphs explaining *why* the count
+  moved ended at **twenty → twenty-two sites**, the state before rows 19 (`session_link.link_entity`)
+  and 20 (`subject_binding.bind_point_subjects`) were added. The increment existed in this changelog
+  and **nowhere in the document being narrated**, so the passage a re-verifier reads to understand
+  the number answered with a smaller one. The closing increment is now stated (twenty-two →
+  twenty-four sites, eighteen → twenty rows, and **neither new row is customer-callable**, so the
+  numeral the ruling rests on — seven rows, ten sites — is unchanged), and the chain is **asserted**:
+  `test_the_change_chain_ends_at_the_headline_counts` compares the LAST `<from> → <to> <unit>`
+  increment of each unit to the table, so a chain that stops short reds instead of reading as
+  history. Non-vacuity is measured: on the pre-fix document it reds on
+  *"stops at `twenty-two` sites while its table has 24"* **and** on the missing rows increment.
+- **Two `file.py:NNNN` citations in the fifth-correction entry were already rotten when written.**
+  `_state_related_objects` / `_state_related_points` were cited at lines 28773 and 28790 of
+  `sdk.py`; at the head those lines are a validity-window helper and a sort-key comparison, while
+  the readers themselves sit **over 600 lines** further down (measured for this entry: 619 at the
+  head, and 5 lines off already at the commit that wrote the citation). The entry now uses
+  **`sdk.py`, symbol-only** — the same form the same block adopts for `_connect_issue_objects` —
+  because re-measuring is what produced the wrong number in the first place, and the rotten numbers
+  are named here as numbers in prose rather than as a `file.py:NNNN` hint, so the passage that says
+  they rot does not hand a re-verifier a fresh one to copy. ⚠️ **This block is deliberately not
+  guarded by a no-hints arm**, and the reason is structural rather than an omission: two of its
+  hints exist **as examples of rot** (`assembly.py:573`/`:789`/`:809`, the `EXTRACTOR-V4` §13.8
+  pointer the fourth correction replaced, and `sdk.py:20154`, the `_connect_issue_objects` citation
+  that was wrong when written), so a blanket arm would red on the passage that *documents* the
+  defect. What the arm enforces — *the symbols are authoritative, the line number is a
+  convenience* — therefore applies here in the smaller form this block can actually keep: **no hint
+  is written as a re-verification aid**, and the four that remain across these two entries
+  (`ranking.py:1066`, `sdk.py:13559`, `mcp_server.py:6804` in the fifth-correction bullet, plus
+  `topic_summarization.py:211` a paragraph below it) are dated record rather than pointers into the
+  live table.
+- **`_numeral` advertised digits it could not receive.** Its docstring promised *"digits are
+  accepted as well, so a rewrite that writes `6` instead of `SIX` stays checkable"*, while all five
+  `_PROSE_*` captures were `([A-Za-z][A-Za-z-]*)` — so `token.isdigit()` was unreachable and a
+  digit rewrite of the headline matched **nothing**, redding the count arm with *"§13 no longer
+  states its site count … restore the sentence"*: a false diagnosis telling a fixer to restore a
+  sentence that is present. The captures now accept `[A-Za-z][A-Za-z-]*|\d+` through one shared
+  `_NUMERAL` body, the parsing was split into `_parse_prose_counts()` so the sentence forms have a
+  seam, and `test_the_numeral_parsing_accepts_digits` feeds **both spellings of the same claim**
+  through all four units plus the chain form. It reds if the captures go back to words-only.
+
+### Follow-up, same day — the ELEVENTH correction: the call-time class is DERIVED, and it found two customer doors the census was missing (`PR #9398`, sixth review)
+
+The sixth review found no defect in the derivation, the table or the KEEP ruling either. Both of its
+findings were about the **third class** — the one whose relationship type is an expression rather
+than a name — and both are the same defect seen from two sides: the class was **declared, not
+derived**, so its completeness was a matter of trust.
+
+- **A hand list can only validate the entries it is handed.** `UNDERIVABLE_CALL_TIME` was a
+  one-entry list (`bind_point_subjects`) and the arm checked it in both directions — but nothing
+  enumerated a *new* member, so a reader of the shape shipped green **by construction**. The
+  reviewer measured it on six synthetic probes: a parameter, a dict lookup, a `for rel in` loop over
+  a rel-family `frozenset`, and so on, all invisible. That is exactly the defect the third review
+  found for the empty-pattern shape (declared as ONE example instead of derived as a class), one
+  class over.
+- **§13 therefore overstated both the class and the resolver.** It said the resolver follows
+  `for rel in CONSTANT` "in the module that defines the constant" — true for a tuple, **false for a
+  frozenset**, which is the idiomatic shape here (`DERIVABLE_STRUCTURAL_RELS`,
+  `_ABOUT_REPLAY_RELS`, `ENTITY_LINKED_RELS`). `_resolve` handled `ast.Tuple`/`ast.List` only and
+  fell through to the gap for `ast.Set` and `frozenset({...})`. It also said the class had
+  "one dict-lookup member", which was false at that head: the six probes above were live readers,
+  and two of them are customer doors.
+
+**The fix, in three moves.** (1) `_resolve` follows `ast.Set` and the collection constructors, so a
+rel-family frozenset is a named site like a tuple. (2) An empty **type slot** on a resolved candidate
+is a SHAPE (`-[:{rel}]->` resolves to `-[:]->`), so the class is walked like the empty-pattern one —
+`_call_time_sites()` — and every member must be a §13 row or a `CALL_TIME_REL` register entry saying
+why its gap cannot carry `aboutObject` for a referent. The register is not the class: the derivable
+members are rows, and the floor is on the derived set, so an empty register cannot make the arm
+vacuous. (3) The class walk's file filter must be a strict SUPERSET of the class or a filtered-out
+reader is an invisible one; it is verified exhaustively (a full 242-module walk derives the same
+eleven members, so nothing is missed by the 68-file filter).
+
+**What the derivation found — and what it moved.** Two undeclared **customer-callable** readers:
+`TortoiseSDK.traverse` (type is caller-supplied; `validate_rel_type` allowlists it against
+`KNOWN_REL_TYPES`, which carries the about\* family) and `TortoiseSDK.ingest`'s connection duplicate
+probe (`relation` allowlisted through `_VALID_EDGE_PREDICATES`). They are **rows 21 and 22**, and
+unlike every previous increment **this one moves the numeral the KEEP ruling rests on: seven → nine
+customer-callable rows, ten → twelve sites** — the direction an under-counted census fails in, since
+it understates the surface that ruling defends. The remaining members are register entries with
+their reasons: the five operator-rel legs (`_bfs_select_operators`, `apply_payload_operators`,
+`_fold_edge_message_changed`, `_find_operator`, `create_direct_edge`), the fixed `COMPLETED_STEP`
+onboarding edge (`_capture_onboarding_snapshot`), and `_rebuild_all_replay` — the reviewer's named
+miss, which deletes and rewrites replayed edges **by type** from a journal field and so reads the
+edge as data, not for a referent. Counts: **twenty-four → twenty-six sites, twenty → twenty-two
+rows**; the chain's closing increment is stated and asserted, as the tenth correction requires.
+
+**Measured, not asserted.** Non-vacuity for each new arm: against the pre-fix document **11 of 23
+arms red** (the derivation arms stay green by design — they pin the mechanism, not the prose); with
+the call-time walk removed, three arms red including the floor and the synthetic-new-member arm;
+with the frozenset branch removed, `test_the_resolver_follows_a_frozenset_rel_family` reds. The
+mechanism cases also pin the two near-misses that must NOT count (a named type, a `MERGE` writer)
+and the neighbouring class's shapes (an empty pattern belongs to the empty-pattern walk), so the two
+shape walks cannot double-count one site and then each re-declare it. `_type_slot` is shared by both
+walks, which also closes a hole the fourth review named: `-[r {idx:$i}]->` names **no** type, because
+that colon is a property-map key, not a type.
+
+⚠️ **The two figures in this entry were re-read at the head that closed the round after it.** They
+were written at `9b5d14b10`, when the file held 17 arms; five arms arrived with this very round
+(17 → 22) and one more in the twelfth, so "10 of 17" described an artifact that no longer existed.
+A record that stops at the head it was written against is the same rot this section exists to end,
+one level up — hence the re-read, not a footnote.
+
+### Follow-up, same day — the TWELFTH correction: the empty-pattern class was walked in ONE of its two spellings (`PR #9398`, seventh review)
+
+The seventh review found no defect in the derivation the eleventh correction added, the table, the
+CI registration or the numerals the KEEP ruling rests on. It found one **live reader the whole
+census could not see**, and one promise that was in prose only.
+
+- **A traversal that names no type has TWO legal spellings, and only one was walked.**
+  `_EMPTY_TRAVERSAL` required brackets, so `-[r]->` derived and `(n)--()` did not — but the
+  bracket-less form is the same traversal: no type is written, so it walks every relationship type,
+  `aboutObject` included. There was a live member: `domain_validators.validate_chain_integrity`,
+  inside the `orphaned_draft` rule (`#131`), runs `MATCH (n:Point {status:'draft'}) … AND NOT
+  (n)--()` — a degree count over every edge type, the same read `session_source_migration._degree`
+  is already registered for. The module carries no `aboutObject` literal and no rel-family constant,
+  so the file filter skipped it and no walk ever reached it. §13's *"every such reader is enumerated
+  by its own shape walk"* was therefore **false at that head**, and the shape a new orphan/degree
+  rule is idiomaticly written in was the one that shipped green.
+- **The "numbering of record" omitted two arms.** The docstring's `WHAT THIS PINS` list held 19
+  entries for 22 arms; the two with no entry were the call-time class's mechanism arm and its
+  synthetic-new-member arm — the latter being the arm the PR body advertised as the sixth review's
+  headline fix. The list says of itself that it is the numbering of record, and three places in the
+  file cite arms *by number*, so an omission there is not cosmetic.
+
+**The fix, in three moves.** (1) `_BARE_TRAVERSAL` derives the bracket-less form — `<-->`, `<--`,
+`-->`, `--`, anchored between two node patterns (`)` … `(`) so a bare `--` in prose, a CLI flag or a
+`->` in a log message is not a traversal — and both shape predicates (`_may_traverse_every_type`,
+`_is_empty_pattern_read`) use it, so the file FILTER and the walk cannot disagree. (2)
+`validate_chain_integrity` is a named `EMPTY_PATTERN` entry with its reason (a degree count, not a
+read for a referent), taking the register from eighteen to nineteen members, and `_EMPTY_PATTERN_CASES`
+gains five bracket-less cases plus the two near-misses that must NOT derive (`--` inside a string
+literal, a `MERGE (n)-->(m)` writer) — the mechanism arm has the new direction on sources that are
+not today's tree. (3) `test_the_docstring_names_every_arm` makes the numbering of record executable:
+every `test_` function is a numbered entry or a declared collapse (`_COLLAPSED_ARMS`), the numbers are
+contiguous with no duplicates (an *"arm N"* reference must not silently resolve to the wrong arm),
+and every collapsed name is a real arm the prose still names.
+
+**Measured.** With the bracket-less spelling un-walked, three arms red — `test_the_empty_pattern_class_is_declared`
+(the new register entry stops deriving), `test_the_empty_pattern_class_derivation_holds` (the five
+new cases) and `test_a_new_call_time_reader_cannot_ship_green` (an `EMPTY_PATTERN` entry that no
+longer resolves into the walk keyspace). Removing entries 20/21 from `WHAT THIS PINS` reds
+`test_the_docstring_names_every_arm` naming both, and a duplicated entry number reds it on the
+duplicate. Counts are unchanged: **twenty-six sites, twenty-two rows, nine customer-callable rows
+(twelve sites)** — this round added no reader to the table, which is the point: the member it found
+is not one.
+
+### The eighth review — the walk's own gate, and a promise the prose made
+
+The eighth review found no defect in the derivation, the table, the CI registration or the four
+asserted numerals. Every finding was in the surface *around* the instrument: a text gate inside the
+named census, and prose claims nothing read.
+
+- **The named census re-imposed on itself the blindness `_files()` exists to refute.** `_sites_in()`
+  kept only two of the four predicates its own file filter admits on, so a module admitted *because
+  of its shape* was parsed and then deliberately not walked. A constant FRAGMENT interpolated into
+  the type slot — `_REL = "about"` then `f"…[:{_REL}Object]…"`, which the resolver follows and which
+  §13 promises *"reds the guard until it gets a row here"* — derived nothing. It also made the
+  superset arm unfalsifiable: that arm re-uses this walk as its own proof, so a narrowing here was
+  invisible to the arm written to catch narrowings.
+- **§13.8 lost a question.** The rewrite of `EXTRACTOR-V4-ARCHITECTURE.md` §13.8's question 2 removed the
+  newline before question 3, which became the tail of the paragraph above it (`…cheap to keep.**3.
+  **Should every expansion…`). The list rendered one item short while the sentence that introduces
+  it still said *"The three questions below"*, and §15 still cross-references *"question 3"*.
+  Nothing saw it: the line-citation arm scans that line for `file.py:NNNN` and the sibling arm reads
+  backticked symbols, and both survive a missing newline.
+- **Three present-tense copies of the register's size, one numeral stale.** The arm that polices that
+  numeral reads it out of this document, so the register could grow past the number three comments
+  quoted and red nothing — the file that exists to make counts executable carried unread copies of
+  one. `_MIN_CALL_TIME`'s comment carried the same kind of copy for the call-time walk's member
+  count, a numeral behind the derivation.
+
+**The fix.** The gate goes: `_files()` admits a module, so the named census walks it — and a
+docstring is skipped there as it already is in the other two walks (prose that QUOTES a pattern is
+not an executed read; a docstring naming the edge would otherwise have demanded a §13 row for a
+comment). Two cases are added: a `{_REL}Object` fragment to `_MECHANISM_CASES` and to
+`_NEW_READER_CASES`, and a docstring case to `_MECHANISM_CASES`, all asserted *through the walk*
+rather than through the resolver alone — `_resolve` was already correct, which is why the gate hid
+the member. §13.8's newline is restored, and the copy in each stale comment is replaced by the property
+plus a pointer at the arm that measures it. Two arms make both prose defects executable:
+`test_the_extractor_section_keeps_its_three_questions` compares the count the sentence states to the
+items that start their own line (its predicate is run on a glued sample and a clean one, so the
+detector is measured, not trusted), and `test_the_file_states_no_count_it_does_not_measure` bans a
+restated census numeral in this test file altogether.
+
+**Measured.** Restoring the gate reds two arms (`test_the_census_derives_a_relationship_name_built_at_runtime`
+on the fragment case and `test_a_new_call_time_reader_cannot_ship_green` on the new reader); dropping
+the docstring exclusion reds the mechanism arm; re-gluing §13.8's item 3 reds the new list arm; putting
+the stale count back in a comment reds the count-copy arm. Counts are unchanged — **twenty-six sites,
+twenty-two rows, nine customer-callable rows (twelve sites)** — the gate was hiding no member at
+this head, which is the point: it would have hidden the next one.
+
+### The ninth review — the clause detector was case-sensitive, and a numeral nothing claimed
+
+The ninth review found no defect in the table, the three derivations, the CI registration or the four
+asserted numerals. Both of its findings were in the instrument's own handling.
+
+- **The governing-clause detector was case-SENSITIVE.** `_CLAUSE` carried no `re.IGNORECASE` while
+  both of its consumers `.upper()`ed the capture — the normalization a regex that can only yield
+  upper case makes dead code. A reader written `match (n)-[:aboutObject]->(m)` therefore derived into
+  NO class: not the named census, not the empty-pattern walk, not the call-time walk. The
+  completeness arm stayed green while §13 shipped a row short. No reader in the tree is written that
+  way today, so nothing was missed at that head — the failure was latent, not shipped.
+- **The flag alone was not the fix, and that was measured rather than reasoned.** With
+  `re.IGNORECASE` and no anchor, the completeness arm derived a FALSE site in
+  `value_extractor.GROUNDING_SYSTEM`: an LLM prompt whose prose says *"match summary items"* and
+  whose JSON schema then carries an example naming the edge, so the English verb governed a bracket.
+  The clause is now anchored on the `(` a real Cypher clause always carries, and both directions are
+  pinned in `_MECHANISM_CASES` / `_EMPTY_PATTERN_CASES`: a lowercase clause that must derive, a
+  lowercase `merge` and a prose sentence that must not.
+- **The docstring stated an envelope site count that nothing claimed.** The issue body names no
+  count; the issue's owner-decision comment and this changelog state the real one, and the docstring
+  disagreed with both. The numeral is removed rather than corrected — a count restated in a file that
+  does not measure it is the rot this guard polices — and the restated-count ban was widened to the
+  two spellings it could not see (the hyphenated `-site envelope` form and the `sites claimed` form).
+
+**Measured.** Restoring the case-sensitive detector reds two arms (both lowercase cases); taking the
+flag but dropping the anchor reds two (the prose near-miss and the false `value_extractor` site).
+Counts are unchanged.
+
+### The tenth review — two more restated counts, and the ban stops listing spellings
+
+The tenth review found the four asserted numerals, the three derived sets and the CI registration
+sound, and one defect left: two present-tense copies of census counts inside the guard itself, in
+spellings the restated-count ban could not see.
+
+- **The anti-vacuity floors' comment stated a pair the table never carried.** It read *"deliberately
+  BELOW today's census (20 named sites / 22 rows at the time of writing)"*, and those two numerals
+  never coexisted — the row count and the site count arrived in different corrections — so the
+  comment paired a symbol count with a row count, the units error the guard exists to stop. It also
+  contradicted this changelog's own record of the floors.
+- **The customer-callable floor's comment stated the row count one increment behind the table**, in a
+  present-tense `the table declares <N> today`.
+
+Neither was seen because the ban was a fixed list of four spellings, and this was the third round of
+widening it after the fact. It now states the PROPERTY: a COUNT with a census UNIT, scoped as current
+(`today`, `currently`) or as a dated reading (`at the time of writing`), in either order — plus a
+numeral-last alternative for the spelling that carries no unit word. It also scans the UNWRAPPED text
+(start-of-line comment markers are blanked to spaces, so every reported line number still points at
+the line the author sees), because the wrapped pair is precisely how one of the copies survived a
+per-line scan.
+
+Both comments are now property-only and point at `test_the_prose_counts_match_the_table`, the arm
+that measures the table. **Measured.** Restoring the two pre-fix comments reds
+`test_the_file_states_no_count_it_does_not_measure` on both, and each pre-fix line is a control
+sample inside that arm, so the shapes cannot silently fall out of coverage. Counts are unchanged —
+**twenty-six sites, twenty-two rows, nine customer-callable rows (twelve sites)**.
+
+## §13's derived class now covers the FRAGMENT half, and three claims in the guard became executable (2026-10-21, `#7948`)
+
+Review cycle 5 found four defects, all inside the guard that makes §13 executable rather than anything
+in the table it pins. Each is closed by making the claim run.
+
+**The fragment census existed and was never CALLED.** `_untyped_fragment_sites()` carried a 40-line
+docstring stating that *any string expression holding a dash-delimited relationship bracket with no rel
+type and no clause at all is itself a site, and its enclosing symbol must account for it (a row, an
+exclusion, or a `_NON_LITERAL` pin)* — and no test invoked it. So the bypass it documents was open:
+`_WALK = "-[r]->"` beside `query("MATCH (n)" + _WALK + "(m)")` enters neither census (the bracket and
+its clause live in different constants), and the whole suite stayed green. It is now wired into
+`test_no_untyped_walk_lacks_a_row_or_a_stated_exclusion` with exactly the ownership rule its docstring
+states — row, `_EXCLUDED_UNTYPED`, or `_NON_LITERAL` pin — a floor so it cannot go vacuous, and a
+synthetic part-assembled fixture so the detection itself is falsifiable. **Non-vacuity measured**: the
+probe above, appended to `tortoise/fanout.py`, reds naming `fanout.py (inside _WALK_FRAGMENT)`; it was
+green on the pre-fix tree. §13's sentence now states that half of the class (*in a read clause, or
+assembled from a dash-delimited fragment part that carries no clause of its own*), so the document and
+the instrument say one thing.
+
+**A docstring is prose, not a query — and the two halves of the census disagreed about it.** The untyped
+census filtered prose through `_docstring_ids()`; `_literal_read_sites()` and `_reads_naming_the_edge()`
+accepted every string constant. Measured on the pre-fix predicate: replace row 9's link query with
+`CONTAINS` and paste the old query into `audit_session_retrofit`'s **docstring** → every arm green, so a
+row kept its *"the named symbol really reads the edge"* verdict after the code stopped reading it. One
+rule now, asserted both ways by `test_a_docstring_is_prose_and_not_a_read_site`: prose is dropped, and
+the same query in the function BODY is still counted.
+
+**The carrier arm had no floor, so it could report green having asserted nothing.** It is the only arm
+asserting *"the constant IS the read"* (rows 17–21, 23), and it built its pairs in nested loops ending
+`assert not broken`. A carrier refactored to `ABOUT_EDGE_TYPES = _SHARED_ABOUT + ("aboutObject",)` is no
+longer splice-shaped, so `_carrier_declarations()` yields `{}`, the loops run zero times, and the arm
+passes while the `_NON_LITERAL` pins those rows carry keep the other arms green. It now counts the pairs
+it examined (`assert checked`; 7 at this head) and pins which refactor empties the candidate set, the way
+the sibling arms already guard (`assert census`, `assert pins`, `assert _EXCLUDED_UNTYPED`).
+
+**A third copy of the count was left stale — in the prior art this PR cites.** B2.7 of
+`REVIEW-CONSOLIDATED-2026-09-23.md` closed with *"⇒ the customer-callable count is four, not two"* while
+§13 and §13.8 stated SEVENTEEN at that pass, and nothing read that file. The durable form is a POINTER, not a fourth
+number, so the row now marks its figure superseded and sends the reader to §13's table — and
+`test_the_prior_art_points_at_the_table_instead_of_restating_the_count` keeps the pointer there, because
+a restated count is a copy that rots on the next pass.
+
+## Two censuses of the same table merge — and the first one's DERIVATION survives it (`#9400`, 2026-10-21)
+
+Two branches made §13 executable inside the same hour. `#9398` landed
+`tests/test_7948_about_edge_read_sites.py`, whose table covered **26 sites across 22 rows, 9
+customer-callable, 12 door-reaching**. `#9400` is the wider pass: the merged table now carries
+**37 rows, 19 customer-callable, across 22 distinct doors** — it derives the all-edge class a
+name-based census cannot see (`SubgraphExpander._neighbors`, `navigation._hop_query`, the backup
+dump and the counts that verify and settle it, the org export, the delete blast-radius preview,
+the v2.5 backfill), and the carrier-constant readers (`ABOUT_EDGE_TYPES`, `TortoiseSDK._ABOUT_TYPES`).
+
+⚠️ **The first resolution called it a straight supersession, and that was WRONG — it was a
+measurement artefact, not a finding.** The claim "every symbol the landed table names is named
+here, plus 36 more" came from comparing two different row spellings (`module.py **symbol**` vs
+`module.py::Symbol`): the regex matched only one of them, so the other table looked almost empty.
+Measured properly, the wider pass had **dropped four rows** the narrower one carried —
+`sdk.py::TortoiseSDK.traverse` and `sdk.py::TortoiseSDK.ingest` (both customer-callable
+CALL-TIME doors) and `session_link.py::link_entity` / `subject_binding.py::bind_point_subjects`
+(both write-path readers whose relationship type is an expression). A name-and-literal census
+cannot see any of the four; that is exactly why the narrower guard derived them from the resolved
+SHAPE. They are **rows 34–37** now, so the table is a superset **by measurement** rather than by
+assertion, and the "36" is gone: 37 rows against 26 is ELEVEN more.
+
+**The narrower guard retires as a FILE, not as a capability.** The two cannot coexist — each
+parses §13 in its own row shape, so the landed guard reads a table it can no longer find and
+reddens 10 of its 25 legs. What it *derived*, though, is the part that mattered: the call-time
+class (a type slot holding an expression, which no literal scan sees) and both legal spellings of
+an empty relationship pattern (the bracketed `-[r]->` and the bracket-less `(n)--()`, the second of
+which once left a live member undeclared). Those derivations moved, verbatim, into
+`tests/_about_call_time_census.py`; `tests/test_7948_about_object_read_sites.py` consumes them and
+pins both directions — every derived site must own a row or a stated exclusion, and every
+exclusion must still derive. The prose pins that came with the old file (its own row count, its
+`<from> → <to> sites` change chain) could not survive the restructure; they are the narration this
+document no longer keeps, and the changelog is where it lives.
+
+The old guard's name now appears nowhere in this file: a guard name in prose is a citation, and a
+citation to a deleted file is rot of the same kind the guards exist to prevent — so the mention
+above is the retirement record itself, not a citation of a live guard.
+
+What did NOT move with the retirement is the measured property finding (`#9397`/`#9403`): the
+`aboutObject` edge is **not** property-free — `confidence` is ORIGINATED by two writers
+(`session_link.link_entity`, `subject_binding.bind_point_subjects`) and `idx` is re-materialized
+in an inline pattern map by `cache_projection.relation_statement`. The wider census changed the
+count, not that measurement, and `tests/test_9397_about_edge_properties.py` still pins it.
+
+## §17.1's replay permit is HANDLE-ONLY, and the raw-query lane sits behind its own answer (`#9391`, 2026-10-22)
+
+`FalkorProjection.query`'s refusal was scope-CONDITIONED on the same
+`_CACHE_WRITE_AUTHORIZED` ContextVar every sanctioned lane sets, and
+`_replay_write_scope()` sets it around a rebuild engine's body — so the public
+raw-query lane, the one door that exists to write the cache WITHOUT the
+projection, was a permitted writer for a whole rebuild. Measured, on a
+journal-armed projection: outside the window `DirectCacheWriteRefused`, inside it
+the same `CREATE` landed. Latent rather than live (no engine called `self.query`),
+and pinned nowhere: the handoff on the closed `#9210` cited
+`tests/test_9079_record_lane_declared.py::test_the_replay_window_also_authorizes_the_raw_query_lane`,
+a file and test that never existed in this tree (the merged `#9213` file is
+`tests/test_9079_record_replay_declared.py`, and `git log --all -S` finds no such
+commit). The closed issue's scoping comment then excluded the leg as "already
+pinned" on that premise; the correction note is on `#9210`, and the shape of the
+defect — a withdrawn claim standing in for a measurement — is the one this
+changelog exists to keep.
+
+The design decision that replaced it, with its measurements. (1) The permit is
+now LANE-DEPENDENT, not scope-dependent: `_raw_query_lane_permit()` answers "did a
+lane deliberately open the raw lane too", and `_HANDLE_ONLY_WRITE_LANES` names the
+lanes that do not. (2) The closure travels with the SCOPE STACK, because the first
+shape of the fix closed only the un-nested window and every real rebuild nests —
+`rebuild_all` opens the restore and synthetic lanes per leg inside its own replay
+window, and `rebuild_from_record` opens the `schema-ddl` lane for its indexes — so
+each nest re-opened the door (measured: the `CREATE` landed under all three).
+`_handle_only_write_scope()` therefore carries `_RAW_QUERY_CLOSED_DEPTH` beside the
+lane reason, inherited by nested lanes and cleared by the same `finally`. (3) The
+match is on the LANE (`_lane_of`), because four of the ledger's seven rows declare
+`f"{PREFIX}: {detail}"` templates — an exact-string set would have made adding one
+a silent no-op — and the `graph-metadata` row is stated as the matcher's limit,
+since its writers share no prefix. (4) Both `replay` declaration sites use the
+helper: `_replay_write_scope()` and `event_store.reestablish_watermark`, which
+declares its own lane because an inner scope shadows any `with` at its call site.
+
+Two residuals are stated rather than closed. Every lane outside the set still opens
+the raw lane when it is NOT nested inside a handle-only window — that width is
+`#9079`'s sanctioning decision, and a wholesale refusal there is a measured P0 (it
+silently degraded a hosted writer family). And `tests/test_9121_onboarding_residual_pins.py`
+derives its opener population from the AST, so routing `_replay_write_scope()`
+through the new helper DROPPED it from the population and would have blinded the
+escape-(3) detector to any `with _replay_write_scope():` — the fix declared the
+delegation hop (`_DELEGATED_OPENERS`) instead of recording only the new name.
+
+Pin: `tests/test_9391_replay_window_raw_query_width.py` (nine legs: the refused raw
+lane inside and outside the window, three real nests, the still-permitted handle at
+an ARMED door, reads unblocked, the lane-name branch with no window, the
+declaration constants, the second declaration site, the rebuild engines still
+projecting INSIDE the window through an armed handle, and no permit past its
+`with`).
+
+## The narration stamp left §17.5, and the classification states its own ground (2026-10-22, `#8542`)
+
+`#9523` (W1b) corrected the id classification in §17.5 with a `corrected 2026-10-21` stamp and a
+"Provenance of that correction" preamble (the rule itself lives in the placement doc's §1.4). The
+stamp, the preamble, and the passage's reference to its own wording (*"the sentence above records
+three groups"*) are removed: a design document states the rule it settled on, and the record of what
+changed belongs here. The ground the classification rests on is stated in the same place instead — a
+re-derivation against `tortoise/ids.py` / `sdk._ULID_RE` and `tests/test_identity_contract.py`,
+**not** a re-census of the live graph, with the populations still the 2026-10-08 measurement. The
+two-store finding and the three id groups are unchanged.
+
+`#9562` (main `22deecf83`) had already taken out the two words the narration guard matched — the
+`corrected` before the date — so that arm is green there. What remained, and what this change
+removes, is the preamble and the self-reference — shapes the guard's arms did not reach either. That
+second gap is closed here too: `_CHANGE_NARRATION` now carries `Provenance of (that|this)
+(correction|change)` and `the|this sentence|passage|paragraph|line above records|states|…`, each
+measured at 0 hits across the three design documents at this head (so the widening reds nothing) and
+pinned in both directions — the verbatim pre-fix lines and a near-miss — in
+`test_the_class_check_is_neither_dead_nor_noisy`. Removing the word an arm happens to match is not
+the same as pinning the class, which is why the class is now pinned. The entry's own pointer is
+pinned by
+`tests/test_extractor_v4_citation_rot.py::test_the_changelog_entry_names_the_section_the_stamp_actually_left`.

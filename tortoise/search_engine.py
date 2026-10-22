@@ -395,11 +395,20 @@ class EpBreakdown:
 # (``createdAt``) are additive and OFF by default: the search point fetch reads
 # those columns only when this flag is set, so a default call is byte-identical
 # (the #3986 freeze carve-out — a default-off response field is not a surface
-# change. NO RECORDING SURFACE EXISTS for it: ``config/surface-manifest.yml`` has
-# no ``response_fields`` key and ``tools/surface_manifest.py`` derives none, so
-# this carve-out is ASSERTED here, not recorded in the manifest. Recording it
-# would need both a manifest key and its derivation path — a change to the
-# artifact and to the ``cut``/``check`` pair that owns it).
+# change).
+#
+# ⛔ AND IT IS RECORDED — the recording surface DOES exist, and this note used
+# to assert the opposite ("``config/surface-manifest.yml`` has no
+# ``response_fields`` key and ``tools/surface_manifest.py`` derives none");
+# both clauses were FALSE, and ``CONTRIBUTING.md``"s "And it must still be
+# recorded … an unrecorded field has no approval behind it" is the rule they
+# were invoked to escape. The block exists (``response_fields:`` in the
+# manifest), ``tools/surface_manifest.py`` carries it across a re-cut
+# (``_carried_response_fields``), validates it (non-empty, every entry anchored
+# to a row) and renders it into ``docs/product/mcp-sdk-surface.md``. This
+# carve-out's two fields ride it as the ``provenance.source`` /
+# ``provenance.captured_at`` rows — so the carve-out is RECORDED, not merely
+# asserted here. (The four default-ON #8658 keys below have their own rows.)
 SEARCH_PROVENANCE_FLAG_ENV = "TORTOISE_SEARCH_PROVENANCE"
 
 
@@ -592,6 +601,139 @@ def read_currency_links(graph, point_ids: Iterable[str]) -> dict[str, list[dict]
     return out
 
 
+def read_reference_currency_links(
+        graph, entity_ids: Iterable[str]) -> dict[str, list[dict] | None]:
+    """#5199 — the same pair, read for an **ENTITY** (`:Object` / `:Event`).
+
+    ``read_currency_links`` answers for a **Point**, over its ``extractedFrom``
+    links. A derived ``:Object`` / ``:Event`` has no such link: it reaches its
+    source through ``(Source)-[:references]->(entity)`` (§3.4), which is the
+    link that carries the ``sourceVersion`` note for the DERIVATION classes
+    (owner ruling 2026-09-25, option A — ``Event``/``Document`` annotate, an
+    identity/mention ``Object`` link carries no ``sourceVersion``). Without this
+    read the question *"are the entities we reason about still about the content
+    we hold?"* is unanswerable for every class except ``:Point``, which is the
+    gap #5199 names.
+
+    Returns ``{entity_id: [link, ...]}`` — the same row shape as
+    :func:`read_currency_links` (``source``, ``recorded``, ``current``,
+    ``currency``) — keyed by the id the CALLER used. THREE states, and they are
+    deliberately distinguishable:
+
+    * ``[link, ...]`` — the covered node's links, in ``(source, recorded)``
+      order;
+    * ABSENT — no inbound ``references`` link, or not in the batch. The caller's
+      verdict is :func:`aggregate_currency`'s anti-vacuity ``unknown``;
+    * ``None`` — the address named MORE THAN ONE node, so it is REFUSED rather
+      than answered (see the identity paragraph below). Absence must never be
+      read as "nothing references this entity" when the truth is "this read
+      declined to pick a node", so the refusal keeps its key.
+
+    ⛔ AN ``Object`` READS ``unknown``, AND THAT IS THE ANSWER, NOT A BUG. Its
+    link carries no ``sourceVersion`` by the same ruling, so the pair is
+    unfillable and :func:`currency_status` returns ``unknown`` — deliberately
+    never ``current``. Do not "fix" this by stamping an anchor onto an identity
+    link: that reverses the ruling and is pinned against in
+    ``tests/test_source_version_references_5199.py``.
+
+    Identity: a row is attributed to the COORDINATES THE CALLER USED, never to
+    a derived value. Three coordinates are legal because the provenance writers
+    mint three node shapes, and each is addressed differently:
+
+    * a ``:Source`` (D10: a document IS a source) is addressed by ``url``
+      (``projection/edges.py``'s ``key_clause = "{url:$eid}" if entity_label ==
+      "Source"``). ``_upsert_document`` happens to also write
+      ``s.id=coalesce(s.id, $id)``, but ``_mint_source_stub`` writes NO ``id``
+      and a Source's ``id`` is not guaranteed to equal its ``url`` — so a read
+      that matched ``id`` alone would report ``unknown``, with no links, for
+      every stub-minted document provenance while the note sits on the edge;
+    * a legacy raw-Cypher ``:Event`` carries only ``eventId``;
+    * ``id`` is the ordinary coordinate for an ``:Event`` / ``:Object``.
+
+    ⛔ ONE ADDRESS, ONE REFERENCED NODE — OR NO ANSWER. A single address can
+    name more than one node (``entity_identity.py`` names this fold as the
+    historic wrong answer: *MATCH returning several rows … folds two identities
+    into one value*). Rather than union several nodes' links under one verdict —
+    which can accuse the wrong entity and can downgrade a current node on a
+    stranger's link — an address that resolves to more than one node keeps its
+    key with a ``None`` value: the read REFUSED it (see the three states above),
+    and :func:`aggregate_currency` is never asked.
+
+    ⚠️ THE REFUSAL COUNTS *REFERENCED* NODES — the honest limit of an
+    edge-anchored read, stated rather than implied. The query walks
+    ``references`` edges, so a node with no inbound link is invisible to the
+    check: an address naming one LINKED and one UNLINKED node is answered for
+    the linked one. Making the refusal TOTAL needs a node-anchored pre-read
+    (``MATCH (n) WHERE n.id IN $ids OR …``), which is a label-less scan of the
+    graph and therefore a cost decision, not a free addition. Until then:
+    uniqueness is ``entity_identity._require_unique_id``'s job, and an address
+    that names a linked node plus an unlinked twin reads as the linked node's
+    verdict.
+
+    This function owns the graph read itself (one query, as
+    :func:`read_currency_links` does), the pair extraction and the ordering. The
+    §4.6 **aggregate** is what it leaves to its caller — that is
+    :func:`aggregate_currency`'s job, and passing it the pairs is the call site's.
+    """
+    ids = list(entity_ids)
+    if not ids:
+        return {}
+    wanted = set(ids)
+    rows = graph.query(
+        "MATCH (s:Source)-[ref:references]->(n) "
+        "WHERE n.id IN $ids OR n.eventId IN $ids OR n.url IN $ids "
+        "RETURN id(n), n.id, n.eventId, n.url, s.url, "
+        "ref.sourceVersion, s.contentHash",
+        params={"ids": ids},
+    ).result_set
+    out: dict[str, list[dict] | None] = {}
+    idents: dict[str, set] = {}
+    for node_uid, nid, neid, nurl, url, remembered, current in rows:
+        recorded = remembered or ""
+        now = current or ""
+        row = {
+            "source": url or "",
+            "recorded": recorded,
+            "current": now,
+            "currency": currency_status(recorded, now),
+        }
+        # The NODE's identity — used only to detect an address that names more
+        # than one node, never to key a row. It is the engine's own node id
+        # (`id(n)`, stable within this query snapshot, which is all that is
+        # needed), NOT a fingerprint of the node's VALUES: two distinct nodes
+        # can carry the same coordinates (`id:'x'` twice is exactly the raw
+        # duplicate corruption `entity_identity._require_unique_id` refuses
+        # first), and a value fingerprint would call them one node — the very
+        # fold this check exists to catch. A derived property key would do the
+        # same, which is why the row returns no derived identity at all.
+        ident = node_uid
+        # Attribute to EVERY coordinate the caller actually asked for. An empty
+        # string is not a coordinate, so a `id: ''` node is reached through its
+        # `eventId`/`url` rather than skipped. The coordinates are DEDUPED: the
+        # ordinary production shape carries ``id`` and ``eventId`` with the SAME
+        # value, and appending once per coordinate would double that row.
+        for key in dict.fromkeys((nid, neid, nurl)):
+            if key and key in wanted:
+                out.setdefault(key, []).append(dict(row))
+                # `ident` goes in AS the engine returned it. Coercing it through
+                # `or ""` would turn node id 0 into the empty string and fold it
+                # with any other falsey id — an accidental VALUE fingerprint,
+                # which is exactly what this set must never be.
+                idents.setdefault(key, set()).add(ident)
+    # ONE ADDRESS, ONE NODE — OR NO ANSWER (see the docstring). An address that
+    # named more than one node keeps its KEY with a ``None`` value: a verdict
+    # assembled from a node the caller may not have addressed is not an answer,
+    # but silently dropping the key would make a REFUSAL indistinguishable from
+    # "no inbound reference" — and a caller that cannot tell those apart could
+    # read absence as "nothing references this entity".
+    for key in [k for k, seen in idents.items() if len(seen) > 1]:
+        out[key] = None
+    for links in out.values():
+        if links is not None:  # a refused address keeps its `None` (see above)
+            links.sort(key=lambda lk: (lk["source"], lk["recorded"]))
+    return out
+
+
 @dataclass
 class SearchResult:
     id: str
@@ -682,6 +824,48 @@ class SearchResult:
     # them, so an unflagged call stays byte-identical; empty ⇒ absent.
     currency: str = ""  # current | stale | unknown
     outdated_sources: list = field(default_factory=list)  # the behind links
+    # #8658: the Point's VERBATIM PROVENANCE — the anchor Slice A's
+    # ``retrieval.package_evidence_pool`` (#2683) collapses a distilled point's
+    # own source chunk/turn onto (``quote`` + ``source_turn_id``) and the
+    # address #2684 surfaces (``span_start``/``span_end``). The eval lane's
+    # ingest supplies all four (``tools/longmem_eval/ingest.py::
+    # point_props_for_hits``); the PRODUCT point fetch read none of them, so
+    # ``_is_own_source`` returned False on its first line (empty quote) and
+    # both provenance legs were INERT on real graphs.
+    #
+    # ADDITIVE and PRESENT-ONLY in ``to_dict``: each key is emitted only when
+    # the Point actually carries the datum, so an unprovenanced hit — every row
+    # written before E3/E4, and every row whose writer never had a verbatim
+    # source — stays byte-identical to pre-change output. A default that
+    # emitted four empty fields would make every legacy hit look provenanced to
+    # the package's own truthiness gates.
+    #
+    # ⚠️ This is a DEFAULT-ON additive response field, and that IS a departure
+    # from the #3986 carve-out recorded on ``search_provenance_enabled`` above
+    # ("a default-off response field is not a surface change") — the shape that
+    # does not gate as an addition is by definition the one that is OFF by
+    # default and leaves the response unchanged when off
+    # (``CONTRIBUTING.md``). ⛔ So the response shape DOES change here, and that
+    # is stated plainly rather than argued away: what is NOT novel is the
+    # INFORMATION — the four values are the point's OWN stored verbatim anchor,
+    # already on the node, already emitted to any caller of the eval lane, and
+    # already named by ``package_evidence_pool``'s docstring as the key it
+    # collapses on — but a default-on key is still a response addition, so it
+    # is RECORDED as one. A default-off gate was rejected because it would keep
+    # the read path's own documented contract inert by default, which is the
+    # defect #8658 exists to remove. ⛔ It IS recorded, in the one place that
+    # records response fields: four `response_fields` rows on `tortoise_search`
+    # in ``config/surface-manifest.yml``, rendered into the "Recorded response
+    # fields" table in ``docs/product/mcp-sdk-surface.md``.
+    # (An earlier draft of this comment claimed no such surface existed — it
+    # does: the block, its `check` validation, and its `render` are all in
+    # ``tools/surface_manifest.py``, and ``CONTRIBUTING.md``"s "it must still be
+    # recorded" applies to exactly this shape. The `outdated` row is the
+    # non-flag-gated precedent.)
+    quote: str = ""
+    source_turn_id: Any = None
+    span_start: Any = None
+    span_end: Any = None
 
     def to_dict(self) -> dict:
         """Convert to JSON-safe dict for API responses."""
@@ -787,6 +971,20 @@ class SearchResult:
                 prov["fyi"] = {"reason": FYI_REASON_SOURCE_DRIFT,
                                "sources": self.outdated_sources}
             d["provenance"] = prov
+        # #8658: verbatim provenance — additive keys, each emitted ONLY when the
+        # Point carries it (present-only, so unprovenanced hits stay
+        # byte-identical). ``span_start == 0`` is a REAL address and must
+        # survive, so the gate is presence (``is not None``), never truthiness;
+        # ``source_turn_id`` arrives as ``int|None`` and the graph drops a null
+        # prop (#2949), so an absent link arrives as None or "".
+        if self.quote:
+            d["quote"] = self.quote
+        if self.source_turn_id is not None and self.source_turn_id != "":
+            d["source_turn_id"] = self.source_turn_id
+        if self.span_start is not None:
+            d["span_start"] = self.span_start
+        if self.span_end is not None:
+            d["span_end"] = self.span_end
         return d
 
 
@@ -815,14 +1013,20 @@ def classify_query(
 #: took. #4199 adds a second OPTIONAL key — ``scope``
 #: (:data:`VECTOR_SCOPE_KEY`, value :data:`VECTOR_SCOPE_EMPTY`) — present
 #: only on a vector entry whose ``scope_kinds`` predicate selected NO nodes.
-#: Legs that do not pass either key are byte-identical to the shared shape.
+#: Legs that do not pass any optional key are byte-identical to the shared
+#: shape. #8488 adds a third OPTIONAL key — ``declined``
+#: (:data:`LEXICAL_DECLINED_KEY`) — present only on a lexical-arm entry that
+#: RAN and then declined to rank (see :data:`DEFAULT_BM25_CORPUS_CAP`).
 def _trace_entry(leg: str, *, ran: bool, degraded: bool,
                  reason: str | None, count: int,
-                 mechanism: str | None = None) -> dict:
+                 mechanism: str | None = None,
+                 declined: bool = False) -> dict:
     entry = {"leg": leg, "ran": ran, "degraded": degraded,
              "reason": reason, "count": count}
     if mechanism is not None:
         entry[VECTOR_MECHANISM_KEY] = mechanism
+    if declined:
+        entry[LEXICAL_DECLINED_KEY] = True
     return entry
 
 
@@ -832,6 +1036,15 @@ def _trace_entry(leg: str, *, ran: bool, degraded: bool,
 #: of them was relevant", which the search surface must NOT mistake for a
 #: leg failure and answer from the TF-IDF fallback.
 BELOW_RELEVANCE_FLOOR = "below_relevance_floor"
+
+#: #5412 — leg-trace reason recorded when the caller supplied NO query vector
+#: at all. The dense leg was never asked a question, so it neither ran nor
+#: failed (``ran=False``, ``degraded=False``). Its own term is required:
+#: without an entry the declaration could only infer ``leg_absent`` (a leg
+#: blamed for not existing) or ``leg_trace_unavailable``, and
+#: ``require_hybrid_read``'s refusal named that wrong cause. It must never
+#: read as a healthy run — a keyword-only read is not a hybrid read (#2952).
+NO_QUERY_VECTOR = "no_query_vector"
 
 
 # ── #4999: the vector leg's MECHANISM (index vs scan) ───────────────────────
@@ -993,6 +1206,10 @@ def declared_degraded_read(leg_trace: list[dict] | None) -> dict | None:
     leg did not run (``ran=False``) or ran degraded (``degraded=True`` — e.g.
     ``no_embedder``, ``encode_failed``, ``breaker_open``, ``query_failed``,
     ``index_missing``, ``no_embeddings``, ``timeout``), else ``None``.
+    A leg the read never asked — ``no_query_vector``, recorded
+    ``ran=False``/``degraded=False`` (#5412) — is also declared: it
+    contributed no semantic rows, and the ``reason`` names that instead of
+    the misleading ``leg_absent``.
 
     Shape: ``{"degraded_read": True, "hybrid": False,
     "vector_leg_unavailable": <bool — False for a keyword-only fallback whose
@@ -1332,7 +1549,8 @@ def run_fts_query(
 #: The cap is a memory/latency bound, not a ranking parameter, and it is
 #: LOUD **and DECLINED**: the leg asks for one row more than the cap, so it can
 #: tell "exactly cap" (a complete ranking) from "more than cap" (a window) —
-#: and on a WINDOW it returns NO rows at all, recording ``degraded=True``. The
+#: and on a WINDOW it returns NO rows at all, recording ``declined=True``
+#: (NOT ``degraded`` — see below). The
 #: shipped graph-side leg answers over the whole label (it is index-backed), so
 #: replacing its rows with a ranking over the first ``cap`` ids in id order —
 #: oldest-first on this tree's ULID ids, i.e. blind to the newest documents,
@@ -1342,14 +1560,47 @@ def run_fts_query(
 #: arm gets) and leaves the signal in the trace. Raise the cap (or add an
 #: id-descending window) before enabling the arm on a store that large.
 #:
-#: ⚠️ What ``degraded=True`` then COSTS the read, stated because it is wider
-#: than "this leg ran": ``read_status.classify_leg_trace`` reports the read as
-#: ``degraded`` when any leg entry is degraded, and ``ask_lane`` sets
-#: ``retrieval_degraded`` the same way. On a store at the cap that is the
-#: intended signal (the corpus the arm could see was a window), but it also
-#: means #2952's narrower reading ("the leg contributed no results") does not
-#: apply. That is the deliberate trade: a truncated corpus must not read as a
-#: clean measurement.
+#: ⛔ What the decline must NOT cost the read (#8488 follow-up). The decline
+#: used to record ``degraded=True`` so that a measurement could not read a
+#: truncated corpus as a clean BM25 result. That carrier was wrong, because
+#: ``degraded`` is NOT a leg-local flag: ``read_status.classify_leg_trace``
+#: reports the whole READ as ``degraded`` when any entry carries it, and
+#: ``ask_lane`` sets ``retrieval_degraded`` the same way. So on a store at the
+#: cap, enabling the arm relabelled EVERY successful read "the memory layer is
+#: IMPAIRED" — the recorded term for a store that could not be reached or a
+#: retrieval leg that did not run, NOT a leg-local "this scorer returned
+#: nothing" — while nothing here was impaired: the shipped lexical leg had in
+#: fact answered over the WHOLE label and every row was returned. The
+#: arm is an alternative SCORER for a SAME leg slot, not a leg, so its
+#: declining cannot mean "a retrieval leg did not run". (The decline's own entry
+#: adds no impairment; it says nothing about the OTHER legs, which report
+#: themselves — a vector leg that failed is degraded on its own entry.)
+#:
+#: The measurement's need — "a truncated corpus must not read as a clean BM25
+#: measurement" — is what :data:`LEXICAL_DECLINED_KEY` makes ANSWERABLE, and
+#: it is not yet answered by any consumer in this tree: the entry records
+#: ``ran=True, declined=True, degraded=False, count=0`` with NO ``mechanism``
+#: key (BM25 produced no rows, so it may not claim to have), so a baseline can
+#: count declines exactly instead of inferring them from a blanket
+#: degradation — but no in-tree fold counts it yet, and the TWO folds that
+#: read the old carrier now record a declining arm as a RUN, not an impairment,
+#: deliberately:
+#:
+#: * ``retrieval_preflight.merge_leg_trace`` — the shared interpreter both
+#:   ``arms/a4_tortoise`` and ``parity/mabench_tortoise`` record through — folds
+#:   only ``degraded``, so the run record's (and the parity cell's)
+#:   ``retrieval_degraded`` no longer fires on a decline, and a decline is
+#:   therefore NOT distinguishable there from the arm being OFF.
+#: * ``retrieval_metering`` tallies the decline as a leg run, not a degraded one.
+#:
+#: That is the correct polarity for both (neither claims an impairment, which is
+#: what this whole note is about), but it does mean the decline's measurement
+#: signal is carried ONLY by the trace entry: a measurement that wants it must
+#: read :data:`LEXICAL_DECLINED_KEY` off the trace — which is exactly what
+#: #8486's baseline has to do, and why the key exists. Whoever wires it must not
+#: route it back through ``degraded``; the parity lane already persists the raw
+#: entries (``capability_gate.leg_trace``), so the signal survives in that
+#: artifact even while the boolean does not carry it.
 #:
 #: ⛔ Cost, stated and NOT measured. Unlike ``run_vector_query``'s embedded
 #: brute force — which scores inside the engine and returns ``limit`` rows —
@@ -1360,6 +1611,20 @@ def run_fts_query(
 #: embedded-lane-only, and why its latency must be measured (#8486) before it
 #: is enabled anywhere.
 DEFAULT_BM25_CORPUS_CAP = 20000
+
+#: #8488 — trace-entry key marking a lexical ARM that ran and then DECLINED to
+#: rank (``ran=True, count=0``): the corpus it could read was a window
+#: (:data:`DEFAULT_BM25_CORPUS_CAP`), so it returned nothing and left the
+#: shipped leg's whole-label rows in place. PER-LEG: written only on an
+#: ``fts`` entry produced by the in-process BM25 arm; no other leg passes it.
+#:
+#: Why it exists instead of ``degraded``: ``degraded`` is aggregated into the
+#: READ's recorded status (``read_status.classify_leg_trace``) and into
+#: ``ask_lane``'s ``retrieval_degraded``, so carrying a leg-local decline there
+#: reported a complete read as an impaired one. ``mechanism`` cannot carry it
+#: either — that key answers "which path produced these rows", and here there
+#: are no rows, which is why a declined entry writes no ``mechanism`` at all.
+LEXICAL_DECLINED_KEY = "declined"
 
 #: #8488 — the value of the leg trace's ``mechanism`` key when the lexical leg
 #: was scored IN-PROCESS by Okapi BM25 (``run_bm25_query``) rather than by the
@@ -1475,16 +1740,22 @@ def run_bm25_query(
       ``mechanism`` key is written: nothing was read, and the leg cannot
       search that family at all. A consumer counting ``mechanism == "bm25"``
       must not count it (that is ``_record``'s own contract).
-    * corpus WIDER than ``corpus_cap`` — ``ran=True``, ``degraded=True``,
-      ``count=0``: the leg DID read, and it declined to return a windowed
-      ranking (see ``DEFAULT_BM25_CORPUS_CAP``), so the shipped whole-label
-      rows survive. ``degraded`` is what separates this from a clean empty.
+    * corpus WIDER than ``corpus_cap`` — ``ran=True``, ``declined=True``,
+      ``degraded=False``, ``count=0``: the leg DID read, and it declined to
+      return a windowed ranking (see ``DEFAULT_BM25_CORPUS_CAP``), so the
+      shipped whole-label rows survive. It writes NO ``mechanism`` key for the
+      same reason the refusal does not: BM25 produced no rows for this read,
+      so a baseline counting ``mechanism == "bm25"`` must not count it — it
+      counts :data:`LEXICAL_DECLINED_KEY` instead. It is NOT ``degraded``:
+      that flag is aggregated into the READ's recorded status, and this decline
+      impairs nothing (the shipped lexical leg answered over the whole label).
+      Marking it degraded relabelled healthy reads as impaired memory.
     * a query that matched nothing — ``ran=True``, ``degraded=False``,
       ``empty_results``, ``count=0``.
 
-    ``degraded`` is recorded only where the leg's OWN result is incomplete or
-    declined (a failed read, an open breaker, a corpus over the cap), never on
-    a clean empty result.
+    ``degraded`` is recorded only where the leg's OWN result is incomplete
+    AND the read is impaired by it (a failed read, an open breaker), never on
+    a clean empty result and never on a decline.
 
     ``keep_numeric`` is threaded, never decided: the search lane's
     byte-identical control is a RECORDED decision and its reopen belongs to the
@@ -1501,7 +1772,7 @@ def run_bm25_query(
     validate_entity_type(entity_type)
 
     def _record(*, ran: bool, degraded: bool, reason: str | None,
-                count: int) -> None:
+                count: int, declined: bool = False) -> None:
         # The leg NAME stays "fts": the leg trace's vocabulary has three slots
         # and the lexical one is that name (``read_status``, the metering fold
         # and the eval lane all key on it). WHICH scorer produced the rows is
@@ -1509,15 +1780,19 @@ def run_bm25_query(
         # additive seam #4999 introduced for index-vs-scan, so a measurement
         # can tell a BM25-scored lexical leg from a server-scored one without
         # a fourth leg name anywhere in the tree. The key is written ONLY when
-        # the leg ran: ``_trace_entry``'s contract leaves it absent on a
-        # ``breaker_open`` skip, and a consumer counting ``mechanism ==
-        # "bm25"`` must not count a skip as a run.
+        # the leg ran AND did not decline (a declined arm produced no rows, so it
+        # may not claim the path that produced them): ``_trace_entry``'s contract
+        # leaves it absent on a ``breaker_open`` skip, on the refusal branch, and
+        # on the corpus-cap decline, and a consumer counting ``mechanism ==
+        # "bm25"`` must count neither a skip nor a decline as a BM25-scored read.
         if meter:
             _retrieval_metering.note_leg("fts", ran=ran, degraded=degraded)
         if leg_trace is not None:
             leg_trace.append(_trace_entry(
                 "fts", ran=ran, degraded=degraded, reason=reason, count=count,
-                mechanism=(LEXICAL_MECHANISM_BM25 if ran else None)))
+                mechanism=(LEXICAL_MECHANISM_BM25
+                           if (ran and not declined) else None),
+                declined=declined))
 
     if not _breaker_allow("bm25"):
         logger.warning("BM25 circuit breaker OPEN — skipping BM25 strategy")
@@ -1592,15 +1867,23 @@ def run_bm25_query(
             # answered over the whole label; a ranking over the first ``cap``
             # ids (oldest-first on ULID ids) is not the same answer and is
             # often a weaker one — so the caller keeps the shipped rows, the
-            # same fail-safe an empty arm gets. ``degraded`` records WHY the
+            # same fail-safe an empty arm gets. ``declined`` records WHY the
             # slot was left alone; ``count=0`` because nothing was returned.
+            #
+            # NOT ``degraded``: that flag propagates to the READ's recorded
+            # status (``read_status.classify_leg_trace``) and to
+            # ``ask_lane``'s ``retrieval_degraded``, and this decline impairs
+            # nothing — the shipped lexical leg answered over the whole label and
+            # the rows are returned. The decline is a property of THIS ARM, not
+            # an impairment of the memory layer (see ``DEFAULT_BM25_CORPUS_CAP``).
             logger.warning(
                 "BM25 corpus exceeds the %d-row cap — declining to replace "
                 "the shipped lexical rows with a ranking over the first %d "
                 "ids; raise %s or measure on a smaller corpus (#8486)",
                 corpus_cap, corpus_cap, "DEFAULT_BM25_CORPUS_CAP")
             _breaker_record("bm25", True)
-            _record(ran=True, degraded=True, reason="empty_results", count=0)
+            _record(ran=True, degraded=False, reason="empty_results",
+                    count=0, declined=True)
             return []
         docs = [
             (row[0], index_text(row[1], row[2])) for row in rows if row[0]
@@ -1648,6 +1931,8 @@ def run_vector_query(
     raising — the exception-only catch never fires for the real empty case):
     {0-row result set with zero embedded points → ``no_embeddings``},
     {0-row result set with embedded points present → ``empty_results``},
+    {the caller supplied NO query vector → ``no_query_vector``, with
+    ``ran=False``/``degraded=False`` — the leg was never asked (#5412)},
     {an embedding the distance expression cannot read — a non-numeric value, or
     a width the query vector cannot pair with (a plain ``List`` of the RIGHT
     width is normalised by ``vector_write.stored_embedding_vector_expr``, #8316)
@@ -1769,6 +2054,11 @@ def run_vector_query(
         leg_trace.append(entry)
 
     if not query_vec:
+        # #5412: this is an EXIT BRANCH, so it records one. Nothing ran and
+        # nothing failed — the caller asked the dense leg nothing — and the
+        # entry says exactly that (``ran=False``/``degraded=False``) instead of
+        # leaving a gap the declaration had to read as ``leg_absent``.
+        _record(ran=False, degraded=False, reason=NO_QUERY_VECTOR, count=0)
         return []
     # #4028 — the retrieval relevance floor. Expressed in COSINE terms
     # (embeddings.VECTOR_RELEVANCE_FLOOR); each return branch below converts

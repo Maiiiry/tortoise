@@ -1,17 +1,17 @@
 ---
-title: "Tortoise — Canonical Ontology v3.29"
+title: "Tortoise — Canonical Ontology v3.30"
 type: data
 domain: data
 status: live
 created: 2026-08-05
-updated: 2026-10-17
+updated: 2026-10-21
 ownedBy: epistemic-team
 aboutSubjects: epistemic-team
 aboutObjects: tortoise
 doc_status: live
 ---
 
-# Tortoise — Canonical Ontology v3.29
+# Tortoise — Canonical Ontology v3.30
 
 > **Status:** LIVE — canonical. Co-located with the code it governs (tortoise repo).
 > **Supersedes:** ONTOLOGY_v2.5.md (eldato repo, deprecated).
@@ -474,6 +474,14 @@ model**, never as an invitation to merge the two nodes. The reasoning is pinned 
 > **deferred** decision (#5013 §4.4 · #5088 · `OVERRIDES:` posted on #5013), not an accident
 > of history.
 
+**The self-loop is now refused at the writer, and that does not lift the deferral (`#5151`).**
+`link_source_to_entity` (`tortoise/projection/edges.py`) writes NO `references` edge when a
+`Source` target resolves to the same node as the source — the node is still merged, only the
+degenerate edge is suppressed — so a caller that hands it colliding keys can no longer mint
+`(:Source {url:'X'})-[:references]->(:Source {url:'X'})`. That guard makes the *edge* safe; it
+does **not** merge the two nodes, because the collapse's cost in the deferred decision above is
+node TOPOLOGY (two addresses for one document), not merely the edge.
+
 **`documentKind` — the genre axis.** When `sourceKind: document`, `documentKind` names the **genre** of the document. The core vocabulary and the pack extension point are in **§5** (single home).
 
 **`documentKind` is not `sourceKind`.** `sourceKind` answers *what kind of source this is* (`document`, `conversation`, `github_issue`, `agentSession` — the full vocabulary is in §5); `documentKind` answers *what genre of document it is*. Different questions — **neither absorbs the other**.
@@ -559,7 +567,7 @@ suppresses operator promotion exactly as a draft Point does.
 | `provenance_spans` | JSON | — | — | Window spans derived from the capture path's `provenance_refs` (plan-defined, #909 §4.3 #6; written by the capture path, slice 5+) |
 | `is_episodic` | bool | — | — | Quota exemption discriminator — true on the session Source (registered #909 §4.3 #13; planned for the capture path, slice 5+) |
 | `version` | integer | ✅ | — | **Monotonic version counter**, 1 at creation, +1 on each content-hash change. The cheap ordinal beside `contentHash`'s identity |
-| `rawState` / `rawStateAt` | string / ISO8601 | — | — | **The raw-availability axis** — the *third* value on a source record, after identity (`url`) and version (`contentHash`); `STORAGE-ARCHITECTURE.md` §9.4 ③ places it there, not as a fourth kind of source. `rawState` is **recordable** as `present` (the documented way back) or `deleted` — **a deletion is an ACT**, recorded durably and BOUNDED by `raw_state.RAW_DELETION_MARKER_TTL` (**10 days** — Cassandra's `gc_grace_seconds` default; metadata about the link back to the raw, never a copy of it and never a retention period on user content, R1). `rawStateAt` is the instant the state was **recorded** — minted on **every** state-carrying write, including `rawState='present'`; when `rawState` is `deleted`, the marker's expiry policy is derived from it. **`offline` / `access_revoked` are CONDITIONS, observed live and NEVER stored** (#3998 owner ruling, Option A, 2026-10-14): the observation is **caller-supplied** — a caller that has probed the raw routes it through `raw_state.resolve_raw_availability(props, observed=…)`, and **no reader supplies an observation today** (**#8740**, the tracked follow-up), so a caller reading without one sees only the recorded act; a *stored* condition is a legacy row that the availability resolver reads fail-closed as `unrecognised`, while the `:Source`-property read bag still serves it verbatim (**#8739**, the tracked residual in `tortoise/projection/entities.py`). **Read-time contract:** a recorded act WINS over any observation, so a probe can never un-delete a memory; with no observation the read reports the record it holds and always emits the entry (never an empty result standing in for an unreachable raw); expiry authorises a LATER, JOURNALLED drop of the marker and never resurrects on read. Coverage is `create_source`/`_upsert_source` — including a version transition, whose state rides the **`SourceVersioned`** record and folds back through `_fold_source_versioned` → `_upsert_source` — plus the `SourceCreated` replay; the property is refused on the generic entity surface and via `props` |
+| `rawState` / `rawStateAt` | string / ISO8601 | — | — | **The raw-availability axis** — the *third* value on a source record, after identity (`url`) and version (`contentHash`); `STORAGE-ARCHITECTURE.md` §9.4 ③ places it there, not as a fourth kind of source. `rawState` is **recordable** as `present` (the documented way back) or `deleted` — **a deletion is an ACT**, recorded durably and BOUNDED by the deletion-marker TTL (**10 days** — Cassandra's `gc_grace_seconds` default; metadata about the link back to the raw, never a copy of it and never a retention period on user content — **R1**, whose authority is `docs/retention-and-deletion.md`). `rawStateAt` is the instant the state was **recorded** — minted on **every** state-carrying write, including `rawState='present'`; when `rawState` is `deleted`, the marker's expiry policy is derived from it. **`offline` / `access_revoked` are CONDITIONS, observed live and NEVER stored** (#3998 owner ruling, Option A, 2026-10-14): an observation is **caller-supplied** at read time and never persisted, so a read holding no observation reports only the recorded act, and a condition found in stored data is not part of this axis — the availability resolution reads it fail-closed as `unrecognised`. **Read-time contract:** a recorded act WINS over any observation, so a probe can never un-delete a memory; with no observation the read reports the record it holds and always emits the entry (never an empty result standing in for an unreachable raw); expiry authorises a LATER, JOURNALLED drop of the marker and never resurrects on read. The state rides the source write and, on a **version transition**, the **`SourceVersioned`** record; the property is refused on the generic entity surface and via `props` |
 | `topics` | array | — | `dc:subject` | Topic list captured from the source |
 | `summary` | string | — | `dc:description` | Summary captured from the source |
 | `sessionId` | string | — | — | The session this source arrived in |
@@ -841,10 +849,10 @@ silently-empty cell.
 | `client_captured_at_source` | `_write_session_and_turns`, `_fold_session_recorded`, `_rebuild_all_replay` |
 | `source` | `_write_session_and_turns`, `_fold_session_recorded`, `_rebuild_all_replay` |
 | `capture_redactions` | `_TURN_WRITE_CYPHER`, `_fold_session_recorded`, `merge_capture_session`, `_rebuild_all_replay` |
-| `capture_ok` | `_capture_session_impl`, `capture_session`, `_capture_abandoned_marker`, `_fold_session_recorded`, `_rebuild_all_replay` |
-| `capture_extractor` | `_capture_session_impl`, `capture_session`, `_capture_abandoned_marker`, `_fold_session_recorded`, `_rebuild_all_replay` |
-| `entity_links_attempted` | `_capture_session_impl`, `capture_session`, `_relink_sessions_after_index`, `_fold_session_recorded`, `_rebuild_all_replay` |
-| `entity_links_created` | `_capture_session_impl`, `capture_session`, `_relink_sessions_after_index`, `_fold_session_recorded`, `_rebuild_all_replay` |
+| `capture_ok` | `_capture_session_impl`, `_stamp_capture_attempt_state`, `_capture_abandoned_marker`, `_fold_session_recorded`, `_rebuild_all_replay` |
+| `capture_extractor` | `_capture_session_impl`, `_stamp_capture_attempt_state`, `_capture_abandoned_marker`, `_fold_session_recorded`, `_rebuild_all_replay` |
+| `entity_links_attempted` | `_capture_session_impl`, `_stamp_entity_link_counters`, `_relink_sessions_after_index`, `_fold_session_recorded`, `_rebuild_all_replay` |
+| `entity_links_created` | `_capture_session_impl`, `_stamp_entity_link_counters`, `_relink_sessions_after_index`, `_fold_session_recorded`, `_rebuild_all_replay` |
 | `value_nodes_created` | `_execute_commit_writes`, `_rebuild_all_replay` |
 | `value_nodes_held` | `_commit_region`, `_rebuild_all_replay` |
 | `draft_count` | `_execute_commit_writes`, `_rebuild_all_replay` |

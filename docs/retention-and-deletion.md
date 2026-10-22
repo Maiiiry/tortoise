@@ -263,6 +263,52 @@ existing delete paths.
 **not** user content and **not** a deletion promise, so it is exempt from the
 "link or be a named constant" rule.
 
+**The purge rides the read surface (#9576).** There are two doors to this
+retention: the hosted sweeper (`hosted_api._sweep_events`) purges on its own
+schedule, and a LAZY, interval-gated pass runs inside `TortoiseSDK.poll_events` —
+which is what the `tortoise_events_poll` MCP tool and the REST events poll call.
+That tool is `readOnlyHint: true` and needs only `graphs:read`, so a read-only key
+can cause a `DETACH DELETE`. That is deliberate and recorded, not an oversight —
+and the sweeper is the strongest reason it is not alarming: the deletion happens on
+a schedule anyway, so a poll triggering it is not the poll *adding* a deletion.
+
+> **OVERRIDES:** `readOnlyHint: true` ⇒ the call deletes nothing — the poll
+> purges `:GraphEvent` rows the store owns, on a timer, idempotently. It also
+> overrides #4122's `maintenance` default (`read-low`/`write-high`: a confined,
+> idempotent, derived-value write is tiered `maintenance`): this deletion is
+> system-owned retention, not a refreshed derived value, and `maintenance` would
+> drop `readOnlyHint` on a tool agents poll in a loop — a confirmation prompt per
+> poll.
+
+The alternatives are worse for the caller: declaring a write would take a
+subscription feed away from `graphs:read` keys, and dropping the read hint would
+put a confirmation prompt in front of every poll of a tool agents poll in a loop.
+The delete is confined to the store's own bookkeeping (nothing here is replayed
+by a rebuild) and is idempotent, which is what keeps the departure narrow. A gated
+purge also refreshes the `(:GraphEventMeta).first_seq` watermark
+(`_refresh_first_seq`) — a second, non-deleting write on the same read path, and
+system-owned for the same reason; the recorded reason at the registry entry names
+both.
+
+The decision is checkable: the carve-out is declared in
+`tests/tool_surface_capabilities.py` → `RETENTION_CARVEOUTS` (with the
+out-of-boundary mutation it covers, `OUT_OF_BOUNDARY_MUTATORS`), the reason sits
+at the registry entry in `tortoise/tool_registry.py`, and
+`TestReadTierCannotHideAnOutOfBoundaryWrite` fails if the poll moves to a writing
+tier, if it stops reaching the purge, or if any OTHER reading-tier tool (`read`
+**or** `maintenance`) reaches one of the mutations declared there without a
+carve-out. A NEW cross-module mutation
+cannot be auto-detected (that invisibility is the whole #9576 gap), so it must be
+added to `OUT_OF_BOUNDARY_MUTATORS` with the code that introduces it — the arm
+enforces the declaration, not the discovery. One bound is deliberate and recorded:
+the carve-out is keyed on the TOOL, not the `(tool, mutation)` pair, so if the poll
+ever reached a *second* declared out-of-boundary mutation the entry would stay
+green and its reason would silently drift — re-read the reason when the reach
+widens (a `(tool, op)` key is the fix if that ever happens). Re-tier the poll deliberately or not
+at all: a move to a writing tier must delete the carve-out with it, a move to
+`maintenance` keeps it (that tier must still declare the deletion), and either
+re-tier fails the ruling pin `test_the_read_classification_this_issue_asked_about`.
+
 ## A different axis: OAuth credential hygiene
 
 `tortoise/oauth.py` `OAUTH_ACCESS_RETENTION_S` / `OAUTH_REFRESH_RETENTION_S` /
@@ -383,10 +429,15 @@ not a whitelist — a file outside the set above may still link here.
 **Named implementation constants** (exempt by design): `tortoise/retention.py` and
 `tortoise/backup_config.py` are exempt whole-file (every line is the authority);
 `tortoise/{backup_sweep,hosted_api,sdk,supabase_control,raw_state}.py` are exempt
-only on lines that name a canonical constant. `docs/ONTOLOGY.md` is exempt only on
-lines that name a canonical constant too (its §4.6 row does carry a bare window
-number, but it names `RAW_DELETION_MARKER_TTL` on that same line — the constant,
-not the absence of a number, is what makes the line traceable). `website/apps/dashboard/src/graphs.test.js`
+only on lines that name a canonical constant. `docs/ONTOLOGY.md` is line-scoped
+for the same reason — its window prose stays gated, one line at a time — but its
+§4.6 row carries a bare window number and names **no** constant: it passes because
+that row **links this document** (and names the **`R1`** ruling, *never a retention
+period on user content*), so a reader following the row lands on the authority rather
+than on a restated number. The model document cites the authority; the constant name
+is build detail and deliberately does not appear there. `RAW_DELETION_MARKER_TTL`
+remains the **sole numeric authority** for the deletion-marker window — the row in
+the table above. `website/apps/dashboard/src/graphs.test.js`
 is derived: it imports `TRASH_GRACE_DAYS` from `graphs.js` rather than restating
 the number.
 
@@ -419,9 +470,11 @@ this document supersedes them): `docs/plans/2026-09-06-2304-delete-trash-can.md`
 > the draft body to appear in the served `/privacy` page, so §6/§16 (and every
 > other retained-number sentence) **must be edited in BOTH files together** —
 > updating one without the other reddens the gate. Only the G-gate
-> preface/metadata (the `## Draft metadata` block, the delete-account capability
-> check, and the LFPDPPP / outline / canonical-sentence notes above the anchor)
-> is the historical snapshot, kept for the record and not rendered.
+> preface/metadata (the `## Draft metadata` block — whose residence row carries
+> the CURRENT fact, so read it rather than assuming this block is all history —
+> the delete-account capability check, and the LFPDPPP / outline /
+> canonical-sentence / drafting-rule notes above the anchor) is the drafting
+> preface — not rendered, and not the policy — kept for the record.
 >
 > **Division of labour.** The policy copy states the **restore window** as one
 > number (7 days), the **backup horizon** as one number (four weeks), and the

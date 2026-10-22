@@ -1,10 +1,13 @@
 """#8066: a SERVED skill's test subject is the tracked copy, never the relay.
 
-`skills` and `scripts` are tracked symlinks (mode 120000) whose committed blobs
-are ABSOLUTE paths in one developer's home
-(`/Users/danielospina/Documents/GitHub/agent-infra/{skills,scripts}`). They
-dangle everywhere else, so `read skills/commit-workflow/SKILL.md` is ENOENT
-and `node scripts/check-doc-affiliation.cjs` cannot run.
+`skills` is a tracked symlink (mode 120000) whose committed blob is an
+ABSOLUTE path in one developer's home
+(`/Users/danielospina/Documents/GitHub/agent-infra/skills`), so `read
+skills/commit-workflow/SKILL.md` is ENOENT everywhere else. `scripts` had the
+same shape until #9475 untracked it — it is now gitignored and materialised per
+machine from `$AGENT_INFRA_PATH` by `tools/link_agent_infra_scripts.py`, so on
+a fresh clone it is ABSENT rather than dangling, and
+`node scripts/check-doc-affiliation.cjs` cannot run until that has run.
 
 The generalisable defect the issue's comment thread registers is NOT "a
 symlink is dead" — it is that a gate whose SUBJECT is resolved through that
@@ -41,7 +44,9 @@ class it exists to catch (the #1349/#2938 silent-drop class). A change to a
 non-core SOURCE_PATTERNS entries (`tests/_html_links.py`,
 `tests/test_embedded_concurrency.py`), where a named-surface match REPLACES the
 `core` fallback in `select()` (#2938) and selects `onboarding`. This file is
-registered on BOTH surfaces, and
+registered on ALL THREE surfaces a `tests/**/*.py` file can select — `core`,
+`onboarding`, and `eval` (#8066 ⟂ #9380: `tests/eval/ask/` is an exact `eval`
+SOURCE_PATTERNS entry, so the ratchet's subject reaches that surface too) — and
 `test_8066_relay_ratchet_is_registered_on_every_surface_it_covers` enumerates
 every in-scope file and pins the property rather than the declaration.
 
