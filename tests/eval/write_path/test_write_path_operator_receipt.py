@@ -381,6 +381,28 @@ def test_checker_accepts_a_rekeyed_endpoint():
 # ── coverage: every edge in the denominator has a verdict ───────────────────
 
 
+def _session_results(edges: list[dict], session_id: str = "wp01_quarry_debug") -> list[dict]:
+    """The per-session duplicate ``runner.py`` writes for EVERY completed
+    session — i.e. the shape the checker actually runs on.
+
+    Deliberately receipt-shaped: a fixture without this block is not the
+    artifact a real run emits, and the P1 below lives exactly in that gap.
+    """
+    return [{
+        "session_id": session_id,
+        "planted_operators": [
+            {
+                "id": e["id"],
+                "expected_kind": e.get("expected_kind"),
+                "verdict": e.get("verdict"),
+                "edge_correct": e.get("edge_correct"),
+                "forms_found": e.get("forms_found"),
+            }
+            for e in edges
+        ],
+    }]
+
+
 def test_checker_rejects_a_receipt_missing_edges_from_its_denominator():
     """A denominator of 15 with only 3 per-edge verdicts is a receipt that
     reports 12 edges it never graded."""
@@ -389,6 +411,53 @@ def test_checker_rejects_a_receipt_missing_edges_from_its_denominator():
     failures = _failures(checker.check_receipt(receipt, denominator=15))
     assert "E4-COVERAGE" in failures
     assert "E4-DENOM" not in failures
+
+
+def test_checker_rejects_a_truncated_receipt_that_carries_session_results():
+    """The SAME refusal, on the receipt shape a real run produces.
+
+    ``runner.py`` sets ``session_results[].planted_operators`` for every session
+    of a completed run, so this block is present on every receipt the gate is
+    ever pointed at. The per-session cross-check once rebound the loop variable
+    ``planted`` (the denominator, an int) to one of its dicts, which made BOTH
+    ``isinstance(planted, int)`` arms of E4-COVERAGE unreachable — and
+    E4-COVERAGE is the ONLY gold-independent coverage rule (E4-COVERAGE-IDS /
+    E4-KIND are skipped without a readable gold). A receipt publishing 15 edges
+    while carrying per-edge evidence for 3 was therefore certified as
+    ``EVIDENCE VALID`` on the offline route (``--denominator 15``), which is
+    the fail-open this test pins (#9520 review, P1).
+    """
+    edges = [_edge(f"wp01_quarry_debug_op_{i:02d}") for i in (1, 2, 3)]
+    receipt = _receipt(edges, session_results=_session_results(edges))
+    receipt["operator_audit"]["planted"] = 15
+    result = checker.check_receipt(receipt, denominator=15)
+    assert "E4-COVERAGE" in _failures(result)
+    # ...and the refusal is the COVERAGE one, not an accident of another rule.
+    assert "E4-DENOM" not in _failures(result)
+    assert result["ok"] is False
+
+
+def test_checker_still_measures_coverage_on_a_receipt_with_session_results():
+    """The pass arm must survive the same shape — a rule that is merely never
+    reached reads identical to a rule that holds."""
+    edges = [_edge(f"wp01_quarry_debug_op_{i:02d}") for i in (1, 2, 3)]
+    receipt = _receipt(edges, session_results=_session_results(edges))
+    result = _check(receipt)
+    coverage = [r for r in result["rules"] if r["rule"] == "E4-COVERAGE"]
+    assert coverage, "E4-COVERAGE was never emitted on the receipt shape"
+    assert [r["ok"] for r in coverage] == [True]
+
+
+def test_checker_emits_coverage_on_the_committed_receipt():
+    """Real artifact, not a fixture: the committed E4 receipt carries
+    ``session_results``, and E4-COVERAGE must be among its rules."""
+    receipt = json.loads(E4_RECEIPT.read_text(encoding="utf-8"))
+    assert receipt.get("session_results"), "fixture drift: the receipt is not receipt-shaped"
+    result = checker.check_receipt(receipt)
+    coverage = [r for r in result["rules"] if r["rule"] == "E4-COVERAGE"]
+    assert coverage, "E4-COVERAGE was not emitted on the committed receipt"
+    assert coverage[0]["ok"] is True
+    assert result["ok"] is True, _failures(result)
 
 
 # ── the grader emits the evidence the checker reads ─────────────────────────

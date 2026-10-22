@@ -527,7 +527,9 @@ verdicts are the right COUNT but not the gold's edge set**, **an edge whose
 `extractor.real` (the monkeypatched WIRE lane), a non-`llm` posture, a
 wired-but-not-persisted edge, an edge with no pre/post refs or an unresolved
 post-ref, a `remapped` flag that contradicts its own refs, a receipt missing
-edges from its own denominator, and — the rule the epic needs — **an
+edges from its own denominator (**E4-COVERAGE** — the one coverage rule that
+holds even when the gold cannot be read, so a truncated receipt cannot ride the
+`--denominator` offline route), and — the rule the epic needs — **an
 unexplained miss**.
 
 > ⛔ A RED E4 with every miss named is a VALID, exit-0 outcome. #9077 says so

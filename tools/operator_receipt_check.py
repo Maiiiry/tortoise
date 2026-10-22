@@ -431,6 +431,12 @@ def check_receipt(
     # (the operator lane reads it, and `runner` renders it into the notes), so
     # it is cross-checked rather than trusted: two copies that disagree is a
     # self-contradicting artifact whichever one is right.
+    # ⛔ The loop variable is `duplicate`, NEVER `planted`: `planted` is the
+    # receipt's DENOMINATOR (an int) and rebinding it here to a
+    # `planted_operators` dict silently disarmed BOTH arms of E4-COVERAGE
+    # (`isinstance(planted, int)` is False against a dict) on every receipt
+    # `runner.py` completes — so 15 published edges with 3 graded rows was
+    # certified as evidence (#9520 review, P1).
     for entry in receipt.get("session_results") or []:
         if not isinstance(entry, dict):
             _fail(rules, "E4-NUMERATOR",
@@ -438,13 +444,13 @@ def check_receipt(
                   "cannot be bound to the per-edge rows")
             continue
         session_id = entry.get("session_id") or "?"
-        for planted in entry.get("planted_operators") or []:
-            if not isinstance(planted, dict):
+        for duplicate in entry.get("planted_operators") or []:
+            if not isinstance(duplicate, dict):
                 _fail(rules, "E4-NUMERATOR",
                       f"session_results[{session_id!r}].planted_operators: "
                       "entry is not an object")
                 continue
-            edge_id = planted.get("id")
+            edge_id = duplicate.get("id")
             row = results.get(edge_id)
             if not isinstance(row, dict):
                 _fail(rules, "E4-NUMERATOR",
@@ -453,10 +459,10 @@ def check_receipt(
                       "the graded rows are not the same edge set")
                 continue
             for key in ("verdict", "edge_correct", "expected_kind"):
-                if planted.get(key) != row.get(key):
+                if duplicate.get(key) != row.get(key):
                     _fail(rules, "E4-NUMERATOR",
                           f"{edge_id}: session_results says {key}="
-                          f"{planted.get(key)!r} while the graded row says "
+                          f"{duplicate.get(key)!r} while the graded row says "
                           f"{row.get(key)!r} — one artifact, two answers")
 
     if named_misses:
@@ -464,13 +470,20 @@ def check_receipt(
               f"{len(named_misses)} miss(es) individually named")
 
     # ── E4-COVERAGE: the per-edge set must be the whole denominator ──────
-    if isinstance(planted, int) and not isinstance(planted, bool) and results \
-            and len(results) != planted:
+    # Read the denominator OFF THE RECEIPT here rather than borrowing an
+    # earlier local: this is the ONE gold-independent coverage rule (both
+    # E4-COVERAGE-IDS and E4-KIND are skipped when the gold is unreadable), so
+    # it may never be left unreachable because some later loop reused a name.
+    graded_total = audit.get("planted")
+    if isinstance(graded_total, int) and not isinstance(graded_total, bool) \
+            and results and len(results) != graded_total:
         _fail(rules, "E4-COVERAGE",
-              f"{len(results)} per-edge verdicts for a denominator of {planted} — "
-              "edges are missing from the receipt")
-    elif isinstance(planted, int) and results:
-        _pass(rules, "E4-COVERAGE", f"all {planted} planted edges carry a verdict")
+              f"{len(results)} per-edge verdicts for a denominator of "
+              f"{graded_total} — edges are missing from the receipt")
+    elif isinstance(graded_total, int) and not isinstance(graded_total, bool) \
+            and results:
+        _pass(rules, "E4-COVERAGE",
+              f"all {graded_total} planted edges carry a verdict")
 
     # ── E4-COVERAGE-IDS / E4-KIND: the count is not the corpus ───────────
     # #9077 review finding: a length check cannot tell "the real 15" from "any
