@@ -1243,10 +1243,11 @@ def declared_set_violations(entries, sdk_src: str | None = None) -> list[str]:
     # describing the code, and it must be deleted deliberately rather than left to
     # read as a standing decision.
     #
-    # ⚠️ SUBSET SEMANTICS: `entries` may be a synthetic subset (the `_probe` and
-    # `flipped` call sites pass "served set minus one tool"), so an absent tool proves
-    # NOTHING on its own — the file's own `NON_SDK_WRITER_BINDINGS` idiom is to skip a
-    # missing tool rather than report it. Reporting on absence would make a future
+    # ⚠️ SUBSET SEMANTICS: `entries` may be a synthetic subset (`without_dream` and
+    # `without` in `tests/test_tool_registry.py` pass "served set minus one tool"),
+    # so an absent tool proves NOTHING on its own — the file's own
+    # `NON_SDK_WRITER_BINDINGS` idiom is to skip a missing tool rather than report
+    # it. Reporting on absence would make a future
     # probe aimed at `tortoise_events_poll` emit "delete the decision record", which
     # is the opposite of this ledger's purpose. Liveness is therefore decided against
     # the SERVED set, not against whatever subset the caller handed in: an entry that

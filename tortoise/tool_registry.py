@@ -622,7 +622,10 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
         # declared in `tests/tool_surface_capabilities.py` -> RETENTION_CARVEOUTS
         # (with the out-of-boundary mutation it covers), and a guard fails if this
         # entry stops claiming the read hint, stops reaching the purge, or if ANY
-        # other read-hinted tool reaches an out-of-boundary mutation undeclared.
+        # other reading-tier tool reaches one of those DECLARED mutations without a
+        # carve-out. A new cross-module mutation is not auto-detectable (that is the
+        # #9576 gap), so it must be added to `OUT_OF_BOUNDARY_MUTATORS` alongside
+        # the code that introduces it.
         # Re-tier it deliberately (and delete the carve-out) or not at all — see
         # the `TestReadTierCannotHideAnOutOfBoundaryWrite` family in
         # `tests/test_tool_registry.py`.

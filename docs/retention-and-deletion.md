@@ -263,11 +263,14 @@ existing delete paths.
 **not** user content and **not** a deletion promise, so it is exempt from the
 "link or be a named constant" rule.
 
-**The purge rides the read surface (#9576).** The retention pass is
-interval-gated and LAZY — it runs from `TortoiseSDK.poll_events`, which is what
-the `tortoise_events_poll` MCP tool (and the REST events poll) call. That tool is
-`readOnlyHint: true` and needs only `graphs:read`, so a read-only key can cause a
-`DETACH DELETE`. That is deliberate and recorded, not an oversight:
+**The purge rides the read surface (#9576).** There are two doors to this
+retention: the hosted sweeper (`hosted_api._sweep_events`) purges on its own
+schedule, and a LAZY, interval-gated pass runs inside `TortoiseSDK.poll_events` —
+which is what the `tortoise_events_poll` MCP tool and the REST events poll call.
+That tool is `readOnlyHint: true` and needs only `graphs:read`, so a read-only key
+can cause a `DETACH DELETE`. That is deliberate and recorded, not an oversight —
+and the sweeper is the strongest reason it is not alarming: the deletion happens on
+a schedule anyway, so a poll triggering it is not the poll *adding* a deletion.
 
 > **OVERRIDES:** `readOnlyHint: true` ⇒ the call deletes nothing — the poll
 > purges `:GraphEvent` rows the store owns, on a timer, idempotently.
@@ -287,9 +290,12 @@ The decision is checkable: the carve-out is declared in
 out-of-boundary mutation it covers, `OUT_OF_BOUNDARY_MUTATORS`), the reason sits
 at the registry entry in `tortoise/tool_registry.py`, and
 `TestReadTierCannotHideAnOutOfBoundaryWrite` fails if the poll stops claiming the
-read hint, stops reaching the purge, or if any OTHER read-hinted tool reaches an
-undeclared out-of-boundary mutation. Re-tier it deliberately (and delete the
-carve-out with it) or not at all.
+read hint, stops reaching the purge, or if any OTHER reading-tier tool reaches one
+of the mutations declared there without a carve-out. A NEW cross-module mutation
+cannot be auto-detected (that invisibility is the whole #9576 gap), so it must be
+added to `OUT_OF_BOUNDARY_MUTATORS` with the code that introduces it — the arm
+enforces the declaration, not the discovery. Re-tier the poll deliberately (and
+delete the carve-out with it) or not at all.
 
 ## A different axis: OAuth credential hygiene
 

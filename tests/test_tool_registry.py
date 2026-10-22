@@ -1605,6 +1605,23 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         assert "_refresh_first_seq" in purged, (
             "the carve-out's reason also names the :GraphEventMeta watermark SET")
 
+    def test_a_filtered_subset_does_not_report_the_carveout_as_dead(self, monkeypatch):
+        """The subset-skip branch, pinned (review round 4): `declared_set_violations`
+        is handed filtered sets by other tests (`served set minus one tool`), so an
+        absent carve-out target there is a filtered call, NOT a dead declaration.
+        Both directions matter — a genuinely removed target must still red."""
+        import tool_surface_capabilities as tsc
+
+        subset = [e for e in tsc.served_registry()
+                  if e.name != "tortoise_events_poll"]
+        assert tsc.declared_set_violations(subset) == []
+
+        # …but if the tool is really gone from the SERVED set, the record is dead.
+        monkeypatch.setattr(tsc, "served_registry", lambda: subset)
+        violations = tsc.declared_set_violations(subset)
+        assert any("names no served tool" in v and "tortoise_events_poll" in v
+                   for v in violations), violations
+
     def test_the_carveout_is_stale_when_the_entry_stops_being_a_read(self):
         """Mutation 3 (declaration moves): if `tortoise_events_poll` is ever
         re-tiered off `read`, the carve-out becomes an excuse for a WRITE tool's
