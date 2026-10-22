@@ -36,6 +36,10 @@ extractor to make the number green). So this tool checks:
 * every ``edge_correct`` edge ALSO ``persisted`` — the committed nodes are in
   the eventId-keyed retrieval layer, which is the half the historical 0/4
   failed structurally (``operator_counts`` was silently ``{}``);
+* every operator node a wired edge NAMES is a member of the receipt's published
+  ``operators_provenanced_ids`` set (#9569) — the ids the receipt itself proves
+  retrievable, so a shape-valid fabricated id cannot pass, and a receipt that
+  omits the set on a run with wired edges is refused rather than passed;
 * every ``edge_correct`` edge carries, per side, a pre- and post-commit
   endpoint ref that resolves, with ``remapped`` consistent with the #4716
   re-key it reports;
@@ -362,13 +366,12 @@ def check_receipt(
                 #   (b) the run cannot have named MORE distinct operator nodes
                 #       than it committed (`operators_total`).
                 #
-                # ⛔ This is NOT the complete binding: proving an id names a
-                # node that actually entered the eventId-keyed layer needs the
-                # PROVENANCED-ID SET published in the receipt, which the
-                # committed artifact does not carry (it publishes only the
-                # count, `operators_provenanced`). That is tracked as #9569 —
-                # until it lands, a plausible-looking fabricated id passes.
-                # Reported as a named residual rather than papered over.
+                # ⛔ The binding is now COMPLETE (#9569): an id must also be a
+                # member of `operator_audit.operators_provenanced_ids`, the set
+                # of operator nodes the receipt itself proves retrievable
+                # (eventId-stamped). The shape test above alone let a
+                # plausible-looking fabricated id pass; membership is checked at
+                # receipt level (below) where the set has been validated.
                 for op_id in op_ids:
                     if not (isinstance(op_id, str) and _OP_ID_RE.match(op_id)):
                         _fail(rules, "E4-FORMING",
@@ -441,23 +444,87 @@ def check_receipt(
               "capture of a corpus carrying planted operators must commit at least "
               "one operator node")
 
-    # ── E4-FORMING (receipt level): the named nodes fit inside the run ────
+    # ── E4-FORMING (receipt level): the named nodes fit inside the run AND
+    #    inside the PROVENANCED id set (#9569) ──────────────────────────────
     # A receipt cannot claim MORE distinct operator nodes than the run
-    # committed. Cheap, artifact-truthful, and red-able — it does not prove each
-    # id RESOLVES (that needs the published id set, #9569), but it refuses a
-    # duplicate list padded past the denominator.
+    # committed. Cheap, artifact-truthful, and red-able.
+    #
+    # #9569 closes the remaining vacuity. #9520 made a wired edge NAME its
+    # forming operators and bound each name to the graph's id SPACE — but a
+    # shape-valid id proves nothing about whether that node ever entered the
+    # eventId-keyed retrieval layer, and the artifact published only the COUNT
+    # of provenanced operators (`operators_provenanced`), so there was no set
+    # to bind against. The receipt now publishes that set
+    # (`operators_provenanced_ids`, emitted by the runner from the same
+    # surfaces/predicate as the count), and a wired edge may only name a member
+    # of it. Two refusals come out of that, both named:
+    #
+    #   * a receipt that names forming operators but publishes NO set — the
+    #     field's absence is a REFUSAL, never a pass (a receipt that omits what
+    #     it cannot deny is exactly the shape #9520 refused one level down);
+    #   * an id that is shape-valid but NOT in the set — the fabricated-id case
+    #     the issue was filed for.
     distinct_named = sorted(set(named_op_ids))
     summary["named_op_ids"] = len(distinct_named)
+    raw_prov_ids = audit.get("operators_provenanced_ids")
+    prov_ids: set[str] | None = None
+    if raw_prov_ids is not None:
+        if not isinstance(raw_prov_ids, list) or not all(
+                isinstance(i, str) and i for i in raw_prov_ids):
+            _fail(rules, "E4-FORMING",
+                  "operator_audit.operators_provenanced_ids: expected a list of "
+                  f"operator-node ids, got {raw_prov_ids!r} — the set the wired "
+                  "edges are bound against must be readable, not a blob")
+        else:
+            malformed = [i for i in raw_prov_ids if not _OP_ID_RE.match(i)]
+            if malformed:
+                _fail(rules, "E4-FORMING",
+                      "operator_audit.operators_provenanced_ids carries "
+                      f"non-operator ids {malformed[:5]!r} — a provenanced set "
+                      "that is not in the graph's id space proves nothing")
+            else:
+                prov_ids = set(raw_prov_ids)
+                summary["operators_provenanced_ids"] = len(prov_ids)
+                # A published set cannot be larger than the counts that
+                # summarize it: `operators_provenanced` is the number of
+                # eventId-stamped nodes and `operators_total` the population.
+                for field, published in (("operators_provenanced", provenanced),
+                                         ("operators_total", total)):
+                    if isinstance(published, int) and not isinstance(published, bool) \
+                            and len(prov_ids) > published:
+                        _fail(rules, "E4-FORMING",
+                              f"operators_provenanced_ids carries {len(prov_ids)} "
+                              f"id(s) but operator_audit.{field}={published} — a "
+                              "provenanced set cannot be larger than the count "
+                              "it is published with")
     if distinct_named and isinstance(total, int) and not isinstance(total, bool) \
             and len(distinct_named) > total:
         _fail(rules, "E4-FORMING",
               f"the wired edges name {len(distinct_named)} distinct operator "
               f"nodes but the run committed {total} — the receipt asserts more "
               "forming operators than exist")
-    elif distinct_named:
-        _pass(rules, "E4-FORMING",
-              f"{len(distinct_named)} distinct forming operator id(s) fit inside "
-              f"operators_total={total}")
+    if distinct_named and raw_prov_ids is None:
+        _fail(rules, "E4-FORMING",
+              f"the wired edges name {len(distinct_named)} forming operator "
+              "node(s) but the receipt publishes no "
+              "operator_audit.operators_provenanced_ids — nothing binds those "
+              "ids to nodes the receipt itself proves retrievable, so a "
+              "fabricated name passes (#9569). A receipt that omits the set on "
+              "a run that HAS wired edges is a refusal, not a pass")
+    elif distinct_named and prov_ids is not None:
+        unprovenanced = sorted(set(distinct_named) - prov_ids)
+        if unprovenanced:
+            _fail(rules, "E4-FORMING",
+                  f"the wired edges name {len(unprovenanced)} operator node(s) "
+                  f"that are NOT in operators_provenanced_ids: "
+                  f"{unprovenanced[:5]!r} — an id that did not enter the "
+                  "eventId-keyed retrieval layer formed nothing retrievable "
+                  "(the fabricated-name case #9569 exists to refuse)")
+        else:
+            _pass(rules, "E4-FORMING",
+                  f"{len(distinct_named)} distinct forming operator id(s) fit "
+                  f"inside operators_total={total} and are all members of the "
+                  f"{len(prov_ids)}-id provenanced set")
 
     # ── E4-NUMERATOR: the PUBLISHED numbers must BE the graded rows ─────
     # The two published numerators are what a reader quotes ("15/15"), and

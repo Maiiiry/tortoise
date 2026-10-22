@@ -2021,6 +2021,10 @@ def build_receipt(report: dict, *, justification: str | None = None) -> dict:
             # retrievable memory layer (eventId-stamped).
             "operators_total": audit.get("operators_total"),
             "operators_provenanced": audit.get("operators_provenanced"),
+            # #9569: the ids those two counts summarize — the set the E4
+            # checker binds every `edge_op_ids` entry against, so a wired edge
+            # can only name a node the receipt itself proves retrievable.
+            "operators_provenanced_ids": audit.get("operators_provenanced_ids"),
             # #9077 (E4): the PER-EDGE evidence the epic's closing rule asks
             # for — every planted edge either wired+persisted or carrying a
             # named cause, each wired edge carrying its pre/post-commit
@@ -2132,6 +2136,31 @@ def validate_receipt(receipt: dict) -> list[str]:
             issues.append(
                 "receipt.extractor.real: expected a bool, got "
                 f"{extractor.get('real')!r}"
+            )
+    # #9569 additive provenanced-operator-id set — validated only when present,
+    # for the same back-compat reason as `extractor`: every receipt that
+    # predates the field is still shape-valid, and it is the E4 CHECKER (never
+    # shape validation) that refuses such a receipt as evidence. SHAPE only:
+    # whether the ids name nodes that are RETRIEVABLE is the checker's verdict.
+    audit = receipt.get("operator_audit")
+    if isinstance(audit, dict) and "operators_provenanced_ids" in audit:
+        ids = audit.get("operators_provenanced_ids")
+        if not isinstance(ids, list):
+            issues.append(
+                "receipt.operator_audit.operators_provenanced_ids: expected a "
+                f"list of operator-node ids, got {type(ids).__name__}"
+            )
+        elif any(not isinstance(i, str) or not i.strip() for i in ids):
+            bad = next(i for i in ids if not isinstance(i, str) or not i.strip())
+            issues.append(
+                "receipt.operator_audit.operators_provenanced_ids: every entry "
+                f"must be a non-empty string, got {bad!r}"
+            )
+        elif len(set(ids)) != len(ids):
+            issues.append(
+                "receipt.operator_audit.operators_provenanced_ids: expected "
+                "DISTINCT ids (the set is published sorted and deduplicated), "
+                f"got {len(ids)} entries with {len(set(ids))} distinct"
             )
     return issues
 

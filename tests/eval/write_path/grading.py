@@ -543,6 +543,42 @@ def _miss_cause(verdict: str, planted: dict) -> str:
     )
 
 
+def _operator_node_provenanced(node: object) -> bool:
+    """True when an OPERATOR node entered the eventId-keyed memory layer.
+
+    The single predicate behind both the published COUNT and (since #9569) the
+    published ID SET — a receipt whose count and set were derived from two
+    predicates could disagree with itself, which is the substitution this whole
+    audit exists to refuse.
+    """
+    return isinstance(node, dict) and bool(node.get("event_id"))
+
+
+def provenanced_operator_ids(surfaces) -> list[str]:
+    """The operator-node ids that ARE retrievable (eventId-stamped), sorted.
+
+    #9569: the receipt published only the COUNT of provenanced operators
+    (``operators_provenanced``), never the ids — ``session_results[*]``
+    carries ``provenance`` counts and per-form ``operator_counts``, so no field
+    in the artifact let the E4 checker bind an ``edge_op_ids`` entry to a node
+    the receipt itself PROVES retrievable. ``["not-a-real-op"]`` is a non-empty
+    list of plausible-looking names, so the shape binding #9520 shipped leaves
+    a fabricated id passing.
+
+    The predicate is ``_edge_persisted``'s own, applied to the same surfaces,
+    so the set is what the per-edge persistence verdict was already computed
+    from — it is published, not re-derived from a second traversal.
+    """
+    ids: set[str] = set()
+    for surface in surfaces or ():
+        for node in (surface or {}).get("operator_nodes") or []:
+            if _operator_node_provenanced(node):
+                point_id = node.get("point_id")
+                if isinstance(point_id, str) and point_id:
+                    ids.add(point_id)
+    return sorted(ids)
+
+
 def _edge_persisted(detail: dict, from_surface: dict, to_surface: dict) -> bool:
     """Did the committed edge SURVIVE into the retrievable memory layer?
 
@@ -565,12 +601,9 @@ def _edge_persisted(detail: dict, from_surface: dict, to_surface: dict) -> bool:
                 for r in (detail.get("endpoints") or {}).get(side) or []]
         if not refs or any(ref not in retrievable for ref in refs):
             return False
-    provenanced = {n.get("point_id")
-                   for n in (from_surface.get("operator_nodes") or [])
-                   if n.get("event_id")}
-    provenanced |= {n.get("point_id")
-                    for n in (to_surface.get("operator_nodes") or [])
-                    if n.get("event_id")}
+    # #9569: the SAME predicate the receipt-level id set is published from, so
+    # `persisted` and `operators_provenanced_ids` cannot contradict each other.
+    provenanced = set(provenanced_operator_ids((from_surface, to_surface)))
     return all(oid in provenanced for oid in detail.get("edge_op_ids") or [])
 
 
@@ -714,7 +747,14 @@ def grade_planted_operators(
     Returns::
 
         {"planted": int, "edge_correct": int, "content_ok": int,
+         "operators_provenanced_ids": [str],
          "results": {edge_id: detail}, "by_session": {sid: {...}}}
+
+    ``operators_provenanced_ids`` (#9569) is the set of operator nodes that
+    entered the eventId-keyed memory layer — the ids the runner's
+    ``operators_provenanced`` count summarizes, published so the E4 checker can
+    bind every wired edge's ``edge_op_ids`` to a node the receipt proves
+    retrievable.
 
     Pooled fractions are honest denominators (planted == 0 ⇒ empty audit).
 
@@ -787,6 +827,14 @@ def grade_planted_operators(
         ),
         "results": results,
         "by_session": by_session,
+        # #9569: the ID SET behind `operators_provenanced` (which the runner
+        # publishes as a count next to this audit). Published here, from the
+        # same snapshots and the same predicate `_edge_persisted` uses, so an
+        # `edge_op_ids` entry can be bound to a node this receipt PROVES
+        # retrievable — the binding `["not-a-real-op"]` defeated while only a
+        # count was published.
+        "operators_provenanced_ids": provenanced_operator_ids(
+            snapshots_by_session.values()),
     }
 
 

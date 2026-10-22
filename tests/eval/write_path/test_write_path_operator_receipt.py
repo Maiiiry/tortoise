@@ -147,6 +147,14 @@ def _receipt(edges: list[dict] | None = None, **over) -> dict:
             ),
             "operators_total": 7,
             "operators_provenanced": 7,
+            # #9569: the PROVENANCED id set every wired `edge_op_ids` entry is
+            # bound against. Derived from the fixture's own edges (the ids the
+            # edges name ARE the nodes this run proved retrievable), so a
+            # fixture that did not intend to test the membership rule stays
+            # green for the right reason.
+            "operators_provenanced_ids": sorted({
+                op_id for e in edges for op_id in e.get("edge_op_ids") or []
+            }),
             "results": {e["id"]: e for e in edges},
         },
     }
@@ -830,3 +838,132 @@ def test_checker_names_a_non_string_operator_id_without_crashing():
     edge["edge_op_ids"] = [GRAPH_OP_ID, 5]
     result = _check(receipt)
     assert "E4-FORMING" in _failures(result)
+
+
+# ── #9569: the PROVENANCED id set, not just the id shape ────────────────────
+#
+# #9520 bound `edge_op_ids` to the graph's id SPACE and to `operators_total`,
+# which refuses the empty list and the placeholder — but a SHAPE-VALID id names
+# nothing the receipt proves retrievable, so `["<hex>-<hex12>"]` fabricated from
+# thin air passed. The receipt now publishes
+# `operator_audit.operators_provenanced_ids` (the set the count summarizes), and
+# the checker refuses both a membership miss and the field's ABSENCE on a run
+# that names forming operators. Each arm below is red-able: delete the rule it
+# names and it fails.
+
+
+def test_grading_emits_only_the_provenanced_operator_ids():
+    """The published set is `_edge_persisted`'s own predicate — eventId-stamped
+    operator nodes, deduplicated and sorted. An unstamped operator is exactly
+    the silent-drop signature #2552 closed, so it must NOT appear here even
+    though it appears in `operator_counts` (that query does not filter on
+    eventId)."""
+    surfaces = {
+        "s1": {
+            "operator_nodes": [
+                {"point_id": GRAPH_OP_ID, "event_id": "ev-1"},
+                {"point_id": _op_id("unstamped"), "event_id": None},
+                {"point_id": _op_id("blank"), "event_id": ""},
+            ],
+        },
+        "s2": {
+            "operator_nodes": [
+                # Same node surfaced from a second session: a set, not a list.
+                {"point_id": GRAPH_OP_ID, "event_id": "ev-1"},
+                {"point_id": _op_id("second"), "event_id": "ev-2"},
+            ],
+        },
+    }
+    assert grading.provenanced_operator_ids(surfaces.values()) == sorted(
+        [GRAPH_OP_ID, _op_id("second")])
+    # The count and the set are derived from ONE predicate: the set's length can
+    # never exceed the count the receipt publishes beside it.
+    assert len(grading.provenanced_operator_ids(surfaces.values())) <= sum(
+        s["operators_provenanced"] for s in (
+            {"operators_provenanced": sum(
+                1 for n in surface["operator_nodes"] if n.get("event_id"))}
+            for surface in surfaces.values()
+        )
+    )
+
+
+def test_grading_audit_carries_the_id_set_for_a_real_graded_edge():
+    """End to end through the grader: the wired edge's own operator node is in
+    the published set, so the checker's membership arm has something true to
+    bind to (a set that never contained the id would red every real receipt)."""
+    points, snapshot = _audit_snapshot()
+    audit = grading.grade_planted_operators(
+        _gold("SUPPORTS", FOOT, CLAIM), {"wp01_quarry_debug": points},
+        {"wp01_quarry_debug": snapshot})
+    edge = audit["results"]["wp01_quarry_debug_op_supports"]
+    assert edge["edge_correct"] and edge["persisted"]
+    assert set(edge["edge_op_ids"]) <= set(audit["operators_provenanced_ids"])
+
+
+def test_checker_rejects_a_forming_operator_id_outside_the_provenanced_set():
+    """THE issue's case: a shape-valid id that names nothing retrievable.
+
+    Under #9520 alone this artifact passed — the id is the right shape and there
+    are fewer of them than `operators_total`. It is a fabricated name.
+    """
+    receipt = _receipt()
+    fabricated = _op_id("fabricated")
+    edge = receipt["operator_audit"]["results"]["wp01_quarry_debug_op_01"]
+    edge["edge_op_ids"] = [fabricated]
+    # The set is otherwise honest: the OTHER edge's node is still published.
+    assert fabricated not in receipt["operator_audit"]["operators_provenanced_ids"]
+    result = _check(receipt)
+    failures = _failures(result)
+    assert "E4-FORMING" in failures
+    detail = next(r["detail"] for r in result["rules"]
+                  if r["rule"] == "E4-FORMING" and not r["ok"])
+    assert fabricated in detail and "provenanced" in detail
+
+
+def test_checker_rejects_a_receipt_that_publishes_no_provenanced_id_set():
+    """ABSENCE is a refusal, never a pass — the same rule #9520 applied one
+    level down to the empty `edge_op_ids`. A receipt that cannot show the set
+    has not shown that its named operators are retrievable."""
+    receipt = _receipt()
+    for edge in receipt["operator_audit"]["results"].values():
+        edge["expected_kind"] = "SUPERSEDE"  # point-level: names nothing
+    # ...so a receipt whose edges name NO operators may legitimately omit it.
+    assert _check(receipt)["ok"] is True
+
+    receipt = _receipt()
+    receipt["operator_audit"].pop("operators_provenanced_ids")
+    result = _check(receipt)
+    assert "E4-FORMING" in _failures(result)
+    detail = next(r["detail"] for r in result["rules"]
+                  if r["rule"] == "E4-FORMING" and not r["ok"])
+    assert "operators_provenanced_ids" in detail
+    # Shape validation stays back-compatible: an OLD receipt is still valid in
+    # shape — the E4 CHECKER is what refuses it as evidence.
+    assert runner.validate_receipt(receipt) == []
+
+
+@pytest.mark.parametrize("value", ["not-a-list", {"a": 1}, 3, [None], [""], [7]])
+def test_checker_names_a_malformed_provenanced_id_set(value):
+    """A blob where the set belongs is refused BY NAME, never a traceback."""
+    receipt = _receipt()
+    receipt["operator_audit"]["operators_provenanced_ids"] = value
+    result = _check(receipt)
+    assert "E4-FORMING" in _failures(result)
+
+
+def test_checker_rejects_a_provenanced_set_outside_the_operator_id_space():
+    """The set is bound to the graph's id space for the same reason the edges
+    are: a set of human-readable labels proves nothing about a node."""
+    receipt = _receipt()
+    receipt["operator_audit"]["operators_provenanced_ids"] = ["not-a-real-op"]
+    assert "E4-FORMING" in _failures(_check(receipt))
+
+
+@pytest.mark.parametrize("field", ["operators_provenanced", "operators_total"])
+def test_checker_rejects_a_provenanced_set_larger_than_its_own_count(field):
+    """A published set cannot be bigger than the count that summarizes it."""
+    receipt = _receipt()
+    receipt["operator_audit"][field] = 1
+    receipt["operator_audit"]["operators_provenanced_ids"] = sorted(
+        {_op_id("a"), _op_id("b")})
+    assert "E4-FORMING" in _failures(_check(receipt))
