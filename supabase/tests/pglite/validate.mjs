@@ -859,7 +859,7 @@ try {
 
   // §9.1's narrative home, the DELETE half (#9555). The fixture's capture writes
   // a narrative row for `sess1` (the `SessionRecorded` leg, ev-12) and deletes
-  // the session (ev-35), so the projection's own `DELETE FROM
+  // the session (the `SessionDeleted` at ev-32), so the projection's own `DELETE FROM
   // public.session_narrative` must leave NOTHING behind — a delete that filtered
   // the wrong tenant, or that the secondary projection never emitted, leaves a
   // row here. (The create half is exercised by the snapshot leg above; its

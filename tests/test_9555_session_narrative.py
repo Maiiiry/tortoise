@@ -351,14 +351,43 @@ def test_a_value_the_column_cannot_hold_is_an_absence_not_a_raise():
     assert _narrative_statements(record) == []
 
 
-def test_a_bad_typed_count_does_not_fail_the_records_own_mutation():
-    """The regression pin: the batch still contains the session upsert, so a
-    carrier whose count this home cannot store still lands its own row."""
+def test_a_count_this_home_cannot_hold_still_lands_the_records_own_row():
+    """The regression pin: `{"total": 7}` is the shape the CARRIER accepts (its
+    own column is jsonb) and this home cannot, so the batch must still carry the
+    session upsert and no narrative row at all. (A payload the carrier itself
+    refuses — an integer `capture_redactions` — would prove nothing here: that
+    record never reaches Postgres, `tests/test_9078…` pins the refusal.)"""
     record = {"type": "SessionRecorded", "id": "s1",
-              "capture_redactions": "sentinel"}
+              "capture_redactions": {"total": 7}}
     statements = rp.mutations_for(record, org_id=ORG, graph_id=GRAPH)
     assert any("INSERT INTO public.session " in s.sql for s in statements)
     assert not [s for s in statements if rr.NARRATIVE_TABLE in s.sql]
+
+
+def test_an_unrepresentable_count_is_stated_as_no_count_on_a_recapture():
+    """Arrival order must not decide the number. A second capture over the same
+    session that carries a count this column cannot hold must READ as "no count
+    stated" — leaving the first capture's number untouched would serve a value
+    the latest record contradicts (the same false claim as writing 0), so the
+    upsert writes NULL in the `DO UPDATE` branch. The first record's statement
+    omits the column entirely, which is what makes the omission safe on INSERT
+    and stale on CONFLICT."""
+    first = rp.mutations_for(
+        {"type": "SessionRecorded", "id": "s1", "story_arc": "the arc",
+         "turn_count": 2},
+        org_id=ORG, graph_id=GRAPH)
+    second = rp.mutations_for(
+        {"type": "SessionRecorded", "id": "s1", "story_arc": "the arc",
+         "turn_count": 2 ** 31},
+        org_id=ORG, graph_id=GRAPH)
+    insert_first = next(x for x in first if rr.NARRATIVE_TABLE in x.sql)
+    insert_second = next(x for x in second if rr.NARRATIVE_TABLE in x.sql)
+    assert "turn_count" in insert_first.sql.split("DO UPDATE")[0]
+    assert "turn_count = NULL" not in insert_first.sql
+    # The re-capture states no count: NULL in the conflict branch, and no stale
+    # parameter re-asserting one.
+    assert "turn_count = NULL" in insert_second.sql
+    assert "turn_count" not in insert_second.sql.split("DO UPDATE")[0]
 
 
 def test_a_usable_count_is_projected_even_beside_an_unusable_one():
@@ -472,7 +501,10 @@ def test_the_reader_serves_the_narrative_and_the_verbatim_turns():
     # Ordered by the id's own index — the key contract, not the row order a
     # database happened to return.
     assert [t.index for t in text.turns] == [0, 2, 10]
+    # `content` is the STORED framed form (what was captured); `body` is the
+    # un-framed text a consumer should read.
     assert text.turns[0].content == "[user] first thing said"
+    assert text.turns[0].body == "first thing said"
     assert text.turns[0].speaker == "user"
     assert text.turns[1].speaker is None
     # Un-framed ONCE: the frame's role is not repeated beside `point.speaker`.
@@ -572,6 +604,15 @@ def test_the_source_verbatim_fetch_resolves_through_the_record_not_an_edge():
     assert text is not None
     assert text.narrative == "the arc"
     assert text.transcript == "user: verbatim"
+    # ⚠️ The lookup must probe the PRIMARY KEY, not the unindexed `url` column:
+    # for a `:Source` the canonical key IS the url, so both hold the same string
+    # while only `node_key` is indexed — `url = %s` would filter the tenant's
+    # whole source set on §9.4's answer-time path. The double matches on a SQL
+    # substring, so this is the only thing that can pin the choice.
+    source_sqls = [sql for sql, _p in conn.executed if "public.source" in sql]
+    assert source_sqls
+    assert all("node_key = %s" in sql for sql in source_sqls)
+    assert not any("url = %s" in sql for sql in source_sqls)
 
 
 def test_a_source_with_no_session_is_an_honest_absence():

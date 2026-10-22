@@ -47,12 +47,15 @@ another session's turn ids (`sec` vs `sec_t0`), which is the bug that comment
 records.
 
 ⚠️ **The STORED text of a turn is FRAMED** — `"[role] body"`
-(`sdk._capture_turn_frame`, the single definition) — so this module never serves
-`point.content` raw: `transcript` un-frames with the writer's own inverse
+(`sdk._capture_turn_frame`, the single definition) — so the **`transcript` is the
+only un-framed, §9.4-usable surface**, and `Turn.content` is the stored framed
+form exactly as the record holds it (it is what a reader needs to prove what was
+captured). `transcript` un-frames with the writer's own inverse
 (`sdk._capture_turn_role_text`, imported lazily so this module stays importable
-without the SDK's weight) and labels the line once. Serving the framed string
-would read `"user: [user] hello"`; a second local copy of the frame grammar
-would be a second declaration of it, which is why the SDK's inverse is used.
+without the SDK's weight) and labels the line once; `Turn.body` exposes the same
+un-framed body for one turn. Serving the framed string as the transcript would
+read `"user: [user] hello"`; a second local copy of the frame grammar would be a
+second declaration of it, which is why the SDK's inverse is used.
 
 TENANCY IS A PER-CALL ARGUMENT
 ==============================
@@ -98,12 +101,27 @@ class RecordReadError(Exception):
 
 @dataclass(frozen=True)
 class Turn:
-    """One raw turn, verbatim, in capture order."""
+    """One turn in capture order.
+
+    ``content`` is the **STORED** text — the framed `"[role] body"` string
+    (`sdk._capture_turn_frame`), unchanged. Use ``body`` (or ``SessionText.
+    transcript``) for un-framed prose: building §9.4's verbatim text out of
+    ``content`` would prepend the frame to the line and read
+    `"user: [user] hello"`. ``speaker`` is the record's own label, and is
+    ``None`` when the capture had none — as is the frame's ``"unknown"``
+    sentinel, which is the writer's placeholder and never a speaker.
+    """
 
     turn_id: str
     index: int
     content: str
     speaker: str | None = None
+
+    @property
+    def body(self) -> str:
+        """The un-framed body of this turn (§9.4's verbatim text for one turn)."""
+        _role, body = _role_and_body(self.content)
+        return body
 
 
 @dataclass(frozen=True)

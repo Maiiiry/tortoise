@@ -416,9 +416,12 @@ RESET ROLE;
 -- ── 6b. The §9.1 narrative home (#9555, R7) ───────────────────────────────
 -- The narrative is TEXT in Postgres, not a node (§9.1). This block pins that
 -- the home exists, is a tenancy surface like the other nine, and that the two
--- things a narrative must not be able to do — dangle off no session, or be read
--- across a tenant boundary — are refused by the DATABASE rather than by a
--- convention in Python.
+-- things a narrative must not be able to do — dangle off no TENANT GRAPH, or be
+-- read across a tenant boundary — are refused by the DATABASE rather than by a
+-- convention in Python. (It deliberately does NOT require a `public.session` row:
+-- the FK anchors on the graph, and §9.4's own delete path removes the session
+-- row before the narrative, so a session-scoped FK would abort the batch — the
+-- assertion further down pins the survival.)
 SELECT tests.assert(
   (SELECT count(*) FROM pg_class
    WHERE relname = 'session_narrative' AND relkind = 'r' AND relrowsecurity) = 1,

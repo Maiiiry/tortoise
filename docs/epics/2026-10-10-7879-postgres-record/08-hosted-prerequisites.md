@@ -323,7 +323,7 @@ write order.
 |---|---|
 | `narrative` | the commit's `story_arc` ⚠️ **— no journal carrier exists yet, see below** |
 | `summary` | the same record's `summary`, projected ONLY alongside the narrative (the capture's own session `:Source` sets `summary` to the transcript's first utterance, which is not the narrative) |
-| `capture_redactions` | `SessionRecorded.capture_redactions` (`#4911`) — **integer**, because a count is not an envelope (`#9264`/R4 is the jsonb disagreement one table over) |
+| `capture_redactions` | `SessionRecorded.capture_redactions` (`#4911`) — **integer**, because a count is not an envelope. ⚠️ NULL in practice today: the carrier's own `session.capture_redactions` is jsonb while the producer emits an integer, so that record is REFUSED (#9264/R4) and never reaches this table; a count this column cannot hold is written as NO count, never a 0 or a coerced shape |
 | `turn_count` | `SessionRecorded.turn_count` |
 
 ⛔ **The transcript is NOT duplicated here.** The raw turns are already first-class record rows
@@ -360,7 +360,8 @@ nothing). Both were shown to redden under a mutation (RLS disabled; the count CH
 1. **The narrative has NO journal carrier in this tree.** `story_arc` is written to the *graph* by the
    layer-1 commit's raw Cypher (`hosted_api.py`'s document/event MERGEs) and raw Cypher is not a
    journal record (§17.1's unjournalled-writer ledger), so a live capture lands
-   `capture_redactions`/`turn_count` and a **NULL `narrative`**. The projection is correct and total;
+   `turn_count` (and `capture_redactions` NULL — that record is refused, see the column table above) with a
+   **NULL `narrative`**. The projection is correct and total;
    its narrative carrier does not exist yet. The fix is a producer on the layer-1 commit path (journal
    the derived `:Source`/`:Event` write with `summary`/`story_arc`/`sessionId`), which is
    capture-path work and must not be improvised alongside a schema change.

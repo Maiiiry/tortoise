@@ -1760,6 +1760,7 @@ def _narrative_upsert_statement(
     graph_id: str,
     session_id: str,
     values: Mapping[str, Any],
+    resets: Sequence[str] = (),
 ) -> Statement:
     """Upsert the narrative row, touching ONLY the columns this record owns.
 
@@ -1767,6 +1768,13 @@ def _narrative_upsert_statement(
     (NULLs for the fields it does not carry), the second record to arrive
     would ERASE the first one's half — an order-dependent record, i.e. a
     replay that is not idempotent and a live/rebuild divergence.
+
+    ``resets`` are columns THIS record carries but cannot represent (a count the
+    INTEGER refuses). They are written NULL on conflict rather than left alone:
+    the count is this carrier's own column, rebuilt by every capture, so
+    "carried but unrepresentable" must read as *no count stated* — leaving the
+    previous capture's number in place would serve a value the latest record
+    contradicts, which is the same false claim as writing 0.
     """
     columns = ["org_id", "graph_id", "session_id", *values, "props"]
     params: list[Any] = [
@@ -1775,7 +1783,9 @@ def _narrative_upsert_statement(
         json.dumps({}),
     ]
     placeholders = ", ".join(["%s"] * len(columns))
-    updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in values)
+    updates = ", ".join(
+        [f"{c} = EXCLUDED.{c}" for c in values] + [f"{c} = NULL" for c in resets]
+    )
     sql = (
         f"INSERT INTO public.{NARRATIVE_TABLE} ({', '.join(columns)}) "
         f"VALUES ({placeholders}) "
@@ -1865,6 +1875,7 @@ def _narrative_statements(
         if isinstance(summary, str) and summary.strip():
             values["summary"] = summary
 
+    resets: list[str] = []
     for key in _NARRATIVE_INT_KEYS:
         value = carrier.get(key)
         # PROJECTED ONLY WHEN THE VALUE FITS THE COLUMN — and never coerced.
@@ -1876,17 +1887,30 @@ def _narrative_statements(
         # a live capture to fail — the INSERT raises `integer out of range`
         # inside the carrier's own transaction, taking the row and the journal
         # position with it. A value the column cannot hold is therefore an
-        # ABSENCE in this home — the column stays NULL and the reader returns
+        # ABSENCE in this home — the column reads NULL and the reader returns
         # None — never a 0 (a false claim about the capture) and never a coerced
         # value (which would hide the disagreement). The field's authority
         # remains the carrier's own column.
         if (isinstance(value, int) and not isinstance(value, bool)
                 and 0 <= value <= _INT4_MAX):
             values[key] = value
+        elif value is not None:
+            # CARRIED, BUT UNREPRESENTABLE. On a FRESH row an omitted column is
+            # already NULL; on a RE-CAPTURE the previous value would survive in
+            # the `DO UPDATE` branch's untouched column, so the reset is what
+            # makes "no count stated" true in both orders.
+            resets.append(key)
 
+    # A record whose whole content this home cannot represent contributes NO row:
+    # a carrier whose only payload is an unrepresentable count is not a narrative,
+    # and inserting an all-NULL row would turn an honest absence into a row that
+    # reads as "session known, no text". `turn_count`/`capture_redactions` are
+    # only meaningful beside the text they belong to, and the carrier that
+    # rebuilds them carries that text.
     if not values:
         return []
-    return [_narrative_upsert_statement(org_id, graph_id, session_id, values)]
+    return [_narrative_upsert_statement(org_id, graph_id, session_id, values,
+                                        resets)]
 
 
 # ════════════════════════════════════════════════════════════════════════════

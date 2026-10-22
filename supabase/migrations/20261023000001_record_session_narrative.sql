@@ -98,8 +98,13 @@
 -- raw Cypher is **not** a journal record (§17.1's unjournalled-writer ledger):
 -- `grep -rn story_arc tortoise/` finds commit *payloads* and those raw writes,
 -- and no producer journals either. So on a live capture today this row lands
--- with `capture_redactions`/`turn_count` filled and `narrative` NULL: the
--- projection is correct and total, but the narrative carrier does not exist yet
+-- with `turn_count` filled, `capture_redactions` NULL and `narrative` NULL: the
+-- projection is correct and total, but the narrative carrier does not exist yet.
+-- ⚠️ `capture_redactions` is NULL because the record's OWN column,
+-- `public.session.capture_redactions`, is jsonb while the producer emits an
+-- integer, so a `SessionRecorded` carrying one is refused (`DatatypeMismatch`)
+-- and never reaches this table at all — #9264/R4 is that disagreement, and this
+-- home states no count until it is settled rather than inventing a shape.
 -- — which is exactly why the header above classes the two text columns as
 -- PRIMARY-WITHOUT-CARRIER rather than PRIMARY. The producer (journal the derived
 -- `:Source`/`:Event` write with `summary`/`story_arc`/`sessionId`) and the wiring
