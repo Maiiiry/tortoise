@@ -666,7 +666,8 @@ DELIBERATE_URI_MUTATIONS: dict[str, list[str]] = {
     # added the BROAD form (`r'monkeypatch\.setenv\(\s*"TORTOISE_DB_URI"'`) at
     # this anchor, while `main` carries the NARROW one above and deliberately
     # removed the broad row for good reason: Python's last-wins dict semantics
-    # made the second row DEAD (it never applied) and ruff flagged it `F601`, so
+    # mean the LATER (broad) row WINS — a duplicate key is an active override,
+    # not a harmless no-op — and ruff flagged it `F601`, so
     # the merge product was TWO identical keys — a repo-wide `ruff check .` red
     # (#9089 review) — and, had ruff allowed it, this row winning would have
     # silently RE-WIDENED the exemption `main` narrowed. Removing it changes no
