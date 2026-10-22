@@ -997,10 +997,10 @@ def write_classification_violations(entries, mcp_src: str | None = None) -> list
                                 or e.annotations.readOnlyHint is not False) \
                 and e.name not in RETENTION_CARVEOUTS:
             out.append(
-                f"{e.name}: read-only annotation but its handler reaches "
+                f"{e.name}: no writer annotation but its handler reaches "
                 f"out-of-boundary mutation(s) {sorted(out_of_boundary)} — declare it "
-                f"in RETENTION_CARVEOUTS with the reason, or stop claiming a read "
-                f"hint (#9576)")
+                f"in RETENTION_CARVEOUTS with the reason, or declare a writer "
+                f"(#9576)")
         if reached_writes:
             if e.http_policy:
                 if e.annotations is None or e.annotations.readOnlyHint is not False:
