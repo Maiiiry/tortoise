@@ -203,9 +203,13 @@ def test_the_probes_owners_map_names_no_landed_criterion_lane():
         "gate refused: x", prereg_ok=False)}
     assert rows["E5"]["blocked_by"] == "#9075", rows["E5"]
     assert "#7947 LANDED" in rows["E5"]["note"], rows["E5"]["note"]
-    # and E1/E2's ALSO_BLOCKED_BY note is not disturbed by the new suffix
+    # and E1/E2's ALSO_BLOCKED_BY note is not disturbed by the criterion-lane
+    # suffix. (#9075's own LANDED note DOES reach E1's note once `prereg_ok` —
+    # it is the gate behind every row — so the assertion names the E5-only
+    # suffix rather than the bare word; see
+    # `test_a_row_that_blames_the_landed_pre_registration_says_it_landed`.)
     assert "the measurement itself is #9076" in rows["E1"]["note"]
-    assert "LANDED" not in rows["E1"]["note"]
+    assert "#7947 LANDED" not in rows["E1"]["note"]
 
 
 # ── V2: the five-row contract ────────────────────────────────────────────
@@ -1779,13 +1783,80 @@ def test_prereg_ancestry_is_resolved_against_the_measured_head(
     assert "not an ancestor" in why, why
 
 
-def test_read_preregistration_refuses_a_commit_without_the_artifact():
-    """The shipped state: the commit resolves, the artifact is absent (#9075)."""
+def test_read_preregistration_refuses_a_commit_without_the_artifact(
+        tmp_path, monkeypatch):
+    """The shipped log's state at its own stamp: the artifact was ABSENT (#9075).
+
+    ⚠️ This arm used to point at THIS checkout's ``HEAD``, because that WAS the
+    shipped state when it was written. `#9075` has since landed its record
+    (`#9507`), so `HEAD` carries it and the old form now asserts the opposite of
+    the tree — a false red. The refusal is pinned against a commit that
+    genuinely lacks the artifact, which is the state it exists for; the LANDED
+    record gets its own pin below (`…is_read_not_refused_for_its_claim_name`).
+
+    Non-vacuity: the artifact is absent from that commit, so the pre-fix reader
+    returns this same refusal — the arm pins the MESSAGE (the reason a lane
+    reads) and the landing arm reds on the pre-fix key requirement.
+    """
+    repo, _parent, child = _ancestry_pair(tmp_path)
+    # `_git` shells out against `ROOT`; monkeypatch restores it for the suite.
+    monkeypatch.setattr(probe, "ROOT", repo)
     record, why = probe.read_preregistration(
-        HEAD, Path("docs/evidence/7949-capstone/preregistration.json"))
+        child, Path("docs/evidence/7949-capstone/preregistration.json"))
     assert record is None
     assert "does not carry" in why
     assert "#9075" in why
+
+
+def test_the_landed_preregistration_is_read_not_refused_for_its_claim_name():
+    """#9075 LANDED (#9507) — G0 must READ its record, not refuse its spelling.
+
+    The landed record asserts ``written_before_any_scored_run`` **with its
+    basis** (`PRE-REGISTRATION.md` check 3 requires exactly that, and refuses
+    the unqualified ``written_before_any_run`` because it is false as soon as
+    any log exists), while this probe demanded only the unqualified name. So the
+    only legitimate pre-registration in the repo was refused at G0 and the
+    instrument could never read one at all — an inert gate standing in front of
+    the epic's closing rule.
+
+    Non-vacuity: the pre-fix reader returns a refusal ("does not assert
+    written_before_any_run") for this exact file at this head.
+    """
+    artifact = Path("docs/evidence/7949-capstone/preregistration.json")
+    assert (_REPO / artifact).is_file(), (
+        "the pre-registration is committed on `main` (#9507); if it is gone, "
+        "the bundle's dependency claim changed and this pin must be re-derived")
+    record, why = probe.read_preregistration(HEAD, artifact)
+    assert record is not None, why
+    assert record["schema"] == probe.PREREG_SCHEMA
+    assert record["written_before_any_scored_run"] is True
+
+
+def test_a_scored_run_claim_without_its_basis_is_refused(tmp_path, monkeypatch):
+    """The landed claim form is only checkable against the reason it gives.
+
+    ``written_before_any_scored_run: true`` with no basis is the bare boolean
+    `PRE-REGISTRATION.md` check 3 rejects, so accepting the new spelling must not
+    become a fail-open: the basis is part of the claim.
+
+    Non-vacuity: the pre-fix reader refuses this record too, but for the WRONG
+    reason (it never looks at the scored-run claim), and
+    ``test_the_landed_preregistration_is_read_not_refused_for_its_claim_name``
+    is what reds on the pre-fix code. This arm keeps the new arm honest.
+    """
+    for missing, fragment in ((None, "without stating its basis"),
+                              ("   ", "without stating its basis")):
+        payload = {"schema": probe.PREREG_SCHEMA,
+                   "written_before_any_scored_run": True}
+        if missing is not None:
+            payload["written_before_any_scored_run_basis"] = missing
+        repo, sha = _prereg_repo(tmp_path / ("none" if missing is None
+                                            else "blank"), payload)
+        monkeypatch.setattr(probe, "ROOT", repo)
+        record, why = probe.read_preregistration(
+            sha, Path("docs/evidence/7949-capstone/preregistration.json"))
+        assert record is None, record
+        assert fragment in why, why
 
 
 def test_backend_must_be_searchable(monkeypatch):
@@ -1887,3 +1958,148 @@ def test_a_prereg_that_freezes_no_corpus_is_refused_not_a_no_op(tmp_path, monkey
     assert "corpus.sha256" in record["run"]["reason"], record["run"]["reason"]
     assert record["prereg"]["status"] == "OK"
     assert record["corpus"]["sha256"] == probe.corpus_sha256(corpus)
+
+
+# ── F3 (#9089 review): a MALFORMED pre-registration refuses, never crashes ──
+
+def _prereg_repo(tmp_path: Path, payload: object) -> tuple[Path, str]:
+    """A throwaway repo whose ONE commit carries ``payload`` as the prereg.
+
+    The record's producer is another lane (#9075), so its SHAPE is untrusted
+    input. A real commit is used (not a stubbed ``_git``) because the property
+    under test is that G0 refuses a shape `git show` hands it verbatim.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repo, _parent, _child = _ancestry_pair(tmp_path)
+    artifact = repo / "docs/evidence/7949-capstone/preregistration.json"
+    artifact.write_text(json.dumps(payload))
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "prereg"],
+                   check=True)
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                         capture_output=True, text=True,
+                         check=True).stdout.strip()
+    return repo, sha
+
+
+def test_a_prereg_record_that_is_not_an_object_is_refused_not_a_traceback(
+        tmp_path, monkeypatch):
+    """A root of ``[]`` used to raise ``AttributeError`` out of ``main()``.
+
+    ⛔ The failure mode is not "an ugly traceback": the acceptance command is
+    ``capstone_run.py … | tee docs/evidence/7949-capstone/capstone.log``, so a
+    traceback (stderr only, exit 1) TRUNCATES the committed evidence file to an
+    empty log and leaves no table saying why — the artifact the next lane reads
+    is destroyed by the gate that exists to refuse rather than guess.
+
+    Non-vacuity: the pre-fix reader calls ``record.get("schema")`` on a list, so
+    this test raises instead of asserting (and ``out`` is never written).
+    """
+    repo, sha = _prereg_repo(tmp_path, [])
+    monkeypatch.setattr(probe, "ROOT", repo)
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text(json.dumps([{"role": "user", "content": "hello"}]))
+    out = tmp_path / "capstone.log"
+    code = probe.main(["--prereg", sha, "--corpus", str(corpus),
+                       "--out", str(out)])
+    assert code == 2, code
+    record = cvc.extract_block(out.read_text())
+    assert record["run"]["status"] == "REFUSED"
+    assert "not an object" in record["run"]["reason"], record["run"]["reason"]
+    # The refusal is a G0 refusal — the prereg was looked at and unusable.
+    assert record["prereg"]["status"] == "ABSENT"
+    assert not cvc.check(record, repo=_REPO, require_green=False), (
+        "the refusal table must parse")
+    assert "V9" in _codes(record, require_green=True)
+
+
+def test_a_prereg_whose_corpus_block_is_not_an_object_is_refused(
+        tmp_path, monkeypatch):
+    """``corpus: "nope"`` made ``frozen.get(...)`` raise in G1, after G0 passed.
+
+    Non-vacuity: the pre-fix reader returns the record, so ``main()`` reaches
+    G1 and raises ``AttributeError`` on the string — no table, exit 1.
+    """
+    repo, sha = _prereg_repo(tmp_path, _frozen_prereg(corpus="nope"))
+    monkeypatch.setattr(probe, "ROOT", repo)
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text(json.dumps([{"role": "user", "content": "hello"}]))
+    out = tmp_path / "capstone.log"
+    code = probe.main(["--prereg", sha, "--corpus", str(corpus),
+                       "--out", str(out)])
+    assert code == 2, code
+    record = cvc.extract_block(out.read_text())
+    assert "corpus as a str" in record["run"]["reason"], record["run"]["reason"]
+
+
+def test_a_prereg_whose_corpus_items_is_not_a_count_is_refused(
+        tmp_path, monkeypatch):
+    """``items: "fifteen"`` (or a float, or a bool) is not a turn count.
+
+    Non-vacuity: the pre-fix G1 does ``int(frozen["items"])`` inline, so a
+    non-numeric truthy value raises ``ValueError`` out of ``main()`` — no
+    table, exit 1, and ``tee`` truncates the shipped log.
+    """
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text(json.dumps([{"role": "user", "content": "hello"}]))
+    sha_of = probe.corpus_sha256(corpus)
+    for index, (bad, fragment) in enumerate((("fifteen", "not a turn count"),
+                                            (True, "BOOLEAN"),
+                                            (1.5, "fractional turn count"))):
+        repo, sha = _prereg_repo(tmp_path / f"bad-{index}",
+                                _frozen_prereg(
+                                    corpus={"sha256": sha_of, "items": bad}))
+        monkeypatch.setattr(probe, "ROOT", repo)
+        out = tmp_path / f"capstone-{fragment.split()[0]}.log"
+        code = probe.main(["--prereg", sha, "--corpus", str(corpus),
+                           "--out", str(out)])
+        assert code == 2, (bad, code)
+        record = cvc.extract_block(out.read_text())
+        assert fragment in record["run"]["reason"], (bad, record["run"]["reason"])
+
+
+def test_a_prereg_that_freezes_a_numeric_string_count_still_measures(
+        tmp_path, monkeypatch):
+    """``items: "1"`` is a count a producer may legitimately emit — not refused.
+
+    The guard must not become a NEW false refusal: a JSON producer that writes
+    counts as strings is normalised to an int by the reader, and G1's own
+    turn-count comparison then does the deciding (1 == 1 passes, 2 fails).
+    """
+    corpus = tmp_path / "corpus.json"
+    corpus.write_text(json.dumps([{"role": "user", "content": "hello"}]))
+    _read_prereg_ok(monkeypatch, _frozen_prereg(
+        corpus={"sha256": probe.corpus_sha256(corpus), "items": "1"}))
+    monkeypatch.delenv("TORTOISE_DB_URI", raising=False)
+    monkeypatch.delenv("TORTOISE_API_URL", raising=False)
+    out = tmp_path / "g2.log"
+    code = probe.main(["--prereg", HEAD, "--corpus", str(corpus),
+                       "--out", str(out)])
+    # G1 passed (the count matched) and the run reached G2 — the embedded-store
+    # refusal, NOT a "pre-registration is malformed" refusal.
+    record = cvc.extract_block(out.read_text())
+    assert code == 3, (code, record["run"]["reason"])
+    assert record["run"]["gate_failed"] == 3
+    assert record["prereg"]["status"] == "OK"
+
+
+def test_a_row_that_blames_the_landed_pre_registration_says_it_landed():
+    """#9075 closed COMPLETED (#9507) — a re-run's row must not print it bare.
+
+    `#9075` is the ``blocked_by`` of every row on a PRE-G0 refusal, so a table
+    re-generated after the landing would hand the next reader a closed issue as
+    the work to do — the durable-misattribution rule ``LANDED_LANES`` already
+    fixes for a criterion lane, applied to a GATE. The shipped log keeps its
+    pre-landing stamp (and its bare `#9075`), which is why this is pinned on the
+    ROWS the probe emits now, not on the artifact.
+
+    Non-vacuity: pre-fix, the E5 note names `#9075` with no state at all.
+    """
+    assert probe.LANDED_GATES == {"#9075": "#9507"}, probe.LANDED_GATES
+    for prereg_ok in (False, True):
+        rows = {r["criterion"]: r for r in probe.refused_rows(
+            "gate refused: x", prereg_ok=prereg_ok)}
+        blamed = [r for r in rows.values() if r["blocked_by"] == "#9075"]
+        assert blamed, (prereg_ok, rows)
+        for row in blamed:
+            assert "#9075 LANDED (#9507)" in row["note"], (prereg_ok, row["note"])

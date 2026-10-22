@@ -99,9 +99,16 @@ steps observed: (none)   required: S0 S1 S2.1 S2.2 S2.3 S3 S5 S6
 
 `--prereg` names the commit whose tree must CARRY the pre-registration record — the
 runner reads it with `git show <sha>:<artifact>`, never from the worktree, so a threshold
-edited after the numbers are in cannot be served. No commit carries it: **#9075 is open.**
-The corpus argument is a *candidate* (`battery/config/corpus.json`), not a pre-registered
-corpus — none exists for the same reason — and it is labelled as such in the log.
+edited after the numbers are in cannot be served. **At the log's own stamp (`027c8c1ab`)
+no commit carried it — `#9075` was open.** ⚠️ **`#9075` has since LANDED** (`#9507`,
+merged to `main` as `a6085af84`): `preregistration.json` is now committed in THIS
+directory, and the merge-up at `5767d04ac` brought it into this branch. The shipped log
+above is therefore a PRE-landing stamp and is kept as such — a re-run today does not
+reproduce it (see *Reproduce*: G0 now READS the record and the run refuses one gate
+later). The corpus argument is a *candidate* (`battery/config/corpus.json`), not a
+pre-registered corpus — the preregistration freezes its corpus as a FIXTURE REVISION
+(`corpus.fixtures_hash` over `tests/eval/write_path`), not as a turns file whose `sha256`
+G1 compares.
 
 Then the gate, over the log it just produced:
 
@@ -131,23 +138,24 @@ claims below are STALE, which is what the capstone run is built on:
    runner is now this probe rather than nothing.
 3. **⚠️ CORRECTED — a single entry point CAN drive all eight steps.** The body asks this
    as an open question. It resolves YES: `TortoiseSDK.capture_session` →
-   `sdk._extract_session_v2` (`sdk.py:10772`; called at `:9782`) →
-   `extractor_v2.extract_session_v2` (`extractor_v2.py:7634`), which calls, in one pass
-   (line numbers re-derived at `7523ad934`, the merge-up of `origin/main` whose five
-   `sdk.py` commits — `a0ddce4ea`, `77660fe5b`, `01b5486ec`, `2dacb87f5`, `ae66ccdc4` —
-   moved the def and its call site 350 and 343 lines down under the previous cites; the
-   symbol is authoritative and the line is a convenience, which is how the pin's earlier
-   numbers went stale here):
+   `sdk._extract_session_v2` (`sdk.py:11080`; called at `:10117`) →
+   `extractor_v2.extract_session_v2` (`extractor_v2.py:7731`), which calls, in one pass
+   (line numbers re-derived at `5767d04ac`, the merge-up of `origin/main` whose
+   `sdk.py`/`extractor_v2.py` commits moved the def, its call site and every step below
+   under the previous cites — the def 308 lines, the call site 335; this is the SECOND
+   time `main` moved them while this branch was open, and the symbol is authoritative
+   while the line is a convenience, which is how the pin's earlier numbers went stale
+   here):
 
    | step | call site | witness the probe reads | on the receipt? |
    |---|---|---|---|
-   | S0 READ | `_edus_from_conversation` `:7742` | `stats["edus"]`, `stats["chunks"]` | ✅ |
-   | S1 NARRATE | `run_s1` `:7775` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
-   | S2.1 EXTRACT | `run_s2` `:7799` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
-   | S2.2 VET | `_run_vet_pass` `:7828` | `result["vet"]` | ❌ **#9116** |
-   | S2.3 CLASSIFY | `_apply_classify_kinds` `:7844` | `result["classify_later"]` | ❌ **#9116** |
-   | S3 RESOLVE | `search_graph` `:7860` | `result["search"]` | ❌ **#9116** |
-   | S5 CONNECT | `execute_embed` `:8080` (+ `run_s4` `:7881` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
+   | S0 READ | `_edus_from_conversation` `:7839` | `stats["edus"]`, `stats["chunks"]` | ✅ |
+   | S1 NARRATE | `run_s1` `:7872` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
+   | S2.1 EXTRACT | `run_s2` `:7896` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
+   | S2.2 VET | `_run_vet_pass` `:7925` | `result["vet"]` | ❌ **#9116** |
+   | S2.3 CLASSIFY | `_apply_classify_kinds` `:7941` | `result["classify_later"]` | ❌ **#9116** |
+   | S3 RESOLVE | `search_graph` `:7957` | `result["search"]` | ❌ **#9116** |
+   | S5 CONNECT | `execute_embed` `:8177` (+ `run_s4` `:7978` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
    | S6 COMMIT | `execute_embed` payload | `result["payload"]` | ❌ **#9116** |
 
    So the capstone drives the **real entry point**, which is what the epic's phrase *"the
@@ -168,19 +176,21 @@ claims below are STALE, which is what the capstone run is built on:
 
    | issue | title (truncated) | state |
    |---|---|---|
-   | `#9075` | pre-register the capstone corpus, split and scoring BEFORE any E1–E5 run | **OPEN** |
+   | `#9075` | pre-register the capstone corpus, split and scoring BEFORE any E1–E5 run | **CLOSED COMPLETED** — landed as `#9507` (`a6085af84`); the record is in this directory. Re-read 2026-10-22 at the merge-up `5767d04ac` |
    | `#9076` | E1+E2 on one run — volume falls, correctness preserved | **OPEN** |
    | `#9077` | E4 on the real extraction leg — wired AND persisted, no monkeypatch | **OPEN** |
    | `#5199` | the version anchor stops at Points — `:Object`/`:Event` not version-scoped | **OPEN** |
    | `#7947` | the raw-vs-narrative measurement — D3's falsifier | **CLOSED COMPLETED** (2026-10-19) |
    | `#9116` | the run's G5 cannot observe 4 of its 8 steps — `capture_session`'s receipt carries no step surface | **OPEN** |
 
-   `#9075` is a precondition for the whole table (it is G0). ⚠️ A row moves to
-   `RED`/`GREEN` only by RE-RUNNING the probe and producing the artifact — never by
-   reading an issue's state, even when that state is CLOSED. That is why E5 did not turn
-   green when `#7947` closed: the falsifier's numbers are in §10, but no pre-registered
-   capstone pass has re-derived them, and the E5 row's owner is now the G0 gate that would
-   allow one.
+   `#9075` was a precondition for the whole table (it is G0) and it has LANDED, which is
+   why the rows below still read `UNPREREGISTERED`: they record the RUN at `027c8c1ab`,
+   before the record existed. ⚠️ A row moves to `RED`/`GREEN` only by RE-RUNNING the probe
+   and producing the artifact — never by reading an issue's state, even when that state is
+   CLOSED. That is why E5 did not turn green when `#7947` closed, and why E1/E2/E5 do not
+   turn green now that `#9075` has: no SCORED capstone pass has been run against the
+   landed record, and the run still cannot reach one (`#9116` plus the corpus-freeze shape
+   in *Reproduce*).
 
    `#9116` is not a row's blocker, it is the **run's**: the five rows above cannot be
    measured at all until the probe can WITNESS a step (see *What this bundle does NOT
@@ -243,11 +253,18 @@ refuses) — an honest finding for `#7949`, never a guess.
 TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
     tests/test_7949_capstone_verdict_check.py -q -p no:cacheprovider
 
-# the real run, once #9075 lands AND #9116 lands AND a provider key + a searchable
-# backend exist. #9116 is a second precondition, not a detail: the observation
-# surface the probe reads is not on `capture_session`'s receipt yet, so a run today
-# refuses at G5 with S2.2/S2.3/S3/S6 unobserved (see "What this bundle does NOT
-# establish"). Re-running before it lands reproduces the REFUSED table, not a verdict.
+# the real run, once #9116 lands AND a provider key + a searchable backend exist, and
+# once G1 can accept the LANDED pre-registration's corpus freeze. Status at the merge-up
+# `5767d04ac`: #9075 HAS landed (#9507) and G0 now READS its record (the probe accepts the
+# `written_before_any_scored_run` + basis claim the record uses), so a re-run today
+# refuses at G1 — `the pre-registration freezes no corpus.sha256` — because the record
+# freezes a FIXTURE REVISION (`corpus.fixtures_hash` over tests/eval/write_path), not a
+# turns file with a sha256 for G1 to compare. That G1 arm is a real open question for the
+# epic, not a bug: it is recorded here rather than papered over by pointing the probe at
+# a corpus the pre-registration never froze. #9116 is the second precondition: the
+# observation surface the probe reads is not on `capture_session`'s receipt yet, so a run
+# that cleared G1 would refuse at G5 with S2.2/S2.3/S3/S6 unobserved (see "What this
+# bundle does NOT establish").
 python docs/evidence/7949-capstone/probes/capstone_run.py \
     --prereg <pre-registration commit> --corpus <pre-registered corpus> \
     | tee docs/evidence/7949-capstone/capstone.log

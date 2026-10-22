@@ -15,15 +15,19 @@ the corrected reading:
 
 1. **A single entry point DOES exist.** The body says *"whether any single
    entry point … can drive all eight in one pass"* is an open question. It can:
-   ``TortoiseSDK.capture_session`` → ``sdk._extract_session_v2`` →
-   ``extractor_v2.extract_session_v2`` (``extractor_v2.py:7634``) calls
-   ``_edus_from_conversation`` (S0, ``:7742``), ``run_s1`` (S1, ``:7775``),
-   ``run_s2`` (S2.1, ``:7799``), ``_run_vet_pass`` (S2.2, ``:7828``),
+   ``TortoiseSDK.capture_session`` → ``sdk._extract_session_v2``
+   (``sdk.py:11080``, called at ``:10117``) →
+   ``extractor_v2.extract_session_v2`` (``extractor_v2.py:7731``) calls
+   ``_edus_from_conversation`` (S0, ``:7839``), ``run_s1`` (S1, ``:7872``),
+   ``run_s2`` (S2.1, ``:7896``), ``_run_vet_pass`` (S2.2, ``:7925``),
    ``kind_classifier.classify_items``/``_apply_classify_kinds`` (S2.3,
-   ``:7844``), ``search_graph`` (S3, ``:7860``), ``run_s4`` (the gap filler,
-   ``:7881``), and ``execute_embed`` (S5+S6, ``:8080``). Line numbers re-derived
-   at ``027c8c1ab``; the symbol is authoritative and the line is a convenience,
-   which is how the pin's earlier numbers went stale here. So the capstone drives
+   ``:7941``), ``search_graph`` (S3, ``:7957``), ``run_s4`` (the gap filler,
+   ``:7978``), and ``execute_embed`` (S5+S6, ``:8177``). Line numbers re-derived
+   at ``5767d04ac`` — the merge-up of ``origin/main``, which moved ``sdk.py``
+   under the cites a SECOND time while this branch was open (the pre-merge
+   numbers were right at their own head): the symbol is authoritative and the
+   line is a convenience, which is how the pin's earlier numbers went stale
+   here. So the capstone drives
    the REAL entry point — it does not compose the step functions, which the
    issue explicitly forbids.
 2. **``docs/evidence/7949-capstone/`` did not exist and still does not exist as
@@ -173,6 +177,16 @@ ALSO_BLOCKED_BY = {"E1": "#9076", "E2": "#9076"}
 # falsifier is not outstanding work, and a note that stayed silent about it
 # would leave the next reader re-opening a closed issue to find that out.
 LANDED_LANES = {"E5": "#7947"}
+# GATES (not criterion lanes) that have LANDED since the shipped log's stamp.
+# ``#9075`` is the pre-registration record itself and it is the ``blocked_by``
+# of every row on a PRE-G0 refusal, so a re-run must not print the lane name
+# with no state: it closed COMPLETED (`#9507`, `a6085af84`) and the record it
+# produced is committed at ``docs/evidence/7949-capstone/preregistration.json``
+# — the merge-up ``5767d04ac`` is where this branch learned that. The rows keep
+# naming the lane (it is what OWNS the evidence and what the shipped log says)
+# and say out loud that it has landed, which is the same durable-misattribution
+# rule ``LANDED_LANES`` applies to a criterion lane.
+LANDED_GATES = {"#9075": "#9507"}
 
 BEGIN = "=== CAPSTONE-VERDICT-BEGIN ==="
 END = "=== CAPSTONE-VERDICT-END ==="
@@ -341,6 +355,11 @@ def refused_rows(reason: str, *, prereg_ok: bool,
         note += owner
         if cid in ALSO_BLOCKED_BY:
             note += f" / the measurement itself is {ALSO_BLOCKED_BY[cid]}"
+        if owner in LANDED_GATES:
+            note += (f" / {owner} LANDED ({LANDED_GATES[owner]}) — the record it "
+                     "produced is frozen at "
+                     "docs/evidence/7949-capstone/preregistration.json, so what "
+                     "this row is missing is the SCORED pass, not the thresholds")
         note += _landed_suffix(cid)
         rows.append({
             "criterion": cid,
@@ -542,13 +561,71 @@ def read_preregistration(sha: str, artifact: Path,
         record = json.loads(blob.stdout)
     except json.JSONDecodeError as e:
         return None, f"{artifact.as_posix()} at {sha} is not JSON: {e}"
+    # ── TYPE guards, before anything indexes into it (#9089 review F3).
+    # The record's producer is another lane, so its SHAPE is untrusted input:
+    # a root that parses as ``[]`` used to raise ``AttributeError`` out of
+    # ``main()``, which is the worst of both worlds here — the acceptance
+    # command is ``capstone_run.py … | tee capstone.log``, so a traceback (stderr
+    # only, exit 1) truncates the committed evidence log to an EMPTY file and
+    # leaves no table saying why. Every arm below therefore REFUSES (a G0
+    # refusal: exit 2, a full verdict table on stdout), the same shape the
+    # non-JSON arm above already uses.
+    if not isinstance(record, dict):
+        return None, (f"{artifact.as_posix()} at {sha} is a JSON "
+                      f"{type(record).__name__}, not an object — a "
+                      "pre-registration is a schema object, so there is no "
+                      "threshold to read")
     if record.get("schema") != PREREG_SCHEMA:
         return None, (f"{artifact.as_posix()} at {sha} declares schema "
                       f"{record.get('schema')!r}, expected {PREREG_SCHEMA!r}")
-    if not record.get("written_before_any_run"):
-        return None, ("the pre-registration does not assert "
-                      "written_before_any_run — a threshold without that claim "
-                      "may have been chosen to fit the number")
+    # ⚠️ TWO claim spellings, because the producer's spec moved under this probe.
+    # #9075 LANDED its record on `main` (#9507, artifact at
+    # `docs/evidence/7949-capstone/preregistration.json`), and that spec
+    # (`PRE-REGISTRATION.md` check 3) deliberately requires
+    # ``written_before_any_scored_run`` **with its basis stated** — the
+    # unqualified form is refused there because it is false the moment any log
+    # exists. This probe predates the landing and demanded only the old name, so
+    # it refused the ONE legitimate record that exists and could never read a
+    # pre-registration at all — an inert gate. Both are accepted now; the landed
+    # form additionally requires a non-blank basis, because a scored-run claim
+    # with no stated reason is the bare boolean the spec rejects.
+    scored = record.get("written_before_any_scored_run")
+    if scored:
+        basis = record.get("written_before_any_scored_run_basis")
+        if not isinstance(basis, str) or not basis.strip():
+            return None, (
+                f"{artifact.as_posix()} at {sha} asserts "
+                "written_before_any_scored_run without stating its basis — the "
+                "claim is only checkable against the reason it gives")
+    elif not record.get("written_before_any_run"):
+        return None, ("the pre-registration asserts neither "
+                      "written_before_any_scored_run (with its basis) nor the "
+                      "legacy written_before_any_run — a threshold without "
+                      "that claim may have been chosen to fit the number")
+    frozen = record.get("corpus")
+    if frozen is not None and not isinstance(frozen, dict):
+        return None, (f"{artifact.as_posix()} at {sha} declares corpus as a "
+                      f"{type(frozen).__name__}, not an object — G1 compares "
+                      "corpus.sha256 / corpus.items against the run's corpus")
+    if isinstance(frozen, dict) and frozen.get("items") is not None:
+        items = frozen["items"]
+        if isinstance(items, bool):
+            return None, (f"{artifact.as_posix()} at {sha} freezes "
+                          f"corpus.items as a BOOLEAN ({items!r}) — a turn "
+                          "count is not a flag")
+        if isinstance(items, float) and not items.is_integer():
+            return None, (f"{artifact.as_posix()} at {sha} freezes "
+                          f"corpus.items as {items!r} — a fractional turn "
+                          "count is not a count")
+        try:
+            # Normalised HERE, once, so G1's `int(frozen["items"])` cannot be
+            # the thing that raises: a non-numeric value (``"fifteen"``) is a
+            # malformed record, not a run-time input error.
+            frozen["items"] = int(items)
+        except (TypeError, ValueError):
+            return None, (f"{artifact.as_posix()} at {sha} freezes "
+                          f"corpus.items as {items!r}, which is not a turn "
+                          "count")
     return record, ""
 
 
