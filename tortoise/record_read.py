@@ -1,0 +1,273 @@
+"""The record's READ side for §9.1 text — the narrative and the verbatim turns.
+
+WHY THIS MODULE EXISTS
+======================
+`docs/architecture/STORAGE-ARCHITECTURE.md` §9.1 (owner ruling, D1) splits the
+capture in two: the **narrative** (the connected prose form of a captured
+session) and the **raw turn transcript** it was derived from are stored as text
+in **Postgres**, never in the graph — *"the narrative is not something we're
+suggesting to store in the graph (same as raw) but store in supabase"*. §9.4
+makes the link load-bearing rather than a citation nicety: *"at answer time,
+send the source's VERBATIM text, not the extracted claim"* (measured 15.9 /
+22.0 pts). A claim with no reachable verbatim source cannot be served as
+evidence.
+
+`record_projection` is the record's WRITE side (Interface A, journal → Postgres).
+This module is the matching READ side: given a tenant and a session (or a
+`:Source`), return the narrative and the raw turns **from the record only**.
+That is what makes §9.1 checkable — the epic's capstone `#9567` item D7 is
+*"the S1 narrative and raw turn text come back"*, measured with the graph
+destroyed and the journal unavailable.
+
+WHAT IT READS, AND WHAT IT DELIBERATELY DOES NOT
+================================================
+* `public.session_narrative` — the narrative home (`#9555`, migration
+  20261023000001): the narrative text, its summary, the redaction count and the
+  turn count, one row per session.
+* `public.point` — the RAW TURNS. They are already first-class record rows
+  (`is_episodic = true`, `node_key = '<session>_t<i>'`), each with its own
+  identity and journal carrier, so the transcript is SERVED from them and not
+  copied into the narrative table: a second copy of the same text can only
+  drift from the first, and §9.1 rejects paying twice for the same input one
+  level up.
+
+⛔ It never reads `public.journal_event`, and it never reads the graph. The
+moment a rebuild's source of truth is the journal, "the record is the system of
+record" (§2.0) is false for exactly the text §9.1 says must survive.
+
+TURN IDENTITY, STATED AS A RULE
+===============================
+A turn's id is `{session_id}_t{index}` — the derivation owned by
+`sdk._capture_turn_id` (one definition, `#3551`). Its **reader** half is the
+suffix SHAPE: the prefix must match the session id literally and the remainder
+must be all digits, which is the same rule `sdk._capture_turn_ids` applies in
+Cypher (`t.id STARTS WITH $prefix` plus an all-numeric index). The prefix alone
+is not enough: a session whose id itself ends in `_t<i>` would otherwise match
+another session's turn ids (`sec` vs `sec_t0`), which is the bug that comment
+records.
+
+TENANCY IS A PER-CALL ARGUMENT
+==============================
+`org_id` and `graph_id` are required keyword arguments and are bound into every
+statement — the same rule (and the same reason) as `record_projection`: the
+hosted lane serves several tenant graphs from one process, so a tenant resolved
+from anything process-global files one tenant's read under another with no
+error. The record's RLS policies are the boundary underneath (`app.
+current_org_id` + the `*_read_org` policy); this module does not rely on them
+being armed, it filters on the same pair explicitly.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+__all__ = [
+    "RecordReadError",
+    "SessionText",
+    "Turn",
+    "session_text",
+    "source_narrative",
+]
+
+#: The narrative home (#9555).
+NARRATIVE_TABLE = "session_narrative"
+
+#: The turn rows in the record. `node_key` is the turn's canonical key
+#: (`Point` → `id`), which is the `{session}_t{i}` id.
+POINT_TABLE = "point"
+
+
+class RecordReadError(Exception):
+    """A record read failed structurally — never silently returns empty.
+
+    A missing session is `None` (an honest absence). This class is for the
+    cases where "absent" and "broken" must not look alike: a turn id the shape
+    rule cannot parse, or a turn stream the record cannot order.
+    """
+
+
+@dataclass(frozen=True)
+class Turn:
+    """One raw turn, verbatim, in capture order."""
+
+    turn_id: str
+    index: int
+    content: str
+    speaker: str | None = None
+
+
+@dataclass(frozen=True)
+class SessionText:
+    """§9.1's two tiers for one session, as the record holds them.
+
+    ``narrative``/``summary`` come from `public.session_narrative`;
+    ``turns`` come from the episodic `public.point` rows. ``redactions`` is
+    the record's `capture_redactions` column (the column keeps the journal
+    key's name, §3). Both are the record's,
+    neither is a second copy of the other.
+    """
+
+    session_id: str
+    narrative: str | None = None
+    summary: str | None = None
+    redactions: int | None = None
+    turn_count: int | None = None
+    turns: tuple[Turn, ...] = field(default=())
+
+    @property
+    def transcript(self) -> str:
+        """The raw turns joined in capture order — §9.1's "raw transcript".
+
+        Speaker-labelled when the record knows a speaker (the capture writes
+        one on assistant/user turns), bare text otherwise. This is the string
+        §9.4's verbatim path reads; it is derived from the turn rows, never
+        stored a second time.
+        """
+        lines = []
+        for turn in self.turns:
+            if turn.speaker:
+                lines.append(f"{turn.speaker}: {turn.content}")
+            else:
+                lines.append(turn.content)
+        return "\n\n".join(lines)
+
+    @property
+    def verbatim_available(self) -> bool:
+        """Is there any §9.4-usable text at all?"""
+        return bool(self.narrative or self.summary or self.turns)
+
+
+def _cursor(conn: Any):
+    """A DB-API cursor, matching `record_projection.replay`'s protocol."""
+    return conn.cursor()
+
+
+def _rows(cursor) -> list[Any]:
+    rows = cursor.fetchall()
+    return list(rows or ())
+
+
+def _turn_pattern(session_id: str) -> str:
+    """The POSIX regex that matches exactly this session's turn keys.
+
+    `^<session_id>_t[0-9]+$`. `re.escape` escapes regex metacharacters in the
+    session id (`+`, `.`, `(`, …) and leaves `_` alone, so a session named
+    `a_t1` cannot match another session's turns.
+    """
+    return "^" + re.escape(session_id) + "_t[0-9]+$"
+
+
+def _turn_index(turn_id: str, session_id: str) -> int:
+    """The numeric index encoded in a turn key, or a LOUD refusal."""
+    match = re.search(r"_t([0-9]+)$", turn_id)
+    if match is None or not turn_id.startswith(session_id + "_t"):
+        raise RecordReadError(
+            f"turn key {turn_id!r} does not follow `{{session_id}}_t{{index}}` "
+            f"for session {session_id!r} — the record's turn ordering is the "
+            "id's own index (sdk._capture_turn_id), and a key that does not "
+            "carry one cannot be ordered without inventing an order."
+        )
+    return int(match.group(1))
+
+
+def _narrative_row(conn: Any, org_id: str, graph_id: str,
+                   session_id: str) -> tuple | None:
+    cursor = _cursor(conn)
+    cursor.execute(
+        f"SELECT narrative, summary, capture_redactions, turn_count "
+        f"FROM public.{NARRATIVE_TABLE} "
+        f"WHERE org_id = %s AND graph_id = %s AND session_id = %s",
+        (org_id, graph_id, session_id),
+    )
+    rows = _rows(cursor)
+    return rows[0] if rows else None
+
+
+def _turns(conn: Any, org_id: str, graph_id: str,
+           session_id: str) -> tuple[Turn, ...]:
+    cursor = _cursor(conn)
+    cursor.execute(
+        f"SELECT node_key, content, speaker FROM public.{POINT_TABLE} "
+        f"WHERE org_id = %s AND graph_id = %s AND is_episodic IS TRUE "
+        f"AND node_key ~ %s",
+        (org_id, graph_id, _turn_pattern(session_id)),
+    )
+    turns: list[Turn] = []
+    for row in _rows(cursor):
+        turn_id, content, speaker = row[0], row[1], row[2]
+        if not isinstance(turn_id, str) or not isinstance(content, str):
+            raise RecordReadError(
+                f"a turn row for session {session_id!r} has no usable "
+                f"key/content (key={turn_id!r}, content type="
+                f"{type(content).__name__}) — the record is malformed for "
+                "this session."
+            )
+        turns.append(Turn(
+            turn_id=turn_id,
+            index=_turn_index(turn_id, session_id),
+            content=content,
+            speaker=speaker if isinstance(speaker, str) and speaker else None,
+        ))
+    # Ordered by the id's own index, in PYTHON: the order is a property of the
+    # key contract, and re-deriving it in SQL (a regex substring cast) would be
+    # a second declaration of the same rule.
+    turns.sort(key=lambda t: t.index)
+    return tuple(turns)
+
+
+def session_text(conn: Any, *, org_id: str, graph_id: str,
+                 session_id: str) -> SessionText | None:
+    """§9.1's text for one session, read from the record only.
+
+    Returns ``None`` when the record holds neither a narrative row nor any
+    turn — an honest absence (a session captured by a lane that never
+    distilled a narrative, or before this table existed). A session with only
+    one of the two returns what exists: the halves arrive from different
+    records, in either order (see `record_projection._narrative_statements`).
+    """
+    if not session_id:
+        raise RecordReadError("session_text needs a session id")
+    row = _narrative_row(conn, org_id, graph_id, session_id)
+    turns = _turns(conn, org_id, graph_id, session_id)
+    if row is None and not turns:
+        return None
+    narrative, summary, redactions, turn_count = (
+        row if row is not None else (None, None, None, None)
+    )
+    return SessionText(
+        session_id=session_id,
+        narrative=narrative if isinstance(narrative, str) else None,
+        summary=summary if isinstance(summary, str) else None,
+        redactions=redactions if isinstance(redactions, int) else None,
+        turn_count=turn_count if isinstance(turn_count, int) else None,
+        turns=turns,
+    )
+
+
+def source_narrative(conn: Any, *, org_id: str, graph_id: str,
+                     url: str) -> SessionText | None:
+    """§9.4's verbatim fetch: the session text behind a `:Source`'s url.
+
+    §9.4: *"show me the verbatim text behind this claim"* → **the link** — the
+    source's session is `public.source.session_id`, and the text is the
+    session's narrative + turns. This is the record-sourced arm of that fetch:
+    with the graph destroyed the *link* still resolves, because it is a column
+    on the record's own `source` row rather than an edge in the cache.
+    """
+    if not url:
+        raise RecordReadError("source_narrative needs a source url")
+    rows: list[Any] = []
+    if url:
+        cursor = _cursor(conn)
+        cursor.execute(
+            "SELECT session_id FROM public.source "
+            "WHERE org_id = %s AND graph_id = %s AND url = %s",
+            (org_id, graph_id, url),
+        )
+        rows = _rows(cursor)
+    if not rows or not isinstance(rows[0][0], str) or not rows[0][0].strip():
+        return None
+    return session_text(conn, org_id=org_id, graph_id=graph_id,
+                        session_id=rows[0][0])

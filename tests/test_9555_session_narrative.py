@@ -1,0 +1,480 @@
+"""§9.1's narrative home, made executable (#9555, R7, epic #7879).
+
+WHAT THIS PINS. `docs/architecture/STORAGE-ARCHITECTURE.md` §9.1 places the S1
+narrative and the raw turn transcript in **Postgres, not the graph**, and §9.4
+turns the link into the mechanism that reaches the model (*"send the source's
+VERBATIM text, not the extracted claim"*). `#9567`'s D7 measures it: *"the S1
+narrative and raw turn text come back"* — with the graph destroyed and the
+journal unavailable. Five claims, each a test here:
+
+1. **THE HOME EXISTS, AND IT IS SHAPED RIGHT.** One row per session in
+   `public.session_narrative`, keyed `(org_id, graph_id, session_id)` with a
+   foreign key to `public.session` that CASCADES — the tenant-erasure path
+   (`purge_org_record`, migration 20261012000005) reaches it through
+   organizations → graphs → session, so a tenant's narrative dies with the
+   tenant.
+2. **IT IS A TENANCY SURFACE LIKE THE OTHER NINE.** RLS enabled, the
+   `authenticated` read policy on `app.current_org_id`, the `service_role`
+   policy for the write path, and — per R6's recorded decision (`#9554`) — the
+   app-role policy with BOTH `USING` and `WITH CHECK`, guarded on the role
+   existing because R6's migration (which creates it) sorts FIRST.
+3. **IT IS PROJECTED FROM RECORDS THAT ALREADY CARRY IT.** No new producer: the
+   narrative rides `story_arc` on the commit's `:Source`/`:Event` record and the
+   counts ride `SessionRecorded`. Nothing here is invented from a value the
+   journal does not hold (§3's per-write test).
+4. **THE TWO CARRIERS DO NOT CLOBBER EACH OTHER.** They write ONE row, each
+   naming only its own columns in the `DO UPDATE SET`. This is the leg that
+   makes a replay in journal order equal to a live build: an upsert that wrote
+   the whole column set would let whichever record arrived second erase the
+   first one's half.
+5. **THE READ SIDE READS THE RECORD ONLY.** `tortoise.record_read` serves the
+   narrative and the verbatim turns without touching `journal_event` and
+   without touching the graph.
+
+WHY THIS IS DB-FREE. The Python lane runs everywhere; the SQL half (the checks
+firing, RLS under a real role) is the PGlite harness —
+`supabase/tests/20261012000001_record_schema.sql` carries the assertions, and
+`supabase/tests/pglite/validate.mjs` runs them. The statement shapes asserted
+here are the ones that harness executes.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from tortoise import record_projection as rp
+from tortoise import record_read as rr
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MIGRATIONS = REPO_ROOT / "supabase" / "migrations"
+MIGRATION_NAME = "20261023000001_record_session_narrative.sql"
+ORG = "org_9555"
+GRAPH = "graph_9555"
+
+
+def _migration_sql() -> str:
+    return (MIGRATIONS / MIGRATION_NAME).read_text(encoding="utf-8")
+
+
+# ── 1. The home exists, is registered, and ships in the wheel ────────────────
+
+
+def test_the_migration_is_registered_and_exists():
+    """A table the reader cannot see is a table the projection cannot write."""
+    assert MIGRATION_NAME in rp.RECORD_MIGRATIONS
+    assert (MIGRATIONS / MIGRATION_NAME).exists()
+
+
+def test_the_migration_ships_in_the_wheel():
+    """`pyproject.toml` maps `supabase/migrations` to `tortoise.record_migrations`
+    with the glob `*_record_*.sql`; a name the glob misses is a record that is
+    EMPTY on a user's machine while every test here is green."""
+    pattern = re.search(
+        r'"tortoise\.record_migrations"\s*=\s*\["([^"]+)"\]',
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+    )
+    assert pattern is not None, "the wheel's migration glob is gone"
+    assert Path(MIGRATION_NAME).match(pattern.group(1)), (
+        f"{MIGRATION_NAME} does not match the packaged glob "
+        f"{pattern.group(1)!r} — the wheel would ship a record without it"
+    )
+
+
+def test_the_table_is_in_the_record_tables_and_has_its_columns():
+    assert rr.NARRATIVE_TABLE in rp.THE_RECORD_TABLES
+    columns = rp.table_columns()[rr.NARRATIVE_TABLE]
+    assert {"narrative", "summary", "capture_redactions", "turn_count"} <= columns
+    # `redactions` is a COUNT, not an envelope: the #9264/R4 disagreement one
+    # table over was a jsonb column holding an integer.
+    assert re.search(r"\n\s*capture_redactions\s+integer\b", _migration_sql()), (
+        "`capture_redactions` must be declared `integer` in the table body"
+    )
+
+
+def test_the_foreign_key_cascades_so_erasure_reaches_it():
+    sql = _migration_sql()
+    assert "REFERENCES public.graphs (org_id, id)" in sql
+    assert "ON DELETE CASCADE" in sql
+
+
+def test_the_row_does_not_depend_on_the_session_row_landing_first():
+    """⛔ NOT a foreign key into `public.session`, and this is a REGRESSION pin.
+
+    The narrative's carrier is a `:Source`/`:Event` record that NAMES its
+    session, and the record's own `source.session_id` column has no such
+    constraint — the live capture writes the transcript Source through raw
+    Cypher, so a session id can arrive before (or without) a `public.session`
+    row. An FK here would abort the WHOLE record batch on the live door (the
+    source row, the journal position, everything) and wedge a journal replay of
+    that record. The tenancy/erasure anchor is therefore the GRAPH.
+    """
+    sql = _migration_sql()
+    assert "REFERENCES public.session" not in sql
+    # ... and the projection emits no statement that presumes the session row.
+    statements = rp.mutations_for(
+        {"type": "DocumentCreated", "url": "doc://d", "sessionId": "s_new",
+         "story_arc": "an arc"},
+        org_id=ORG, graph_id=GRAPH)
+    narrative = [s for s in statements if rr.NARRATIVE_TABLE in s.sql]
+    assert len(narrative) == 1
+    assert "public.session " not in narrative[0].sql
+
+
+# ── 2. It is a tenancy surface like the other nine ───────────────────────────
+
+
+def test_the_migration_carries_the_same_tenancy_posture_as_the_nine():
+    sql = _migration_sql()
+    assert "ENABLE ROW LEVEL SECURITY" in sql
+    # The `authenticated` read policy on the GUC every other record table uses.
+    assert "CREATE POLICY session_narrative_read_org" in sql
+    assert "current_setting('app.current_org_id', true)" in sql
+    # The write path's policy.
+    assert "CREATE POLICY session_narrative_service_role_all" in sql
+    # SELECT-only for `authenticated`: the write path is #7951, not this grant.
+    assert "REVOKE ALL ON public.session_narrative FROM anon, authenticated, public" in sql
+    assert "GRANT SELECT ON public.session_narrative TO authenticated" in sql
+
+
+def test_the_app_role_policy_is_guarded_on_the_role_and_checks_the_write():
+    """R6 (`#9554`) decides the record's application path connects as a
+    NOBYPASSRLS role, so every record table needs that role's policy — with
+    `WITH CHECK`, or the write side of the boundary is open. It is guarded on
+    the role existing because R6's migration sorts FIRST; where R6 is absent,
+    no `tortoise_record_app` role exists to reach the table."""
+    sql = _migration_sql()
+    assert "rolname = 'tortoise_record_app'" in sql, (
+        "the app-role block must be guarded on the role existing — "
+        "an unguarded CREATE POLICY TO a missing role aborts the migration"
+    )
+    app_block = sql.split("rolname = 'tortoise_record_app'", 1)[1]
+    assert "CREATE POLICY session_narrative_app_tenant" in app_block
+    assert "USING (org_id = current_setting('app.current_org_id', true))" in app_block
+    assert "WITH CHECK (org_id = current_setting('app.current_org_id', true))" in app_block
+
+
+# ── 3./4. The projection, and the no-clobber rule ────────────────────────────
+
+
+def _narrative_statements(record):
+    return [s for s in rp.mutations_for(record, org_id=ORG, graph_id=GRAPH)
+            if f"public.{rr.NARRATIVE_TABLE}" in s.sql]
+
+
+def _set_columns(statement) -> set[str]:
+    """The columns a statement writes on conflict (`DO UPDATE SET`)."""
+    tail = statement.sql.split("DO UPDATE SET", 1)[1]
+    return {c.strip() for c in re.findall(r"([a-z_]+)\s*=\s*EXCLUDED\.", tail)}
+
+
+def test_a_narrative_carrying_record_projects_the_narrative_home():
+    """The layer-1 commit writes `story_arc` onto the transcript `:Source`; the
+    record must land it in the narrative home, in the SAME batch as the source
+    row (never as a separate replay that can be lost)."""
+    record = {
+        "type": "SourceCreated",
+        "url": "session:s_9555",
+        "sessionId": "s_9555",
+        "story_arc": "First the capture, then the fold.",
+        "summary": "a capture session",
+    }
+    statements = rp.mutations_for(record, org_id=ORG, graph_id=GRAPH)
+    narrative = [s for s in statements
+                 if f"INSERT INTO public.{rr.NARRATIVE_TABLE}" in s.sql]
+    assert len(narrative) == 1
+    assert "First the capture, then the fold." in narrative[0].params
+    assert ORG in narrative[0].params and GRAPH in narrative[0].params
+    assert "s_9555" in narrative[0].params
+    # The declared source upsert is still there, and comes first.
+    assert statements.index(narrative[0]) > 0
+    assert any("INSERT INTO public.source" in s.sql for s in statements)
+
+
+def test_the_session_record_projects_the_redaction_and_turn_counts():
+    record = {
+        "type": "SessionRecorded",
+        "id": "s_9555",
+        "capture_redactions": 7,
+        "turn_count": 12,
+    }
+    narrative = _narrative_statements(record)
+    assert len(narrative) == 1
+    assert 7 in narrative[0].params and 12 in narrative[0].params
+
+
+def test_the_two_carriers_never_erase_each_others_columns():
+    """THE IDEMPOTENCE LEG. Two records build one row; each must write only its
+    own columns, so the order they arrive in cannot decide the row's content."""
+    narrative_record = {
+        "type": "DocumentCreated",
+        "url": "doc://s_9555.md",
+        "sessionId": "s_9555",
+        "story_arc": "the arc",
+    }
+    counts_record = {
+        "type": "SessionRecorded",
+        "id": "s_9555",
+        "capture_redactions": 3,
+        "turn_count": 4,
+    }
+    text_cols = _set_columns(_narrative_statements(narrative_record)[0])
+    count_cols = _set_columns(_narrative_statements(counts_record)[0])
+    assert {"narrative", "summary"} & text_cols
+    assert "capture_redactions" in count_cols and "turn_count" in count_cols
+    assert not ({"capture_redactions", "turn_count"} & text_cols), (
+        "the narrative record would write NULL counts over the counts the "
+        "session record landed — an order-dependent record"
+    )
+    assert not ({"narrative", "summary"} & count_cols), (
+        "the session record would erase the narrative the source record landed"
+    )
+
+
+def test_the_two_carriers_are_independent_of_their_arrival_order():
+    """ORDER-INDEPENDENCE, executed rather than asserted about a pure function.
+
+    The row is built by two records. Each writes only its own columns, so the
+    row after `[text, counts]` is the row after `[counts, text]` — which is what
+    makes a live build and a journal replay converge regardless of the order the
+    producers happened to emit in. The batch is built through `replay_plan`, i.e.
+    the same call a replay makes, and the two orders are compared statement by
+    statement.
+    """
+    text_record = {"type": "DocumentCreated", "url": "doc://s",
+                   "sessionId": "s1", "story_arc": "the arc"}
+    counts_record = {"type": "SessionRecorded", "id": "s1",
+                     "capture_redactions": 3, "turn_count": 4}
+
+    def narrative_rows(order):
+        plan = rp.replay_plan(order, org_id=ORG, graph_id=GRAPH)
+        return [(s.sql, s.params) for s in plan
+                if f"INSERT INTO public.{rr.NARRATIVE_TABLE}" in s.sql]
+
+    forward = narrative_rows([text_record, counts_record])
+    reverse = narrative_rows([counts_record, text_record])
+    assert len(forward) == len(reverse) == 2
+    # Each carrier's statement is byte-identical in both orders; only their
+    # SEQUENCE differs, and the SET lists are disjoint, so the row they build is
+    # the same.
+    assert set(forward) == set(reverse)
+    forward_cols = [_set_columns(rp.Statement(sql, params))
+                    for sql, params in forward]
+    assert not (forward_cols[0] & forward_cols[1])
+
+
+def test_a_summary_without_the_narrative_is_not_the_narrative_column():
+    """The capture's own session `:Source` sets `summary` to the transcript's
+    first utterance — not the S1 narrative. Projecting it unconditionally would
+    let the narrative's companion column hold a prose snippet, and would make a
+    D7 read look satisfied against text that is not the narrative."""
+    record = {"type": "SourceCreated", "url": "session:s1",
+              "sessionId": "s1", "summary": "first thing said"}
+    assert _narrative_statements(record) == []
+
+
+def test_a_nested_carrier_is_read_like_the_declared_mutation_reads_it():
+    """`ConversationMiner` emits `{type: "EventRecorded", event: {…}}` and the
+    declared mutation accepts that shape; a shape-keyed projection that only
+    looked at the envelope would silently drop exactly the mining lane's
+    narrative."""
+    record = {"type": "EventRecorded",
+              "event": {"eventId": "ev1", "sessionId": "s1",
+                        "summary": "a summary", "story_arc": "a mined arc"}}
+    statements = _narrative_statements(record)
+    assert len(statements) == 1
+    assert "a mined arc" in statements[0].params
+    assert "a summary" in statements[0].params
+
+
+def test_a_record_without_a_session_coordinate_contributes_nothing():
+    record = {"type": "PointAdded", "point": {"id": "p1", "content": "x"}}
+    assert _narrative_statements(record) == []
+
+
+def test_a_record_naming_a_session_but_carrying_no_text_contributes_nothing():
+    record = {"type": "SessionRecorded", "id": "s1"}
+    assert _narrative_statements(record) == []
+
+
+def test_a_value_the_column_cannot_hold_is_an_absence_not_a_raise():
+    """THE SECONDARY HOME MAY NOT FAIL THE CARRIER'S OWN WRITE.
+
+    `session.capture_redactions` is jsonb and accepts shapes this table's
+    INTEGER refuses (`#9264`/R4 is that disagreement, one table over). Raising
+    here would turn an additive projection into a NEW way for a live capture to
+    fail — so a value the column cannot hold is simply not projected, and the
+    reader returns `None` (an absence), never `0` (a false claim) and never a
+    coerced value (which would hide the disagreement).
+    """
+    record = {"type": "SessionRecorded", "id": "s1",
+              "capture_redactions": {"total": 7}, "turn_count": -1}
+    assert _narrative_statements(record) == []
+
+
+def test_a_bad_typed_count_does_not_fail_the_records_own_mutation():
+    """The regression pin: the batch still contains the session upsert, so a
+    carrier whose count this home cannot store still lands its own row."""
+    record = {"type": "SessionRecorded", "id": "s1",
+              "capture_redactions": "sentinel"}
+    statements = rp.mutations_for(record, org_id=ORG, graph_id=GRAPH)
+    assert any("INSERT INTO public.session" in s.sql for s in statements)
+    assert not [s for s in statements if rr.NARRATIVE_TABLE in s.sql]
+
+
+def test_a_usable_count_is_projected_even_beside_an_unusable_one():
+    record = {"type": "SessionRecorded", "id": "s1",
+              "capture_redactions": 5, "turn_count": "not-a-count"}
+    statements = _narrative_statements(record)
+    assert len(statements) == 1
+    assert 5 in statements[0].params
+    assert "turn_count" not in _set_columns(statements[0])
+
+
+def test_a_non_text_narrative_is_not_projected_and_does_not_raise():
+    """An `:Event` record has no `story_arc` COLUMN, so a non-string value lands
+    in its props tail and the record's own write succeeds; the narrative home
+    must not turn that into a failure. It projects nothing."""
+    record = {"type": "EventRecorded", "eventId": "e1", "sessionId": "s",
+              "story_arc": ["not", "prose"]}
+    statements = _narrative_statements(record)
+    assert statements == []
+
+
+# ── 5. The read side: the record, and only the record ────────────────────────
+
+
+class _Cursor:
+    def __init__(self, conn, sql="", params=()):
+        self._conn = conn
+        self._rows: list = []
+        for marker, rows in conn.rows_by_marker.items():
+            if marker in sql:
+                self._rows = list(rows)
+                break
+
+    def execute(self, sql, params=()):
+        self._conn.executed.append((sql, tuple(params)))
+        self._rows = []
+        for marker, rows in self._conn.rows_by_marker.items():
+            if marker in sql:
+                self._rows = list(rows)
+                break
+        return self
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _Conn:
+    """A DB-API shaped double that records every statement it is given."""
+
+    def __init__(self, **rows_by_marker):
+        self.rows_by_marker = rows_by_marker
+        self.executed: list[tuple[str, tuple]] = []
+
+    def cursor(self):
+        return _Cursor(self)
+
+
+def test_the_reader_serves_the_narrative_and_the_verbatim_turns():
+    conn = _Conn(**{
+        "public.session_narrative": [("the arc", "a capture", 7, 2)],
+        "public.point": [
+            ("s_9555_t0", "first thing said", "user"),
+            ("s_9555_t10", "later thing said", "assistant"),
+            ("s_9555_t2", "second thing said", None),
+        ],
+    })
+    text = rr.session_text(conn, org_id=ORG, graph_id=GRAPH,
+                           session_id="s_9555")
+    assert text is not None
+    assert text.narrative == "the arc"
+    assert text.summary == "a capture"
+    assert text.redactions == 7
+    assert text.turn_count == 2
+    # Ordered by the id's own index — the key contract, not the row order a
+    # database happened to return.
+    assert [t.index for t in text.turns] == [0, 2, 10]
+    assert text.turns[0].content == "first thing said"
+    assert text.turns[0].speaker == "user"
+    assert text.turns[1].speaker is None
+    assert "user: first thing said" in text.transcript
+    assert text.verbatim_available
+
+
+def test_the_reader_never_touches_the_journal_or_invents_a_table():
+    conn = _Conn(**{
+        "public.session_narrative": [("the arc", None, 0, 0)],
+        "public.point": [],
+    })
+    rr.session_text(conn, org_id=ORG, graph_id=GRAPH, session_id="s_9555")
+    joined = " ".join(sql for sql, _ in conn.executed)
+    assert "journal_event" not in joined, (
+        "§9.1's text must be reproducible from the RECORD — reading the journal "
+        "here defeats the point of the record being the system of record"
+    )
+    assert "falkor" not in joined.lower()
+    # Every statement is scoped to the caller's tenant pair.
+    for _sql, params in conn.executed:
+        assert params[:2] == (ORG, GRAPH)
+
+
+def test_an_absent_session_is_an_honest_absence():
+    conn = _Conn(**{"public.session_narrative": [], "public.point": []})
+    assert rr.session_text(conn, org_id=ORG, graph_id=GRAPH,
+                           session_id="s_none") is None
+
+
+def test_a_session_with_turns_and_no_narrative_yet_still_serves_the_turns():
+    """The two halves arrive from different records in either order."""
+    conn = _Conn(**{
+        "public.session_narrative": [],
+        "public.point": [("s_t0", "hello", None)],
+    })
+    text = rr.session_text(conn, org_id=ORG, graph_id=GRAPH, session_id="s")
+    assert text is not None and text.narrative is None
+    assert text.transcript == "hello"
+
+
+def test_the_turn_shape_rule_does_not_cross_sessions():
+    """The prefix alone is not the rule: a session whose id ends in `_t<i>`
+    would otherwise match another session's turns (`sec` vs `sec_t0`), which is
+    the bug `sdk._capture_turn_ids` records. The reader's regex is anchored."""
+    sec = rr._turn_pattern("sec")
+    assert re.match(sec, "sec_t0")
+    assert not re.match(sec, "sec_t0_t0")
+    assert not re.match(sec, "sec_extra_t0")
+    assert re.match(rr._turn_pattern("a+b"), "a+b_t3")
+    assert not re.match(rr._turn_pattern("a+b"), "aab_t3")
+
+
+def test_a_turn_key_that_carries_no_index_is_a_loud_failure():
+    # The SQL pattern would not return it; the direct call proves the refusal
+    # rather than an invented order.
+    with pytest.raises(rr.RecordReadError):
+        rr._turn_index("s_tX", "s")
+
+
+def test_the_source_verbatim_fetch_resolves_through_the_record_not_an_edge():
+    """§9.4's link: `source.session_id` is a COLUMN, so it survives the graph
+    being destroyed — which is the whole point of D7."""
+    conn = _Conn(**{
+        "public.source": [("s_9555",)],
+        "public.session_narrative": [("the arc", "sum", 1, 1)],
+        "public.point": [("s_9555_t0", "verbatim", "user")],
+    })
+    text = rr.source_narrative(conn, org_id=ORG, graph_id=GRAPH,
+                              url="session:s_9555")
+    assert text is not None
+    assert text.narrative == "the arc"
+    assert text.transcript == "user: verbatim"
+
+
+def test_a_source_with_no_session_is_an_honest_absence():
+    conn = _Conn(**{"public.source": [("",)], "public.session_narrative": [],
+                    "public.point": []})
+    assert rr.source_narrative(conn, org_id=ORG, graph_id=GRAPH,
+                               url="corpus://x") is None

@@ -308,6 +308,61 @@ the finding (see §E).
 **Decision needed:** none — §9.1 and the 2026-09-23 owner quote already place it. Only *which table
 shape* is open, and that is an engineering choice inside the existing schema discipline.
 
+**DECIDED (2026-10-22, #9555) — the shape, and why.** One table, **`public.session_narrative`**
+(migration `20261023000001_record_session_narrative.sql`), keyed `(org_id, graph_id, session_id)` with
+an `ON DELETE CASCADE` foreign key into **`public.graphs`** — ⛔ **not** into `public.session`, and that
+is a regression pin: the narrative's carrier is a `:Source`/`:Event` record that *names* its session,
+and the record's own `source.session_id` column has no such constraint (the live capture writes the
+transcript Source through raw Cypher, so a session id can arrive before, or without, a session row).
+An FK into `public.session` aborted the **whole record batch** on the live door (source row, journal
+position, everything) and wedged a replay of that record. The graph FK keeps the tenancy anchor and
+the erasure cascade (organizations → graphs → this table) without making the row's existence depend on
+write order.
+
+| column | carrier (§3: PRIMARY iff the journal carries it) |
+|---|---|
+| `narrative` | the commit's `story_arc` ⚠️ **— no journal carrier exists yet, see below** |
+| `summary` | the same record's `summary`, projected ONLY alongside the narrative (the capture's own session `:Source` sets `summary` to the transcript's first utterance, which is not the narrative) |
+| `capture_redactions` | `SessionRecorded.capture_redactions` (`#4911`) — **integer**, because a count is not an envelope (`#9264`/R4 is the jsonb disagreement one table over) |
+| `turn_count` | `SessionRecorded.turn_count` |
+
+⛔ **The transcript is NOT duplicated here.** The raw turns are already first-class record rows
+(episodic `public.point`, `node_key = '<session>_t<i>'`), each with its own identity and journal
+carrier; a second per-turn table would duplicate a carrier that exists — the “double the anchor count
+for the same input” cost §9.1 rejects one level up — and two copies of the same text can only drift.
+`tortoise/record_read.py` SERVES the transcript from those rows (`session_text`), by the same
+suffix-shape rule `sdk._capture_turn_ids` applies (`{session}_t<all digits>`), so D7's “raw turn text
+comes back” is measured against the record's own turn rows.
+
+**Why the two carriers cannot clobber each other.** One row is built by two records (the narrative
+record owns the text, `SessionRecorded` owns the counts), so each upsert names **only its own columns**
+in the `DO UPDATE SET` — otherwise whichever record arrived second would write NULLs over the first
+one's half, i.e. a replay whose result depends on arrival order. Pinned by comparing the two arrival
+orders through `replay_plan`, and by a PGlite assertion that the narrative survives its session row
+being deleted.
+
+**Verification:** `tests/test_9555_session_narrative.py` (DB-free: schema shape, tenancy posture, the
+statement shapes, order-independence, the reader reading the record only) plus the PGlite assertions in
+`supabase/tests/20261012000001_record_schema.sql` §6b (RLS, the graph-FK refusal, the session-row
+independence, the negative count, the `authenticated` write refusal, and a cross-tenant read returning
+nothing). Both were shown to redden under a mutation (RLS disabled; the count CHECK removed).
+
+**⚠️ What does NOT land here, stated so the item is not over-claimed (this is R7's remainder):**
+
+1. **The narrative has NO journal carrier in this tree.** `story_arc` is written to the *graph* by the
+   layer-1 commit's raw Cypher (`hosted_api.py`'s document/event MERGEs) and raw Cypher is not a
+   journal record (§17.1's unjournalled-writer ledger), so a live capture lands
+   `capture_redactions`/`turn_count` and a **NULL `narrative`**. The projection is correct and total;
+   its narrative carrier does not exist yet. The fix is a producer on the layer-1 commit path (journal
+   the derived `:Source`/`:Event` write with `summary`/`story_arc`/`sessionId`), which is
+   capture-path work and must not be improvised alongside a schema change.
+2. **No caller serves from the record yet.** Wiring the read arm into `rebuild_from_record`'s operator
+   verb (R8, `#9556`) and into the ask/answer verbatim path is where D7's end-to-end measurement runs,
+   and the production record DSN is still unarmed (R1, `#9548`).
+
+So the **home, the projection and the record-only reader** land here; D7's measurement does not close
+with this change, and #9555 stays open on (1) and (2).
+
 ### R8 — A restore path from the record: an operator verb and a drill · **M** · code + ops · **BLOCKER**
 
 **What:** `FalkorProjection.rebuild_from_record` (`projection/__init__.py:16271`) is a method with
