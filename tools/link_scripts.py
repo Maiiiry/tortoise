@@ -36,11 +36,29 @@ One read-only verdict per invocation, then (only with ``--apply``) a repair:
      target, resolved and dangling-or-not) | ``real-directory`` | ``file``;
   3. ``--apply``: re-point a wrong/dangling/absent ``scripts`` symlink at the
      wanted root, atomically (a temp symlink in the same directory, then
-     ``os.replace``). A REAL directory is refused, never clobbered — it may be a
-     hand-built lane tree;
+     ``os.replace``). A REAL directory (or a regular file) is refused, never
+     clobbered — it may be a hand-built lane tree. Without ``--apply`` such a
+     state is NOT a refusal: it is simply not ours to repair, so the rail
+     verdict alone decides the exit code;
   4. report whether the rail entry point resolves *through* ``scripts``
      (``--rail``, default ``admin-merge.sh``). This is the verdict that would
      have told a lane, at dispatch time, that its merge path was gone.
+
+Exit 0 is a single reading: it requires BOTH that ``scripts`` already resolves to
+the wanted root (nothing left to repair) AND that the rail resolves through it. A
+wrong-but-live ``scripts`` link that still finds the rail exits 1 with
+``repair: NEEDED`` rather than 0 — otherwise one exit code would carry two
+meanings ("the shared root is in place" vs "the rail is reachable") and a caller
+keying on the first would be misled.
+
+Side effect of ``--apply`` (read this before committing)
+--------------------------------------------------------
+``scripts`` is a **tracked** symlink (git mode 120000), so a repair leaves a
+MODIFIED TRACKED FILE in the worktree. The repair is host-local: committing it
+re-writes the blob to *this* host's absolute path, which is precisely how #9327
+was created, so it must not be committed (a broad `git add`/`git commit -a`
+would sweep it into an unrelated PR), and `git checkout -- scripts` silently
+restores the committed link.
 
 Why the rail check is separate from the symlink check
 -----------------------------------------------------
@@ -54,12 +72,18 @@ never inferred from the symlink verdict.
 
 Exit codes
 ----------
-  0  reachable — ``scripts`` resolves to the wanted root AND the rail entry
-     point resolves through it
-  1  NOT reachable — the repair is known and not yet applied (dry run), or
+  0  reachable AND nothing left to do — ``scripts`` already resolves to the
+     wanted root AND the rail entry point resolves through it. Exit 0 is
+     therefore a single reading, not two: a `scripts` link that a repair would
+     still re-point (``repair: NEEDED``) is NOT 0, even when the rail happens to
+     resolve through it
+  1  NOT reachable — a repair is known and not yet applied (dry run), or
      ``--apply`` ran but the rail still does not resolve (see the verdict)
-  2  REFUSED / could not evaluate — no usable target, or ``scripts`` is a real
-     directory that will not be clobbered
+  2  REFUSED / could not evaluate — no usable target, or ``--apply`` was asked
+     to replace a real directory / regular file (never clobbered). A DRY RUN
+     over a real directory is NOT a refusal: a hand-built lane tree is
+     legitimate, so the rail verdict alone decides 0/1 and the ``repair:`` line
+     says it is not ours to replace
   3  usage error
 
 Usage
@@ -169,7 +193,12 @@ def needs_repair(info: dict, target: Path) -> bool:
 
 
 def repair(link: Path, target: Path) -> None:
-    """Point ``scripts`` at ``target`` atomically. Never clobbers a real tree."""
+    """Point ``scripts`` at ``target`` atomically. Never clobbers a real tree.
+
+    The repaired path is a **tracked** symlink (git mode 120000), so a repair
+    leaves a modified tracked file in the worktree. See ``NOTE`` in ``_render``:
+    the repair is host-local and must not be committed.
+    """
     if link.is_dir() and not link.is_symlink():
         raise Refused(
             f"{link} is a REAL directory (not a symlink) — refusing to replace it. "
@@ -197,7 +226,8 @@ def rail_verdict(checkout: Path, rail: str) -> dict:
 
 
 def _render(checkout: Path, target: Path | None, info: dict, repair_needed: bool,
-            applied: bool, rail: dict, refusal: str | None) -> None:
+            applied: bool, rail: dict, refusal: str | None,
+            not_repairable: str | None = None) -> None:
     print(f"link_scripts: checkout={checkout}")
     print(f"  target: {target if target is not None else '(unresolved)'}")
     recorded = info.get("recorded")
@@ -209,8 +239,19 @@ def _render(checkout: Path, target: Path | None, info: dict, repair_needed: bool
         print(f"  REFUSED: {refusal}")
     if applied:
         print("  repair: APPLIED")
+        # #9564 review P3: `scripts` is a TRACKED symlink (git mode 120000), so
+        # a repair modifies a tracked file. Committing this host's absolute path
+        # would re-create #9327 for every other host while looking like a fix —
+        # say so where the repair happens, not only in the docstring.
+        print("  NOTE: `scripts` is a TRACKED symlink — this repair is HOST-LOCAL. "
+              "Do NOT commit it (and do not `git add -A`/`git commit -a` near it): "
+              "committing re-writes the blob to THIS host's absolute path, "
+              "re-creating #9327 for every other host. `git checkout -- scripts` "
+              "restores the committed (possibly dangling) link.")
     elif repair_needed:
         print("  repair: NEEDED — re-run with --apply")
+    elif not_repairable:
+        print(f"  repair: NOT OURS TO DO — {not_repairable}")
     verdict = "REACHABLE" if rail["reachable"] else "UNREACHABLE"
     print(f"  rail: {rail['path']} -> {verdict}")
     if not rail["reachable"]:
@@ -259,9 +300,17 @@ def main(argv: list[str] | None = None) -> int:
         refusal = str(exc)
 
     repair_needed = False
-    if target is not None and info["state"] in (STATE_REAL_DIR, STATE_FILE):
-        refusal = refusal or (
-            f"{link} is a {info['state']} — refusing to replace it")
+    not_repairable: str | None = None
+    if info["state"] in (STATE_REAL_DIR, STATE_FILE):
+        # A real directory / a regular file is LEGITIMATE (a hand-built lane
+        # tree), so it must not decide the RAIL verdict of a read-only dry run:
+        # this used to set `refusal` unconditionally, which made a plain
+        # `uv run python tools/link_scripts.py` over a lane tree report REFUSED
+        # / exit 2 even when `scripts/admin-merge.sh` resolved fine. The refusal
+        # belongs to the only action that would clobber it — `--apply`.
+        not_repairable = f"{link} is a {info['state']} — refusing to replace it"
+        if args.apply:
+            refusal = refusal or not_repairable
     elif target is not None:
         repair_needed = needs_repair(info, target)
         if repair_needed and args.apply:
@@ -272,26 +321,40 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 applied = True
                 info = classify(link)
+                # Recompute: after a successful repair the `repair:` dimension is
+                # SATISFIED, so exit 0 stays one reading (#9564 review P2).
+                repair_needed = needs_repair(info, target)
 
     rail = rail_verdict(checkout, args.rail)
+    # #9564 review P2: exit 0 means BOTH "the shared root is in place" and "the
+    # rail resolves". `repair_needed` used to be ignored, so a `scripts` link to
+    # a stale-but-live directory that happens to hold the rail printed
+    # `repair: NEEDED` and still exited 0 — two meanings for one code.
+    if refusal:
+        exit_code = EXIT_REFUSED
+    elif repair_needed or not rail["reachable"]:
+        exit_code = EXIT_UNREACHABLE
+    else:
+        exit_code = EXIT_REACHABLE
+
     if args.json:
         print(json.dumps({
             "checkout": str(checkout),
             "target": str(target) if target else None,
             "scripts": info,
             "repair_needed": repair_needed,
+            "repairable": not_repairable is None,
+            "repair_note": not_repairable,
             "applied": applied,
             "rail": rail,
             "refusal": refusal,
-            "exit": (EXIT_REFUSED if refusal
-                     else EXIT_REACHABLE if rail["reachable"] else EXIT_UNREACHABLE),
+            "exit": exit_code,
         }, indent=2))
     else:
-        _render(checkout, target, info, repair_needed, applied, rail, refusal)
+        _render(checkout, target, info, repair_needed, applied, rail, refusal,
+                not_repairable)
 
-    if refusal:
-        return EXIT_REFUSED
-    return EXIT_REACHABLE if rail["reachable"] else EXIT_UNREACHABLE
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -107,6 +107,80 @@ def test_a_symlink_to_the_wrong_live_directory_is_repointed(checkout: Path, shar
     assert os.readlink(checkout / "scripts") == str(shared)
 
 
+def test_a_wrong_but_rail_working_symlink_is_not_a_clean_verdict(
+        checkout: Path, shared: Path, tmp_path: Path):
+    """#9564 review P2: exit 0 must mean ONE thing.
+
+    A `scripts` link pointing at a stale-but-LIVE scripts directory that happens
+    to CONTAIN the rail is still wrong (it is not the wanted shared root), yet it
+    used to print `repair: NEEDED` and exit 0: "the shared root is in place" and
+    "the rail is reachable" were two readings of one code. Exit 0 now requires
+    both, so this shape is 1 with the repair still reported.
+    """
+    other = tmp_path / "stale-replica" / "scripts"
+    other.mkdir(parents=True)
+    rail = other / "admin-merge.sh"
+    rail.write_text("#!/usr/bin/env bash\nexit 0\n")
+    rail.chmod(0o755)
+    (checkout / "scripts").symlink_to(other)
+
+    dry = _run(checkout, env_target=shared)
+    assert dry.returncode == 1, dry.stdout + dry.stderr
+    assert "NEEDED" in dry.stdout
+    assert "REACHABLE" in dry.stdout and "UNREACHABLE" not in dry.stdout
+    # The link is untouched by the dry run — the verdict is a report, not an act.
+    assert os.readlink(checkout / "scripts") == str(other)
+
+    applied = _run(checkout, "--apply", env_target=shared)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert os.readlink(checkout / "scripts") == str(shared)
+
+
+def test_a_real_scripts_directory_can_still_be_a_reachable_verdict(
+        checkout: Path, shared: Path):
+    """#9564 review P2: a legitimate lane tree must not be a REFUSAL on a dry run.
+
+    A hand-built `scripts/` directory is legitimate (the tool never clobbers it).
+    The unconditional refusal made a plain read-only run over a lane tree that
+    DOES contain the rail report REFUSED / exit 2 — a repair nobody asked for
+    deciding the verdict of the primary question. On a dry run the rail verdict
+    alone decides; only `--apply` refuses.
+    """
+    real = checkout / "scripts"
+    real.mkdir()
+    rail = real / "admin-merge.sh"
+    rail.write_text("#!/usr/bin/env bash\nexit 0\n")
+    rail.chmod(0o755)
+
+    dry = _run(checkout, env_target=shared)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "REACHABLE" in dry.stdout and "UNREACHABLE" not in dry.stdout
+    assert "REFUSED" not in dry.stdout
+    assert "NOT OURS TO DO" in dry.stdout
+    assert not real.is_symlink()
+
+    # Without the rail it is a plain NOT-reachable verdict (1), still not 2.
+    rail.unlink()
+    assert _run(checkout, env_target=shared).returncode == 1
+
+    # `--apply` still refuses to replace it — that half is unchanged.
+    refused = _run(checkout, "--apply", env_target=shared)
+    assert refused.returncode == 2, refused.stdout + refused.stderr
+    assert "REFUSED" in refused.stdout
+    assert not real.is_symlink()
+
+
+def test_a_real_scripts_directory_is_never_clobbered_a_dry_run_does_nothing(
+        checkout: Path, shared: Path):
+    """A dry run over a lane tree is mutation-free (no temp link, no repoint)."""
+    real = checkout / "scripts"
+    real.mkdir()
+    (real / "lane-local.sh").write_text("lane tree\n")
+    _run(checkout, env_target=shared)
+    assert sorted(p.name for p in checkout.iterdir()) == ["scripts"]
+    assert sorted(p.name for p in real.iterdir()) == ["lane-local.sh"]
+
+
 def test_the_two_verdicts_are_independent(checkout: Path, tmp_path: Path):
     """A repaired symlink does NOT make the rail reachable (#9327's whole point).
 
@@ -195,10 +269,40 @@ def test_classify_reports_the_state_without_following_into_a_real_tree(checkout:
     assert info["recorded"] is None
 
 
+def test_apply_warns_that_the_repair_must_not_be_committed(checkout: Path, shared: Path):
+    """#9564 review P3: `scripts` is a TRACKED symlink, so a repair is host-local.
+
+    Committing the repaired link re-writes the blob to this host's absolute path
+    — the #9327 bug, re-created for every other host while looking like a fix.
+    The action site must say so (and so must AGENTS.md's `scripts/` row).
+    """
+    (checkout / "scripts").symlink_to("/nowhere")
+    res = _run(checkout, "--apply", env_target=shared)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "TRACKED symlink" in res.stdout
+    assert "Do NOT commit it" in res.stdout
+    assert "#9327" in res.stdout
+
+
 def test_json_verdict_carries_both_halves(checkout: Path, shared: Path):
     (checkout / "scripts").symlink_to("/nowhere")
     res = _run(checkout, "--apply", "--json", env_target=shared)
     payload = json.loads(res.stdout)
     assert payload["applied"] is True
+    assert payload["repair_needed"] is False
+    assert payload["repairable"] is True
     assert payload["rail"]["reachable"] is True
     assert payload["exit"] == 0
+
+
+def test_json_reports_the_unrepairable_state_without_claiming_a_refusal(
+        checkout: Path, shared: Path):
+    """#9564 review P2: `repairable`/`repair_note` are the documented dimension."""
+    real = checkout / "scripts"
+    real.mkdir()
+    payload = json.loads(_run(checkout, "--json", env_target=shared).stdout)
+    assert payload["repairable"] is False
+    assert payload["repair_note"] and "refusing to replace it" in payload["repair_note"]
+    assert payload["refusal"] is None
+    assert payload["exit"] == 1        # no rail in the lane tree
+    assert payload["repair_needed"] is False

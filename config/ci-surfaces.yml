@@ -2676,6 +2676,20 @@ surfaces:
   # measurement that only ran on one lane would stop being checkable.
   - test_journal_growth.py
   - test_test_lane_tool.py
+  # #9327 / #9564 review P1: the `scripts/` reachability tool (the tracked
+  # symlink `git cat-file -p HEAD:scripts` points at ONE host, so the mandated
+  # rail `scripts/admin-merge.sh` may not resolve). This registration is REQUIRED
+  # by `tools/ci_selection.py --integrity` (the `manifest-integrity` job): a test
+  # file absent from every surface reds that gate, and an entry in `carve_out:`
+  # does NOT classify a file for integrity. `core` is the honest home — the
+  # suite is hermetic (temp dirs, real symlinks; no Docker/FalkorDB/network), so
+  # it is deliberately NOT carve_out-registered. This row covers edits to THIS
+  # test file; a change to `tools/link_scripts.py` is covered by the
+  # `tools/link_scripts.py` TOOL_CARVEOUTS entry in tools/ci_selection.py (a
+  # `tools/` source has NO named surface and is filtered out before the `core`
+  # fallback, so this registration alone would not select the suite for a
+  # tool-only PR — the #1349/#3332/#6138 silent-drop class).
+  - test_link_scripts.py
   - test_transport_wait_bound.py  # #3834: transport wait bound + cold-half gate wiring (dual: api)
   # #2877: DB-free guards that a dead backup watcher degrades /health (the file
   # it guards, tortoise/hosted_api.py, selects the `api` surface, so it is

@@ -1937,6 +1937,22 @@ TOOL_CARVEOUTS = (
     # whose answer drives dispatch, exactly like the two entries above.
     # Pinned by test_ci_selection.test_work_claim_tool_change_fails_closed_to_full.
     "tools/work_claim.py",
+    # #9564 review P1 (#9327): the `scripts/` reachability tool owns
+    # tests/test_link_scripts.py. Same #3261/#1349/#3332 silent-drop class as the
+    # collision_preflight / who_is_on / work_claim carve-outs above: `tools/` is a
+    # flat NON_PYTHON_PREFIXES entry and no SOURCE_PATTERNS row matches the tool,
+    # so a link_scripts-only change came back with `changed=[]`, select() took the
+    # docs-only early return — which bypasses the `if not matched:
+    # matched.add("core")` fallback entirely — and NOT ONE of its arms ran on the
+    # most likely change to weaken it (the refusals, the atomic repair, the two
+    # independent verdicts). Registering tests/test_link_scripts.py under `core`
+    # in ci-surfaces.yml does NOT cover this: it applies to edits of the TEST
+    # file, not of the tool. Fail-closed (FULL matrix) is the safe default here
+    # for the same reason it is for `who_is_on.py`: AGENTS.md §Key Directories
+    # tells every lane to RUN this tool, so its verdict drives a merge-path
+    # decision — a false "REACHABLE" is how a lane merges by hand.
+    # Pinned by test_ci_selection.test_link_scripts_tool_change_fails_closed_to_full.
+    "tools/link_scripts.py",
     # #3554: the `:Session` writer inventory + D9 retrofit instrument
     # (tools/session_retrofit_audit.py) owns
     # tests/test_session_schema_3554.py. Same silent-drop class as the

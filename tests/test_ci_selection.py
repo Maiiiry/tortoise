@@ -2751,6 +2751,38 @@ def test_who_is_on_tool_change_fails_closed_to_full():
         assert "core" in r["surfaces"], path
 
 
+def test_link_scripts_tool_change_fails_closed_to_full():
+    # #9564 review P1 (#9327): tools/link_scripts.py owns
+    # tests/test_link_scripts.py — the guards that pin the two INDEPENDENT
+    # verdicts (a correct symlink does not make the rail reachable), the atomic
+    # repair, the dry-run purity and every refusal. Same #3261/#4256 silent-drop
+    # class as the who_is_on / work_claim carve-outs above: `tools/` is a flat
+    # NON_PYTHON_PREFIXES entry and no SOURCE_PATTERNS row matches the tool, so
+    # without this TOOL_CARVEOUTS entry a link_scripts-only change came back as
+    # `changed=[]`, select() took the docs-only early return (surfaces=[], tier-1
+    # smoke only) — which BYPASSES the `if not matched: matched.add("core")`
+    # fallback — and none of the arms ran on the file AGENTS.md tells every lane
+    # to run. Registering tests/test_link_scripts.py under `core` in
+    # ci-surfaces.yml does NOT cover this: it applies to edits of the TEST file,
+    # not of the tool.
+    # Mutation check: removing the TOOL_CARVEOUTS entry (or the `core`
+    # registration, for the second half) filters the path out and fails the
+    # asserts below.
+    r = _sel(["tools/link_scripts.py"])
+    assert r["full"] is True, r
+    assert r["test_files"] == "ALL", r
+    assert "core" in r["surfaces"], r
+
+
+def test_link_scripts_suite_is_classified_by_the_manifest():
+    # #9564 review P1: the manifest-integrity gate walks every test file and
+    # reds on one that no surface classifies — an entry in `carve_out:` does NOT
+    # count, so tests/test_link_scripts.py must be REGISTERED. Pinned here so the
+    # registration cannot be dropped again while the test file stays on disk.
+    assert classify_test_file("test_link_scripts.py", load_manifest()) == "core"
+    assert integrity(load_manifest()) == []
+
+
 def test_session_retrofit_audit_tool_change_fails_closed_to_full():
     # #3554: tools/session_retrofit_audit.py owns
     # tests/test_session_schema_3554.py, whose guards pin the :Session writer
