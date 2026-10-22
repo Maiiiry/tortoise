@@ -1317,10 +1317,20 @@ def declared_set_violations(entries, sdk_src: str | None = None) -> list[str]:
                 f"RETENTION_CARVEOUTS entry {name!r} names no served tool — "
                 f"delete the carve-out (#9576)")
             continue
-        if getattr(e, "risk", None) != RISK_READ:
+        # ⚠️ The carve-out is invalidated by a WRITING tier, NOT by any non-`read`
+        # tier (review round 7): this arm and the retention arm must be satisfiable
+        # together. The retention arm demands a declaration for every READING tier
+        # (`read | maintenance`) that reaches the purge, so refusing a declaration on
+        # a `maintenance` entry made that the one state with no green — the
+        # prescribed "delete the carve-out" immediately tripped "declare it". A
+        # re-tier off `read` is NOT silently allowed by this: the ruling is pinned by
+        # `test_the_read_classification_this_issue_asked_about`, which reds on any
+        # re-tier and names #9576/#4122. The ledger's own job is only to stop a
+        # WRITER inheriting a reading-tier deletion record.
+        if bool(getattr(e, "writes", False)):
             out.append(
-                f"{name}: RETENTION_CARVEOUTS records a `risk=read` carve-out for "
-                f"retention housekeeping, but the entry is now "
+                f"{name}: RETENTION_CARVEOUTS records a reading-tier carve-out for "
+                f"retention housekeeping, but the entry is now a WRITING tier "
                 f"risk={getattr(e, 'risk', None)!r} — delete the carve-out entry "
                 f"(#9576)")
         reached = (handler_operations(name).operations

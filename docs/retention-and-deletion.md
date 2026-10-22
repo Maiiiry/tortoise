@@ -294,8 +294,10 @@ read hint, stops reaching the purge, or if any OTHER reading-tier tool reaches o
 of the mutations declared there without a carve-out. A NEW cross-module mutation
 cannot be auto-detected (that invisibility is the whole #9576 gap), so it must be
 added to `OUT_OF_BOUNDARY_MUTATORS` with the code that introduces it — the arm
-enforces the declaration, not the discovery. Re-tier the poll deliberately (and
-delete the carve-out with it) or not at all.
+enforces the declaration, not the discovery. Re-tier the poll deliberately or not
+at all: a move to a writing tier must delete the carve-out with it, a move to
+`maintenance` keeps it (that tier must still declare the deletion), and either
+re-tier fails the ruling pin `test_the_read_classification_this_issue_asked_about`.
 
 ## A different axis: OAuth credential hygiene
 

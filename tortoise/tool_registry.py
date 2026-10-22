@@ -750,9 +750,13 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
         # carve-out. A new cross-module mutation is not auto-detectable (that is the
         # #9576 gap), so it must be added to `OUT_OF_BOUNDARY_MUTATORS` alongside
         # the code that introduces it.
-        # Re-tier it deliberately (and delete the carve-out) or not at all — see
-        # the `TestReadTierCannotHideAnOutOfBoundaryWrite` family in
-        # `tests/test_tool_registry.py`.
+        # Re-tier it deliberately or not at all: a move to a WRITING tier must
+        # delete the carve-out with it, while a move to `maintenance` KEEPS it
+        # (that tier must still declare the deletion, and the ledger has a green
+        # state for both reading tiers). Either re-tier reds the ruling pin,
+        # `test_the_read_classification_this_issue_asked_about`, which names
+        # #9576/#4122 — see the `TestReadTierCannotHideAnOutOfBoundaryWrite`
+        # family in `tests/test_tool_registry.py`.
         risk="read",
         http_policy=True,
         sdk_method="poll_events",

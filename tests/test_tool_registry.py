@@ -1453,9 +1453,9 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
 
     The RULING is recorded, not enforced by silence: it stays `read` (see the
     `OVERRIDES:` line at the registry entry and RETENTION_CARVEOUTS), and these
-    tests are what make the record load-bearing — a read-hinted tool that reaches
-    an out-of-boundary mutation must be DECLARED, and the declaration must still
-    describe the code.
+    tests are what make the record load-bearing — a tool on a READING TIER
+    (`read | maintenance`) that reaches an out-of-boundary mutation must be
+    DECLARED, and the declaration must still describe the code.
     """
 
     def test_the_purge_is_invisible_to_the_derivation(self):
@@ -1483,9 +1483,9 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         assert tsc.declared_set_violations(tsc.served_registry()) == []
 
     def test_an_undeclared_read_tool_reaching_one_fails(self, monkeypatch):
-        """Mutation 1: an undeclared read-hinted tool reaching an out-of-boundary
-        mutation is caught — the arm is not vacuous just because the one real
-        carve-out is declared."""
+        """Mutation 1: an undeclared tool on a READING TIER reaching an
+        out-of-boundary mutation is caught — the arm is not vacuous just because the
+        one real carve-out is declared."""
         import tool_surface_capabilities as tsc
 
         # Pretend `query` were an out-of-boundary mutator: the read tools that
@@ -1507,8 +1507,9 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         violations = tsc.write_classification_violations(tsc.served_registry())
         assert not any("out-of-boundary mutation" in v
                        and "tortoise_create_point" in v for v in violations), (
-            "a writer-annotated tool was reported by the READ-tier arm — the arm "
-            "must be keyed on the read hint, not on reaching an operation")
+            "a writer-annotated tool was reported by the reading-tier arm — the arm "
+            "must be keyed on the reading TIERS (read | maintenance), not on "
+            "reaching an operation")
         # probe premise: the tool the arm must ignore really is a WRITING tier
         create = next(e for e in tsc.served_registry()
                       if e.name == "tortoise_create_point")
@@ -1547,6 +1548,30 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         assert not any("out-of-boundary" in v for v in
                        tsc.write_classification_violations([maint])), (
             "a declared carve-out must silence the arm")
+
+    def test_a_maintenance_retier_keeps_the_ledger_satisfiable(self):
+        """The LEDGER must have a green state for every reading tier (review round
+        7): the retention arm demands a declaration for `read | maintenance`, so the
+        liveness arm must not ALSO refuse one on `maintenance` — otherwise the two
+        messages prescribe each other ("delete the carve-out" → "declare it") and the
+        next lane concludes the guard is broken.
+
+        What refuses a silent re-tier is the RULING pin, not the ledger: see
+        `test_the_read_classification_this_issue_asked_about` below, which reds on
+        `maintenance` and names #9576/#4122.
+        """
+        import dataclasses
+
+        import tool_surface_capabilities as tsc
+
+        maint = [dataclasses.replace(e, risk="maintenance")
+                 if e.name == "tortoise_events_poll" else e
+                 for e in tsc.served_registry()]
+        assert tsc.declared_set_violations(maint) == [], (
+            "the liveness arm refused the carve-out on a READING tier — the two "
+            "arms are then unsatisfiable together")
+        assert tsc.write_classification_violations(maint) == [], (
+            "the retention arm demands a declaration the liveness arm refuses")
 
     def test_the_carveout_is_stale_when_the_reach_signal_disappears(self, monkeypatch):
         """Mutation 3 (arm non-vacuity): the LIVENESS arm fires when the reach
@@ -1638,12 +1663,16 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         assert any("names no served tool" in v and "tortoise_events_poll" in v
                    for v in violations), violations
 
-    def test_the_carveout_is_stale_when_the_entry_stops_being_a_read(self):
+    def test_the_carveout_is_stale_when_the_entry_becomes_a_writer(self):
         """Mutation 3 (declaration moves): if `tortoise_events_poll` is ever
-        re-tiered off `read`, the carve-out becomes an excuse for a WRITE tool's
-        deletion — it must be deleted deliberately at the same time, and this arm
-        is what refuses to let the two drift apart (#9576's "do not silently
-        reclassify", read in the other direction)."""
+        re-tiered to a WRITING tier, the carve-out becomes an excuse for a WRITE
+        tool's deletion — it must be deleted deliberately at the same time, and this
+        arm is what refuses to let the two drift apart (#9576's "do not silently
+        reclassify", read in the other direction).
+
+        A move to `maintenance` is NOT this case: it keeps the deletion declared
+        (see `test_a_maintenance_retier_keeps_the_ledger_satisfiable`) and is refused
+        by the ruling pin instead."""
         import dataclasses
 
         import tool_surface_capabilities as tsc
@@ -1653,7 +1682,7 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         flipped = [dataclasses.replace(e, risk="write")
                    if e.name == "tortoise_events_poll" else e
                    for e in tsc.served_registry()]
-        assert any("records a `risk=read` carve-out" in v
+        assert any("now a WRITING tier" in v
                    for v in tsc.declared_set_violations(flipped))
 
     def test_the_read_classification_this_issue_asked_about(self):
