@@ -1413,8 +1413,8 @@ class TestCapabilityModel:
 class TestReadTierCannotHideAnOutOfBoundaryWrite:
     """#9576 (the #4122 defect class): `tortoise_events_poll` is `read` — a
     `readOnlyHint: true` entry a client auto-approves and a `graphs:read` key may
-    call — while its handler path runs an interval-gated `DETACH DELETE` of expired
-    `:GraphEvent` rows (`poll_events` -> `_maybe_purge_events` ->
+    call — while its handler path runs an interval-gated `DETACH DELETE` of
+    expired-or-over-cap `:GraphEvent` rows (`poll_events` -> `_maybe_purge_events` ->
     `event_store.purge_expired`/`purge_overflow`).
 
     That mutation lives OUTSIDE the `sdk.py` derivation boundary, so
@@ -1543,13 +1543,31 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
 
         from tortoise.sdk import TortoiseSDK
 
-        body = inspect.getsource(TortoiseSDK.poll_events)
-        called = {node.func.attr for node in ast.walk(ast.parse(textwrap.dedent(body)))
-                  if isinstance(node, ast.Call)
-                  and isinstance(node.func, ast.Attribute)}
-        assert "_maybe_purge_events" in called, (
-            "poll_events no longer calls the retention purge — the carve-out and "
-            "its OVERRIDES line now describe a deletion that does not happen")
+        # ONE HOP IS FOLLOWED, not just the direct call (review round 2): moving
+        # the purge behind a `self._purge_if_due()` helper is a legitimate refactor
+        # and must not be reported as "the deletion no longer happens" while the
+        # runtime test says it still does. Anything deeper than one hop stops being
+        # a readable pin, so it fails closed with the message below.
+        cls = ast.parse(textwrap.dedent(inspect.getsource(TortoiseSDK)))
+        methods = {n.name: n for n in ast.walk(cls)
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        def _self_calls(node) -> set[str]:
+            return {n.func.attr for n in ast.walk(node)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "self"}
+
+        reached = _self_calls(methods["poll_events"])
+        for name in list(reached):  # the one hop
+            if name in methods:
+                reached |= _self_calls(methods[name])
+        assert "_maybe_purge_events" in reached, (
+            "poll_events does not reach the retention purge (directly or via one "
+            "self.<helper> hop) — if this was a deeper refactor, update this pin; "
+            "otherwise the carve-out and its OVERRIDES line describe a deletion "
+            "that does not happen")
         # …and the purge itself still performs the DELETE the record names.
         from tortoise import event_store
 
@@ -1587,8 +1605,7 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         from tool_surface_capabilities import served_registry
 
         from tortoise.mcp_auth import _current_legacy_full_access, _current_scopes
-        from tortoise.mcp_server import _enforce_mcp_tool_scope
-        from tortoise.mcp_server import WRITE_TOOL_NAMES
+        from tortoise.mcp_server import WRITE_TOOL_NAMES, _enforce_mcp_tool_scope
 
         entry = next(e for e in served_registry() if e.name == "tortoise_events_poll")
         assert entry.annotations is not None
@@ -1619,7 +1636,6 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         import time
 
         import tortoise.event_store as es
-
         from tortoise.monitoring import event_retention_interval
         from tortoise.sdk import TortoiseSDK
 

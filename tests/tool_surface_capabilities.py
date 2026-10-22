@@ -92,7 +92,8 @@ NON_SDK_READ_BINDINGS: dict[str, str] = {
 #
 # `tortoise_events_poll` declares `readOnlyHint: true` and needs only
 # `graphs:read`, yet its handler path (`poll_events` -> `_maybe_purge_events`)
-# runs an interval-gated `DETACH DELETE` of expired `:GraphEvent` rows through
+# runs an interval-gated `DETACH DELETE` of expired-or-over-cap `:GraphEvent` rows
+# through
 # `event_store.purge_expired` / `purge_overflow`. That mutation lives OUTSIDE the
 # `sdk.py` derivation boundary, so `sdk_graph_mutators()` cannot see it: the
 # derivative sets are silent, `reached_writes` is EMPTY, and every arm below
@@ -120,7 +121,7 @@ NON_SDK_READ_BINDINGS: dict[str, str] = {
 RETENTION_CARVEOUTS: dict[str, str] = {
     "tortoise_events_poll":
         "poll_events -> event_store.purge_expired/purge_overflow: DETACH DELETE "
-        "of expired :GraphEvent rows, then `_refresh_first_seq` SETs the "
+        "of expired-or-over-cap :GraphEvent rows, then `_refresh_first_seq` SETs the "
         "(:GraphEventMeta).first_seq watermark — both system-owned, "
         "interval-gated — #9576/#4122",
 }
@@ -133,7 +134,7 @@ RETENTION_CARVEOUTS: dict[str, str] = {
 # caught by nothing (#9576).
 OUT_OF_BOUNDARY_MUTATORS: dict[str, str] = {
     "poll_events": "event_store.purge_expired/purge_overflow (DETACH DELETE of "
-                   "expired :GraphEvent rows + the `_refresh_first_seq` "
+                   "expired-or-over-cap :GraphEvent rows + the `_refresh_first_seq` "
                    "(:GraphEventMeta).first_seq SET) — invisible to "
                    "sdk_graph_mutators()",
 }

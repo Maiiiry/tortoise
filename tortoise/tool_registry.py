@@ -604,8 +604,10 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
         # #4122 defect class). The handler path also runs interval-gated retention
         # housekeeping on SYSTEM-owned rows (`poll_events` -> `_maybe_purge_events`
         # -> `event_store.purge_expired`/`purge_overflow`, a `DETACH DELETE` of
-        # expired `:GraphEvent` rows), so a read-only key CAN cause a DELETE. It
-        # stays `read` because both alternatives are worse for the caller:
+        # expired-or-over-cap `:GraphEvent` rows, then `_refresh_first_seq` SETs the
+        # `(:GraphEventMeta).first_seq` watermark), so a read-only key CAN cause a
+        # DELETE and a watermark write. It stays `read` because both alternatives
+        # are worse for the caller:
         # `writes=True` would take a poll away from `graphs:read` keys entirely,
         # and a non-read tier would drop the hint on a tool agents poll in a loop
         # (a confirmation prompt per poll). The rows are the store's own
