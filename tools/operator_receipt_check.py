@@ -515,6 +515,16 @@ def check_receipt(
               f"{type(session_results).__name__} — the per-session duplicate "
               "cannot be bound to the per-edge rows")
         session_results = []
+    # ⛔ An ABSENT duplicate is a refusal, not a pass: `runner.py` always writes
+    # `session_results`, so a receipt without it is not a receipt the runner
+    # produced, and treating "no second copy" as "nothing to disagree with"
+    # makes the cross-check opt-in by the artifact under audit.
+    if isinstance(planted, int) and not isinstance(planted, bool) and planted > 0 \
+            and not session_results:
+        _fail(rules, "E4-NUMERATOR",
+              "receipt.session_results: absent or empty — a completed run always "
+              "publishes the per-session duplicate, so its absence is a receipt "
+              "defect, not a clean bill for the cross-check")
     for entry in session_results or []:
         if not isinstance(entry, dict):
             _fail(rules, "E4-NUMERATOR",

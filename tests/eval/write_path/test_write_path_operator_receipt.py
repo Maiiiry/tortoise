@@ -134,6 +134,15 @@ def _receipt(edges: list[dict] | None = None, **over) -> dict:
             "source_file": "/repo/tortoise/extractor_v2.py",
             "real": True,
         },
+        "session_results": [{
+            "session_id": "wp01_quarry_debug",
+            "planted_operators": [
+                {"id": e["id"], "verdict": e.get("verdict"),
+                 "edge_correct": e.get("edge_correct"),
+                 "expected_kind": e.get("expected_kind")}
+                for e in edges
+            ],
+        }],
         "operator_audit": {
             "planted": len(edges),
             "edge_correct": sum(1 for e in edges if e.get("edge_correct")),
@@ -628,7 +637,27 @@ def test_build_receipt_carries_the_per_edge_evidence_and_extractor():
             "source_file": "/repo/tortoise/extractor_v2.py",
             "real": True,
         },
-        "session_results": [],
+        # A graded planted edge implies a session result: `runner.build_receipt`
+        # carries this through from the run, and the checker refuses a receipt
+        # whose second publication of the same claim is missing.
+        "session_results": [{
+            "session_id": "wp01_quarry_debug",
+            "emitted": 1,
+            "leaked": 0,
+            "macro": {"survived": 0, "total": 0},
+            "strict": {"survived": 0, "total": 0},
+            "quotes": {"grounded": 0, "total": 0},
+            "provenance": {"provenanced": 1, "total": 1},
+            "memory_point_count": 2,
+            "operator_counts": {},
+            "planted_operators": [
+                {"id": eid, "verdict": row.get("verdict"),
+                 "edge_correct": row.get("edge_correct"),
+                 "expected_kind": row.get("expected_kind"),
+                 "forms_found": row.get("forms_found")}
+                for eid, row in audit["results"].items()
+            ],
+        }],
         "notes": [],
         "log": [],
     }
@@ -922,3 +951,96 @@ def test_checker_rejects_a_duplicate_that_contradicts_its_graded_row():
         }],
     }]
     assert "E4-NUMERATOR" in _failures(_check(receipt))
+
+
+def test_checker_refuses_a_receipt_whose_description_is_not_a_number():
+    """A blank endpoint ref is not ref evidence.
+
+    `pre_ref`/`post_ref` are the #4716 two-id-space proof: emptied, the receipt
+    still carries `resolves`/`remapped` flags asserting a remap that the refs
+    cannot show. Without the non-empty arm the checker certifies it.
+    """
+    receipt = _receipt()
+    ref = receipt["operator_audit"]["results"]["wp01_quarry_debug_op_01"]
+    ref = ref["endpoints"]["from"][0]
+    ref["pre_ref"] = ""
+    ref["post_ref"] = ""
+    assert "E4-REFS" in _failures(_check(receipt))
+
+
+def test_checker_refuses_a_duplicate_entry_that_is_not_an_object():
+    """A malformed duplicate must be NAMED, not silently skipped: a `continue`
+    with no rule lets any shape error defeat the cross-check entirely."""
+    receipt = _receipt()
+    receipt["session_results"] = [{"session_id": "s1", "planted_operators": [5]}]
+    assert "E4-NUMERATOR" in _failures(_check(receipt))
+
+
+def test_checker_refuses_a_duplicate_naming_an_edge_the_rows_do_not_carry():
+    """The duplicate and the graded rows must be the SAME edge set: a duplicate
+    naming an unknown edge is a second copy of a different claim."""
+    receipt = _receipt()
+    receipt["session_results"] = [{
+        "session_id": "s1",
+        "planted_operators": [{
+            "id": "ffffffffff-abcdefabcdef",
+            "verdict": "from_content_missing",
+            "edge_correct": False,
+            "expected_kind": "SUPPORTS",
+        }],
+    }]
+    assert "E4-NUMERATOR" in _failures(_check(receipt))
+
+
+def test_checker_refuses_a_denominator_it_cannot_verify(monkeypatch):
+    """No readable corpus and no declared gold = no denominator binding at all.
+
+    `E4-COVERAGE-IDS`/`E4-KIND` are skipped without a binding, so this arm is the
+    only thing between "unverifiable" and "certified" on the offline route.
+    """
+    monkeypatch.setattr(checker, "current_edge_map", lambda: None)
+    receipt = _receipt()
+    result = checker.check_receipt(receipt)
+    assert "E4-DENOM" in _failures(result)
+
+
+def test_checker_names_a_receipt_that_is_not_an_object():
+    """The root-shape guard: without its `_fail` the checker exits 1 with ZERO
+    named rules, breaking the documented contract."""
+    result = checker.check_receipt([1, 2])
+    assert "E4-SHAPE" in _failures(result)
+
+
+@pytest.mark.parametrize("shape", ["absent", "empty", "null"])
+def test_checker_refuses_a_receipt_with_no_per_session_duplicate(shape):
+    """The cross-check must not be opt-in by the artifact under audit.
+
+    `runner.py` always writes `session_results`, so a receipt without one is not
+    a receipt the runner produced — and treating "no second copy" as "nothing to
+    disagree with" makes the whole duplicate check skippable by deleting a key.
+    """
+    receipt = _receipt()
+    if shape == "absent":
+        receipt.pop("session_results")
+    elif shape == "empty":
+        receipt["session_results"] = []
+    else:
+        receipt["session_results"] = None
+    assert "E4-NUMERATOR" in _failures(_check(receipt))
+
+
+def test_a_declared_gold_whose_size_contradicts_the_denominator_is_named():
+    """The `edge_ids`-size arm is not dead code: it decides the MESSAGE.
+
+    With a declared gold of the wrong size it fires before the generic
+    `planted != want` arm, so the refusal says "the declared gold holds N edges"
+    rather than "the committed gold holds N" — a different diagnosis (you
+    declared the wrong corpus vs. you measured the wrong corpus).
+    """
+    receipt = _receipt([_edge("a"), _edge("b")])
+    result = checker.check_receipt(
+        receipt, edge_ids={"a": "SUPPORTS", "b": "SUPPORTS", "c": "NEGATE"})
+    details = [r["detail"] for r in result["rules"]
+               if r["rule"] == "E4-DENOM" and not r["ok"]]
+    assert details, _failures(result)
+    assert any("the declared gold holds" in d for d in details), details
