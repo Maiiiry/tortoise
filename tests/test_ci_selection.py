@@ -1911,7 +1911,12 @@ def test_record_schema_pin_runs_on_migration_or_doc_change():
         # `test_record_schema_placement.py` pins the record schema against the
         # placement table.
         "supabase/migrations/20261018000001_record_point_money_value_2782.sql",
-        "docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md",
+        # #9555/R7: the FORWARD migration that CREATES
+        # `public.session_narrative`. Both readers must run on a change to this
+        # file alone — `test_record_projection.py` reads its CREATE TABLE for the
+        # column set, `test_record_schema_placement.py` pins the record schema
+        # against the placement table — plus the narrative suite itself.
+        "supabase/migrations/20261023000001_record_session_narrative.sql",
     ):
         r = _sel([changed])
         assert r["full"] is False, (changed, r)

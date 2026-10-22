@@ -400,9 +400,13 @@ def test_a_usable_count_is_projected_even_beside_an_unusable_one():
 
 
 def test_a_non_text_narrative_is_not_projected_and_does_not_raise():
-    """An `:Event` record has no `story_arc` COLUMN, so a non-string value lands
-    in its props tail and the record's own write succeeds; the narrative home
-    must not turn that into a failure. It projects nothing."""
+    """A non-string `story_arc` is an absence here, not a failure.
+
+    The carrier's OWN `story_arc` is a TEXT column (`public.event`,
+    `20261012000001_record_event_stream.sql`), and `_jsonb_or_scalar`
+    `json.dumps`-es a list/dict into it — so the carrier's write SUCCEEDS with a
+    serialised (non-prose) value. This home must not turn that into a failure;
+    it projects nothing, because a non-string is not §9.1 prose."""
     record = {"type": "EventRecorded", "eventId": "e1", "sessionId": "s",
               "story_arc": ["not", "prose"]}
     statements = _narrative_statements(record)

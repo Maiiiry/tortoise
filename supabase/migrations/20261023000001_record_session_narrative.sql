@@ -37,8 +37,13 @@
 --     purpose: the count IS an integer, and the jsonb sibling on
 --     `public.session` is the schema↔producer disagreement `#9264` (R4) exists
 --     to remove. A count is not an envelope.
---   * `turn_count` <- `SessionRecorded.turn_count`, the same record, the same
---     journal carriage.
+--   * `turn_count` <- `SessionRecorded.turn_count`, riding a DIFFERENT and
+--     EARLIER `SessionRecorded` than `capture_redactions` above (that one is
+--     emitted by `_write_capture_turns`, this one by `_write_session_and_turns`'
+--     session record, which never carries `capture_redactions`). That two-record
+--     shape is exactly WHY each upsert names only its own columns: the halves
+--     arrive separately, so a whole-column-set write would erase whichever
+--     landed first, and the replay would then depend on arrival order.
 --   * `narrative`  <- the commit's `story_arc`, and `summary` <- the same
 --     records' `summary`: **PRIMARY-WITHOUT-CARRIER today.** §9.1 places this
 --     text here, so the COLUMN is right — but no producer journals it (see the

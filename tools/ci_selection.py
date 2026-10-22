@@ -1303,8 +1303,17 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # can drift them. Pinned by
              # tests/test_ci_selection.py::test_record_schema_pin_runs_on_migration_or_doc_change.
              "supabase/migrations/20261018000001_record_point_money_value_2782.sql",
-             "docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md",
-             # RETIRED 2026-10-19: the orchestrator harness (and therefore
+             # #9555/R7: the FORWARD record migration that CREATES
+             # `public.session_narrative`. Same gap as the #8263/#2782 entries
+             # above and it sorts outside the `2026101200000` prefix: a
+             # forward-migration-only diff selects NO surface, so the legs that
+             # read this migration's TEXT (`test_record_projection.py`,
+             # `test_record_schema_placement.py`, `test_9555_session_narrative.py`,
+             # `test_7950_capstone_probe.py`) would not run on the very change
+             # that can drift them — the same #1349/#3332/#3616 silent-drop
+             # class. Pinned by
+             # tests/test_ci_selection.py::test_record_schema_pin_runs_on_migration_or_doc_change.
+             "supabase/migrations/20261023000001_record_session_narrative.sql",
              # tests/test_orchestrator_harness.py) moved to
              # agent-infra/scripts/orchestrator-harness/. This repo keeps only a pointer
              # README plus the two scripts whose fixes are UNPORTED (`merge-one.sh`,
