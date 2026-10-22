@@ -91,6 +91,17 @@ rail: measured on this host it holds 16 helper scripts and **no**
 tool exists to refuse, so the two are reported separately and the rail verdict is
 never inferred from the symlink verdict.
 
+What merging this does NOT do (read this before citing it as the fix)
+---------------------------------------------------------------------
+It does **not** make the rail reachable in the merged tree. The tracked symlink
+blob is deliberately left untouched (re-pointing it in git is how #9327 was
+created), and nothing invokes this tool yet — no workflow, no husky hook, no
+dispatch/bootstrap integration. The deliverable is a DIAGNOSTIC plus a MANUAL
+repair: a fresh worktree or clone still materializes a dangling ``scripts``, and
+the rail becomes reachable only after ``--apply`` is run in that worktree. The
+repair is host-local and cannot be persisted. Wiring the check where lanes
+converge (dispatch brief, bootstrap) is follow-up work, not this change.
+
 Exit codes
 ----------
   0  reachable AND nothing left to do — ``scripts`` already resolves to the
@@ -106,7 +117,9 @@ Exit codes
      ``--force``). A DRY RUN over a real directory is NOT a refusal: a
      hand-built lane tree is legitimate, so the rail verdict alone decides 0/1
      and the ``repair:`` line says it is not ours to replace
-  3  usage error
+  3  usage error — including every ``argparse`` rejection: the parser is
+     subclassed (``_UsageParser``) so a mistyped flag cannot arrive as the ``2``
+     that means REFUSED
 
 Usage
 -----
@@ -152,6 +165,22 @@ STATE_FILE = "file"
 
 class Refused(Exception):
     """The tool cannot evaluate, or must not act. Nothing was changed."""
+
+
+class _UsageParser(argparse.ArgumentParser):
+    """Usage errors exit ``3`` — ``2`` is reserved for REFUSED.
+
+    ``argparse``'s default ``error()`` exits **2**, which is this tool's
+    ``EXIT_REFUSED``: "you typed ``--aply``" and "I evaluated and refused" would
+    then share one number (and a ``--json`` caller would get an empty payload
+    with a refusal code). The same remedy, for the same reason, as
+    ``tools/graph_census.py`` and ``tools/collision_preflight.py``.
+    """
+
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
 
 
 def resolve_target(explicit: str | None) -> Path:
@@ -221,6 +250,10 @@ def repair(link: Path, target: Path) -> None:
     The repaired path is a **tracked** symlink (git mode 120000), so a repair
     leaves a modified tracked file in the worktree. See ``NOTE`` in ``_render``:
     the repair is host-local and must not be committed.
+
+    The guard below covers a REAL directory only; a regular file is refused by
+    ``main()``'s ``STATE_FILE`` branch before this is called, so a future second
+    caller must pre-filter it too (it would be replaced by ``os.replace``).
     """
     if link.is_dir() and not link.is_symlink():
         raise Refused(
@@ -277,6 +310,15 @@ def _render(checkout: Path, target: Path | None, info: dict, repair_needed: bool
               "committing re-writes the blob to THIS host's absolute path, "
               "re-creating #9327 for every other host. `git checkout -- scripts` "
               "restores the committed (possibly dangling) link.")
+    elif refusal and not not_repairable:
+        # #9564 review P3: the plain re-run instruction is guidance that CANNOT
+        # work beside a refusal — `--apply` refuses again — so printing it next
+        # to "REFUSED: … pass --force" told the operator to repeat the exact
+        # action that just failed. The refusal IS the guidance; this line only
+        # reports that the repair dimension is still owed. A real-directory /
+        # regular-file refusal keeps its own "NOT OURS TO DO" line below, whose
+        # guidance (move it aside yourself) is the working one.
+        print("  repair: NOT APPLIED — nothing was changed; see REFUSED above")
     elif repair_needed:
         print("  repair: NEEDED — re-run with --apply")
     elif not_repairable:
@@ -290,7 +332,7 @@ def _render(checkout: Path, target: Path | None, info: dict, repair_needed: bool
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
+    p = _UsageParser(
         prog="link_scripts",
         description="Verify (and with --apply repair) the reachability of the "
                     "checkout's `scripts/` surface and the mandated rail entry "

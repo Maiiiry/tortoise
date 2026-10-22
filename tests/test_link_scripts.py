@@ -67,8 +67,22 @@ def _run(checkout: Path, *args: str, env_target: Path | None = None,
 
 def test_a_dangling_committed_symlink_is_reported_as_an_unreachable_rail(
         checkout: Path, shared: Path):
-    """THE REGRESSION. This is what `git cat-file -p HEAD:scripts` produced."""
-    (checkout / "scripts").symlink_to("/Users/danielospina/Documents/GitHub/agent-infra/scripts")
+    """THE REGRESSION. This is the shape `git cat-file -p HEAD:scripts` produces.
+
+    The committed TEXT is
+    ``/Users/danielospina/Documents/GitHub/agent-infra/scripts`` — one host's
+    absolute path. It is deliberately NOT used verbatim as the fixture target:
+    on the machine that wrote that blob the path RESOLVES, so ``classify()``
+    reports ``symlink`` with ``dangling=False`` and the ``DANGLING`` arm below
+    fails with a message asserting the opposite of what the tool did (the same
+    trap `tests/test_website_static.py` records for the sibling `skills` relay,
+    #8066/#8027). The shape under test is "an absolute target that resolves on
+    no other host", so the fixture is an unresolvable one — the host-independent
+    idiom the other arms in this file already use.
+    """
+    # the recorded blob text, for documentation only:
+    #   /Users/danielospina/Documents/GitHub/agent-infra/scripts
+    (checkout / "scripts").symlink_to("/nonexistent-host/agent-infra/scripts")
     res = _run(checkout, env_target=shared)
     assert res.returncode == 1, res.stdout + res.stderr
     assert "DANGLING" in res.stdout
@@ -169,6 +183,12 @@ def test_apply_refuses_to_trade_a_working_rail_for_a_rail_less_shared_root(
     assert "REFUSED" in refused.stdout
     assert "REACHABLE to unreachable" in refused.stdout
     assert "--force" in refused.stdout
+    # #9564 review P3: a refusal must not ALSO print the plain "re-run with
+    # --apply" remedy — re-running it refuses again, so the operator was told to
+    # repeat the exact action that just failed. The refusal (`--force`) is the
+    # only guidance that works here.
+    assert "re-run with --apply" not in refused.stdout, refused.stdout
+    assert "NOT APPLIED" in refused.stdout
     # Nothing changed, and the rail is still there.
     assert os.readlink(checkout / "scripts") == str(replica)
     assert (checkout / "scripts" / "admin-merge.sh").is_file()
@@ -300,6 +320,22 @@ def test_a_nonexistent_checkout_is_a_usage_error(tmp_path: Path, shared: Path):
 def test_rail_name_must_be_a_bare_filename(checkout: Path, shared: Path):
     res = _run(checkout, "--rail", "../etc/passwd", env_target=shared)
     assert res.returncode == 3
+
+
+def test_an_argparse_usage_error_exits_3_not_2(checkout: Path, shared: Path):
+    """#9564 review P3: argparse's default ``error()`` exits 2 = EXIT_REFUSED.
+
+    ``2`` is this tool's "I evaluated and REFUSED — nothing changed". A mistyped
+    flag is a different fact ("you called it wrong", ``3``), and on the default
+    parser both printed the same number — with ``--json`` the caller also got no
+    payload at all, just a refusal code. Pinned on the two shapes that matter: a
+    misspelled option and an invented one.
+    """
+    typo = _run(checkout, "--aply", env_target=shared)
+    assert typo.returncode == 3, typo.stdout + typo.stderr
+    assert "error:" in typo.stderr
+    unknown = _run(checkout, "--no-such-flag", env_target=shared)
+    assert unknown.returncode == 3, unknown.stdout + unknown.stderr
 
 
 # ── idempotence / purity ────────────────────────────────────────────────────
