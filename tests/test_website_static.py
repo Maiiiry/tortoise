@@ -32,11 +32,13 @@ Repo-local, zero network, stdlib only (the test_waitlist_form.py pattern):
    the owner, not a defect to "fix" — see `TestInvestorsProgressCopy`.
 
 7. Product-root marker contract (PR #9652 review, P1): the string that proves
-   the tortoise host serves product.html at `/` is pinned in TWO surfaces the
-   pre-merge matrix cannot see — `PRODUCT_ROOT_MARKER` in
-   `tests/e2e/test_legal_pages.py` and the `grep -qF` in the post-deploy DNS
-   preflight (`.github/workflows/deploy-pages.yml`). Both must be structural
-   (not hero prose) and must agree; see `TestProductRootMarkerContract`.
+   the tortoise host serves product.html at `/` is pinned in TWO surfaces that
+   drift independently — `PRODUCT_ROOT_MARKER` in
+   `tests/e2e/test_legal_pages.py` (exercised by the pre-merge `legal-e2e` job
+   and by post-deploy `verify-legal`) and the `grep -qF` in the post-deploy DNS
+   preflight (`.github/workflows/deploy-pages.yml`), which NO pre-merge leg
+   reads. Both must be structural (not hero prose) and must agree; see
+   `TestProductRootMarkerContract`.
 
 Run:  TORTOISE_TEST_CARVE_OUT=1 python -m pytest tests/test_website_static.py -v
       (a URI-less run fails at session setup by construction — epic #1647 P4;
@@ -1242,15 +1244,26 @@ class TestInvestorsProgressCopy:
 #      greps the served root and only then exports `TORTISE_HOST_CHECK=1`.
 #
 # That preflight's miss branch is a `::warning::`, so a stale marker does not
-# red the job — it turns the tortoise-host half of the suite OFF, green.There
-# is no pre-merge leg that reads either pin: `tests/e2e/test_legal_pages.py`
-# runs post-deploy only, so the change that breaks the marker is the one whose
-# verification quietly stops running (PR #8597 named this; PR #9652 hit it
-# again by replacing the hero `<h1>`, which WAS the marker).
+# red the job — it turns the tortoise-host half of the suite OFF, green. The
+# pre-merge `legal-e2e` job (`.github/workflows/ci.yml`) DOES run
+# `tests/e2e/test_legal_pages.py`, against a local `wrangler pages dev` with
+# `TORTISE_HOST_CHECK=1` — but it reads the e2e constant only, never the
+# workflow's grep, so it cannot see the preflight half drift; and until this PR
+# fixed the constant's ordering, its local-emulation canary was dead and the
+# tortoise-host tests skipped there too. Post-deploy, the preflight's marker is
+# read by no pre-merge leg at all. In BOTH legs a drifted marker SKIPS the
+# tortoise-host half green, so the change that breaks the marker is the one
+# whose verification quietly stops running (PR #8597 named this; PR #9652 hit it
+# again by replacing the hero `<h1>`, which WAS the marker) — which is why the
+# pin belongs here, graded at PR time on the committed files.
 #
 # This file is selected whenever `website/product.html` changes (the
-# `onboarding` surface in config/ci-surfaces.yml), so it is the right place to
-# tie both pins back to the committed page.
+# `onboarding` surface in config/ci-surfaces.yml), AND also whenever
+# `tests/e2e/test_legal_pages.py` changes (a `SOURCE_PATTERNS["onboarding"]`
+# row in tools/ci_selection.py) — the file that holds the constant this gate
+# parses had to be reachable, or the marker could be re-cut there with the gate
+# asleep. Both paths are pinned by
+# tests/test_ci_selection.py::test_product_root_marker_guard_runs_on_a_legal_pages_only_diff.
 LEGAL_PAGES_E2E = REPO_ROOT / "tests" / "e2e" / "test_legal_pages.py"
 DEPLOY_PAGES_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy-pages.yml"
 INDEX_HTML = REPO_ROOT / "website" / "index.html"
