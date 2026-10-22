@@ -120,7 +120,9 @@ NON_SDK_READ_BINDINGS: dict[str, str] = {
 RETENTION_CARVEOUTS: dict[str, str] = {
     "tortoise_events_poll":
         "poll_events -> event_store.purge_expired/purge_overflow: DETACH DELETE "
-        "of expired :GraphEvent rows (interval-gated, system-owned) — #9576/#4122",
+        "of expired :GraphEvent rows, then `_refresh_first_seq` SETs the "
+        "(:GraphEventMeta).first_seq watermark — both system-owned, "
+        "interval-gated — #9576/#4122",
 }
 
 # SDK operations that MUTATE storage from a module OUTSIDE the `sdk.py` derivation
@@ -131,7 +133,9 @@ RETENTION_CARVEOUTS: dict[str, str] = {
 # caught by nothing (#9576).
 OUT_OF_BOUNDARY_MUTATORS: dict[str, str] = {
     "poll_events": "event_store.purge_expired/purge_overflow (DETACH DELETE of "
-                   "expired :GraphEvent rows) — invisible to sdk_graph_mutators()",
+                   "expired :GraphEvent rows + the `_refresh_first_seq` "
+                   "(:GraphEventMeta).first_seq SET) — invisible to "
+                   "sdk_graph_mutators()",
 }
 
 # Registry `sdk_method` labels that do not resolve to a TortoiseSDK attribute.
@@ -1227,9 +1231,17 @@ def declared_set_violations(entries, sdk_src: str | None = None) -> list[str]:
     # tool that no longer exists, no longer claims the read hint, or no longer
     # reaches the operation it was carved out for is a record that stopped
     # describing the code, and it must be deleted deliberately rather than left to
-    # read as a standing decision. Both arms follow the subset semantics the rest of
-    # this function has: a caller that hands in a SUBSET will see the absent entries
-    # reported, exactly as the `DECLARED_BINDING_DIVERGENCES` arm does.
+    # read as a standing decision.
+    #
+    # ⚠️ SUBSET SEMANTICS: `entries` may be a synthetic subset (the `_probe` and
+    # `flipped` call sites pass "served set minus one tool"), so an absent tool proves
+    # NOTHING on its own — the file's own `NON_SDK_WRITER_BINDINGS` idiom is to skip a
+    # missing tool rather than report it. Reporting on absence would make a future
+    # probe aimed at `tortoise_events_poll` emit "delete the decision record", which
+    # is the opposite of this ledger's purpose. Liveness is therefore decided against
+    # the SERVED set, not against whatever subset the caller handed in: an entry that
+    # is missing here but present there is a filtered call, not a dead declaration.
+    served_names = {e.name for e in served_registry()}
     for op in sorted(OUT_OF_BOUNDARY_MUTATORS):
         if op not in methods:
             out.append(
@@ -1242,6 +1254,8 @@ def declared_set_violations(entries, sdk_src: str | None = None) -> list[str]:
                 f"decision is the point (#9576)")
         e = by_name.get(name)
         if e is None:
+            if name in served_names:
+                continue  # synthetic subset — not a liveness signal (see above)
             out.append(
                 f"RETENTION_CARVEOUTS entry {name!r} names no served tool — "
                 f"delete the carve-out (#9576)")

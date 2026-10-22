@@ -276,7 +276,11 @@ The alternatives are worse for the caller: declaring a write would take a
 subscription feed away from `graphs:read` keys, and dropping the read hint would
 put a confirmation prompt in front of every poll of a tool agents poll in a loop.
 The delete is confined to the store's own bookkeeping (nothing here is replayed
-by a rebuild) and is idempotent, which is what keeps the departure narrow.
+by a rebuild) and is idempotent, which is what keeps the departure narrow. A gated
+purge also refreshes the `(:GraphEventMeta).first_seq` watermark
+(`_refresh_first_seq`) — a second, non-deleting write on the same read path, and
+system-owned for the same reason; the recorded reason at the registry entry names
+both.
 
 The decision is checkable: the carve-out is declared in
 `tests/tool_surface_capabilities.py` → `RETENTION_CARVEOUTS` (with the

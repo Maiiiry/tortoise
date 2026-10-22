@@ -1472,9 +1472,22 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         assert any("out-of-boundary mutation" in v and "tortoise_query" in v
                    for v in violations), violations
         # …and a WRITE-classified tool is not what this arm is for: a writer is
-        # already refused a `graphs:read` key and has no read hint to misuse.
+        # already refused a `graphs:read` key and has no read hint to misuse. The
+        # op is chosen to be one a WRITER-ANNOTATED tool really reaches, so this
+        # half can fail — probing a read-only op and asserting a writer is absent
+        # would be vacuous (review P2: it was, on the first cut).
+        monkeypatch.setitem(
+            tsc.OUT_OF_BOUNDARY_MUTATORS, "create_point",
+            "probe: pretend a mutation lives outside sdk.py")
+        violations = tsc.write_classification_violations(tsc.served_registry())
         assert not any("out-of-boundary mutation" in v
-                       and "tortoise_create_point" in v for v in violations)
+                       and "tortoise_create_point" in v for v in violations), (
+            "a writer-annotated tool was reported by the READ-tier arm — the arm "
+            "must be keyed on the read hint, not on reaching an operation")
+        # probe premise: the tool the arm must ignore really is writer-annotated
+        create = next(e for e in tsc.served_registry()
+                      if e.name == "tortoise_create_point")
+        assert create.annotations.readOnlyHint is False
 
     def test_a_second_undeclared_purger_is_caught(self, monkeypatch):
         """Mutation 2: dropping the carve-out makes the REAL tool fail.
@@ -1490,11 +1503,19 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
         assert any("tortoise_events_poll" in v and "out-of-boundary mutation" in v
                    for v in violations), violations
 
-    def test_the_carveout_is_stale_when_the_purge_stops_being_reached(self, monkeypatch):
-        """Mutation 3 (code moves): the declaration must follow the CODE. If the
-        poll stops reaching the purge, the carve-out is a record that no longer
-        describes anything and must be re-decided — not left to read as a standing
-        decision."""
+    def test_the_carveout_is_stale_when_the_reach_signal_disappears(self, monkeypatch):
+        """Mutation 3 (arm non-vacuity): the LIVENESS arm fires when the reach
+        signal it reads disappears.
+
+        Scope, stated so the label is not over-claimed (review P2): this stubs
+        `handler_operations`, so it proves the ARM, not the code. Deleting
+        `self._maybe_purge_events(proj)` from `poll_events` would NOT move this
+        signal — `handler_operations` derives from the MCP handler's SDK-handle
+        references, so it would still report `{'poll_events'}`. The code-level pin
+        is `test_poll_events_really_runs_the_retention_delete` (runtime) plus
+        `test_the_poll_body_still_calls_the_purge` (source) below; this one keeps
+        the liveness arm from being dead.
+        """
         import tool_surface_capabilities as tsc
 
         real = tsc.handler_operations
@@ -1505,6 +1526,37 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
             if name == "tortoise_events_poll" else real(name, source))
         assert any("no longer reaches" in v
                    for v in tsc.declared_set_violations(tsc.served_registry()))
+
+    def test_the_poll_body_still_calls_the_purge(self):
+        """The CODE half of the record, read from the source: `TortoiseSDK.
+        poll_events` must still call `_maybe_purge_events`.
+
+        The reach signal the liveness arm reads cannot see this (it stops at the
+        MCP handler), and the runtime test proves the behaviour end to end — this
+        is the cheap tripwire for the one edit that would quietly drop the purge
+        while every other test stayed green (it is `try`-wrapped, so a silent
+        removal costs nothing at runtime).
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from tortoise.sdk import TortoiseSDK
+
+        body = inspect.getsource(TortoiseSDK.poll_events)
+        called = {node.func.attr for node in ast.walk(ast.parse(textwrap.dedent(body)))
+                  if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Attribute)}
+        assert "_maybe_purge_events" in called, (
+            "poll_events no longer calls the retention purge — the carve-out and "
+            "its OVERRIDES line now describe a deletion that does not happen")
+        # …and the purge itself still performs the DELETE the record names.
+        from tortoise import event_store
+
+        purged = inspect.getsource(event_store.purge_expired)
+        assert "DETACH DELETE" in purged
+        assert "_refresh_first_seq" in purged, (
+            "the carve-out's reason also names the :GraphEventMeta watermark SET")
 
     def test_the_carveout_is_stale_when_the_entry_stops_being_a_read(self):
         """Mutation 3 (declaration moves): if `tortoise_events_poll` is ever
