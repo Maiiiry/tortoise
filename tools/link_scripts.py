@@ -40,6 +40,8 @@ One read-only verdict per invocation, then (only with ``--apply``) a repair:
      clobbered — it may be a hand-built lane tree. Without ``--apply`` such a
      state is NOT a refusal: it is simply not ours to repair, so the rail
      verdict alone decides the exit code;
+     ``--apply`` is ALSO refused when the current link reaches the rail and the
+     wanted root does not contain it (see below);
   4. report whether the rail entry point resolves *through* ``scripts``
      (``--rail``, default ``admin-merge.sh``). This is the verdict that would
      have told a lane, at dispatch time, that its merge path was gone.
@@ -51,6 +53,21 @@ wrong-but-live ``scripts`` link that still finds the rail exits 1 with
 meanings ("the shared root is in place" vs "the rail is reachable") and a caller
 keying on the first would be misled.
 
+The symmetric guard: never trade a working rail for a "correct" link
+--------------------------------------------------------------------
+``resolve_target`` refuses to *create* a dangling link where the operator had
+none, i.e. an action that makes reachability worse is refused. The same holds
+for the rail: on this fleet the shared ``$AGENT_INFRA_PATH/scripts`` holds the
+helper scripts and **no** ``admin-merge.sh`` (the rail lives in the lane
+replicas), so a lane whose ``scripts`` points at a rail-bearing replica is
+REACHABLE — and a blind ``--apply`` would re-point it at a directory without the
+rail and leave the lane with no sanctioned merge route. The decisions are not
+symmetric in cost (exit 1 and a re-pointable link are recoverable; a destroyed
+rail is not), so ``--apply`` refuses that re-point (exit 2, link untouched) and
+requires an explicit ``--force``. The guard reads the rail *through the current
+link* BEFORE acting, and the target's own rail — it never infers the new rail
+state from the symlink state.
+
 Side effect of ``--apply`` (read this before committing)
 --------------------------------------------------------
 ``scripts`` is a **tracked** symlink (git mode 120000), so a repair leaves a
@@ -58,7 +75,11 @@ MODIFIED TRACKED FILE in the worktree. The repair is host-local: committing it
 re-writes the blob to *this* host's absolute path, which is precisely how #9327
 was created, so it must not be committed (a broad `git add`/`git commit -a`
 would sweep it into an unrelated PR), and `git checkout -- scripts` silently
-restores the committed link.
+restores the committed link. Measured 2026-10-22: the rail itself does NOT
+refuse on a dirty tree (``$AGENT_INFRA_PATH/scripts/admin-merge.sh`` runs no
+``git status --porcelain`` / ``diff-index --quiet`` gate), so the dirty tracked
+``scripts`` entry does not block the merge this repair unblocks — but it still
+must not be committed.
 
 Why the rail check is separate from the symlink check
 -----------------------------------------------------
@@ -79,11 +100,12 @@ Exit codes
      resolve through it
   1  NOT reachable — a repair is known and not yet applied (dry run), or
      ``--apply`` ran but the rail still does not resolve (see the verdict)
-  2  REFUSED / could not evaluate — no usable target, or ``--apply`` was asked
-     to replace a real directory / regular file (never clobbered). A DRY RUN
-     over a real directory is NOT a refusal: a hand-built lane tree is
-     legitimate, so the rail verdict alone decides 0/1 and the ``repair:`` line
-     says it is not ours to replace
+  2  REFUSED / could not evaluate — no usable target, ``--apply`` was asked to
+     replace a real directory / regular file (never clobbered), or ``--apply``
+     would take the rail from REACHABLE to unreachable (overridable with
+     ``--force``). A DRY RUN over a real directory is NOT a refusal: a
+     hand-built lane tree is legitimate, so the rail verdict alone decides 0/1
+     and the ``repair:`` line says it is not ours to replace
   3  usage error
 
 Usage
@@ -92,6 +114,7 @@ Usage
     uv run python tools/link_scripts.py --apply          # repair the symlink
     uv run python tools/link_scripts.py --json
     uv run python tools/link_scripts.py --target /path/to/scripts --rail admin-merge.sh
+    uv run python tools/link_scripts.py --apply --force   # accept losing the rail
 """
 from __future__ import annotations
 
@@ -217,12 +240,18 @@ def repair(link: Path, target: Path) -> None:
             tmp.unlink()
 
 
+def _reaches_rail(root: Path, rail: str) -> tuple[str, bool]:
+    """(resolved path, reachable?) for ``rail`` under ``root`` — follows links."""
+    real = Path(os.path.realpath(root / rail))
+    return str(real), real.exists() and os.access(real, os.X_OK)
+
+
 def rail_verdict(checkout: Path, rail: str) -> dict:
     """Does the rail entry point resolve THROUGH ``scripts`` from here?"""
     path = checkout / "scripts" / rail
-    real = Path(os.path.realpath(path))
-    return {"rail": rail, "path": str(path), "resolved": str(real),
-            "reachable": real.exists() and os.access(real, os.X_OK)}
+    resolved, reachable = _reaches_rail(checkout / "scripts", rail)
+    return {"rail": rail, "path": str(path), "resolved": resolved,
+            "reachable": reachable}
 
 
 def _render(checkout: Path, target: Path | None, info: dict, repair_needed: bool,
@@ -277,6 +306,10 @@ def main(argv: list[str] | None = None) -> int:
                         f"(default: {DEFAULT_RAIL})")
     p.add_argument("--apply", action="store_true",
                    help="re-point a wrong/dangling/absent `scripts` symlink")
+    p.add_argument("--force", action="store_true",
+                   help="with --apply: re-point even when that trades a rail-"
+                        "bearing `scripts` link for a target that does not "
+                        "contain the rail (losing the merged path)")
     p.add_argument("--json", action="store_true", help="machine-readable verdict")
     args = p.parse_args(argv)
 
@@ -299,6 +332,11 @@ def main(argv: list[str] | None = None) -> int:
     except Refused as exc:
         refusal = str(exc)
 
+    # The rail state BEFORE any action: the repair decision must not be made
+    # from the target alone (#9564 review P2) — a target that lacks the rail
+    # cannot be allowed to replace a link that reaches one.
+    rail_before = rail_verdict(checkout, args.rail)
+
     repair_needed = False
     not_repairable: str | None = None
     if info["state"] in (STATE_REAL_DIR, STATE_FILE):
@@ -314,16 +352,34 @@ def main(argv: list[str] | None = None) -> int:
     elif target is not None:
         repair_needed = needs_repair(info, target)
         if repair_needed and args.apply:
-            try:
-                repair(link, target)
-            except Refused as exc:
-                refusal = str(exc)
+            target_resolved, target_has_rail = _reaches_rail(target, args.rail)
+            if rail_before["reachable"] and not target_has_rail and not args.force:
+                # The symmetric guard (#9564 review P2): the rail is the ONLY
+                # sanctioned merge path, and this fleet's shared scripts root
+                # does not contain it. Re-pointing a rail-bearing link at that
+                # root would take the lane from mergeable to stranded — the
+                # `resolve_target` refusal to CREATE a dangling link is the same
+                # rule, cheaper direction. Nothing was changed.
+                refusal = (
+                    f"{link} currently reaches the rail ("
+                    f"{rail_before['resolved']}) and the wanted root ({target}) "
+                    f"does not contain {args.rail} "
+                    f"(resolved {target_resolved}) — re-pointing would take the "
+                    f"rail from REACHABLE to unreachable and leave this checkout "
+                    f"with no sanctioned merge route. Nothing was changed. Pass "
+                    f"--force if losing the rail is what you want")
             else:
-                applied = True
-                info = classify(link)
-                # Recompute: after a successful repair the `repair:` dimension is
-                # SATISFIED, so exit 0 stays one reading (#9564 review P2).
-                repair_needed = needs_repair(info, target)
+                try:
+                    repair(link, target)
+                except Refused as exc:
+                    refusal = str(exc)
+                else:
+                    applied = True
+                    info = classify(link)
+                    # Recompute: after a successful repair the `repair:`
+                    # dimension is SATISFIED, so exit 0 stays one reading
+                    # (#9564 review P2).
+                    repair_needed = needs_repair(info, target)
 
     rail = rail_verdict(checkout, args.rail)
     # #9564 review P2: exit 0 means BOTH "the shared root is in place" and "the
@@ -343,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
             "target": str(target) if target else None,
             "scripts": info,
             "repair_needed": repair_needed,
+            "rail_before": rail_before,
             "repairable": not_repairable is None,
             "repair_note": not_repairable,
             "applied": applied,

@@ -136,6 +136,51 @@ def test_a_wrong_but_rail_working_symlink_is_not_a_clean_verdict(
     assert os.readlink(checkout / "scripts") == str(shared)
 
 
+def test_apply_refuses_to_trade_a_working_rail_for_a_rail_less_shared_root(
+        checkout: Path, tmp_path: Path):
+    """#9564 review P2: the repair itself can be the destructive direction.
+
+    The fleet shape: ``$AGENT_INFRA_PATH/scripts`` holds the helper scripts and
+    **no** ``admin-merge.sh`` (the rail lives in lane replicas). A lane whose
+    ``scripts`` points at a rail-bearing replica is REACHABLE today, and a blind
+    ``--apply`` re-points it at the shared root — taking the lane from "rail
+    reachable" to "no sanctioned merge route", with the working target recorded
+    only in stdout. ``resolve_target`` already refuses the cheaper version of
+    this (creating a dangling link where there was none), so the expensive one
+    is refused here too: exit 2, link and rail untouched, ``--force`` overrides.
+    """
+    replica = tmp_path / "lane-replica" / "scripts"
+    replica.mkdir(parents=True)
+    rail = replica / "admin-merge.sh"
+    rail.write_text("#!/usr/bin/env bash\nexit 0\n")
+    rail.chmod(0o755)
+    (checkout / "scripts").symlink_to(replica)
+
+    bare = tmp_path / "agent-infra" / "scripts"   # the shared root: no rail
+    bare.mkdir(parents=True)
+
+    # A dry run is a report: REACHABLE, with the repair still owed.
+    dry = _run(checkout, env_target=bare)
+    assert dry.returncode == 1, dry.stdout + dry.stderr
+    assert "REACHABLE" in dry.stdout and "NEEDED" in dry.stdout
+
+    refused = _run(checkout, "--apply", env_target=bare)
+    assert refused.returncode == 2, refused.stdout + refused.stderr
+    assert "REFUSED" in refused.stdout
+    assert "REACHABLE to unreachable" in refused.stdout
+    assert "--force" in refused.stdout
+    # Nothing changed, and the rail is still there.
+    assert os.readlink(checkout / "scripts") == str(replica)
+    assert (checkout / "scripts" / "admin-merge.sh").is_file()
+
+    # The operator can still take that decision deliberately.
+    forced = _run(checkout, "--apply", "--force", env_target=bare)
+    assert forced.returncode == 1, forced.stdout + forced.stderr
+    assert "APPLIED" in forced.stdout
+    assert os.readlink(checkout / "scripts") == str(bare)
+    assert "UNREACHABLE" in forced.stdout
+
+
 def test_a_real_scripts_directory_can_still_be_a_reachable_verdict(
         checkout: Path, shared: Path):
     """#9564 review P2: a legitimate lane tree must not be a REFUSAL on a dry run.
@@ -232,10 +277,24 @@ def test_a_target_that_is_not_a_directory_is_a_refusal(checkout: Path, tmp_path:
     assert not (checkout / "scripts").exists()
 
 
-def test_an_absolute_checkout_is_required(tmp_path: Path, shared: Path):
+def test_a_nonexistent_checkout_is_a_usage_error(tmp_path: Path, shared: Path):
+    """P3 (#9564 round 2): the rule is "checkout must exist", not "must be absolute".
+
+    ``main()`` normalises with ``Path(...).absolute()`` and only rejects a path
+    that is not a directory, so a RELATIVE existing checkout is accepted; naming
+    this `test_an_absolute_checkout_is_required` asserted a contract the tool
+    does not have.
+    """
     res = subprocess.run([sys.executable, str(TOOL), "--checkout", str(tmp_path / "nope")],
                          capture_output=True, text=True, check=False)
     assert res.returncode == 3
+    # A relative checkout that DOES exist is accepted (the tool makes it absolute).
+    (tmp_path / "wt").mkdir()
+    rel = subprocess.run([sys.executable, str(TOOL), "--checkout", "wt",
+                          "--target", str(shared)], cwd=str(tmp_path),
+                         capture_output=True, text=True, check=False)
+    assert rel.returncode == 1, rel.stdout + rel.stderr   # absent link, rail owed
+    assert "scripts: absent" in rel.stdout
 
 
 def test_rail_name_must_be_a_bare_filename(checkout: Path, shared: Path):
@@ -292,6 +351,9 @@ def test_json_verdict_carries_both_halves(checkout: Path, shared: Path):
     assert payload["repair_needed"] is False
     assert payload["repairable"] is True
     assert payload["rail"]["reachable"] is True
+    # The pre-action rail state is reported too (#9564 review P2): the repair
+    # decision is not made from the target alone.
+    assert payload["rail_before"]["reachable"] is False
     assert payload["exit"] == 0
 
 
