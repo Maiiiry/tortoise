@@ -86,6 +86,23 @@ slow_shards: 5
 
 surfaces:
   api:
+  - test_9583_openapi_read_only_claim.py
+  # #9583: a served GET docstring IS the OpenAPI operation `description` a customer
+  # reads, and `/v1/packs` advertised "read-only pack introspection" while its handler
+  # calls `pack_state.get_tenant_packs`, whose self-heal `ensure_tenant_packs` MERGEs a
+  # missing starter `:PackInstall`. This is the REST half of #9575's registry lint: it
+  # derives the offender from the ALREADY-SERVED schema of BOTH FastAPI apps this repo
+  # serves (`hosted_api` and the self-host daemon), so a NEW GET fronting a declared
+  # read-through writer fails without anyone remembering the file exists.
+  #
+  # `api` is the row that RUNS it: `tortoise/hosted_api.py` is an EXACT `api`
+  # SOURCE_PATTERNS match that REPLACES the `core` fallback in `select()` (measured:
+  # `--changed-files tortoise/hosted_api.py` -> surfaces ['api','onboarding']). The
+  # `core` row below is the OTHER half: the D4a record this file asserts lives in
+  # `tortoise/pack_state.py`, which matches no SOURCE_PATTERN and falls through to `core`
+  # (measured: that diff selects `core` ALONE). Reverting the fix is a diff to BOTH
+  # files, so this is the #1349/#2938/#3154 silent-drop class: without these rows the
+  # gate that exists to catch the regression would not run on the change that causes it.
   # #9189: REGISTERED, not diff-carrying — the file is a `carve_out:` member, so
   # `select()` strips it from `test_files` (`files -= carve`) on every non-full
   # selection and it RUNS through the carve-out leg instead (`carve_out_run` ->
@@ -1488,6 +1505,13 @@ surfaces:
   # it guards span `tortoise/` — a battery-only or sdk-only change must run it.
   - test_vector_write_seam_4520.py
   core:
+  - test_9583_openapi_read_only_claim.py
+  # #9583: the `core` arm of the read-only-claim / lockstep pin. Half of the file asserts
+  # the SERVED OpenAPI descriptions (`api`, above); the other half asserts that
+  # `tortoise/pack_state.py`'s D4a record still states the ensure half. `pack_state.py`
+  # matches no SOURCE_PATTERN, so a pack_state.py-only change selects `core` alone and
+  # the `api` row never applies — and D4a is exactly what such a change re-stales.
+  # `--integrity` also requires every `tests/**/test_*.py` to carry a classification.
   - test_5412_empty_query_vector_leg_trace.py
   # #8093: the `:Graph.namespace` cell of `docs/registry-graph-schema.md` vs the
   # namespace the code derives (`acl_graph_users._graph_namespace`,
@@ -8080,6 +8104,7 @@ durations:
   # with `# unmeasured` so `render_refreshed_manifest` clears it on that first
   # sweep (#9110 review P2).
   test_code_freshness_9494.py: 2.0  # unmeasured — new in #9494: flat default until the first post-merge sweep
+  test_9583_openapi_read_only_claim.py: 2.0  # unmeasured — new in #9583 (#3400/#4348 one-file trap): the file is ADDED BY THIS PR, so the refresher (which samples push-to-main junit artifacts) cannot have measured it, and an absent row packs it at the flat 2.0s default while `duration_coverage_issues()` falls under the 90% floor — MEASURED this turn: WITHOUT this row `ci_selection.py --integrity` exits 1 on the merged tree at `durations coverage 89.9% (892/992 fast files)`, while `origin/main` (1ff23919c) exits 0, so this PR alone tipped it. The weight is the flat default deliberately, the same choice the `test_9208_change_feed_degraded.py` row above states: a LOCAL reading is not a shard-layout input (#3419/#2788). For context only, not as the weight: on the private docker lane the file collects 8 tests that pass in 3.68 s (`testcase/@time` sum), whole-file wall 6.0 s including pytest startup — it asserts served OpenAPI descriptions and AST pins, so it takes no graph and pays no per-leg embedder load. Refresh from the first post-merge sweep that includes it.
 on_demand:
   - eval/retrieval/test_integration.py
   - test_perf_lane_volunteer_context.py
