@@ -312,6 +312,53 @@ def test_public_site_surface_change_selects_onboarding_and_skips_slow():
         assert "test_website_docs_consistency.py" in r["test_files"], changed
 
 
+def test_product_root_marker_guard_runs_on_a_legal_pages_only_diff():
+    """PR #9652 review (P2): the marker guard must run on the FILE it parses.
+
+    `tests/test_website_static.py::TestProductRootMarkerContract` pins three
+    surfaces together: `website/product.html`, the `PRODUCT_ROOT_MARKER`
+    literal in `tests/e2e/test_legal_pages.py`, and the DNS preflight grep in
+    `.github/workflows/deploy-pages.yml`. Only the first selected the guard —
+    `tests/e2e/test_legal_pages.py` matched no SOURCE_PATTERNS row and fell
+    back to `core`, where `test_website_static.py` (registered `onboarding`
+    only) does not live.
+
+    So re-cutting the marker by editing ONLY the e2e constant — the file the
+    contract is named after, and the edit PR #8597 and PR #9652 each had to
+    make — ran no guard, and the workflow kept grepping the old string: the
+    preflight's `::warning::` branch then skipped the tortoise-host half green.
+    MEASURED before the entries: `_sel(["tests/e2e/test_legal_pages.py"])` ->
+    `surfaces == ["core"]` with `test_website_static.py` ABSENT.
+
+    Both halves are asserted because the fix has both: the `onboarding`
+    SOURCE_PATTERNS row selects the guard, and the `CORE_ALSO` entry keeps
+    `core` (a named-surface match REPLACES the `tests/` -> `core` fallback).
+
+    Mutation check: dropping the SOURCE_PATTERNS row fails the `onboarding`
+    assert (surfaces become `["core"]`); dropping the CORE_ALSO entry fails
+    the `core` assert (surfaces become `["onboarding"]`).
+    """
+    changed = "tests/e2e/test_legal_pages.py"
+    assert (REPO / changed).exists(), f"the marker contract's subject is gone: {changed}"
+    r = _sel([changed])
+    assert r["full"] is False, (changed, r["full"])
+    assert "onboarding" in r["surfaces"], (
+        f"{changed} selects {r['surfaces']} — the guard that parses its "
+        "PRODUCT_ROOT_MARKER (test_website_static.py) never runs, so a marker "
+        "move in this file merges with the deploy preflight grepping a string "
+        "the page no longer serves (#8596/#8597 class, #9652 review P2)"
+    )
+    assert "test_website_static.py" in r["test_files"], (
+        f"{changed} does not select test_website_static.py — the served-root "
+        "marker contract has no guard on the one file that defines the marker"
+    )
+    assert "core" in r["surfaces"], (
+        f"{changed} selects {r['surfaces']} — the onboarding SOURCE_PATTERNS "
+        "match replaced the `tests/` -> core fallback, so every core-registered "
+        "test silently drops off the diff (CORE_ALSO entry removed?)"
+    )
+
+
 def test_the_capacity_guards_derived_source_selects_the_guard():
     """#3329/#8492: a change to the guard's DERIVED SOURCE must select the guard.
 
