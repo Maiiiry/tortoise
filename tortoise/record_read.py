@@ -46,6 +46,14 @@ is not enough: a session whose id itself ends in `_t<i>` would otherwise match
 another session's turn ids (`sec` vs `sec_t0`), which is the bug that comment
 records.
 
+⚠️ **The STORED text of a turn is FRAMED** — `"[role] body"`
+(`sdk._capture_turn_frame`, the single definition) — so this module never serves
+`point.content` raw: `transcript` un-frames with the writer's own inverse
+(`sdk._capture_turn_role_text`, imported lazily so this module stays importable
+without the SDK's weight) and labels the line once. Serving the framed string
+would read `"user: [user] hello"`; a second local copy of the frame grammar
+would be a second declaration of it, which is why the SDK's inverse is used.
+
 TENANCY IS A PER-CALL ARGUMENT
 ==============================
 `org_id` and `graph_id` are required keyword arguments and are bound into every
@@ -120,17 +128,18 @@ class SessionText:
     def transcript(self) -> str:
         """The raw turns joined in capture order — §9.1's "raw transcript".
 
-        Speaker-labelled when the record knows a speaker (the capture writes
-        one on assistant/user turns), bare text otherwise. This is the string
+        A turn's STORED text is framed (`"[role] body"`, `sdk._capture_turn_frame`),
+        so each line is un-framed with the writer's own inverse and labelled ONCE
+        — the frame's role, or `point.speaker` when the record knows one. Serving
+        the frame raw would read `"user: [user] hello"`. This is the string
         §9.4's verbatim path reads; it is derived from the turn rows, never
         stored a second time.
         """
         lines = []
         for turn in self.turns:
-            if turn.speaker:
-                lines.append(f"{turn.speaker}: {turn.content}")
-            else:
-                lines.append(turn.content)
+            role, body = _role_and_body(turn.content)
+            label = turn.speaker or (role if role != _UNFRAMED_ROLE else None)
+            lines.append(f"{label}: {body}" if label else body)
         return "\n\n".join(lines)
 
     @property
@@ -147,6 +156,23 @@ def _cursor(conn: Any):
 def _rows(cursor) -> list[Any]:
     rows = cursor.fetchall()
     return list(rows or ())
+
+
+#: One role the writer's inverse returns for text carrying NO frame.
+_UNFRAMED_ROLE = "unknown"
+
+
+def _role_and_body(stored: str) -> tuple[str, str]:
+    """`(role, body)` for one stored turn text — the WRITER's own inverse.
+
+    Imported lazily: `sdk` is heavy and this module is on the read path. The
+    alternative — a local copy of the `"[role] body"` grammar — would be a second
+    declaration of the frame, and `sdk._capture_turn_role_text` exists precisely
+    so the writer and its readers cannot drift.
+    """
+    from tortoise.sdk import _capture_turn_role_text
+
+    return _capture_turn_role_text(stored)
 
 
 def _turn_pattern(session_id: str) -> str:
@@ -169,7 +195,17 @@ def _turn_index(turn_id: str, session_id: str) -> int:
             "id's own index (sdk._capture_turn_id), and a key that does not "
             "carry one cannot be ordered without inventing an order."
         )
-    return int(match.group(1))
+    try:
+        return int(match.group(1))
+    except ValueError as exc:  # a digit run past CPython's conversion limit
+        # `sdk._capture_turn_ids` records the SAME trap: `isdecimal()` being
+        # true does not imply `int()` parseable, and the failure it raises is a
+        # bare ValueError that would escape this module's typed contract and
+        # take the whole session read (narrative included) with it.
+        raise RecordReadError(
+            f"turn key {turn_id!r} carries a numeric suffix this process cannot "
+            f"parse as an index ({exc}) — the turn cannot be ordered."
+        ) from exc
 
 
 def _narrative_row(conn: Any, org_id: str, graph_id: str,
@@ -188,11 +224,19 @@ def _narrative_row(conn: Any, org_id: str, graph_id: str,
 def _turns(conn: Any, org_id: str, graph_id: str,
            session_id: str) -> tuple[Turn, ...]:
     cursor = _cursor(conn)
+    # SARGEABLE RANGE FIRST, shape rule SECOND. `node_key ~ <regex>` alone is not
+    # sargable, so the plan would be "every point row in this tenant graph" on
+    # §9.4's answer-time path. `(org_id, graph_id, node_key)` is the primary key,
+    # so a prefix RANGE bounds the scan to this session's neighbourhood (`_t` …
+    # `_u`, since `t` < `u`), and the anchored regex still decides membership —
+    # including the case the range cannot: a session id that is a prefix of
+    # another (`sec` vs `sec_t0`).
     cursor.execute(
         f"SELECT node_key, content, speaker FROM public.{POINT_TABLE} "
         f"WHERE org_id = %s AND graph_id = %s AND is_episodic IS TRUE "
-        f"AND node_key ~ %s",
-        (org_id, graph_id, _turn_pattern(session_id)),
+        f"AND node_key >= %s AND node_key < %s AND node_key ~ %s",
+        (org_id, graph_id, session_id + "_t", session_id + "_u",
+         _turn_pattern(session_id)),
     )
     turns: list[Turn] = []
     for row in _rows(cursor):

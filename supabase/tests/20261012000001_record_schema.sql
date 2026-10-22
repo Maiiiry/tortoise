@@ -539,6 +539,9 @@ SELECT tests.assert(
 SELECT tests.assert(
   (SELECT count(*) FROM public.journal_event WHERE org_id = 'org_7968') = 0,
   '7968: purge_org_record cascaded the append-only journal');
+SELECT tests.assert(
+  (SELECT count(*) FROM public.session_narrative WHERE org_id = 'org_7968') = 0,
+  '9555: purge_org_record cascaded the tenant out of session_narrative');
 
 -- The RPC is the ONLY caller allowed to set the purge flag: an
 -- authenticated session must not be able to execute it (nor, therefore, to

@@ -9,19 +9,24 @@ journal unavailable. Five claims, each a test here:
 
 1. **THE HOME EXISTS, AND IT IS SHAPED RIGHT.** One row per session in
    `public.session_narrative`, keyed `(org_id, graph_id, session_id)` with a
-   foreign key to `public.session` that CASCADES — the tenant-erasure path
-   (`purge_org_record`, migration 20261012000005) reaches it through
-   organizations → graphs → session, so a tenant's narrative dies with the
-   tenant.
+   foreign key to **`public.graphs`** (NOT `public.session`) that CASCADES — the
+   tenant-erasure path (`purge_org_record`, migration 20261012000005) reaches it
+   through organizations → graphs → this table, so a tenant's narrative dies
+   with the tenant, while the row's existence does not depend on the session row
+   landing first.
 2. **IT IS A TENANCY SURFACE LIKE THE OTHER NINE.** RLS enabled, the
    `authenticated` read policy on `app.current_org_id`, the `service_role`
    policy for the write path, and — per R6's recorded decision (`#9554`) — the
    app-role policy with BOTH `USING` and `WITH CHECK`, guarded on the role
-   existing because R6's migration (which creates it) sorts FIRST.
-3. **IT IS PROJECTED FROM RECORDS THAT ALREADY CARRY IT.** No new producer: the
-   narrative rides `story_arc` on the commit's `:Source`/`:Event` record and the
-   counts ride `SessionRecorded`. Nothing here is invented from a value the
-   journal does not hold (§3's per-write test).
+   existing because R6's migration (which creates it) is the one that sorts
+   first.
+3. **IT IS PROJECTED FROM THE RECORDS THAT CARRY IT — AND THE TEXT COLUMNS ARE
+   PRIMARY-WITHOUT-CARRIER TODAY.** `capture_redactions`/`turn_count` ride
+   `SessionRecorded` (PRIMARY, journal-carried). `narrative`/`summary` are the
+   text the record must keep but whose journal carrier does not exist in this
+   tree yet (`story_arc` reaches the graph by raw Cypher, which is not a journal
+   record) — see the migration's ⚠️ block. The projection is written and pinned
+   for the day it does; this suite never pretends a live capture fills it.
 4. **THE TWO CARRIERS DO NOT CLOBBER EACH OTHER.** They write ONE row, each
    naming only its own columns in the `DO UPDATE SET`. This is the leg that
    makes a replay in journal order equal to a live build: an upsert that wrote
@@ -42,6 +47,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -170,6 +176,14 @@ def _set_columns(statement) -> set[str]:
     return {c.strip() for c in re.findall(r"([a-z_]+)\s*=\s*EXCLUDED\.", tail)}
 
 
+def _insert_columns(sql: str) -> list[str]:
+    """The payload columns an INSERT names, in bind order (bookkeeping removed)."""
+    inside = sql.split("(", 1)[1].split(")", 1)[0]
+    columns = [c.strip() for c in inside.split(",")]
+    return [c for c in columns
+            if c not in {"org_id", "graph_id", "session_id", "props"}]
+
+
 def test_a_narrative_carrying_record_projects_the_narrative_home():
     """The layer-1 commit writes `story_arc` onto the transcript `:Source`; the
     record must land it in the narrative home, in the SAME batch as the source
@@ -253,6 +267,23 @@ def test_the_two_carriers_are_independent_of_their_arrival_order():
         return [(s.sql, s.params) for s in plan
                 if f"INSERT INTO public.{rr.NARRATIVE_TABLE}" in s.sql]
 
+    def apply_order(order) -> dict[str, Any]:
+        """Simulate the row the two statements build, column by column.
+
+        A statement binds `(org_id, graph_id, session_id, *values, props)` in the
+        order its INSERT column list names, so the values line up positionally
+        with that list. Applying each statement to a dict is the smallest honest
+        model of `ON CONFLICT … DO UPDATE SET c = EXCLUDED.c`, and it is what
+        makes the claim executable: the ROW after `[text, counts]` must equal
+        the ROW after `[counts, text]`.
+        """
+        row: dict[str, Any] = {}
+        for sql, params in narrative_rows(order):
+            columns = _insert_columns(sql)
+            for column, value in zip(columns, params[3:3 + len(columns)], strict=False):
+                row[column] = value
+        return row
+
     forward = narrative_rows([text_record, counts_record])
     reverse = narrative_rows([counts_record, text_record])
     assert len(forward) == len(reverse) == 2
@@ -263,6 +294,12 @@ def test_the_two_carriers_are_independent_of_their_arrival_order():
     forward_cols = [_set_columns(rp.Statement(sql, params))
                     for sql, params in forward]
     assert not (forward_cols[0] & forward_cols[1])
+    # ... and the row itself, built in both orders.
+    assert apply_order([text_record, counts_record]) == \
+        apply_order([counts_record, text_record])
+    assert apply_order([counts_record, text_record]) == {
+        "narrative": "the arc", "capture_redactions": 3, "turn_count": 4,
+    }
 
 
 def test_a_summary_without_the_narrative_is_not_the_narrative_column():
@@ -320,7 +357,7 @@ def test_a_bad_typed_count_does_not_fail_the_records_own_mutation():
     record = {"type": "SessionRecorded", "id": "s1",
               "capture_redactions": "sentinel"}
     statements = rp.mutations_for(record, org_id=ORG, graph_id=GRAPH)
-    assert any("INSERT INTO public.session" in s.sql for s in statements)
+    assert any("INSERT INTO public.session " in s.sql for s in statements)
     assert not [s for s in statements if rr.NARRATIVE_TABLE in s.sql]
 
 
@@ -341,6 +378,21 @@ def test_a_non_text_narrative_is_not_projected_and_does_not_raise():
               "story_arc": ["not", "prose"]}
     statements = _narrative_statements(record)
     assert statements == []
+
+
+def test_a_count_larger_than_the_column_accepts_is_an_absence_not_an_overflow():
+    """THE OTHER HALF OF "MUST NOT FAIL THE CARRIER". `session.capture_redactions`
+    is jsonb and accepts an unbounded integer; this table's INTEGER does not, and
+    an `integer out of range` raised inside the carrier's transaction would take
+    the session row AND the journal position with it. So the bound is the
+    COLUMN's, not just `>= 0`."""
+    record = {"type": "SessionRecorded", "id": "s1",
+              "capture_redactions": 2 ** 31, "turn_count": 3}
+    statements = _narrative_statements(record)
+    assert len(statements) == 1
+    assert 2 ** 31 not in statements[0].params
+    assert "capture_redactions" not in _set_columns(statements[0])
+    assert 3 in statements[0].params
 
 
 # ── 5. The read side: the record, and only the record ────────────────────────
@@ -380,12 +432,16 @@ class _Conn:
 
 
 def test_the_reader_serves_the_narrative_and_the_verbatim_turns():
+    """The fixture rows are the REAL stored shape: a capture turn's `content` is
+    framed `"[role] body"` (`sdk._capture_turn_frame`), so a reader that served
+    the frame raw (or labelled it twice: `"user: [user] hello"`) would be
+    invisible against an unframed fixture."""
     conn = _Conn(**{
         "public.session_narrative": [("the arc", "a capture", 7, 2)],
         "public.point": [
-            ("s_9555_t0", "first thing said", "user"),
-            ("s_9555_t10", "later thing said", "assistant"),
-            ("s_9555_t2", "second thing said", None),
+            ("s_9555_t0", "[user] first thing said", "user"),
+            ("s_9555_t10", "[assistant] later thing said", "assistant"),
+            ("s_9555_t2", "[user] second thing said", None),
         ],
     })
     text = rr.session_text(conn, org_id=ORG, graph_id=GRAPH,
@@ -398,10 +454,14 @@ def test_the_reader_serves_the_narrative_and_the_verbatim_turns():
     # Ordered by the id's own index — the key contract, not the row order a
     # database happened to return.
     assert [t.index for t in text.turns] == [0, 2, 10]
-    assert text.turns[0].content == "first thing said"
+    assert text.turns[0].content == "[user] first thing said"
     assert text.turns[0].speaker == "user"
     assert text.turns[1].speaker is None
+    # Un-framed ONCE: the frame's role is not repeated beside `point.speaker`.
     assert "user: first thing said" in text.transcript
+    assert "[user]" not in text.transcript
+    # A turn with no `speaker` column still gets the frame's role.
+    assert "user: second thing said" in text.transcript
     assert text.verbatim_available
 
 
@@ -458,13 +518,22 @@ def test_a_turn_key_that_carries_no_index_is_a_loud_failure():
         rr._turn_index("s_tX", "s")
 
 
+def test_a_digit_run_past_the_conversion_limit_is_the_typed_refusal():
+    """`isdecimal()` being true does not imply `int()` parseable: a 5000-digit
+    suffix matches the shape rule and would raise a bare `ValueError`, escaping
+    this module's `RecordReadError` contract and taking the whole session read
+    (narrative included) with it — the trap `sdk._capture_turn_ids` records."""
+    with pytest.raises(rr.RecordReadError):
+        rr._turn_index("s_t" + "9" * 5000, "s")
+
+
 def test_the_source_verbatim_fetch_resolves_through_the_record_not_an_edge():
     """§9.4's link: `source.session_id` is a COLUMN, so it survives the graph
     being destroyed — which is the whole point of D7."""
     conn = _Conn(**{
         "public.source": [("s_9555",)],
         "public.session_narrative": [("the arc", "sum", 1, 1)],
-        "public.point": [("s_9555_t0", "verbatim", "user")],
+        "public.point": [("s_9555_t0", "[user] verbatim", "user")],
     })
     text = rr.source_narrative(conn, org_id=ORG, graph_id=GRAPH,
                               url="session:s_9555")

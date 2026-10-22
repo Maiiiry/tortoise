@@ -51,16 +51,24 @@
 -- policy with BOTH `USING` and `WITH CHECK` so the hosted application path
 -- (`tortoise_record_app`, NOBYPASSRLS) is scoped to the GUC tenant rather than
 -- bypassing the boundary. That block is GUARDED on the role existing: R6's
--- migration creates the role and sorts BEFORE this one (20261022000001 <
--- 20261023000001), so on any database that has R6 applied this table is
--- covered on a FRESH database; on a database that is upgraded incrementally, an
--- already-applied migration is not re-run, so the guard skips here and R6's own
--- migration must cover this table when it lands (its test asserts a policy per
--- table in `THE_RECORD_TABLES`, which this migration extends — so the gap is
--- visible as a red on R6's suite, not silent). The guard can only ever ADD a
--- policy for a role another migration created; it cannot weaken one. The three-policy assertion in `supabase/tests/20261012000001_record_
+-- migration (`20261022000001_record_tenancy_role_and_guc.sql`, recorded by
+-- #9554's decision, PR #9600) creates the role and sorts BEFORE this one —
+-- but it is **not in this tree yet**, so state the requirement as a DEPENDENCY
+-- rather than as fact:
+--   * R6 lands first (a fresh database): the role exists, this branch creates
+--     the policy, and the ordering holds;
+--   * a database upgraded INCREMENTALLY never re-runs an applied migration, so
+--     whichever of the two lands second must add what the other could not. R6's
+--     own test asserts a policy for every table in `THE_RECORD_TABLES`, which
+--     this migration extends — so R6 reds until it covers this table, i.e. the
+--     gap is visible on R6's suite rather than silent. If R6 ever lands with a
+--     LATER timestamp, R6 must create this table's policy explicitly.
+-- The guard can only ever ADD a policy for a role another migration created; it
+-- cannot widen one, and where the role is absent nothing is granted.
+-- The three-policy assertion in `supabase/tests/20261012000001_record_
 -- schema.sql` is written the same way R6 writes it: the app policy is asserted
--- only where the role exists.
+-- only where the role exists (and in today's harness, where it does not, the
+-- assertion is `0 = 0` BY DESIGN — it becomes meaningful the moment R6 lands).
 --
 -- ERASURE. `purge_org_record` (20261012000005) deletes the organization, which
 -- cascades organizations -> graphs -> THIS table (the FK below is ON DELETE
@@ -69,17 +77,20 @@
 -- not the journal.
 --
 -- ⚠️ THE CARRIER GAP, STATED SO THIS TABLE IS NOT OVER-READ. `story_arc` (the
--- narrative) is written to the GRAPH by the layer-1 commit's raw Cypher and is
--- journaled by **no producer in this tree** — `grep -rn story_arc tortoise/`
--- finds commit *payloads* and the raw Cypher writes, and a raw Cypher write is
--- not a journal record (§17.1's unjournalled-writer ledger). So on a live
--- capture today this row lands with `capture_redactions`/`turn_count` filled
--- and `narrative` NULL: the projection is correct and total, but its narrative
--- carrier does not exist yet. That producer (and the wiring of the read arm
--- into R8's restore verb / the ask path) is the remainder of #9555 — recorded
--- on the issue, deliberately not faked here by writing a NULL-looking value or
--- by scraping the graph (which would make the record's text depend on the
--- cache it is supposed to survive).
+-- `narrative`) and its `summary` are written to the GRAPH by the layer-1 commit's
+-- raw Cypher (`hosted_api.py`: `SET s.story_arc=$arc, s.sessionId=$sid …`), and
+-- raw Cypher is **not** a journal record (§17.1's unjournalled-writer ledger):
+-- `grep -rn story_arc tortoise/` finds commit *payloads* and those raw writes,
+-- and no producer journals either. So on a live capture today this row lands
+-- with `capture_redactions`/`turn_count` filled and `narrative` NULL: the
+-- projection is correct and total, but the narrative carrier does not exist yet
+-- — which is exactly why the header above classes the two text columns as
+-- PRIMARY-WITHOUT-CARRIER rather than PRIMARY. The producer (journal the derived
+-- `:Source`/`:Event` write with `summary`/`story_arc`/`sessionId`) and the wiring
+-- of the read arm into R8's restore verb / the ask path are the remainder of
+-- #9555 — recorded on the issue, deliberately not faked here by writing a
+-- NULL-looking value or by scraping the graph (which would make the record's
+-- text depend on the cache it is supposed to survive).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS public.session_narrative (

@@ -1727,6 +1727,11 @@ _NARRATIVE_KEY = "story_arc"
 #: The INTEGER fields the narrative home reproduces beside the text.
 _NARRATIVE_INT_KEYS: tuple[str, ...] = ("capture_redactions", "turn_count")
 
+#: The largest value the record's `integer` columns accept. A count above it
+#: fits the carrier's own `jsonb` column and would raise `integer out of range`
+#: INSIDE the carrier's transaction — see the projection's guard.
+_INT4_MAX = 2**31 - 1
+
 
 def _session_coordinate(record: Mapping[str, Any]) -> str | None:
     """The session this record is a narrative/count carrier for, if any.
@@ -1843,15 +1848,19 @@ def _narrative_statements(
         value = carrier.get(key)
         # PROJECTED ONLY WHEN THE VALUE FITS THE COLUMN — and never coerced.
         # The secondary home must not be able to FAIL the carrier's own write:
-        # `session.capture_redactions` is jsonb and accepts shapes this table's
-        # INTEGER refuses (`#9264`/R4 is that disagreement one table over), so
-        # raising here would turn an additive projection into a NEW way for a
-        # live capture to fail. A value the column cannot hold is therefore an
+        # `session.capture_redactions` is jsonb and accepts shapes AND an
+        # unbounded integer (`[2**31, inf)`), both of which this table's INTEGER
+        # refuses (`#9264`/R4 is the shape half, one table over), so raising or
+        # overflowing here would turn an additive projection into a NEW way for
+        # a live capture to fail — the INSERT raises `integer out of range`
+        # inside the carrier's own transaction, taking the row and the journal
+        # position with it. A value the column cannot hold is therefore an
         # ABSENCE in this home — the column stays NULL and the reader returns
-        # None — never a 0 (which would be a false claim about the capture) and
-        # never a coerced value (which would hide the disagreement). The field's
-        # authority remains the carrier's own column.
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        # None — never a 0 (a false claim about the capture) and never a coerced
+        # value (which would hide the disagreement). The field's authority
+        # remains the carrier's own column.
+        if (isinstance(value, int) and not isinstance(value, bool)
+                and 0 <= value <= _INT4_MAX):
             values[key] = value
 
     if not values:
