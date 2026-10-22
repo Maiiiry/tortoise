@@ -749,12 +749,12 @@ def _ledger_src(reaches: str) -> str:
     )
 
 
-def _probe(name: str, sdk_method: str, *, annotations, http_policy: bool, writes: bool = False):
+def _probe(name: str, sdk_method: str, *, annotations, http_policy: bool, risk: str = "read"):
     from tortoise.tool_registry import ToolDefinition
     return ToolDefinition(
         name=name, id=f"surface.probe.{name.removeprefix('tortoise_')}",
         description="probe", annotations=annotations,
-        http_policy=http_policy, sdk_method=sdk_method, writes=writes,
+        http_policy=http_policy, sdk_method=sdk_method, risk=risk,
     )
 
 
@@ -1096,21 +1096,32 @@ class TestCapabilityModel:
         disagreed, so the exemption is empty and the check is restated as the
         invariant the name list stood for — both directions, any `http_policy`.
         The rogue probes below prove it can still fire."""
-        from tool_surface_capabilities import exemption_set_violations, served_registry
+        from tool_surface_capabilities import (
+            RiskProbe, exemption_set_violations, served_registry,
+        )
 
-        from tortoise.tool_registry import _ro, _rw
+        from tortoise.tool_registry import _maint, _ro, _rw
         served = served_registry()
         assert served, "served registry is empty — the check would be vacuous"
         assert exemption_set_violations(served) == []
-        # `_probe` leaves writes=False, so a writer annotation makes the two
-        # disagree — exactly the #4474 defect — and the check must fire.
-        rogue = _probe("tortoise_rogue_writer", "query", annotations=_rw(),
-                       http_policy=False)
+        # #4122: `readOnlyHint`/`writes` are now DERIVED from `risk` in
+        # `ToolDefinition.__post_init__`, so a disagreeing pair cannot be built
+        # through the constructor — the defect class is unrepresentable by
+        # construction. The predicate is kept as defence in depth, and these
+        # `RiskProbe` stand-ins BYPASS the derivation to prove it can still fire.
+        rogue = RiskProbe("tortoise_rogue_writer", risk="read",
+                          annotations=_rw(), writes=False)
         assert exemption_set_violations([rogue])
         # The reverse direction too: a declared writer behind a read annotation.
-        reverse = _probe("tortoise_rogue_reader", "query", annotations=_ro(),
-                         http_policy=False, writes=True)
+        reverse = RiskProbe("tortoise_rogue_reader", risk="write",
+                            annotations=_ro(), writes=False)
         assert exemption_set_violations([reverse])
+        # And the third class the two-way invariant could not express (#4122):
+        # `maintenance` — a write a read-only key is deliberately allowed — is
+        # coherent, so it must NOT be reported.
+        maintenance = RiskProbe("tortoise_rogue_maintenance", risk="maintenance",
+                                annotations=_maint(), writes=False)
+        assert exemption_set_violations([maintenance]) == []
 
     def test_guard4_rename_simulation_fails_loudly(self):
         """A stale write-surface map (renamed/removed tool, or a declared write
@@ -1215,8 +1226,6 @@ class TestCapabilityModel:
         import tool_surface_capabilities as tsc
         from tool_surface_capabilities import declared_set_violations, served_registry
 
-        from tortoise.tool_registry import _rw
-
         # The real registry is clean — the violation below is caused by the probe.
         assert declared_set_violations(served_registry()) == []
         # ... and the op is genuinely NOT declared on any entry (the premise of
@@ -1224,13 +1233,17 @@ class TestCapabilityModel:
         assert not any(e.sdk_method == "get_tenant_packs" for e in served_registry())
         assert tsc.NON_SDK_READ_BINDINGS["get_tenant_packs"] == "tortoise_packs_list"
 
-        flipped = [dataclasses.replace(e, annotations=_rw())
-                   if e.name == "tortoise_packs_list" else e
-                   for e in served_registry()]
-        assert any("get_tenant_packs" in v and "non-read HTTP tool" in v
-                   for v in declared_set_violations(flipped)), (
-            "the read-classification property is unchecked for a handler-served "
-            "read-through op")
+        # #4122: the mutation is a RECLASSIFICATION now — the hints are derived,
+        # so re-annotating alone cannot move the entry out of `maintenance`.
+        # Both a `write` and a `read` reclassification must red the arm.
+        for reclassified in ("write", "read"):
+            flipped = [dataclasses.replace(e, risk=reclassified)
+                       if e.name == "tortoise_packs_list" else e
+                       for e in served_registry()]
+            assert any("get_tenant_packs" in v and "not `risk=maintenance`" in v
+                       for v in declared_set_violations(flipped)), (
+                f"the read-classification property is unchecked when "
+                f"tortoise_packs_list is reclassified as {reclassified!r}")
 
     def test_read_through_non_sdk_binding_is_live(self):
         """#4035 review (P1): the op→tool binding is live — a vanished bound tool
@@ -1483,10 +1496,10 @@ class TestToolIdentity:
         from tortoise.tool_registry import RETIRED_TOOL_REGISTRY, TOOL_REGISTRY
 
         served = [*TOOL_REGISTRY, *RETIRED_TOOL_REGISTRY]
-        writer_annotated = sorted(
-            e.name for e in served
-            if e.annotations is not None and e.annotations.readOnlyHint is False
-        )
+        # #4122: derived from the DECLARED risk — `readOnlyHint` is now derived
+        # from risk, so keying this on the hint would be asserting the
+        # derivation against itself.
+        writer_annotated = sorted(e.name for e in served if e.writes)
         # 48 = the served writer census (44 live + 4 retired shims). Pinned
         # here so the derived loop below can never pass by covering nothing.
         assert len(writer_annotated) == 48, writer_annotated
@@ -1512,11 +1525,8 @@ class TestToolIdentity:
         from tortoise.mcp_server import _enforce_mcp_tool_scope
         from tortoise.tool_registry import TOOL_REGISTRY
 
-        reads = sorted(
-            e.name for e in TOOL_REGISTRY
-            if e.annotations is not None and e.annotations.readOnlyHint is True
-        )
-        assert reads, "no read-annotated tool in the live registry"
+        reads = sorted(e.name for e in TOOL_REGISTRY if not e.writes)
+        assert reads, "no read-classified tool in the live registry"
 
         scopes_tok = _current_scopes.set(["graphs:read"])
         legacy_tok = _current_legacy_full_access.set(False)

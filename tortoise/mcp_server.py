@@ -99,6 +99,14 @@ if "pytest" not in sys.modules:
 # readOnlyHint=true: agent auto-approves, no confirmation needed
 # destructiveHint=true: agent MUST get human confirmation
 # idempotentHint=true: repeated calls have no extra side effects
+#
+# ⛔ THESE ARE DERIVED, NOT DECLARED (#4122 owner ruling). The one declaration is
+# `ToolDefinition.risk` (read|maintenance|write|destructive|admin); `writes` and
+# `readOnlyHint` are computed from it in `ToolDefinition.__post_init__`, so a
+# tool that writes on a self-heal path can no longer advertise `readOnlyHint`.
+# `maintenance` is the class for exactly that case (recompute-and-store): read-
+# permissioned and still metered as a read, but NOT read-only — clients
+# auto-approve on readOnlyHint, which is what made #4122 a customer promise bug.
 
 # ----
 # Server instructions (epic #2080 end-state seam #2126 — Claude-family
