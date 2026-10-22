@@ -752,3 +752,81 @@ def test_checker_rejects_an_edge_without_its_verdict(field):
         supersede = _receipt([_edge("op_a", kind="SUPERSEDE")])
         supersede["operator_audit"]["results"]["op_a"][field] = []
         assert "E4-FORMING" not in _failures(_check(supersede))
+
+
+# ── the guards that make the refusal a NAME, not a traceback ────────────────
+#
+# Each arm below is red-able by construction: remove the rule it names and the
+# test fails. That is the standard this file already holds itself to — "a rule
+# that is merely never reached reads identical to a rule that holds" — and it is
+# why these exist rather than being trusted to the implementation reading right.
+
+
+def test_checker_rejects_an_operator_id_that_is_not_one():
+    """A non-empty `edge_op_ids` is not a NAME.
+
+    `["not-a-real-op"]` closes the empty case and nothing else: `persisted` is
+    then "every forming operator is retrievable" over a string that names no
+    node. The graph mints `<hex-time>-<hex-random>` (`tortoise/ids.py::ulid`),
+    so an entry outside that id space is a placeholder, refused by name.
+    """
+    receipt = _receipt()
+    edge = receipt["operator_audit"]["results"]["wp01_quarry_debug_op_01"]
+    edge["edge_op_ids"] = ["not-a-real-op"]
+    assert "E4-FORMING" in _failures(_check(receipt))
+    # Shape is not enough on its own: hex on both sides is what the graph mints.
+    edge["edge_op_ids"] = ["zzzzzzzz-zzzzzzzz"]
+    assert "E4-FORMING" in _failures(_check(receipt))
+
+
+def test_checker_rejects_more_forming_operators_than_the_run_committed():
+    """A receipt cannot name more operator nodes than `operators_total`."""
+    receipt = _receipt()
+    receipt["operator_audit"]["operators_total"] = 1
+    receipt["operator_audit"]["operators_provenanced"] = 1
+    # Two distinct ids are named across the fixture's two wired edges.
+    assert "E4-FORMING" in _failures(_check(receipt))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("session_results", 5),
+    ("session_results", {"s": 1}),
+])
+def test_checker_names_a_non_list_session_results(field, value):
+    """A malformed duplicate is a NAMED refusal — `2` is reserved for an
+    unreadable FILE, and an uncaught `TypeError` prints no rule at all."""
+    receipt = _receipt()
+    receipt[field] = value
+    result = _check(receipt)
+    assert "E4-NUMERATOR" in _failures(result)
+
+
+@pytest.mark.parametrize("value", [5, "rows", {"a": 1}])
+def test_checker_names_a_non_list_planted_operators(value):
+    receipt = _receipt()
+    receipt["session_results"] = [{"session_id": "s1", "planted_operators": value}]
+    assert "E4-NUMERATOR" in _failures(_check(receipt))
+
+
+@pytest.mark.parametrize("bad_id", [5, None, ["a"], {"a": 1}])
+def test_checker_names_a_non_string_duplicate_edge_id(bad_id):
+    """`results.get(<unhashable>)` raises `TypeError: unhashable type` — the
+    lookup is guarded so the receipt is refused by name instead."""
+    receipt = _receipt()
+    receipt["session_results"] = [{
+        "session_id": "s1",
+        "planted_operators": [{"id": bad_id, "verdict": "edge_correct",
+                               "edge_correct": True, "expected_kind": "SUPPORTS"}],
+    }]
+    assert "E4-NUMERATOR" in _failures(_check(receipt))
+
+
+def test_checker_names_a_non_string_operator_id_without_crashing():
+    """A mixed-type id list must not reach `sorted(set(...))`: that raised
+    `TypeError: '<' not supported between instances of 'int' and 'str'` and
+    printed no rule — the same contract break, one level in."""
+    receipt = _receipt()
+    edge = receipt["operator_audit"]["results"]["wp01_quarry_debug_op_01"]
+    edge["edge_op_ids"] = [GRAPH_OP_ID, 5]
+    result = _check(receipt)
+    assert "E4-FORMING" in _failures(result)

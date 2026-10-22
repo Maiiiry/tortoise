@@ -85,11 +85,14 @@ PRODUCT_LANE = "llm"
 # operator node (#2552's cross-session supersession), so it is exempt from the
 # "name the forming operator" requirement E4-FORMING otherwise enforces.
 POINT_LEVEL_KIND = "SUPERSEDE"
-# The shape this graph mints operator-node ids in: two lowercase alphanumeric
-# groups either side of a dash (`1a151d2b0f4-8fa9f9e20655`). Loose on LENGTH on
-# purpose — it pins the ID SPACE (so a placeholder like "not-a-real-op" cannot
-# pass as a name) without freezing an incidental width.
-_OP_ID_RE = re.compile(r"^[0-9a-z]{8,16}-[0-9a-z]{8,16}$")
+# The shape this graph mints operator-node ids in: `tortoise/ids.py::ulid` is
+# `<hex(time_ms)>-<uuid4().hex[:12]>` — lowercase HEX on BOTH sides. Left is
+# length-variable (a millisecond timestamp in hex, 11-13 chars today), right is
+# exactly 12. Pinning hex (not `[0-9a-z]`) is what makes this an ID-SPACE check
+# rather than a smell test: `formsupon-identifier` and `zzzzzzzz-zzzzzzzz` are
+# placeholders, and the committed receipt's ids are
+# `1a151d2b0f4-8fa9f9e20655`, `1a151d3852f-208fd62046c3`.
+_OP_ID_RE = re.compile(r"^[0-9a-f]{8,16}-[0-9a-f]{12}$")
 
 
 def current_edge_map() -> dict[str, str] | None:
@@ -371,8 +374,13 @@ def check_receipt(
                         _fail(rules, "E4-FORMING",
                               f"{edge_id}: edge_op_ids entry {op_id!r} is not an "
                               "operator-node id (expected the graph's "
-                              "`<time>-<random>` shape) — a placeholder proves "
-                              "nothing about what formed the edge")
+                              "`<hex-time>-<hex-random>` shape) — a placeholder "
+                              "proves nothing about what formed the edge")
+                        continue
+                    # Only a STRING that passed the shape check joins the set:
+                    # appending an int/None/dict would make `sorted(set(...))`
+                    # below raise TypeError and print no rule at all — the same
+                    # contract break these guards exist to close.
                     named_op_ids.append(op_id)
 
         # ── E4-REFS: pre/post-commit endpoint refs, per side ────────────
@@ -532,6 +540,14 @@ def check_receipt(
                       "entry is not an object")
                 continue
             edge_id = duplicate.get("id")
+            if not isinstance(edge_id, str):
+                # `results.get(<dict>)` raises `unhashable type` — a malformed
+                # duplicate must be refused BY NAME, never crash the run.
+                _fail(rules, "E4-NUMERATOR",
+                      f"session_results[{session_id!r}].planted_operators: id "
+                      f"{edge_id!r} is not a string — the duplicate cannot be "
+                      "bound to the per-edge rows")
+                continue
             row = results.get(edge_id)
             if not isinstance(row, dict):
                 _fail(rules, "E4-NUMERATOR",
