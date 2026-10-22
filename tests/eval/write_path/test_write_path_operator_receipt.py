@@ -831,6 +831,13 @@ def test_checker_names_a_non_list_session_results(field, value):
     receipt[field] = value
     result = _check(receipt)
     assert "E4-NUMERATOR" in _failures(result)
+    # ...and it is refused for what it IS, exactly once: the value is neither
+    # absent nor empty, so a second "absent or empty" refusal would misdescribe
+    # the defect it just named (#9618 review, nit).
+    numerator = [r for r in result["rules"]
+                 if not r["ok"] and r["rule"] == "E4-NUMERATOR"]
+    assert len(numerator) == 1, [r["detail"] for r in numerator]
+    assert "expected a list" in numerator[0]["detail"]
 
 
 @pytest.mark.parametrize("value", [5, "rows", {"a": 1}])
@@ -922,6 +929,16 @@ def _malformed(mutate):
      ["endpoints"]["from"].__setitem__(0, 5), "E4-REFS"),
     ("session_results entry not a dict",
      lambda r: r.__setitem__("session_results", [5]), "E4-NUMERATOR"),
+    # `results` itself, and a non-LIST `endpoints.from` — the parametrisation
+    # above covered `results[<id>]` and a non-dict ref, never the container.
+    # Neutralised, these raise `AttributeError: 'int' object has no attribute
+    # 'items'` / `TypeError: 'int' object is not iterable` with NO rule named,
+    # which is the contract break this test exists for (#9618 review).
+    ("results not a dict",
+     lambda r: r["operator_audit"].__setitem__("results", 5), "E4-SHAPE"),
+    ("endpoints.from not a list",
+     lambda r: r["operator_audit"]["results"]["wp01_quarry_debug_op_01"]
+     ["endpoints"].__setitem__("from", 5), "E4-REFS"),
 ])
 def test_a_malformed_shape_is_named_never_a_traceback(label, mutate, rule):
     """`2` is reserved for an unreadable FILE; `1` must NAME the failing rule.
@@ -941,19 +958,18 @@ def test_checker_rejects_a_duplicate_that_contradicts_its_graded_row():
     """Two copies of one claim that disagree is a self-contradicting artifact
     whichever one is right — so the duplicate is cross-checked, not trusted."""
     receipt = _receipt()
-    receipt["session_results"] = [{
-        "session_id": "s1",
-        "planted_operators": [{
-            "id": "wp01_quarry_debug_op_01",
-            "verdict": "edge_correct",
-            "edge_correct": False,          # contradicts the graded row
-            "expected_kind": "SUPPORTS",
-        }],
-    }]
-    assert "E4-NUMERATOR" in _failures(_check(receipt))
+    # The duplicate carries EVERY graded row, so the only refusal this fixture
+    # can earn is the contradiction itself (not the coverage arm below).
+    rows = _session_results([_edge(f"wp01_quarry_debug_op_{i:02d}") for i in (1, 2)])
+    rows[0]["planted_operators"][0]["edge_correct"] = False  # contradicts the row
+    receipt["session_results"] = rows
+    result = _check(receipt)
+    assert "E4-NUMERATOR" in _failures(result)
+    assert any("two answers" in r["detail"] for r in result["rules"]
+               if not r["ok"]), _failures(result)
 
 
-def test_checker_refuses_a_receipt_whose_description_is_not_a_number():
+def test_checker_refuses_a_receipt_whose_endpoint_refs_are_blank():
     """A blank endpoint ref is not ref evidence.
 
     `pre_ref`/`post_ref` are the #4716 two-id-space proof: emptied, the receipt
@@ -973,23 +989,89 @@ def test_checker_refuses_a_duplicate_entry_that_is_not_an_object():
     with no rule lets any shape error defeat the cross-check entirely."""
     receipt = _receipt()
     receipt["session_results"] = [{"session_id": "s1", "planted_operators": [5]}]
-    assert "E4-NUMERATOR" in _failures(_check(receipt))
+    result = _check(receipt)
+    assert "E4-NUMERATOR" in _failures(result)
+    assert any("entry is not an object" in r["detail"] for r in result["rules"]
+               if not r["ok"]), _failures(result)
 
 
 def test_checker_refuses_a_duplicate_naming_an_edge_the_rows_do_not_carry():
     """The duplicate and the graded rows must be the SAME edge set: a duplicate
     naming an unknown edge is a second copy of a different claim."""
     receipt = _receipt()
-    receipt["session_results"] = [{
-        "session_id": "s1",
-        "planted_operators": [{
-            "id": "ffffffffff-abcdefabcdef",
-            "verdict": "from_content_missing",
-            "edge_correct": False,
-            "expected_kind": "SUPPORTS",
-        }],
-    }]
-    assert "E4-NUMERATOR" in _failures(_check(receipt))
+    rows = _session_results([_edge(f"wp01_quarry_debug_op_{i:02d}") for i in (1, 2)])
+    # ...every graded row is still covered, so the unknown id is the ONLY defect.
+    rows[0]["planted_operators"].append({
+        "id": "ffffffffff-abcdefabcdef",
+        "verdict": "from_content_missing",
+        "edge_correct": False,
+        "expected_kind": "SUPPORTS",
+    })
+    receipt["session_results"] = rows
+    result = _check(receipt)
+    assert "E4-NUMERATOR" in _failures(result)
+    assert any("are not the same edge set" in r["detail"] for r in result["rules"]
+               if not r["ok"]), _failures(result)
+
+
+def test_checker_refuses_a_duplicate_whose_rows_are_all_emptied_in_place():
+    """The duplicate must COVER the graded rows, not merely be present.
+
+    Emptying every `planted_operators` list in place leaves the key and the
+    seven session entries in place — so the absent/empty arm is satisfied —
+    while reducing the cross-check to comparing nothing: the receipt certified
+    `EVIDENCE VALID` with 0 of its graded rows cross-checked (#9618, P2).
+    """
+    receipt = _receipt()
+    for entry in receipt["session_results"]:
+        entry["planted_operators"] = []
+    result = _check(receipt)
+    assert result["ok"] is False
+    assert any("graded rows" in r["detail"] for r in result["rules"]
+               if not r["ok"]), _failures(result)
+
+
+def test_checker_refuses_a_duplicate_that_keeps_only_the_agreeing_rows():
+    """A subset lets the artifact CHOOSE which rows get cross-checked.
+
+    The tamper: desync one graded row from its duplicate (a verdict the
+    duplicate still carries correctly), then DROP that duplicate entry. The
+    surviving entry agrees, so nothing contradicts — and the receipt certified
+    the desynced row without ever comparing it (#9618, P2).
+    """
+    receipt = _receipt()
+    # A non-content verdict keeps the published numerators binding to their
+    # rows, so the coverage arm is the only thing that can refuse this.
+    receipt["operator_audit"]["results"]["wp01_quarry_debug_op_02"][
+        "verdict"] = "no_form"
+    entry = receipt["session_results"][0]
+    entry["planted_operators"] = [
+        d for d in entry["planted_operators"] if d["id"] != "wp01_quarry_debug_op_02"
+    ]
+    result = _check(receipt)
+    assert result["ok"] is False, _failures(result)
+    assert any("graded rows" in r["detail"] for r in result["rules"]
+               if not r["ok"]), _failures(result)
+
+
+@pytest.mark.parametrize("planted", [15.0, True])
+def test_checker_refuses_a_denominator_that_is_not_an_integer(planted):
+    """`15.0` and `true` are not denominators.
+
+    Both satisfy `planted > 0`, so a checker that only compares magnitudes
+    accepts them — and `E4-COVERAGE` and the absent-duplicate arm are both
+    gated on `isinstance(planted, int)`, so a float denominator silently
+    disables the coverage cross-check instead of being refused. The real
+    receipt's `planted` is `15` (JSON int), so this is a tamper, not a shape
+    the runner emits (#9618 review, P2).
+    """
+    receipt = _receipt()
+    receipt["operator_audit"]["planted"] = planted
+    result = _check(receipt)
+    assert result["ok"] is False
+    assert "E4-DENOM" in _failures(result), _failures(result)
+    assert any("expected an int denominator" in r["detail"] for r in result["rules"]
+               if not r["ok"]), _failures(result)
 
 
 def test_checker_refuses_a_denominator_it_cannot_verify(monkeypatch):
