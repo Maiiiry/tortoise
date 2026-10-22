@@ -977,8 +977,8 @@ def test_checker_refuses_a_receipt_whose_endpoint_refs_are_blank():
     cannot show. Without the non-empty arm the checker certifies it.
     """
     receipt = _receipt()
-    ref = receipt["operator_audit"]["results"]["wp01_quarry_debug_op_01"]
-    ref = ref["endpoints"]["from"][0]
+    ref = receipt["operator_audit"]["results"]["wp01_quarry_debug_op_01"] \
+        ["endpoints"]["from"][0]
     ref["pre_ref"] = ""
     ref["post_ref"] = ""
     assert "E4-REFS" in _failures(_check(receipt))
