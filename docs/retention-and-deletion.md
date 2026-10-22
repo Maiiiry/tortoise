@@ -263,6 +263,30 @@ existing delete paths.
 **not** user content and **not** a deletion promise, so it is exempt from the
 "link or be a named constant" rule.
 
+**The purge rides the read surface (#9576).** The retention pass is
+interval-gated and LAZY — it runs from `TortoiseSDK.poll_events`, i.e. from the
+`tortoise_events_poll` MCP tool, which is `readOnlyHint: true` and needs only
+`graphs:read`. So a read-only key can cause a `DETACH DELETE`. That is
+deliberate and recorded, not an oversight:
+
+> **OVERRIDES:** `readOnlyHint: true` ⇒ the call deletes nothing — the poll
+> purges `:GraphEvent` rows the store owns, on a timer, idempotently.
+
+The alternatives are worse for the caller: declaring a write would take a
+subscription feed away from `graphs:read` keys, and dropping the read hint would
+put a confirmation prompt in front of every poll of a tool agents poll in a loop.
+The delete is confined to the store's own bookkeeping (nothing here is replayed
+by a rebuild) and is idempotent, which is what keeps the departure narrow.
+
+The decision is checkable: the carve-out is declared in
+`tests/tool_surface_capabilities.py` → `RETENTION_CARVEOUTS` (with the
+out-of-boundary mutation it covers, `OUT_OF_BOUNDARY_MUTATORS`), the reason sits
+at the registry entry in `tortoise/tool_registry.py`, and
+`TestReadTierCannotHideAnOutOfBoundaryWrite` fails if the poll stops claiming the
+read hint, stops reaching the purge, or if any OTHER read-hinted tool reaches an
+undeclared out-of-boundary mutation. Re-tier it deliberately (and delete the
+carve-out with it) or not at all.
+
 ## A different axis: OAuth credential hygiene
 
 `tortoise/oauth.py` `OAUTH_ACCESS_RETENTION_S` / `OAUTH_REFRESH_RETENTION_S` /
