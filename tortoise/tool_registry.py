@@ -22,7 +22,7 @@ registrations from this registry. HTTP_ALLOWED is derived — zero manual sync.
 """
 from __future__ import annotations  # noqa: I001
 
-from dataclasses import dataclass, replace, field  # noqa: F401
+from dataclasses import dataclass, replace, field
 from typing import Any, Callable, Optional  # noqa: UP035
 
 from mcp.types import ToolAnnotations
@@ -38,60 +38,109 @@ class RestSpec:
     status_code: int = 200
 
 
-#: The one classification axis a tool declares (#4122 owner ruling).
-#: `writes`, `readOnlyHint` and `idempotentHint` are DERIVED from it — see
-#: `ToolDefinition.__post_init__` — so a permission, a client hint and a scope
-#: cannot drift apart again.
-RISK_LEVELS: tuple[str, ...] = ("read", "maintenance", "write", "destructive", "admin")
-#: Risks that require `graphs:write` (and stop being metered as reads).
-WRITE_RISKS: frozenset[str] = frozenset({"write", "destructive", "admin"})
+# ── #4122: the RISK axis — the single declared statement about a tool ──────
+#
+# Before #4122 a tool's client hints (`annotations`) and its permission (`writes`)
+# were INDEPENDENT fields, so they could disagree — and three tools did: they
+# declared `readOnlyHint: true` (which is what makes a client auto-approve a call
+# without review) while their handlers recompute-and-store into the tenant graph.
+# A `graphs:read-only` key could therefore change customer data through a call it
+# had been told was safe to make unreviewed.
+#
+# ⚠️ OVERRIDES: NIST SP 800-53 AC-6's read-low / write-high default — a tool is
+#    classified by USER-PERCEIVED RISK, not by whether its handler writes, so a
+#    confined, idempotent, derived-value write is permissioned as read
+#    (`maintenance`) instead of being promoted to a write. Owner decision,
+#    #4122 comment 2026-10-21.
+#
+# The axis is `risk`; every client hint and the permission are DERIVED from it, so
+# a hint, a permission and a scope can never drift apart again:
+#
+#     risk = read | maintenance | write | destructive | admin
+#       ├─ writes        (needs graphs:write)  ← risk in {write, destructive, admin}
+#       └─ readOnlyHint  (client auto-approve) ← risk == read
+#
+# `maintenance` is the class PostgreSQL 16 added as a privilege of its own
+# (`MAINTAIN`: VACUUM/ANALYZE/REINDEX run under definer rights, so the caller needs
+# only read). It is neither "read" nor a user write, which is why a 2-state
+# read/write flag could not express it. A maintenance tool KEEPS `graphs:read` and
+# stays counted as a read by read-velocity metering — promoting it to `writes`
+# would hide an expensive recompute from the alerting that exists to catch it.
+RISK_READ = "read"
+RISK_MAINTENANCE = "maintenance"
+RISK_WRITE = "write"
+RISK_DESTRUCTIVE = "destructive"
+RISK_ADMIN = "admin"
+
+RISK_CLASSES: frozenset[str] = frozenset({
+    RISK_READ, RISK_MAINTENANCE, RISK_WRITE, RISK_DESTRUCTIVE, RISK_ADMIN,
+})
+
+# The risks that require `graphs:write`.
+WRITE_RISKS: frozenset[str] = frozenset({
+    RISK_WRITE, RISK_DESTRUCTIVE, RISK_ADMIN,
+})
+
+
+def risk_writes(risk: str) -> bool:
+    """True when a caller needs `graphs:write` to call a tool of this risk."""
+    if risk not in RISK_CLASSES:
+        raise ValueError(f"unknown tool risk {risk!r}; expected one of {sorted(RISK_CLASSES)}")
+    return risk in WRITE_RISKS
+
+
+def risk_annotations(risk: str, *, destructive_hint: bool = False,
+                     idempotent_hint: bool = False) -> ToolAnnotations:
+    """The client hints a risk class implies — the ONLY way hints are produced.
+
+    `readOnlyHint` is the load-bearing one: clients auto-approve a call whose
+    `readOnlyHint` is the literal Boolean `true`, so it MUST be `risk == read` and
+    never "this handler only read something, mostly".
+
+    `destructive_hint` is per-entry and is OR'd with the class, never replaced by
+    it: `tortoise_create_point` is a WRITE that is genuinely idempotent (dedup
+    returns the existing Point), and splitting the 48 write entries into
+    `write` / `destructive` / `admin` is a separate product pass (#4122 completion
+    criterion 1) that must not silently strip a `destructiveHint` agents rely on to
+    demand human confirmation (measured today: 39 entries declare it, 0 declare
+    `risk=destructive`).
+
+    `idempotent_hint` is OR'd the same way, so it can only RAISE the claim,
+    never lower it: for `maintenance` it is inoperative (the class already implies
+    idempotent, and an entry cannot clear it), while for `read`/`write` it is
+    honoured. That asymmetry is deliberate and is recorded here rather than left
+    to be discovered: the decision's table derives `idempotentHint` from
+    `risk == maintenance`, and the 9 `_idem()` write entries keep `True` via this
+    flag because a pinned assertion (`tests/test_tool_registry.py`, create_point)
+    records it as their honest reading — dropping it would only make clients more
+    conservative, never less, which is why the superset is the safe side.
+    """
+    # a non-write may be idempotent, but it may never claim to be destructive
+    if destructive_hint and not risk_writes(risk):
+        raise ValueError(f"risk {risk!r} cannot declare destructiveHint")
+    return ToolAnnotations(
+        readOnlyHint=risk == RISK_READ,
+        destructiveHint=bool(destructive_hint or risk == RISK_DESTRUCTIVE),
+        idempotentHint=bool(idempotent_hint or risk == RISK_MAINTENANCE),
+    )
 
 
 @dataclass(frozen=True)
 class ToolDefinition:
-    """One entry per SDK-exposed operation.
-
-    `risk` is the ONLY classification a lane declares. Everything a caller
-    observes about it is derived, in `__post_init__`:
-
-    ```
-    risk: read | maintenance | write | destructive | admin
-       ├─ writes        (needs graphs:write)  ← derived: write | destructive | admin
-       ├─ readOnlyHint                        ← derived: risk == read
-       └─ idempotentHint                      ← forced TRUE for maintenance
-    ```
-
-    ⛔ OVERRIDES: NIST SP 800-53 AC-6's read-low / write-high default — a tool
-    is classified by **user-perceived risk**, not by whether its handler writes,
-    so a confined, idempotent, derived-value write is permissioned as read
-    (`maintenance`) and stops declaring `readOnlyHint: true` (#4122, owner
-    ruling 2026-10-21). The `OVERRIDES:` marker lives here, next to the field,
-    per the house rule — not only on the issue.
-
-    ⚠️ `idempotentHint` is the one hint NOT fully derived from `risk`: a literal
-    `readOnlyHint ← risk == read` / `idempotentHint ← risk == maintenance`
-    reading would STRIP `idempotentHint` from idempotent writers (e.g.
-    `tortoise_create_point`, whose `dedup=True` path is idempotent), changing
-    client retry semantics that the #4122 ruling never discusses. So the hint
-    is derived as `risk == "maintenance" or <what the entry declares>`.
-    """
+    """One entry per SDK-exposed operation."""
     name: str                    # e.g. "tortoise_create_point"
     id: str                      # immutable stable identity — `name` may change; a
                                  # retired id is reserved once a ledger exists (#3883)
     description: str             # Docstring for MCP + OpenAPI
-    annotations: ToolAnnotations  # readOnlyHint, destructiveHint, idempotentHint
     http_policy: bool            # True = exposed on HTTP surfaces
     sdk_method: str              # Attribute name on TortoiseSDK, e.g. "create_point"
-    risk: str                    # THE declaration (#4122): read|maintenance|write|
-                                 # destructive|admin. `writes`, `readOnlyHint` and
-                                 # `idempotentHint` are derived from it — never
-                                 # hand-set, so they cannot contradict it.
-                                 # ⛔ REQUIRED, deliberately no default: a defaulted
-                                 # `"read"` is the fail-open that PRODUCED #4122
-                                 # (nobody decided `packs_list` was read-only — the
-                                 # default did), and no guard can tell "declared
-                                 # read" from "forgot to declare". Omission is a
-                                 # TypeError at import instead.
+    # ── #4122: the declared axis. Hints and permission are DERIVED below ──
+    # ⛔ REQUIRED, with NO default (review P1): a default of `read` would make a
+    # new entry that forgets the axis a silent READ — `readOnlyHint: true`, so a
+    # client auto-approves it, and `writes: false`, so a `graphs:read` key reaches
+    # it. Before #4122 `annotations` was required, so forgetting it was a
+    # TypeError at import; omission must stay just as loud.
+    risk: str                    # read | maintenance | write | destructive | admin
     handler_override: Optional[Callable] = None  # For raw-Cypher REST ops  # noqa: UP045
     rest_spec: Optional[RestSpec] = None         # For SDK-backed REST ops  # noqa: UP045
     group: str = "memory"        # Curation group (#523): memory|reasoning|graph|sessions|sources|journal|admin|onboarding
@@ -100,41 +149,30 @@ class ToolDefinition:
                                  # self-host uses filesystem packs dir + CLI)
     retired_use_instead: Optional[str] = None  # noqa: UP045  # #3883: non-None ONLY
                                  # on a retired entry — the call that replaces this name.
+    destructive_hint: bool = False  # destructiveHint for a write that also destroys
+    idempotent_hint: bool = False   # idempotentHint for a write that is idempotent
+    # Derived — `init=False`, so no call site can hand-set a hint that disagrees
+    # with `risk` (that independence is the #4122 defect).
+    writes: bool = field(init=False, default=False)
+    annotations: ToolAnnotations = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        """Derive `writes`/`readOnlyHint`/`idempotentHint` from `risk` (#4122).
-
-        This is the defect's root fix, not a tidy-up: before it, `annotations`
-        and `writes` were INDEPENDENT declarations, which is how three tools
-        came to advertise `readOnlyHint: true` (clients auto-approve on that
-        hint) while their handlers wrote to the tenant graph.
-
-        A frozen dataclass cannot assign, so the corrected annotations are put
-        back through `object.__setattr__`. `dataclasses.replace` re-runs this,
-        which is idempotent.
-        """
-        if self.risk not in RISK_LEVELS:
-            raise ValueError(
-                f"{self.name}: unknown risk {self.risk!r} — one of {RISK_LEVELS} "
-                f"(#4122: `risk` is the single classification axis)")
-        object.__setattr__(self, "annotations", self.annotations.model_copy(update={
-            "readOnlyHint": self.risk == "read",
-            "idempotentHint": self.risk == "maintenance" or self.annotations.idempotentHint,
-        }))
-
-    @property
-    def writes(self) -> bool:
-        """DERIVED write permission — a caller needs `graphs:write` (#4122).
-
-        `WRITE_TOOL_NAMES` is the derived view of this property (#4170), so the
-        scope gate and the read-velocity meter read the SAME statement the risk
-        declares. A `maintenance` tool therefore keeps `graphs:read` and stays
-        metered as a read, while no longer claiming `readOnlyHint: true`.
-        """
-        return self.risk in WRITE_RISKS
+        # `frozen=True`, so the derived fields are set through the instance dict.
+        object.__setattr__(self, "writes", risk_writes(self.risk))
+        object.__setattr__(self, "annotations", risk_annotations(
+            self.risk,
+            destructive_hint=self.destructive_hint,
+            idempotent_hint=self.idempotent_hint,
+        ))
 
 
 # ── Shorthand constructors ────────────────────────────────────────
+# ⚠️ #4122: the registry no longer declares hints — every entry declares `risk`
+# and the hints are DERIVED (`ToolDefinition.__post_init__`). `_ro()`/`_rw()`
+# remain only as fixtures for the capability guards' probe entries, which
+# construct a hint SHAPE to simulate a rogue tool; a registry entry that used one
+# would have no way to declare its risk, so do not reintroduce them there.
+# (`_idem()` is gone: it had no caller once the registry migrated.)
 
 def _ro() -> ToolAnnotations:
     return ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=False)
@@ -142,23 +180,6 @@ def _ro() -> ToolAnnotations:
 
 def _rw() -> ToolAnnotations:
     return ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False)
-
-
-def _idem() -> ToolAnnotations:
-    return ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
-
-
-def _maint() -> ToolAnnotations:
-    """`risk="maintenance"` annotations (#4122): NOT a plain read — it writes a
-    confined, idempotent, derived value on a self-heal path — but also not a
-    user write: no `destructiveHint`, and repeatable.
-
-    `readOnlyHint`/`idempotentHint` are re-derived from `risk` by
-    `ToolDefinition.__post_init__`; this constructor exists so a maintenance
-    entry reads like the surrounding `_ro()`/`_rw()`/`_idem()` ones and so the
-    fact that it is NOT `_ro()` is visible at the call site.
-    """
-    return ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True)
 
 
 # ── Registry Entries ────────────────────────────────────────────
@@ -191,13 +212,13 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_create_point",
         id="surface.create_point",
-        risk="write",
         description="Create a Point node (statement, decision, vision, hypothesis, etc.). "
                     "dedup=True (default): idempotent — returns existing Point if content matches. "
                     "Declaring extractedFrom materializes that :Source and links it (#8171); "
                     "a fresh write with no source and no provenance is advised (advisories: "
                     "[{code: no_source, node_id, message}] — advisory only, never a block).",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="create_point",
         rest_spec=RestSpec(method="POST", path="/v1/points",
@@ -207,67 +228,61 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_query",
         id="surface.query",
-        risk="read",
         description="Query points by pointKind and/or property filters — structural exact-match "
                     "retrieval for known shapes (Epic #888: paginated_query + query_points_by_tag "
                     "merged in). Pagination via offset=/limit= (or 1-based page=); tag= filters "
                     "Points by TAGGED edge; include_retracted=True surfaces tombstones. For "
                     "semantic relevance use tortoise_search; for a single known ID use "
                     "tortoise_get_point.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="query",
     ),
     ToolDefinition(
         name="tortoise_paginated_query",
         id="surface.paginated_query",
-        risk="read",
         description="DEPRECATED (Epic #888) — thin alias for tortoise_query(offset=, limit=). "
                     "Kept for one release; will be removed in the next release — migrate now.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="paginated_query",
     ),
     ToolDefinition(
         name="tortoise_check_structure",
         id="surface.check_structure",
-        risk="read",
         description="Check Gate 0→4 chain integrity (orphans, dangling refs).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="check_structure",
     ),
     ToolDefinition(
         name="tortoise_validate_domain",
         id="surface.validate_domain",
-        risk="read",
         description="Validate a domain's ontology integrity (issue #405) — advisory, read-only. "
                     "Runs the domain's graph-surface rules (orphan useCase, dangling refs, "
                     "draft hygiene) and returns enriched, actionable violations "
                     "({rule, kind, ref, message, fix}) + drift warnings. Never modifies "
                     "the graph; violations are warnings, not blocks.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="validate_domain",
     ),
     ToolDefinition(
         name="tortoise_summarize_structure",
         id="surface.summarize_structure",
-        risk="read",
         description="Structure summary — points on the graph across ALL point "
                     "kinds (#2205). Returns {total, operators, gate0_jtbds.."
                     "gate4_requirements, gate_total}: total counts non-operator "
                     "Points of every kind (not just the product-strategy gates), "
                     "operators is reported separately, gate keys stay the "
                     "gate-kind breakdown, gate_total is the gate subtotal.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="summarize_structure",
     ),
     ToolDefinition(
         name="tortoise_audit",
         id="surface.audit",
-        risk="read",
         description="Audit graph wiring quality — 8 checks: missing sourceKind "
                     "(point-level legacy + Source-level canonical), missing sourceDate, "
                     "superseded points without a CORRECTS edge, live IMPL/NAND edges "
@@ -276,34 +291,31 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "edges. Returns structured JSON: per-check counts (uncapped) + "
                     "capped samples + summary + exit_code (0 clean, 1 issues). "
                     "point_kinds: optional pointKind list to scope the audit.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="audit",
     ),
     ToolDefinition(
         name="tortoise_list_pointkinds",
         id="surface.list_pointkinds",
-        risk="read",
         description="List all pointKinds present in the graph with counts. What EXISTS.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_pointkinds",
     ),
     ToolDefinition(
         name="tortoise_list_sources",
         id="surface.list_sources",
-        risk="read",
         description="List all Sources with point counts. Where data came FROM.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_sources",
     ),
     ToolDefinition(
         name="tortoise_list_namespaces",
         id="surface.list_namespaces",
-        risk="read",
         description="List installed pack namespaces.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_namespaces",
     ),
@@ -311,60 +323,51 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_list_batch",
         id="surface.list_batch",
-        risk="read",
         description="Audit one ingest bundle: the stamped artifacts (Points "
                     "created or adopted via dedup + direct edges) carrying the "
                     "given batch_id. Entities/sources are out of stamp scope; "
                     "editorial supersede artifacts are outside audit. "
                     "Completeness holds across rebuild_all.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_batch",
     ),
     ToolDefinition(
         name="tortoise_list_batches",
         id="surface.list_batches",
-        risk="read",
         description="Batch discovery — the most recent distinct ingest batch_ids "
                     "with their point/direct-edge counts (ordered by newest "
                     "stamp, capped at limit, default 20).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_batches",
     ),
     ToolDefinition(
         name="tortoise_packs_list",
         id="surface.packs_list",
-        # #4122 owner ruling: listing can self-heal the PackInstall record, so it
-        # is NOT a plain read — `maintenance` keeps graphs:read (and the tool)
-        # and stops claiming readOnlyHint:true.
-        risk="maintenance",
         description="List this team's active packs (#318): the shared pack catalog "
                     "joined with the tenant graph's PackInstall activation records. "
                     "Read-only; empty result when nothing is installed (existence "
                     "masking — another tenant's packs are never observable).",
-        # ⚠️ The "Read-only;" wording above is STALE and known-wrong (#4122): a
-        # listing may repair the PackInstall record it finds inconsistent, which
-        # is why this entry is `risk="maintenance"`. Left untouched here because
-        # changing a SERVED description needs a `surface_manifest.py cut`, and a
-        # re-cut today drags 282 unrelated `used_by`/`reason` lines from a
-        # pre-existing derivation skew (measured on pristine main; #9561 tracks
-        # both the wording and the skew).
-        annotations=_maint(),
+        # #4122 owner ruling: the handler's self-heal MAY repair the tenant's
+        # PackInstall record, so this is not a read of user state — but the
+        # permission class is `maintenance`, not `write`: it keeps `graphs:read`
+        # (no integration loses the tool) and it stops declaring readOnlyHint.
+        risk="maintenance",
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (calls pack_state.get_tenant_packs)
     ),
     ToolDefinition(
         name="tortoise_pack_install",
         id="surface.pack_install",
-        risk="write",
         description="Install a custom expansion pack on the HOSTED surface (#1935): "
                     "validates against the shared registry + tenant policy "
                     "(reserved starter namespace, ontology-only v1), stores the "
                     "manifest in the tenant graph and activates it. Deployment- "
                     "gated: on self-host this is an actionable stub (use the "
                     "filesystem packs dir + tortoise pack CLI).",
-        annotations=_rw(),  # C5 #2114 (re-review P2): MERGEs manifests/installs — a write
+        risk="write",  # C5 #2114 (re-review P2): MERGEs manifests/installs — a write
+        destructive_hint=True,
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (calls pack_manifest_store.upsert_tenant_manifest)
         group="admin",
@@ -374,19 +377,17 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_list_tags",
         id="surface.list_tags",
-        risk="read",
         description="List all Tag names with count of tagged Points. Where tags are USED.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_tags",
     ),
     ToolDefinition(
         name="tortoise_query_points_by_tag",
         id="surface.query_points_by_tag",
-        risk="read",
         description="DEPRECATED (Epic #888) — thin alias for tortoise_query(tag=). "
                     "Kept for one release; will be removed in the next release — migrate now.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="query_points_by_tag",
     ),
@@ -394,18 +395,16 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_get_point",
         id="surface.get_point",
-        risk="read",
         description="Get a single Point by ID. Returns all properties, or empty dict.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="get_point",
     ),
     ToolDefinition(
         name="tortoise_suggest_entry_points",
         id="surface.suggest_entry_points",
-        risk="read",
         description="Entity resolution — NL query → matching entities from the graph.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="suggest_entry_points",
     ),
@@ -413,12 +412,11 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_search",
         id="surface.search",
-        risk="read",
         description="Hybrid semantic search — FTS + vector + structural RRF fusion with EP "
                     "confidence annotation. Use when matching by MEANING (natural-language "
                     "query); for exact structural/filter queries use tortoise_query. "
                     "Full-scan mode: omit query, set kind → all Points of kind.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="tortoise_fts_query",
         rest_spec=RestSpec(method="GET", path="/v1/search"),
@@ -426,19 +424,17 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_expand_relationships",
         id="surface.expand_relationships",
-        risk="read",
         description="Full relationship payload for ONE Point, incl. each related point's "
                     "content (the expand side of the #1353 list/expand split — search "
                     "returns bounded state entries; use this to read a neighbor's full "
                     "text on demand).",
-        annotations=_ro(),
+        risk="read",
         http_policy=False,
         sdk_method="expand_relationships",
     ),
     ToolDefinition(
         name="tortoise_recall",
         id="surface.recall",
-        risk="read",
         description="Epistemic recall — four intents via mode (preset + override). "
                     "mode='state' (UC1): current high-confidence state — "
                     "multiplicative confidence gate "
@@ -459,7 +455,7 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "returns {nodes, edges, stats}; needs seed (node id, Source url, "
                     "or topic text); depth 1-5, completeness core|full. "
                     "mode='custom': raw params, full control.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="recall_state",
     ),
@@ -467,58 +463,56 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_mine_conversations",
         id="surface.mine_conversations",
-        risk="write",
         description="Mine agent conversations (single transcript or corpus "
                     "batch) into the graph — extraction, entity reification, "
                     "content dedup, temporal wiring, W-3 batch gate. Batch "
                     "per-file failures reported non-fatally in 'errors'. "
                     "WRITES to the graph; corpus mode walks the server "
                     "filesystem — stdio/CLI only (excluded from tenant HTTP).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=False,
         sdk_method="mine_corpus",
     ),
     ToolDefinition(
         name="tortoise_list_dedup_candidates",
         id="surface.list_dedup_candidates",
-        risk="read",
         description="Review queue for dedup/temporal candidates "
                     "(candidate_type=content|temporal|entity).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_dedup_candidates",
     ),
     ToolDefinition(
         name="tortoise_approve_merge",
         id="surface.approve_merge",
-        risk="write",
         description="Review a dedup/temporal candidate — action=merge|reject. "
                     "Wiring deferred to promotion for live priors. WRITES "
                     "review flags + wires edges (idempotent for repeats).",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="approve_merge",
     ),
     ToolDefinition(
         name="tortoise_promote_point",
         id="surface.promote_point",
-        risk="write",
         description="Reviewer-gated draft→live promotion — the only path a "
                     "draft extraction Point may go live (quarantine lock, "
                     "R16 operator promotion, deferred dedup/temporal wiring). "
                     "WRITES status + wires edges.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="promote_point",
     ),
     ToolDefinition(
         name="tortoise_belief_timeline",
         id="surface.belief_timeline",
-        risk="read",
         description="Dated, ordered belief chain for a topic — decision "
                     "Points with validFrom, NAND/CORRECTS links, superseded "
                     "priors visible.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="belief_timeline",
     ),
@@ -526,9 +520,6 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_compute_confidence",
         id="surface.compute_confidence",
-        # #4122 owner ruling: the handler persists the computed confidence
-        # (`SET n.confidence`) — `maintenance`, not a plain read.
-        risk="maintenance",
         description="Compute confidence via EP belief propagation. "
                     "Returns {iterations, converged, confidences}. "
                     "#395: no-arg (no factors/anchors) runs LOCAL EP over "
@@ -542,51 +533,52 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "CalibrationError on uncalibrated graphs. Pass "
                     "require_calibration=False to run on topology alone "
                     "(explicit opt-out).",
-        # #4122 owner ruling: the handler persists the computed confidence
-        # (`SET n.confidence`) — `maintenance`, not a plain read.
-        annotations=_maint(),
+        # #4122 owner ruling: persists `SET n.confidence` — recompute-and-store is
+        # `maintenance` (PostgreSQL's MAINTAIN privilege), not `read` and not a
+        # user write. Keeps `graphs:read` and stays read-velocity metered; stops
+        # declaring readOnlyHint.
+        risk="maintenance",
         http_policy=True,
         sdk_method="compute_confidence",
     ),
     ToolDefinition(
         name="tortoise_set_point_baseline",
         id="surface.set_point_baseline",
-        risk="write",
         description="Set Beta prior evidence for a claim.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="set_point_baseline",
     ),
     ToolDefinition(
         name="tortoise_get_confidence",
         id="surface.get_confidence",
-        # #4122 owner ruling: the lazy dream path WRITES n.confidence (#1157) —
-        # `maintenance`, not a plain read.
-        risk="maintenance",
         description="Get EP confidence for a claim: {mean, variance, alpha, beta}.",
-        annotations=_maint(),
+        # #4122 owner ruling: the lazy `dream(dirty_only=True)` path WRITES
+        # n.confidence (#1157), so this is `maintenance` — refreshes a derived
+        # value under read permission instead of claiming to be a pure read.
+        risk="maintenance",
         http_policy=True,
         sdk_method="get_confidence",
     ),
     ToolDefinition(
         name="tortoise_calibrate_summary",
         id="surface.calibrate_summary",
-        risk="read",
         description="Audit graph calibration state. Returns per-point guidance.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="calibrate_summary",
     ),
     ToolDefinition(
         name="tortoise_dream",
         id="surface.dream",
-        risk="write",
         description="Run EP stabilization (dreaming, #85). "
                     "Default: incremental dirty subgraph. Set full=True for whole-graph. "
                     "mode (epic 903): explicit strategy override "
                     "{\"local\", \"stale-first\", \"full\"} — wins over full; "
                     "budget: per-pass operator cap.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         # #329: whole-graph EP is CPU-heavy — tenant MCP surface excluded
         # (stdio/operator only). REST /v1/dream remains tenant-reachable but is
         # separately budgeted at MAX_DREAM_FULL_PER_HOUR (hosted_api).
@@ -597,12 +589,11 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_dream_health",
         id="surface.dream_health",
-        risk="read",
         description="Dream observability (epic 903-C7): zero-output "
                     "silent-death alarm verdict + health record (last pass, "
                     "coverage, failure rate, region_attempts, warm-start "
                     "savings). Embedded call-triggered evaluator.",
-        annotations=_ro(),
+        risk="read",
         http_policy=False,
         sdk_method="dream_health_check",
         rest_spec=RestSpec(method="GET", path="/v1/dream/health"),
@@ -611,9 +602,9 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_update_point",
         id="surface.update_point",
-        risk="write",
         description="Update properties on a Point. Safe — modifies one Point only.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="update_point",
     ),
@@ -621,42 +612,41 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_create_operator",
         id="surface.create_operator",
-        risk="write",
         description="Create an operator connecting Points. "
                     "op_type: IMPL, NAND, composedOf, decomposesInto, contains, wraps. "
                     "semantics: the Layer-2 meaning (addresses, supports, refutes, "
                     "mutuallyExclusive, hasPart, related, …) — it resolves the direction.",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="create_operator",
     ),
     ToolDefinition(
         name="tortoise_annotate_operator",
         id="surface.annotate_operator",
-        risk="write",
         description="Annotate an operator Point with structured epistemic dimensions "
                     "(bias, precision, consistency, directness).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="annotate_operator",
     ),
     ToolDefinition(
         name="tortoise_get_operator",
         id="surface.get_operator",
-        risk="read",
         description="Get an operator Point by ID. Returns all properties including "
                     "annotation dimensions.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="get_point",  # get_operator uses get_point + is_operator check
     ),
     ToolDefinition(
         name="tortoise_mitigate_operator",
         id="surface.mitigate_operator",
-        risk="write",
         description="Create a mitigation Point that modulates an operator's edge strength. "
                     "Idempotent — second call updates existing mitigation.",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="mitigate_operator",
     ),
@@ -664,22 +654,22 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_file_decision",
         id="surface.file_decision",
-        risk="write",
         description="File a simple decision directly to the graph. "
                     "Creates decision + options + evidence + IMPL edges atomically.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="file_decision",
     ),
     ToolDefinition(
         name="tortoise_file_human_approval",
         id="surface.file_human_approval",
-        risk="write",
         description="File a human approval of a planning artifact to the graph. "
                     "Creates Event (eventKind: humanApproval) + decision Point "
                     "(pointKind: humanApproval) + unidirectional IMPL fan-out "
                     "(label approvedBy) so dependent claims strengthen.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="file_human_approval",
     ),
@@ -687,34 +677,34 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_delete_point",
         id="surface.delete_point",
-        risk="destructive",
         description="Delete a Point. DESTRUCTIVE — requires human confirmation. Cannot be undone. "
                     "dry_run=True previews the blast radius (the point and every edge that "
                     "would be removed) and changes nothing.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="delete_point_wrapped",
     ),
     ToolDefinition(
         name="tortoise_invalidate",
         id="surface.invalidate",
-        risk="write",
         description="Mark a Point outdated with a CORRECTS edge from the correcting Point. "
                     "dry_run=True previews the one-point transition + one edge and changes nothing.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="invalidate_point",
     ),
     ToolDefinition(
         name="tortoise_supersede",
         id="surface.supersede",
-        risk="write",
         description="Atomically replace old Point with new — CORRECTS edge + outdated flag. "
                     "transfer_edges=True (default): full supersede — all edges move from "
                     "old to new. transfer_edges=False: invalidate behavior — outdated flag "
                     "+ CORRECTS edge only, no edge transfer. "
                     "dry_run=True previews exactly which edges would transfer and changes nothing.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="supersede",
     ),
@@ -722,7 +712,6 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_events_poll",
         id="surface.events_poll",
-        risk="read",
         description="Poll graph/claim events after an opaque cursor (at-least-once). "
                     "Returns {events, next_cursor}. Event types: 12 registered claim "
                     "types (PointAdded, OperatorAdded, PointRetracted, PointSuperseded, "
@@ -731,19 +720,19 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "PointRevised reaches the store, and the response adds `changes` "
                     "(per-claim before→after deltas), only while TORTOISE_CHANGE_FEED "
                     "is enabled.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="poll_events",
     ),
     ToolDefinition(
         name="tortoise_retract_point",
         id="surface.retract_point",
-        risk="write",
         description="Tombstone-retract a Point — status='retracted' (point stays "
                     "in graph, excluded from default surfaces). Terminal; cannot "
                     "retract operators or already-terminal points. "
                     "dry_run=True previews the status transition and changes nothing.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="retract_point",
     ),
@@ -751,21 +740,19 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_entity_profile",
         id="surface.entity_profile",
-        risk="read",
         description="Multi-hop BFS from an entity with optional filters (pointKind, "
                     "confidenceMin) — full neighborhood categorized by node type. Use for deep "
                     "entity analysis; for a fast neighbor list use tortoise_list_topics.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (calls navigation.entityProfile)
     ),
     ToolDefinition(
         name="tortoise_traverse",
         id="surface.traverse",
-        risk="read",
         description="Multi-hop graph traversal from entity following ALL relationship types. "
                     "Returns {entity, nodes: [{node, relationship, depth}]}.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (tortoise.navigation.tortoise_traverse on sdk._get_proj(); #3904)
     ),
@@ -773,67 +760,62 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_checkpoint",
         id="surface.checkpoint",
-        risk="write",
         description="Session batch save — two-tier dedup (content hash + embedding similarity). "
                     "Returns {filed: N, duplicates: M}.",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="checkpoint",
     ),
     ToolDefinition(
         name="tortoise_diary_write",
         id="surface.diary_write",
-        risk="write",
         description="Write an agent diary entry (AAAK format suggested). "
                     "Creates a Point with pointKind=diary, authoredBy=agent.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="diary_write",
     ),
     ToolDefinition(
         name="tortoise_diary_read",
         id="surface.diary_read",
-        risk="read",
         description="Read recent diary entries for an agent, newest first.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="diary_read",
     ),
     ToolDefinition(
         name="tortoise_list_graphs",
         id="surface.list_graphs",
-        risk="read",
         description="List all graph names in the database. Useful for namespace discovery.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_graphs",
     ),
     ToolDefinition(
         name="tortoise_status",
         id="surface.status",
-        risk="read",
         description="Graph health + entity counts + FalkorDB connectivity. "
                     "Returns {connected, counts, total_entities}.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="status",
     ),
     ToolDefinition(
         name="tortoise_health",
         id="surface.health",
-        risk="read",
         description="Health check + basic metrics: graph_size, last_ingest, error_count, uptime.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="health",  # monitoring.metrics — not a direct SDK method
     ),
     ToolDefinition(
         name="tortoise_session_context",
         id="surface.session_context",
-        risk="read",
         description="Return 'what happened last session' — diary entries, recent Points, "
                     "Events, confidence changes.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="session_context",
         rest_spec=RestSpec(method="GET", path="/v1/context"),
@@ -841,7 +823,6 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_session_capture",
         id="surface.session_capture",
-        risk="write",
         description="File an agent session into the graph (epic #909 capture path): "
                     "turns become episodic Points, the conversation is LLM-extracted into "
                     "epistemic Points, and the Session links to subject/project entities. "
@@ -860,7 +841,8 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "you are filing the session before you call, so they can decline. Requires "
                     "hosted mode — stdio/self-hosted returns an honest error "
                     "(no local fallback that bypasses the capture pipeline).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         # Custom handler in mcp_server.py — the REST /v1/sessions route stays
         # hand-written in hosted_api.py (raw-Cypher op, Gate 3 pre-step
@@ -871,7 +853,6 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_graph_set_recording",
         id="surface.graph_set_recording",
-        risk="write",
         description="Set or clear a graph's session-recording override (#2302) — the MCP "
                     "twin of PATCH /v1/graphs/{graph_id} (recording), sharing the same "
                     "hosted_api core so the surfaces never drift. recording: true/false "
@@ -880,7 +861,8 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "team:manage-scoped key (or legacy full-access) — the capture 409 "
                     "('Session recording is disabled for this graph') routes agents here; "
                     "call this tool to turn recording back on, then retry the capture.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         # Custom handler in mcp_server.py (ContextVar auth gate); the REST twin
         # is the hand-written PATCH /v1/graphs/{graph_id} in hosted_api.py — no
@@ -890,13 +872,12 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_issue_insight",
         id="surface.issue_insight",
-        risk="read",
         description="Return a compact 'there's more in the graph' insight for a would-be "
                     "issue — call BEFORE filing. Surfaces cross-session decisions / EP-tagged "
                     "claims matching the title (semantic stage) plus prior indexed issues for "
                     "the repo (repo= given). Fail-closed: empty graph -> no_prior_knowledge; "
                     "populated graph + unindexed repo -> repo_not_indexed.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="issue_insight",
         rest_spec=RestSpec(method="GET", path="/v1/issue-insight"),
@@ -905,19 +886,18 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_ingest_corpus",
         id="surface.ingest_corpus",
-        risk="write",
         description="DEPRECATED — use tortoise_index_files. Batch document ingestion — walk directory, parse YAML frontmatter "
                     "from .md files, create/update document Sources "
                     "(D10: a document is a :Source). "
                     "EXCLUDED from tenant HTTP — walks server filesystem with user-supplied path.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=False,
         sdk_method="ingest_corpus",
     ),
     ToolDefinition(
         name="tortoise_ingest",
         id="surface.ingest",
-        risk="write",
         description="Heterogeneous bulk write (epic #888 W4) — one call writes points + "
                     "entities + sources + connections coherently (nodes first, then "
                     "connections). Connections carrying 'operator' (IMPL/NAND) create "
@@ -941,7 +921,8 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "deduped connections never retro-promote). Idempotent-ish: "
                     "points dedup by content hash + kind, sources by url, operators by "
                     "input set.",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="ingest",
     ),
@@ -949,22 +930,20 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_taxonomy",
         id="surface.taxonomy",
-        risk="read",
         description="Count entities by node label. "
                     "Returns {Point: N, Event: N, Subject: N, Object: N, Source: N} "
                     "(D10: a document is a Source, not a :Document node).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="taxonomy",
     ),
     ToolDefinition(
         name="tortoise_list_topics",
         id="surface.list_topics",
-        risk="read",
         description="Fast one-hop neighbor enumeration for an entity — quick discovery and "
                     "navigation. Use for shallow context; for multi-hop filtered BFS use "
                     "tortoise_entity_profile.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="list_topics",
     ),
@@ -972,10 +951,9 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_analyze",
         id="surface.analyze",
-        risk="read",
         description="Answer natural language questions about the Tortoise epistemic graph. "
                     "Ask things like: 'where is the disagreement?' 'what supports claim X?'",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (calls analyze.analyze)
     ),
@@ -983,16 +961,14 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_stale",
         id="surface.stale",
-        risk="read",
         description="Find Points not updated in N days. Returns {stale, count, cutoff, limit}.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="stale_points",
     ),
     ToolDefinition(
         name="tortoise_review_connections",
         id="surface.review_connections",
-        risk="read",
         description="Review graph connections (READ-ONLY — never mutates the graph). "
                     "Hygiene counterpart to connect: mode=add surfaces related-but-missing "
                     "connections as suggestions {from, to, suggested_relation, reason, "
@@ -1004,14 +980,13 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "narrows the candidate pool to the retrieval-NEAREST points — a focus "
                     "filter, not an exact-match or relevance gate (mode=add also applies "
                     "similarity_threshold; mode=prune has no similarity bar).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="review_connections",
     ),
     ToolDefinition(
         name="tortoise_find_cross_lens_candidates",
         id="surface.find_cross_lens_candidates",
-        risk="read",
         description="Cross-lens candidate discovery (READ-ONLY, #438 bring-your-own-agent): "
                     "surface unverified candidate pairs between Points from DIFFERENT "
                     "sources (cross-stream discovery over the vector index) with lens "
@@ -1023,17 +998,16 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "cap 200 candidates/cycle (D4); top_k is hard-clamped to 100 so an "
                     "agent cannot inflate the per-cycle recall budget. Empty results "
                     "(not errors) when there is nothing to see (D8).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="get_cross_lens_candidates",
     ),
     ToolDefinition(
         name="tortoise_provenance",
         id="surface.provenance",
-        risk="read",
         description="Provenance chain — 'Who decided this?' "
                     "Follows authoredBy → Subject → delegation.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="provenance",
     ),
@@ -1041,11 +1015,11 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_org_create",
         id="surface.org_create",
-        risk="admin",
         description="Create isolated team graph via FalkorDB select_graph. "
                     "EXCLUDED from tenant HTTP — provisioning belongs to "
                     "/internal/provision behind FASTAPI_INTERNAL_KEY.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=False,
         sdk_method="org_create",
     ),
@@ -1053,63 +1027,60 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_create_subject",
         id="surface.create_subject",
-        risk="write",
         description="Create a Subject node (team, role, organization, person).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="create_subject",
     ),
     ToolDefinition(
         name="tortoise_create_object",
         id="surface.create_object",
-        risk="write",
         description="Create an Object node (product, customer, skill, etc.).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="create_object",
     ),
     ToolDefinition(
         name="tortoise_create_event",
         id="surface.create_event",
-        risk="write",
         description="Create an Event node (meeting, decision, deployment, etc.).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="create_event",
     ),
     ToolDefinition(
         name="tortoise_get_events",
         id="surface.get_events",
-        risk="read",
         description="Get recent Events, optionally filtered by eventKind (e.g. 'AgentSession').",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="get_events",
     ),
     ToolDefinition(
         name="tortoise_get_session",
         id="surface.get_session",
-        risk="read",
         description="Get a single agent session Event by session_id.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="get_session",
     ),
     ToolDefinition(
         name="tortoise_index_sessions",
         id="surface.index_sessions",
-        risk="write",
         description="DEPRECATED — use tortoise_index_files. Index session .md files "
                     "as AgentSession Events. "
                     "EXCLUDED from tenant HTTP — walks server filesystem with user-supplied path.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=False,
         sdk_method="index_sessions",
     ),
     ToolDefinition(
         name="tortoise_index_files",
         id="surface.index_files",
-        risk="write",
         description="Index a corpus directory of .md files as Sources + Events "
                     "(D10: a document is a Source) (the unified index path — replaces "
                     "tortoise_index_sessions + tortoise_ingest_corpus file semantics "
@@ -1119,109 +1090,107 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "graph, give each corpus a unique corpus_name (default = directory "
                     "basename) to avoid cross-corpus url collisions. "
                     "EXCLUDED from tenant HTTP — walks server filesystem with user-supplied path.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=False,
         sdk_method="index_directory",
     ),
     ToolDefinition(
         name="tortoise_search_sessions",
         id="surface.search_sessions",
-        risk="read",
         description="Search indexed agent sessions. Returns Events with narrative_arc snippets.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="search_sessions",
     ),
     ToolDefinition(
         name="tortoise_create_document",
         id="surface.create_document",
-        risk="write",
         description="Create a document — a :Source keyed by url (research, planDoc, "
                     "meetingNotes, etc.).",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="create_document",
     ),
     ToolDefinition(
         name="tortoise_create_source",
         id="surface.create_source",
-        risk="write",
         description="Create a Source node for provenance (document, web, db, etc.). "
                     "Sources track content origin — url is the permalink key. "
                     "tier (T0-T4 / legacy alias) stores the credibility tier; "
                     "sourceDate is the evidence-age clock.",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="create_source",
     ),
     ToolDefinition(
         name="tortoise_get_source_reliability",
         id="surface.get_source_reliability",
-        risk="write",
         description="Derive a Source's reliability (0-1) — query-time, "
                     "cache-consistency-checked. NOTE: refreshes the reliability "
                     "cache on the Source node (write-through projection), so not read-only.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="get_source_reliability",
     ),
     ToolDefinition(
         name="tortoise_assess_source",
         id="surface.assess_source",
-        risk="write",
         description="Record an agent's assessment of a Source (0-1 score + rationale). "
                     "Creates a pointKind='assessment' Statement Point; latest per "
                     "(url, assessor) wins; weighted by assessor reputation.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="assess_source",
     ),
     ToolDefinition(
         name="tortoise_set_source_tier",
         id="surface.set_source_tier",
-        risk="write",
         description="Set (or change) a Source's credibility tier (T0-T4). "
                     "Non-destructive — never overwrites sourceKind type strings.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="set_source_tier",
     ),
     ToolDefinition(
         name="tortoise_get_entity",
         id="surface.get_entity",
-        risk="read",
         description="Get any entity by ID, eventId, or url. `type` selects the node kind "
                     "(point | entity | operator | events | governance), dispatching exactly as "
                     "the retired per-type getters did; omit it to look the entity up by id. "
                     "The canonical fetch-by-id tool.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="get_entity",
     ),
     ToolDefinition(
         name="tortoise_update_entity",
         id="surface.update_entity",
-        risk="write",
         description="Update any entity's properties.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="update_entity",
     ),
     ToolDefinition(
         name="tortoise_delete_entity",
         id="surface.delete_entity",
-        risk="destructive",
         description="Delete any entity by ID. DESTRUCTIVE — cannot be undone. "
                     "dry_run=True previews the node(s) and every edge that would be "
                     "removed and changes nothing.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="delete_entity",
     ),
     ToolDefinition(
         name="tortoise_create_entity",
         id="surface.create_entity",
-        risk="write",
         description="Create an entity — type: subject|object|event|document. "
                     "Event entities wire about* edges from aboutSubject/aboutObject/"
                     "aboutPoint/aboutDocument props. Returns {node, nudges, "
@@ -1231,65 +1200,65 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "For type='document', declaring extractedFrom materializes "
                     "the :Source (#8171); on subject/object/event it is inert "
                     "and an extracted_from_inert advisory is returned.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="create_entity",
     ),
     ToolDefinition(
         name="tortoise_update",
         id="surface.update",
-        risk="write",
         description="Update a Point OR entity by id. Points get point-lifecycle semantics "
                     "(draft→live promote via status — an already-live point is an idempotent "
                     "no-op, version increment for Point:Object, status validation); entities "
                     "get a plain property update.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="update",
     ),
     ToolDefinition(
         name="tortoise_delete",
         id="surface.delete",
-        risk="destructive",
         description="Delete a Point or entity by id. DESTRUCTIVE — requires human "
                     "confirmation. Cannot be undone. dry_run=True previews the blast "
                     "radius (which node resolves, and every edge that would go) and "
                     "changes nothing.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="delete",
     ),
     ToolDefinition(
         name="tortoise_operator_action",
         id="surface.operator_action",
-        risk="write",
         description="Consolidated operator write action — action=mitigate|annotate. "
                     "mitigate: reason + strength (0-1) — creates/updates the mitigation "
                     "Point (idempotent). annotate: bias/precision/consistency/directness "
                     "(0-1).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (dispatches to sdk.mitigate_operator / sdk.annotate_operator; #3904)
     ),
     ToolDefinition(
         name="tortoise_create_edge",
         id="surface.create_edge",
-        risk="write",
         description="Create a typed structural edge between two entities. "
                     "Relation: performs, produces, uses, memberOf, ownedBy, managedBy, "
                     "about*, related, dependsOn, etc. Operator-less per the reification "
                     "rule (v3.5 §8) — lazy promotion via operator_action when mitigation "
                     "is needed. Returns {edge, created, nudges}.",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="create_edge",
     ),
     ToolDefinition(
         name="tortoise_get_governance",
         id="surface.get_governance",
-        risk="read",
         description="Get all entities owned by a Subject.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="get_owned_entities",
     ),
@@ -1297,34 +1266,32 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_overview",
         id="surface.overview",
-        risk="read",
         description="Graph orientation in one call — consolidates the list_*/status/health/"
                     "taxonomy/structure zoo. section: taxonomy|structure|structure_check|"
                     "pointkinds|tags|sources|namespaces|graphs|topics|health|status|stale. "
                     "Omit section → compact combined summary. topics requires entity_id.",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (dispatches to legacy tools)
     ),
     ToolDefinition(
         name="tortoise_get",
         id="surface.get",
-        risk="read",
         description="Fetch a node by id — consolidates get_point/get_entity/get_operator/"
                     "get_events/get_session/get_governance. type: point|operator|entity|"
                     "event|session|events|governance. Omitted type → auto-detect by id "
                     "lookup (id|eventId|url, then session_id/sessionId).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (dispatches to legacy tools)
     ),
     ToolDefinition(
         name="tortoise_backfill_v25",
         id="surface.backfill_v25",
-        risk="admin",
         description="Backfill database to ONTOLOGY v2.5 schema. "
                     "EXCLUDED from tenant HTTP — schema-level migration (operator-only).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=False,
         sdk_method="backfill_v25",
     ),
@@ -1332,9 +1299,9 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_onboarding_demo_create",
         id="surface.onboarding_demo_create",
-        risk="write",
         description="Create the demo epistemic graph (4 layers) for this team. Idempotent (Q4).",
-        annotations=_idem(),
+        risk="write",
+        idempotent_hint=True,
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py
         rest_spec=RestSpec(method="POST", path="/v1/demo"),
@@ -1342,9 +1309,8 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_onboarding_state",
         id="surface.onboarding_state",
-        risk="read",
         description="Return this team's onboarding progress (Q6 verification).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="",
         rest_spec=RestSpec(method="GET", path="/v1/onboarding/state"),
@@ -1352,13 +1318,13 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_onboarding_seed",
         id="surface.onboarding_seed",
-        risk="write",
         description=("File the two onboarding anchor Subjects (Organization/"
                      "organization + User/naturalPerson linked memberOf) — "
                      "interactive, ontology-precise (#1999 W3): call without "
                      "names to discover gaps/collisions, with user-confirmed "
                      "names to file."),
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="",
         rest_spec=RestSpec(method="POST", path="/v1/onboarding/seed"),
@@ -1366,7 +1332,6 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_manage_sources",
         id="surface.manage_sources",
-        risk="write",
         description=(
             "Configure the memory sources this team uses (the ones Tortoise "
             "reads FROM). action: list|enable|disable; source: github_issues|"
@@ -1386,7 +1351,8 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
             "disable stops recording; enable there reports already-on rather "
             "than changing a recorded default."
         ),
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         # Custom handler in mcp_server.py, following `tortoise_overview`'s
         # consolidation precedent (one entry point, dispatching). NO `rest_spec`
@@ -1398,9 +1364,9 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_onboarding_session_recording",
         id="surface.onboarding_session_recording",
-        risk="write",
         description="Toggle automatic session recording for this team (Q3).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="",
         rest_spec=RestSpec(method="POST", path="/v1/onboarding/session-recording"),
@@ -1408,9 +1374,9 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_onboarding_github_connect",
         id="surface.onboarding_github_connect",
-        risk="write",
         description="Initiate GitHub OAuth — returns authorize URL + CSRF state (Q1).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="",
         rest_spec=RestSpec(method="POST", path="/v1/onboarding/github/connect"),
@@ -1418,9 +1384,9 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_onboarding_github_index",
         id="surface.onboarding_github_index",
-        risk="write",
         description="Start background GitHub indexing of an org's issues/PRs (Q2).",
-        annotations=_rw(),
+        risk="write",
+        destructive_hint=True,
         http_policy=True,
         sdk_method="",
         rest_spec=RestSpec(method="POST", path="/v1/index/github"),
@@ -1428,9 +1394,8 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_onboarding_github_status",
         id="surface.onboarding_github_status",
-        risk="read",
         description="Return GitHub connection status for this team (Q1 verify).",
-        annotations=_ro(),
+        risk="read",
         http_policy=True,
         sdk_method="",
         rest_spec=RestSpec(method="GET", path="/v1/onboarding/github/status"),
