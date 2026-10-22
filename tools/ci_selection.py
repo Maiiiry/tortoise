@@ -1314,6 +1314,8 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # class. Pinned by
              # tests/test_ci_selection.py::test_record_schema_pin_runs_on_migration_or_doc_change.
              "supabase/migrations/20261023000001_record_session_narrative.sql",
+             "docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md",
+             # RETIRED 2026-10-19: the orchestrator harness (and therefore
              # tests/test_orchestrator_harness.py) moved to
              # agent-infra/scripts/orchestrator-harness/. This repo keeps only a pointer
              # README plus the two scripts whose fixes are UNPORTED (`merge-one.sh`,

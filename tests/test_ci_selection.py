@@ -1917,6 +1917,7 @@ def test_record_schema_pin_runs_on_migration_or_doc_change():
         # column set, `test_record_schema_placement.py` pins the record schema
         # against the placement table — plus the narrative suite itself.
         "supabase/migrations/20261023000001_record_session_narrative.sql",
+        "docs/epics/2026-10-10-7879-postgres-record/02-identity-and-placement.md",
     ):
         r = _sel([changed])
         assert r["full"] is False, (changed, r)
