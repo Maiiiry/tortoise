@@ -500,36 +500,6 @@ class TestTheIdentityUpsertFamilyKeepsItsConfirmation:
             assert ann.readOnlyHint is False, name
 
 
-class TestReadTierCannotHideAnOutOfBoundaryWrite:
-    """`events_poll` purges expired `:GraphEvent` rows from `event_store.py`, i.e.
-    outside `sdk.py`, so `sdk_graph_mutators()` cannot see it. The carve-out is
-    declared (`RETENTION_CARVEOUTS`) and this arm is what makes the declaration
-    load-bearing: an undeclared read/maintenance tool that reaches one of those
-    operations fails."""
-
-    def test_the_declared_carveout_is_the_only_one(self):
-        import tool_surface_capabilities as tsc
-
-        declared = set(tsc.RETENTION_CARVEOUTS)
-        assert declared == {"tortoise_events_poll"}, sorted(declared)
-        assert tsc.write_classification_violations(tsc.served_registry()) == []
-
-    def test_an_undeclared_read_tool_reaching_one_fails(self, monkeypatch):
-        import tool_surface_capabilities as tsc
-
-        # Pretend `query` were an out-of-boundary mutator: the read tools that
-        # reach it are not declared, so the arm must fire for them.
-        monkeypatch.setitem(
-            tsc.OUT_OF_BOUNDARY_MUTATORS, "query",
-            "probe: pretend a mutation lives outside sdk.py")
-        violations = tsc.write_classification_violations(tsc.served_registry())
-        assert any("out-of-boundary mutation" in v and "tortoise_query" in v
-                   for v in violations), violations
-        # …and a `maintenance` or writing tool is not what this arm is for.
-        assert not any("out-of-boundary mutation" in v
-                       and "tortoise_create_point" in v for v in violations)
-
-
 class TestPureReadsStillOnlyNeedReadScope:
     def test_every_read_tier_tool_is_admitted_with_graphs_read(self):
         from tortoise.mcp_auth import _current_legacy_full_access, _current_scopes

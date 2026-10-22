@@ -294,7 +294,7 @@ The decision is checkable: the carve-out is declared in
 `tests/tool_surface_capabilities.py` → `RETENTION_CARVEOUTS` (with the
 out-of-boundary mutation it covers, `OUT_OF_BOUNDARY_MUTATORS`), the reason sits
 at the registry entry in `tortoise/tool_registry.py`, and
-`TestReadTierCannotHideAnOutOfBoundaryWrite` fails if the poll moves to a writing
+`tests/test_tool_registry.py::TestReadTierCannotHideAnOutOfBoundaryWrite` fails if the poll moves to a writing
 tier, if it stops reaching the purge, or if any OTHER reading-tier tool (`read`
 **or** `maintenance`) reaches one of the mutations declared there without a
 carve-out. A NEW cross-module mutation

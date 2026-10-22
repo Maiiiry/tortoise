@@ -932,8 +932,12 @@ def handler_self_guards(tool_name: str, source: str | None = None) -> bool:
 # ── Guard predicates ────────────────────────────────────────────────────────
 # Each returns a list of human-readable violations; the real tests assert the
 # list is empty, and the falsifiability tests feed a synthetic input and assert
-# it is NOT empty.  Pure functions — no global registry state — so a synthetic
-# entry list can be evaluated.
+# it is NOT empty.  Pure functions over their arguments — a synthetic entry list
+# can be evaluated — with ONE deliberate exception: `declared_set_violations`
+# decides LIVENESS against the served set, so a filtered subset cannot report a
+# live carve-out as dead (see its ⚠️ SUBSET SEMANTICS note). It is therefore the
+# only predicate here that reads global registry state, and an arm over it is
+# falsified by monkeypatching `served_registry`, not by passing a subset.
 
 
 def privileged_exposure_violations(entries, mcp_src: str | None = None) -> list[str]:
