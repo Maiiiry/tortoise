@@ -22,17 +22,25 @@ Design decisions (locked 2026-08-15, issue #318 — decision comment
 - D4a (#9583, recorded 2026-10-22) — D4's *"read-only"* is a statement of
       what the surface is FOR, and it is not a guarantee the mechanism keeps:
       this module is the shared ensure-then-READ core, so a
-      ``get_tenant_packs`` read can MERGE a missing starter ``:PackInstall``
-      (the #318 self-heal, one per starter namespace, suppressed when the graph
-      carries a ``:PackSelection`` marker — #2728/#8648). Both surfaces
-      advertised D4's word as a guarantee: the MCP ``packs_list`` description
-      was corrected under #9575 and the REST ``GET /v1/packs`` OpenAPI
-      description — served from that route's docstring — under #9583. D4 is
-      kept VERBATIM above rather than reworded: it is a locked decision list,
-      and an unmarked edit would read as history being tidied. D4's intent
-      (these two endpoints exist to EXPOSE state, not to change it at a
-      caller's request) stands; the ensure half is recorded here, where the
-      next reader of D4 will see it.
+      ``get_tenant_packs`` read can MERGE the starter ``:PackInstall`` set. The
+      trigger for that lives in the READ, NOT in the activation helper: the read
+      self-heals only when the graph holds NO ``:PackInstall`` record at all (a
+      partially installed set is never topped up), only while
+      ``PACK_STATE_DISABLE_SELF_HEAL`` is not ``1`` (unset or any other value
+      leaves the write armed — only the literal ``1`` disarms it), and never when
+      a ``:PackSelection`` marker is present or cannot be read (#2728/#8648). A
+      DIRECT ``ensure_tenant_packs`` call — provisioning, the D5 backfill, the
+      Supabase control plane — is not gated that way: it re-MERGEs every starter
+      namespace, so it DOES top up a partial set, and only the marker suppresses
+      it (its own docstring is the authority). Both surfaces advertised D4's word
+      as a guarantee: the REST ``GET /v1/packs`` OpenAPI description — served
+      from that route's docstring — was corrected under #9583, and the MCP
+      ``packs_list`` description still carries the defect its correction (#9575)
+      is scoped to. D4 is kept VERBATIM above rather than reworded: it is a
+      locked decision list, and an unmarked edit would read as history being
+      tidied. D4's intent (these two endpoints exist to EXPOSE state, not to
+      change it at a caller's request) stands; the ensure half is recorded here,
+      where the next reader of D4 will see it.
 - D5  Existing-tenant backfill handles ``org_{name}`` vs ``org_{id}``
       naming via the RECORDED graph_name (graph-scripts/backfill_pack_installs.py).
 - D6  Existence masking — empty result when nothing to see; errors only for
@@ -500,8 +508,10 @@ def get_tenant_packs(sdk: TortoiseSDK, *, graph_name: str | None = None,
     whose configured set is EMPTY) must never be re-seeded behind the user's
     back, which is exactly what made "remove all" unreachable.
 
-    D6 masking: returns [] when there is genuinely nothing to see (starter
-    set empty/unset, catalog unavailable, or ensure failed) — never an error.
+    D6 masking: returns [] when there is genuinely nothing to see (the resolved
+    starter set names no packs — a BLANK ``TORTOISE_STARTER_PACKS``, like unset,
+    means the built-in default set and seeds it; the catalog is unavailable or does
+    not know the configured names, or the ensure failed) — never an error.
     Graph-unreachable RAISES — callers map that to 503 (never empty-on-outage).
 
     #2728: ``status='removed'`` records are TOMBSTONES — absent from the list

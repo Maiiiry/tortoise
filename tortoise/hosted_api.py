@@ -10276,17 +10276,30 @@ async def _session_login_exchange(
     return session
 
 
+# #9583: FastAPI materializes this handler's docstring as the OpenAPI operation
+# ``description`` — the string a generated CLIENT reads — which is why the
+# "read-only" claim had to leave the docstring, not just the MCP registry row.
+# The MCP half is #9575 (``tortoise_packs_list`` still reads "Read-only;" on
+# ``main``; its correction is tracked there), and
+# ``tests/test_9583_openapi_read_only_claim.py`` now holds every served operation
+# to the same axis. The write, its suppression and the empty-list cases are
+# recorded as D4a in ``pack_state``'s module docstring (#2728/#8648).
 @app.get("/v1/packs")
 async def list_packs(org: dict = Depends(get_current_org_gated)):  # noqa: B008
-    """#318: pack introspection — the tenant's ACTIVE packs.
+    """#318: pack introspection — the tenant's INSTALLED packs.
 
-    NOT a pure read (#9583): this GET can cause a WRITE. The route fronts
-    ``pack_state.get_tenant_packs``, whose self-heal ``ensure_tenant_packs``
-    MERGEs a missing starter ``:PackInstall`` activation (one MERGE per starter
-    namespace, skipped when the graph's pack set was deliberately configured —
-    #2728/#8648). Mirrors the MCP ``packs_list`` correction (#4122/#9575) — and
-    it matters twice on this route, because FastAPI serves this docstring as the
-    OpenAPI operation ``description``, i.e. the string a generated client reads.
+    Lists active AND disabled packs (``status='disabled'`` is shown so the user
+    surface can re-enable it); only ``status='removed'`` tombstones are hidden.
+
+    NOT a pure read (#9583): this GET can cause a WRITE. The handler fronts
+    ``pack_state.get_tenant_packs``, whose self-heal MERGEs the starter
+    ``:PackInstall`` set into a graph that holds none — one write per starter
+    namespace, and ALL-OR-NOTHING: it fires only when the graph holds no
+    ``:PackInstall`` record at all, so a partially installed set is never topped
+    up. It is disarmed while ``PACK_STATE_DISABLE_SELF_HEAL`` is ``1`` (any other
+    value, unset included, leaves it armed) and when the graph carries a
+    ``:PackSelection`` marker — a deliberately configured graph is not re-seeded,
+    and a marker that cannot be read makes the ensure decline rather than risk it.
 
     Shared pack catalog + per-tenant ``PackInstall`` activation records
     (graph-native install-state in the tenant graph ``org_{org_id}``).
@@ -10295,10 +10308,19 @@ async def list_packs(org: dict = Depends(get_current_org_gated)):  # noqa: B008
     structurally impossible — no request can name another tenant's graph.
 
     Response matrix (pinned, scoping §4): no auth → 401 (get_current_org);
-    auth + graph unreachable → 503 (never empty-on-outage); auth + no
-    installs → empty list (D6 existence masking — same-tenant no-installs
-    and cross-tenant probes both read empty, never an error); auth +
-    installs → the tenant's pack list.
+    graph-scoped key → 403 (GRAPH_SCOPED_TEAM_SURFACE — a per-graph key may not
+    read the org's pack state); auth + graph unreachable → 503
+    (never empty-on-outage); auth + no installs → the starter set is seeded (the
+    write above) and returned; an empty list only when there is genuinely nothing
+    to show — the resolved starter set names no packs (``TORTOISE_STARTER_PACKS``
+    set to a value naming none, e.g. ``,``; a BLANK value, like unset, means the
+    built-in default set), the catalog is unavailable or does not know the
+    configured starter names, self-heal is disabled, a ``:PackSelection`` marks a
+    deliberately empty configured set, every record is a ``status='removed'``
+    tombstone, or the ensure failed (D6 existence masking: a tenant with nothing to
+    see reads empty rather than an error, never another tenant's packs); auth +
+    installs → the tenant's pack list. A ``:PackSelection`` marker that cannot be
+    READ is not an empty list — it raises out of the read and surfaces as 503.
     """
     org_id = org.get("org_id")
     if not org_id:
