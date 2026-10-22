@@ -87,6 +87,42 @@ def test_writes_is_derived_from_risk():
         t.name for t in _served() if t.risk in WRITE_RISKS)
 
 
+#: Criterion 1's re-tag, pinned by NAME so a re-tag is a reviewable diff (the
+#: same discipline as the #4474 write census). The mechanical default is
+#: `write` — an entry is `destructive`/`admin` only where its OWN description
+#: says so ("DESTRUCTIVE — cannot be undone"; "provisioning"; "schema-level
+#: migration (operator-only)"), never by a lane's opinion of it.
+DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
+    "tortoise_delete", "tortoise_delete_entity", "tortoise_delete_point",
+})
+ADMIN_TOOLS: frozenset[str] = frozenset({
+    "tortoise_backfill_v25", "tortoise_org_create",
+})
+
+
+def test_the_five_value_axis_is_not_dead():
+    """Criterion 1's re-tag step, made falsifiable: the declared `destructive`
+    and `admin` classes are USED, exactly where the entries say so, and every
+    one of them still needs `graphs:write` (a re-tag must never be a quiet
+    de-escalation of a destructive tool)."""
+    by_risk: dict[str, set[str]] = {}
+    for entry in _served():
+        by_risk.setdefault(entry.risk, set()).add(entry.name)
+
+    assert by_risk["destructive"] == DESTRUCTIVE_TOOLS, (
+        f"destructive census moved: {sorted(by_risk['destructive'])}")
+    assert by_risk["admin"] == ADMIN_TOOLS, (
+        f"admin census moved: {sorted(by_risk['admin'])}")
+    # Every value in the axis is in use, so no class is a dead label a future
+    # consent bundle would silently have no inputs for.
+    assert set(by_risk) == set(RISK_LEVELS), sorted(set(by_risk))
+
+    for name in DESTRUCTIVE_TOOLS | ADMIN_TOOLS:
+        entry = _entry(name)
+        assert entry.writes is True, f"{name}: escalated risk lost graphs:write"
+        assert entry.annotations.readOnlyHint is False, f"{name}: readOnlyHint over a destructive tool"
+
+
 # ── The three tools the issue names (criterion 2) ─────────────────
 
 @pytest.mark.parametrize("name", [

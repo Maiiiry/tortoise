@@ -337,6 +337,13 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "joined with the tenant graph's PackInstall activation records. "
                     "Read-only; empty result when nothing is installed (existence "
                     "masking — another tenant's packs are never observable).",
+        # ⚠️ The "Read-only;" wording above is STALE and known-wrong (#4122): a
+        # listing may repair the PackInstall record it finds inconsistent, which
+        # is why this entry is `risk="maintenance"`. Left untouched here because
+        # changing a SERVED description needs a `surface_manifest.py cut`, and a
+        # re-cut today drags 282 unrelated `used_by`/`reason` lines from a
+        # pre-existing derivation skew (measured on pristine main; #9561 tracks
+        # both the wording and the skew).
         annotations=_maint(),
         http_policy=True,
         sdk_method="",  # custom handler in mcp_server.py (calls pack_state.get_tenant_packs)
@@ -674,7 +681,7 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_delete_point",
         id="surface.delete_point",
-        risk="write",
+        risk="destructive",
         description="Delete a Point. DESTRUCTIVE — requires human confirmation. Cannot be undone. "
                     "dry_run=True previews the blast radius (the point and every edge that "
                     "would be removed) and changes nothing.",
@@ -1028,7 +1035,7 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_org_create",
         id="surface.org_create",
-        risk="write",
+        risk="admin",
         description="Create isolated team graph via FalkorDB select_graph. "
                     "EXCLUDED from tenant HTTP — provisioning belongs to "
                     "/internal/provision behind FASTAPI_INTERNAL_KEY.",
@@ -1197,7 +1204,7 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_delete_entity",
         id="surface.delete_entity",
-        risk="write",
+        risk="destructive",
         description="Delete any entity by ID. DESTRUCTIVE — cannot be undone. "
                     "dry_run=True previews the node(s) and every edge that would be "
                     "removed and changes nothing.",
@@ -1237,7 +1244,7 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_delete",
         id="surface.delete",
-        risk="write",
+        risk="destructive",
         description="Delete a Point or entity by id. DESTRUCTIVE — requires human "
                     "confirmation. Cannot be undone. dry_run=True previews the blast "
                     "radius (which node resolves, and every edge that would go) and "
@@ -1308,7 +1315,7 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="tortoise_backfill_v25",
         id="surface.backfill_v25",
-        risk="write",
+        risk="admin",
         description="Backfill database to ONTOLOGY v2.5 schema. "
                     "EXCLUDED from tenant HTTP — schema-level migration (operator-only).",
         annotations=_rw(),

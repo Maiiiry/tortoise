@@ -349,6 +349,11 @@ Found while building this list. None is fixed here — this document changes no 
    `dream(dirty_only=True, ...)`, which runs `SET n.confidence = p.c`. `compute_confidence`
    writes the same property eagerly. `get_source_reliability` writes a reliability cache.
    **This is the blocker on the read/write guarantee** — a read-only key can currently write.
+   *(__Status, 2026-10-22 — #4122 owner ruling, PR #9545:__ the DECLARATION half is fixed.
+   `get_confidence`/`compute_confidence` are `risk="maintenance"` — `readOnlyHint=false`
+   (no client auto-approves them) and still `writes=false` (`graphs:read`, metered as a read).
+   The methods still persist when they refresh, so the guarantee now holds by honest
+   classification rather than by removing the write.)*
 2. **The control plane writes on first use.** Every registry-backed read (`org_list`,
    `graph_list`, `apikey_list`, `membership_list`, `invitation_list`, and others) calls into
    a registry helper that on a cold handle issues `CREATE INDEX` statements. Idempotent, but
