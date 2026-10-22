@@ -218,6 +218,32 @@ def test_b7_runbook_ok_semantics_gate_runs_on_a_runbook_only_diff():
     )
 
 
+def test_canonical_mcp_tools_pin_runs_on_a_docs_only_diff():
+    """#9545 review (P2, finding 4): the `OVERRIDES:` marker pin must run on the doc.
+
+    `tests/test_4122_risk_derived_hints.py::test_canonical_doc_marks_the_maintenance_departure`
+    binds the `OVERRIDES:` block in `docs/product/canonical-mcp-tools.md` that records the
+    `risk="maintenance"` departure from "reads and writes never share a tool". `docs/` is in
+    NON_PYTHON_PREFIXES and that file matches no SOURCE_PATTERNS entry, so a doc-only diff
+    filters to `changed == []` and takes the docs-only early return — tier1 ONLY.
+
+    Registered in `core` alone (its first, still-correct home: the registry arms of the file
+    need no docs), the marker pin was asleep on the one change class that can delete the
+    marker: a docs-only PR dropping the block merged green and only red `main` post-merge
+    (#4309 silent-drop class; the #8614/#8135 shape one doc over). Dropping the `tier1` entry
+    moves the pin back into that hole.
+    """
+    r = _sel(["docs/product/canonical-mcp-tools.md"])
+    assert r["full"] is False
+    assert r["surfaces"] == []
+    assert "test_4122_risk_derived_hints.py" in r["test_files"], (
+        "a docs/product/canonical-mcp-tools.md-only diff must select the pin that binds "
+        "its `OVERRIDES:` marker (test_4122_risk_derived_hints.py) — otherwise a docs-only "
+        "edit that deletes the `maintenance` departure marker merges green (#9545 review "
+        "P2, #4309 class)"
+    )
+
+
 def test_cross_subdomain_cookie_sync_gate_runs_on_a_new_file_diff():
     """#8701 review (P1): the adapter registry-completeness gate must run on the
     diff that ADDS a fourth copy, even when that copy lands in a new file under

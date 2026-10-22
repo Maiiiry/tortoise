@@ -125,7 +125,7 @@ read permission can be granted generously with no path to a destructive action.
 > `writes=false` (so it keeps `graphs:read` and stays metered as a read) **and**
 > `readOnlyHint=false` (so no client auto-approves it), because each writes only a confined,
 > idempotent, derived value on a self-heal path — never a user-visible statement (2026-10-21
-> owner ruling on #4122; landed as #9573, PR #9545). The permission half is what makes the
+> owner ruling on #4122; landed in PR #9573). The permission half is what makes the
 > departure safe rather than the split: only the derived fields can be touched, and the machine
 > hint no longer claims otherwise. A lane that "restores" the principle by promoting these to
 > `writes` would take three tools away from read-only keys and stop metering the recompute as a

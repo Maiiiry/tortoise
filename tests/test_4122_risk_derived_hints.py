@@ -2,6 +2,14 @@
 classification a tool declares, and everything a caller observes about it is
 DERIVED from it, so a hint, a permission and a scope cannot drift apart again.
 
+PROVENANCE (so a later lane does not re-read this file as the fix itself): the
+derivation LANDED in PR #9573, which is what closed #4122. `tortoise/tool_registry.py`
+is identical to `main`; this file is the REGRESSION + MARKER pin — it collects and
+passes against the post-#9573 tree, and it reds if the derivation is reverted (drop
+`__post_init__`'s `model_copy`, or re-add a default to `risk`) or if a departure
+marker is deleted. It is not a failing→passing demonstration against pre-#9573
+`main`: it imports only names the landing commit already exports.
+
 The defect this pins: `tortoise_get_confidence`, `tortoise_compute_confidence` and
 `tortoise_packs_list` advertised `readOnlyHint: True` while their handlers wrote to
 the tenant graph — `annotations` and `writes` were two INDEPENDENT declarations, so

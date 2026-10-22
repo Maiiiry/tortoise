@@ -5490,6 +5490,21 @@ tier1:
 - test_8474_ontology_record.py  # #8474: docs/ONTOLOGY.md §4.6 rawState/rawStateAt availability record vs the declared write surface (hermetic doc pin; a docs-only ONTOLOGY edit runs only tier1) — dual-registered with `core`
 - test_7818_plan_record_5362.py  # #7818/#5362: the #5362 plan's RES-1 / out-of-scope read-path record vs the shipped reply contract (hermetic doc pin; a docs-only plan edit runs only tier1) — dual-registered with `core`
 - test_9399_search_path_claim_scope.py  # #9399: §13's `aboutObject` headline claim vs the scope of the grep it quotes (hermetic doc↔code pin, and the claim's own file list is what a docs-only edit falsifies fastest) — dual-registered with `core`
+# #9545 review (P2, finding 4): `test_4122_risk_derived_hints.py` carries the #4122 doc
+# pins — `canonical-mcp-tools.md`'s `OVERRIDES:` marker for the `risk="maintenance"`
+# departure, and the census/hint/probe assertions over the registry. Its HOME surface is
+# `core` (below), but `docs/product/canonical-mcp-tools.md` matches no SOURCE_PATTERNS
+# entry and `docs/` is in NON_PYTHON_PREFIXES, so a doc-only diff filters to
+# `changed == []` and takes the docs-only early return — tier1 ONLY. Registered in `core`
+# alone, the marker pin was asleep on the ONE change class that can delete it: a
+# docs-only edit that drops the `OVERRIDES:` block would merge green and only red `main`
+# post-merge (the #1349/#3332/#3616/#4309 silent-drop class, the #8614/#8135 shape one doc
+# over). Same `core`=home / `tier1`=docs-only dual-registration idiom as
+# `test_8093_registry_namespace_doc.py` and the `test_7818_ontology_record.py` /
+# `test_8474_ontology_record.py` doc pins. Fast and no-DB (one registry import, an `ast`
+# walk, two doc reads), so tier1 is the correct lane. Pinned by
+# tests/test_ci_selection.py::test_canonical_mcp_tools_pin_runs_on_a_docs_only_diff.
+- test_4122_risk_derived_hints.py
 - test_ep_draft_filter.py
 - test_ep_operatorless.py
 - test_event_store.py
