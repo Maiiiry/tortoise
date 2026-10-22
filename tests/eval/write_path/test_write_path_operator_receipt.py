@@ -24,6 +24,7 @@ No graph, no LLM, no network: every fixture here is a dict.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -77,6 +78,17 @@ def _ref(content_id: str, *, graph_id: str | None = None) -> dict:
     }
 
 
+def _op_id(seed: str) -> str:
+    """An OPERATOR-NODE id of the shape this graph mints (`<time>-<random>`).
+
+    The checker binds `edge_op_ids` to that id space (a placeholder like
+    ``"op-x"`` must not pass as a name), so a fixture that used a human-readable
+    label would be red for the wrong reason and prove nothing about the rule.
+    """
+    digest = hashlib.sha1(seed.encode()).hexdigest()
+    return f"{digest[:13]}-{digest[13:25]}"
+
+
 def _edge(edge_id: str, *, kind: str = "SUPPORTS", **over) -> dict:
     edge = {
         "id": edge_id,
@@ -85,7 +97,7 @@ def _edge(edge_id: str, *, kind: str = "SUPPORTS", **over) -> dict:
         "edge_correct": True,
         "cause": None,
         "forms_found": ["IMPL"],
-        "edge_op_ids": [f"op-{edge_id}"],
+        "edge_op_ids": [_op_id(edge_id)],
         "endpoints": {
             "from": [_ref(f"pt_from_{edge_id}")],
             "to": [_ref(f"pt_to_{edge_id}", graph_id=f"pre-existing-{edge_id}")],
@@ -480,6 +492,9 @@ def _gold(kind: str, from_anchor: str, to_anchor: str, **over) -> dict:
 
 FOOT = "the lease makes re-entry impossible while held"
 CLAIM = "the race cannot re-enter once the lease is held"
+# The operator node the snapshot below commits — minted in the graph's own id
+# space (`<time>-<random>`), which is what the receipt checker binds against.
+GRAPH_OP_ID = _op_id("wp01_quarry_debug_op_supports")
 
 
 def _audit_snapshot(*, operator_event_id: str | None = "ev-1") -> tuple:
@@ -490,13 +505,16 @@ def _audit_snapshot(*, operator_event_id: str | None = "ev-1") -> tuple:
     snapshot = {
         "points": points,
         "operator_edges": [{
-            "op_id": "op-graph-1",
+            # A REAL-shape operator-node id, not a label: the checker binds
+            # `edge_op_ids` to the graph's id space, so `"op-graph-1"` would red
+            # for the wrong reason and stop proving anything about the rule.
+            "op_id": GRAPH_OP_ID,
             "op_type": "IMPL",
             "direction": "unidirectional",
             "endpoints": {from_ref: 0, to_ref: 1},
             "source_id": from_ref,
         }],
-        "operator_nodes": [{"point_id": "op-graph-1",
+        "operator_nodes": [{"point_id": GRAPH_OP_ID,
                             "event_id": operator_event_id}],
         "direct_edges": [],
         "mitigations": [],
@@ -515,7 +533,7 @@ def test_grading_emits_per_edge_refs_persistence_and_no_cause():
     assert detail["edge_correct"] is True
     assert detail["persisted"] is True
     assert detail["cause"] is None
-    assert detail["edge_op_ids"] == ["op-graph-1"]
+    assert detail["edge_op_ids"] == [GRAPH_OP_ID]
     for side, content in (("from", FOOT), ("to", CLAIM)):
         ref = detail["endpoints"][side][0]
         # The committed node kept its content-addressed payload id here, so the

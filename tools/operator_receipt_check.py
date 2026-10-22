@@ -69,6 +69,7 @@ if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +85,11 @@ PRODUCT_LANE = "llm"
 # operator node (#2552's cross-session supersession), so it is exempt from the
 # "name the forming operator" requirement E4-FORMING otherwise enforces.
 POINT_LEVEL_KIND = "SUPERSEDE"
+# The shape this graph mints operator-node ids in: two lowercase alphanumeric
+# groups either side of a dash (`1a151d2b0f4-8fa9f9e20655`). Loose on LENGTH on
+# purpose — it pins the ID SPACE (so a placeholder like "not-a-real-op" cannot
+# pass as a name) without freezing an incidental width.
+_OP_ID_RE = re.compile(r"^[0-9a-z]{8,16}-[0-9a-z]{8,16}$")
 
 
 def current_edge_map() -> dict[str, str] | None:
@@ -271,6 +277,9 @@ def check_receipt(
     wired = 0
     persisted = 0
     named_misses: list[str] = []
+    # Every distinct operator node the wired edges claim formed them (E4-FORMING
+    # binds this list to `operators_total` below).
+    named_op_ids: list[str] = []
     for edge_id, edge in results.items():
         if not isinstance(edge, dict):
             _fail(rules, "E4-SHAPE", f"operator_audit.results[{edge_id!r}]: not an object")
@@ -319,7 +328,8 @@ def check_receipt(
         if edge.get("expected_kind") != POINT_LEVEL_KIND:
             forms = edge.get("forms_found")
             op_ids = edge.get("edge_op_ids")
-            if not (isinstance(forms, list) and forms):
+            if not (isinstance(forms, list) and forms
+                    and all(_non_empty_str(f) for f in forms)):
                 _fail(rules, "E4-FORMING",
                       f"{edge_id} ({edge.get('expected_kind')}): edge_correct "
                       f"with forms_found={forms!r} — the receipt does not say "
@@ -332,6 +342,38 @@ def check_receipt(
                       "'every forming operator is retrievable' true of nothing "
                       "(legal ONLY for a SUPERSEDE, which rides the "
                       "point-level CORRECTS)")
+            else:
+                # A non-empty list is NOT a name. `["not-a-real-op"]` is a "
+                # non-empty list too, so the check above closes the EMPTY case
+                # and would leave a placeholder passing — the same vacuity one
+                # level in. Two artifact-truthful bindings are possible
+                # without re-deriving the run:
+                #
+                #   (a) every entry must be an OPERATOR-NODE id of the shape
+                #       this graph mints (`<time>-<random>`: two lowercase
+                #       alphanumeric groups per side of the dash — the
+                #       committed receipt's own ids are
+                #       `1a151d2b0f4-8fa9f9e20655`, `1a151d3852f-208fd62046c3`).
+                #       Deliberately loose on LENGTH so it pins the id space
+                #       rather than an incidental width.
+                #   (b) the run cannot have named MORE distinct operator nodes
+                #       than it committed (`operators_total`).
+                #
+                # ⛔ This is NOT the complete binding: proving an id names a
+                # node that actually entered the eventId-keyed layer needs the
+                # PROVENANCED-ID SET published in the receipt, which the
+                # committed artifact does not carry (it publishes only the
+                # count, `operators_provenanced`). That is tracked as #9569 —
+                # until it lands, a plausible-looking fabricated id passes.
+                # Reported as a named residual rather than papered over.
+                for op_id in op_ids:
+                    if not (isinstance(op_id, str) and _OP_ID_RE.match(op_id)):
+                        _fail(rules, "E4-FORMING",
+                              f"{edge_id}: edge_op_ids entry {op_id!r} is not an "
+                              "operator-node id (expected the graph's "
+                              "`<time>-<random>` shape) — a placeholder proves "
+                              "nothing about what formed the edge")
+                    named_op_ids.append(op_id)
 
         # ── E4-REFS: pre/post-commit endpoint refs, per side ────────────
         endpoints = edge.get("endpoints")
@@ -391,6 +433,24 @@ def check_receipt(
               "capture of a corpus carrying planted operators must commit at least "
               "one operator node")
 
+    # ── E4-FORMING (receipt level): the named nodes fit inside the run ────
+    # A receipt cannot claim MORE distinct operator nodes than the run
+    # committed. Cheap, artifact-truthful, and red-able — it does not prove each
+    # id RESOLVES (that needs the published id set, #9569), but it refuses a
+    # duplicate list padded past the denominator.
+    distinct_named = sorted(set(named_op_ids))
+    summary["named_op_ids"] = len(distinct_named)
+    if distinct_named and isinstance(total, int) and not isinstance(total, bool) \
+            and len(distinct_named) > total:
+        _fail(rules, "E4-FORMING",
+              f"the wired edges name {len(distinct_named)} distinct operator "
+              f"nodes but the run committed {total} — the receipt asserts more "
+              "forming operators than exist")
+    elif distinct_named:
+        _pass(rules, "E4-FORMING",
+              f"{len(distinct_named)} distinct forming operator id(s) fit inside "
+              f"operators_total={total}")
+
     # ── E4-NUMERATOR: the PUBLISHED numbers must BE the graded rows ─────
     # The two published numerators are what a reader quotes ("15/15"), and
     # nothing else in the receipt is read before them. Left unbound, a receipt
@@ -437,14 +497,35 @@ def check_receipt(
     # (`isinstance(planted, int)` is False against a dict) on every receipt
     # `runner.py` completes — so 15 published edges with 3 graded rows was
     # certified as evidence (#9520 review, P1).
-    for entry in receipt.get("session_results") or []:
+    # A non-list `session_results` (a number, a dict) is the same class of
+    # malformed receipt as a non-dict `resolved_config`: refused BY NAME, never
+    # an uncaught TypeError that prints no rule at all.
+    session_results = receipt.get("session_results")
+    if session_results is not None and not isinstance(session_results, list):
+        _fail(rules, "E4-NUMERATOR",
+              "session_results: expected a list, got "
+              f"{type(session_results).__name__} — the per-session duplicate "
+              "cannot be bound to the per-edge rows")
+        session_results = []
+    for entry in session_results or []:
         if not isinstance(entry, dict):
             _fail(rules, "E4-NUMERATOR",
                   "session_results[]: not an object — the per-session duplicate "
                   "cannot be bound to the per-edge rows")
             continue
         session_id = entry.get("session_id") or "?"
-        for duplicate in entry.get("planted_operators") or []:
+        planted_rows = entry.get("planted_operators")
+        if not isinstance(planted_rows, list):
+            # A malformed-but-parseable duplicate is a NAMED refusal, not a
+            # traceback: `2` is reserved for an unreadable FILE, and an
+            # uncaught TypeError here would print no rule at all (the same
+            # contract break this commit repairs for `resolved_config`).
+            _fail(rules, "E4-NUMERATOR",
+                  f"session_results[{session_id!r}].planted_operators: expected "
+                  f"a list, got {type(planted_rows).__name__} — the per-session "
+                  "duplicate cannot be bound to the per-edge rows")
+            continue
+        for duplicate in planted_rows:
             if not isinstance(duplicate, dict):
                 _fail(rules, "E4-NUMERATOR",
                       f"session_results[{session_id!r}].planted_operators: "
