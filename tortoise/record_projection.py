@@ -1820,13 +1820,30 @@ def _narrative_statements(
     if session_id is None:
         return []
 
+    # A DELETED SESSION TAKES ITS NARRATIVE WITH IT. The record's own delete path
+    # (`hosted_api._delete_session_sync`) emits `SessionDeleted`, whose declared
+    # mutation removes the session row, its turns and its `session:` Source
+    # stub; this table is not a node table (no `node_identity` parent), so it
+    # cannot ride `companion_deletes` and carries its own statement. Without it
+    # §9.4's verbatim path would serve the text of a session the graph no longer
+    # has, and a same-id re-capture would inherit the deleted incarnation's
+    # narrative. Journal order still decides: a narrative record arriving AFTER
+    # the delete re-creates the row, which is the graph fold's own semantics.
+    if record.get("type") == "SessionDeleted":
+        return [Statement(
+            f"DELETE FROM public.{NARRATIVE_TABLE} "
+            "WHERE org_id = %s AND graph_id = %s AND session_id = %s",
+            (org_id, graph_id, session_id),
+        )]
+
     values: dict[str, Any] = {}
     # THE SAME RULE AS THE COUNTS BELOW: project what the column can hold, never
-    # coerce, and never fail the carrier. A `:Source` record's `story_arc` lands
-    # in a TEXT column (so the primary path already refuses a non-string), but
-    # an `:Event` record has no such column and its value falls into the props
-    # tail, where a list is perfectly storable — so raising here would add a
-    # failure the record's own write does not have.
+    # coerce, and never fail the carrier. ⚠️ The primary path does NOT refuse a
+    # non-string `story_arc` — `_jsonb_or_scalar` serialises a list/dict into the
+    # text column, so `public.source.story_arc` can itself hold a non-prose value
+    # (a pre-existing defect of the carrier, filed separately). This home simply
+    # refuses to propagate a non-string as §9.1 prose, and refuses to raise: a
+    # value the column cannot hold faithfully is an ABSENCE here.
     narrative = carrier.get(_NARRATIVE_KEY)
     if isinstance(narrative, str) and narrative.strip():
         values["narrative"] = narrative

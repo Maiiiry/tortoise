@@ -28,21 +28,24 @@
 -- table holds; the transcript is served from the turn rows by
 -- `tortoise.record_read` (see that module), not copied here.
 --
--- WHY THE COLUMNS ARE WHAT THEY ARE (§3's per-write test: a field is PRIMARY
--- iff the journal carries it). Both carriers already ride the journal:
---   * `narrative`  <- the commit's `story_arc`, journal-carried on the
---     `:Source`/`:Event` records that the layer-1 commit writes (hosted_api's
---     §4.1 derived path and the extractor's commit payload). No new producer.
---   * `summary`    <- the same records' `summary` (the one-line name of the
---     narrative; §9.4 uses the narrative for the source-level vector).
+-- WHY THE COLUMNS ARE WHAT THEY ARE (§3's per-write test, in the four-class
+-- form the layer-1 migration states at its head). Two of them are PRIMARY
+-- because their journal carrier exists TODAY; two are PRIMARY-WITHOUT-CARRIER
+-- and the difference is stated rather than glossed:
 --   * `capture_redactions` <- `SessionRecorded.capture_redactions`, the
---     per-window redaction count (`#4911`). INTEGER on purpose: the count IS an integer,
---     and the jsonb sibling on `public.session` is the schema↔producer
---     disagreement `#9264` (R4) exists to remove. A count is not an envelope.
---   * `turn_count` <- `SessionRecorded.turn_count`, the same record.
--- No column here is DERIVED-from-nothing: every one of them is written from a
--- record that already carries it, so this table cannot become authoritative
--- for a value the journal does not hold.
+--     per-window redaction count (`#4911`) — journal-carried today. INTEGER on
+--     purpose: the count IS an integer, and the jsonb sibling on
+--     `public.session` is the schema↔producer disagreement `#9264` (R4) exists
+--     to remove. A count is not an envelope.
+--   * `turn_count` <- `SessionRecorded.turn_count`, the same record, the same
+--     journal carriage.
+--   * `narrative`  <- the commit's `story_arc`, and `summary` <- the same
+--     records' `summary`: **PRIMARY-WITHOUT-CARRIER today.** §9.1 places this
+--     text here, so the COLUMN is right — but no producer journals it (see the
+--     ⚠️ CARRIER GAP block below: the layer-1 commit writes it to the graph by
+--     raw Cypher, which is not a journal record). Under the four-class rule
+--     that means “the journal must be extended”, and extending it is R7's
+--     remainder (#9555), not a claim that the carriage already exists.
 --
 -- TENANCY. Same posture as the other record tables (`#7968`): RLS enabled, an
 -- `authenticated` read policy on `app.current_org_id`, a `service_role` policy
@@ -70,11 +73,21 @@
 -- only where the role exists (and in today's harness, where it does not, the
 -- assertion is `0 = 0` BY DESIGN — it becomes meaningful the moment R6 lands).
 --
--- ERASURE. `purge_org_record` (20261012000005) deletes the organization, which
--- cascades organizations -> graphs -> THIS table (the FK below is ON DELETE
--- CASCADE), so a tenant's narrative dies with the tenant on the one production
--- erasure path. The append-only journal guarantee is untouched: this table is
--- not the journal.
+-- ERASURE. Two paths, and they are different on purpose.
+--   * TENANT erasure: `purge_org_record` (20261012000005) deletes the
+--     organization, which cascades organizations -> graphs -> THIS table (the
+--     FK below is ON DELETE CASCADE), so a tenant's narrative dies with the
+--     tenant. The append-only journal guarantee is untouched: this table is not
+--     the journal.
+--   * SESSION deletion: the record's own delete path (`SessionDeleted`, emitted
+--     by `hosted_api._delete_session_sync`) removes the session row, its turns
+--     and its `session:` Source stub — so the narrative row must go with them.
+--     It does, explicitly: `record_projection._narrative_statements` emits a
+--     DELETE for `SessionDeleted` (the table has no `node_identity` parent for
+--     a companion-delete template, so it carries its own statement). A narrative
+--     row surviving a deleted session would be served by §9.4's verbatim path
+--     for a session the graph no longer has, and a same-id re-capture would
+--     attach the deleted incarnation's narrative to the new one.
 --
 -- ⚠️ THE CARRIER GAP, STATED SO THIS TABLE IS NOT OVER-READ. `story_arc` (the
 -- `narrative`) and its `summary` are written to the GRAPH by the layer-1 commit's

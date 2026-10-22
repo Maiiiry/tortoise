@@ -395,6 +395,22 @@ def test_a_count_larger_than_the_column_accepts_is_an_absence_not_an_overflow():
     assert 3 in statements[0].params
 
 
+def test_a_deleted_session_takes_its_narrative_with_it():
+    """The record's own delete path (`SessionDeleted`, emitted by
+    `hosted_api._delete_session_sync`) removes the session row, its turns and its
+    `session:` Source stub — so the narrative row must go too, or §9.4's verbatim
+    path serves text for a session the graph no longer has and a same-id
+    re-capture inherits the deleted incarnation's narrative."""
+    statements = rp.mutations_for({"type": "SessionDeleted", "id": "s1"},
+                                 org_id=ORG, graph_id=GRAPH)
+    deletes = [s for s in statements
+               if f"DELETE FROM public.{rr.NARRATIVE_TABLE}" in s.sql]
+    assert len(deletes) == 1
+    assert deletes[0].params == (ORG, GRAPH, "s1")
+    # It still removes the session row itself (the declared mutation).
+    assert any("DELETE FROM public.session " in s.sql for s in statements)
+
+
 # ── 5. The read side: the record, and only the record ────────────────────────
 
 
@@ -486,6 +502,20 @@ def test_an_absent_session_is_an_honest_absence():
     conn = _Conn(**{"public.session_narrative": [], "public.point": []})
     assert rr.session_text(conn, org_id=ORG, graph_id=GRAPH,
                            session_id="s_none") is None
+
+
+def test_the_inverse_sentinel_is_not_served_as_a_speaker_label():
+    """`"unknown"` is what the writer's inverse returns for un-framed text — and
+    the writer stores it in `point.speaker` too (`_capture_turn_frame` emits
+    `[unknown] …` for a role-less turn). Filtering it on one side only would
+    serve every role-less turn as `"unknown: …"`, which is not verbatim text."""
+    text = rr.SessionText(session_id="s", turns=(
+        rr.Turn(turn_id="s_t0", index=0, content="[unknown] hi there",
+                speaker="unknown"),
+        rr.Turn(turn_id="s_t1", index=1, content="no frame at all",
+                speaker=None),
+    ))
+    assert text.transcript == "hi there\n\nno frame at all"
 
 
 def test_a_session_with_turns_and_no_narrative_yet_still_serves_the_turns():

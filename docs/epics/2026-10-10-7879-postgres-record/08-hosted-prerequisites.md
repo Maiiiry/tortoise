@@ -334,12 +334,19 @@ for the same input” cost §9.1 rejects one level up — and two copies of the 
 suffix-shape rule `sdk._capture_turn_ids` applies (`{session}_t<all digits>`), so D7's “raw turn text
 comes back” is measured against the record's own turn rows.
 
+**Deletion follows the record's own delete path.** `SessionDeleted` (emitted by
+`hosted_api._delete_session_sync`) removes the session row, its turns and its `session:` Source stub,
+so the projection emits the matching `DELETE` for `session_narrative` — the table is not a node table
+and carries its own statement rather than a `companion_deletes` template. Tenant erasure is the other
+path (organizations → graphs → this table, `ON DELETE CASCADE`).
+
 **Why the two carriers cannot clobber each other.** One row is built by two records (the narrative
 record owns the text, `SessionRecorded` owns the counts), so each upsert names **only its own columns**
 in the `DO UPDATE SET` — otherwise whichever record arrived second would write NULLs over the first
-one's half, i.e. a replay whose result depends on arrival order. Pinned by comparing the two arrival
-orders through `replay_plan`, and by a PGlite assertion that the narrative survives its session row
-being deleted.
+one's half, i.e. a replay whose result depends on arrival order. Pinned by applying both arrival orders
+through `replay_plan` to a row model and comparing the resulting row (the PGlite assertion that the
+narrative survives its **session row** being deleted pins the FK dependency separately — a different
+property, and it is stated there for that reason).
 
 **Verification:** `tests/test_9555_session_narrative.py` (DB-free: schema shape, tenancy posture, the
 statement shapes, order-independence, the reader reading the record only) plus the PGlite assertions in

@@ -138,7 +138,15 @@ class SessionText:
         lines = []
         for turn in self.turns:
             role, body = _role_and_body(turn.content)
-            label = turn.speaker or (role if role != _UNFRAMED_ROLE else None)
+            # `"unknown"` is the INVERSE's sentinel, not a speaker the record
+            # knows — and the writer stores it in `point.speaker` too
+            # (`_capture_turn_frame` emits `[unknown] …` for a role-less turn),
+            # so the sentinel has to be filtered on BOTH sides or every
+            # role-less turn is served as `"unknown: …"`.
+            speaker = turn.speaker
+            if speaker == _UNFRAMED_ROLE:
+                speaker = None
+            label = speaker or (role if role != _UNFRAMED_ROLE else None)
             lines.append(f"{label}: {body}" if label else body)
         return "\n\n".join(lines)
 
