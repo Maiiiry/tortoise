@@ -1410,6 +1410,191 @@ class TestCapabilityModel:
         assert "create_via_const" in sdk_graph_mutators(src)
 
 
+class TestReadTierCannotHideAnOutOfBoundaryWrite:
+    """#9576 (the #4122 defect class): `tortoise_events_poll` is `read` — a
+    `readOnlyHint: true` entry a client auto-approves and a `graphs:read` key may
+    call — while its handler path runs an interval-gated `DETACH DELETE` of expired
+    `:GraphEvent` rows (`poll_events` -> `_maybe_purge_events` ->
+    `event_store.purge_expired`/`purge_overflow`).
+
+    That mutation lives OUTSIDE the `sdk.py` derivation boundary, so
+    `sdk_graph_mutators()` cannot see it, `reached_writes` is empty and every
+    capability arm reports a clean surface while the read tool deletes rows. THE
+    MEASUREMENT (before this family existed):
+
+        handler_operations("tortoise_events_poll").operations == {'poll_events'}
+        "poll_events" in sdk_graph_mutators()          -> False
+        write_classification_violations(served)        -> []      # clean, and wrong
+
+    The RULING is recorded, not enforced by silence: it stays `read` (see the
+    `OVERRIDES:` line at the registry entry and RETENTION_CARVEOUTS), and these
+    tests are what make the record load-bearing — a read-hinted tool that reaches
+    an out-of-boundary mutation must be DECLARED, and the declaration must still
+    describe the code.
+    """
+
+    def test_the_purge_is_invisible_to_the_derivation(self):
+        """The premise, pinned: the structural derivation cannot see this DELETE.
+
+        If this ever goes GREEN the other way (the purge becomes a derived
+        mutation), the carve-out stops being a hole in the analysis and becomes a
+        plain `READ_THROUGH_WRITE_METHODS` row — and this test says so rather than
+        letting the entry sit there unexamined.
+        """
+        import tool_surface_capabilities as tsc
+
+        assert tsc.handler_operations("tortoise_events_poll").operations \
+            == frozenset({"poll_events"})
+        assert "poll_events" not in tsc.sdk_graph_mutators()
+        assert "poll_events" in tsc.OUT_OF_BOUNDARY_MUTATORS
+
+    def test_the_declared_carveout_is_the_only_one(self):
+        import tool_surface_capabilities as tsc
+
+        declared = set(tsc.RETENTION_CARVEOUTS)
+        assert declared == {"tortoise_events_poll"}, sorted(declared)
+        # and the real registry is clean under the new arm
+        assert tsc.write_classification_violations(tsc.served_registry()) == []
+        assert tsc.declared_set_violations(tsc.served_registry()) == []
+
+    def test_an_undeclared_read_tool_reaching_one_fails(self, monkeypatch):
+        """Mutation 1: an undeclared read-hinted tool reaching an out-of-boundary
+        mutation is caught — the arm is not vacuous just because the one real
+        carve-out is declared."""
+        import tool_surface_capabilities as tsc
+
+        # Pretend `query` were an out-of-boundary mutator: the read tools that
+        # reach it (tortoise_query and friends) are NOT declared, so it must fire.
+        monkeypatch.setitem(
+            tsc.OUT_OF_BOUNDARY_MUTATORS, "query",
+            "probe: pretend a mutation lives outside sdk.py")
+        violations = tsc.write_classification_violations(tsc.served_registry())
+        assert any("out-of-boundary mutation" in v and "tortoise_query" in v
+                   for v in violations), violations
+        # …and a WRITE-classified tool is not what this arm is for: a writer is
+        # already refused a `graphs:read` key and has no read hint to misuse.
+        assert not any("out-of-boundary mutation" in v
+                       and "tortoise_create_point" in v for v in violations)
+
+    def test_a_second_undeclared_purger_is_caught(self, monkeypatch):
+        """Mutation 2: dropping the carve-out makes the REAL tool fail.
+
+        This is the "silently tidy it either way" guard the issue asks for: the
+        entry cannot stop being declared without a red, so nobody demotes it to
+        write/`maintenance` OR deletes the record by accident.
+        """
+        import tool_surface_capabilities as tsc
+
+        monkeypatch.delitem(tsc.RETENTION_CARVEOUTS, "tortoise_events_poll")
+        violations = tsc.write_classification_violations(tsc.served_registry())
+        assert any("tortoise_events_poll" in v and "out-of-boundary mutation" in v
+                   for v in violations), violations
+
+    def test_the_carveout_is_stale_when_the_purge_stops_being_reached(self, monkeypatch):
+        """Mutation 3 (code moves): the declaration must follow the CODE. If the
+        poll stops reaching the purge, the carve-out is a record that no longer
+        describes anything and must be re-decided — not left to read as a standing
+        decision."""
+        import tool_surface_capabilities as tsc
+
+        real = tsc.handler_operations
+        monkeypatch.setattr(
+            tsc, "handler_operations",
+            lambda name, source=None: type(
+                "H", (), {"operations": frozenset(), "unresolved": ()})()
+            if name == "tortoise_events_poll" else real(name, source))
+        assert any("no longer reaches" in v
+                   for v in tsc.declared_set_violations(tsc.served_registry()))
+
+    def test_the_carveout_is_stale_when_the_entry_stops_being_a_read(self):
+        """Mutation 3 (declaration moves): if `tortoise_events_poll` is ever
+        re-tiered off `read`, the carve-out becomes an excuse for a WRITE tool's
+        deletion — it must be deleted deliberately at the same time, and this arm
+        is what refuses to let the two drift apart (#9576's "do not silently
+        reclassify", read in the other direction)."""
+        import dataclasses
+
+        import tool_surface_capabilities as tsc
+
+        from tortoise.tool_registry import _rw
+
+        flipped = [dataclasses.replace(e, annotations=_rw())
+                   if e.name == "tortoise_events_poll" else e
+                   for e in tsc.served_registry()]
+        assert any("no longer claims the read hint" in v
+                   for v in tsc.declared_set_violations(flipped))
+
+    def test_the_read_classification_this_issue_asked_about(self):
+        """The RULING, pinned: the poll keeps `readOnlyHint: true`, needs only
+        `graphs:read`, and is not a declared writer.
+
+        Re-tiering it is a surface decision (#4122 / #9576) — not something a
+        later lane gets to do as tidying — so the three facts that make it a read
+        are asserted here, and a `graphs:read`-only key is proven to be admitted.
+        """
+        from tool_surface_capabilities import served_registry
+
+        from tortoise.mcp_auth import _current_legacy_full_access, _current_scopes
+        from tortoise.mcp_server import _enforce_mcp_tool_scope
+        from tortoise.mcp_server import WRITE_TOOL_NAMES
+
+        entry = next(e for e in served_registry() if e.name == "tortoise_events_poll")
+        assert entry.annotations is not None
+        assert entry.annotations.readOnlyHint is True, (
+            "tortoise_events_poll must keep the read hint (#9576 ruling) — a "
+            "confirmation prompt per poll is the cost of dropping it")
+        assert entry.writes is False
+        assert entry.name not in WRITE_TOOL_NAMES
+
+        scopes_tok = _current_scopes.set(["graphs:read"])
+        legacy_tok = _current_legacy_full_access.set(False)
+        try:
+            _enforce_mcp_tool_scope("tortoise_events_poll")  # must NOT raise
+        finally:
+            _current_scopes.reset(scopes_tok)
+            _current_legacy_full_access.reset(legacy_tok)
+
+    def test_poll_events_really_runs_the_retention_delete(self, monkeypatch):
+        """The behaviour the record is ABOUT, proven at runtime (not inferred from
+        a docstring): `poll_events` reaches the interval-gated purge on the normal
+        read path, so the carve-out covers a real DELETE.
+
+        Same gate-opening technique as
+        `test_event_retention_interval_rejects_nonpositive_in_sdk` (#3416): the
+        monotonic clock is simulated and the gate is seeded monotonic-relative, so
+        this is deterministic on a fresh CI runner.
+        """
+        import time
+
+        import tortoise.event_store as es
+
+        from tortoise.monitoring import event_retention_interval
+        from tortoise.sdk import TortoiseSDK
+
+        uptime = 300.0
+        monkeypatch.setattr(time, "monotonic", lambda: uptime)
+        purges: list[str] = []
+        monkeypatch.setattr(es, "purge_expired",
+                            lambda *a, **k: purges.append("expired"))
+        monkeypatch.setattr(es, "purge_overflow",
+                            lambda *a, **k: purges.append("overflow"))
+        monkeypatch.setattr(es, "degraded", lambda proj: None)
+        monkeypatch.setattr(es, "read_after", lambda *a, **k: [])
+        monkeypatch.setattr(TortoiseSDK, "_get_proj", lambda self: object())
+        interval = event_retention_interval()
+        monkeypatch.setattr(TortoiseSDK, "_EVENT_PURGE_LAST", uptime - interval - 1.0)
+
+        # A bare instance (no __init__: this test needs the METHOD, not a store)
+        # so the patched `_get_proj` resolves on the class as a bound method.
+        sdk = TortoiseSDK.__new__(TortoiseSDK)
+        out = sdk.poll_events()
+        assert set(purges) == {"expired", "overflow"}, (
+            "the poll's read path did not reach the retention DELETE — the "
+            "carve-out and its OVERRIDES line would then be covering nothing")
+        # …and the call is still a POLL: the reply shape is the read contract.
+        assert set(out) >= {"events", "next_cursor"}
+
+
 class TestToolIdentity:
     """#4170: the write permission lives on the entry, on a stable `id`.
 

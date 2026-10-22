@@ -600,6 +600,30 @@ _ENTRY_DECLARATIONS: list[ToolDefinition] = [
                     "PointRevised reaches the store, and the response adds `changes` "
                     "(per-claim before→after deltas), only while TORTOISE_CHANGE_FEED "
                     "is enabled.",
+        # ⚠️ `read` IS DELIBERATE, AND IT IS A RECORDED CARVE-OUT (#9576, the
+        # #4122 defect class). The handler path also runs interval-gated retention
+        # housekeeping on SYSTEM-owned rows (`poll_events` -> `_maybe_purge_events`
+        # -> `event_store.purge_expired`/`purge_overflow`, a `DETACH DELETE` of
+        # expired `:GraphEvent` rows), so a read-only key CAN cause a DELETE. It
+        # stays `read` because both alternatives are worse for the caller:
+        # `writes=True` would take a poll away from `graphs:read` keys entirely,
+        # and a non-read tier would drop the hint on a tool agents poll in a loop
+        # (a confirmation prompt per poll). The rows are the store's own
+        # bookkeeping, deleted by policy and never replayed by a rebuild —
+        # `docs/retention-and-deletion.md` records the window as an OPERATIONAL
+        # property, not user content.
+        #
+        #   OVERRIDES: `readOnlyHint: true` ⇒ the call deletes nothing — this poll
+        #   purges `:GraphEvent` rows the store owns, on a timer, idempotently.
+        #
+        # The decision is checkable, not just written down: the carve-out is
+        # declared in `tests/tool_surface_capabilities.py` -> RETENTION_CARVEOUTS
+        # (with the out-of-boundary mutation it covers), and a guard fails if this
+        # entry stops claiming the read hint, stops reaching the purge, or if ANY
+        # other read-hinted tool reaches an out-of-boundary mutation undeclared.
+        # Re-tier it deliberately (and delete the carve-out) or not at all — see
+        # the `TestReadTierCannotHideAnOutOfBoundaryWrite` family in
+        # `tests/test_tool_registry.py`.
         annotations=_ro(),
         http_policy=True,
         sdk_method="poll_events",
