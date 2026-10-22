@@ -80,6 +80,10 @@ if str(REPO_ROOT) not in sys.path:  # run as a script, not as a module
 # only that it is unexpected.
 DISCARDED_DENOMINATOR = 4
 PRODUCT_LANE = "llm"
+# The one operator kind that rides the POINT-level CORRECTS edge and commits no
+# operator node (#2552's cross-session supersession), so it is exempt from the
+# "name the forming operator" requirement E4-FORMING otherwise enforces.
+POINT_LEVEL_KIND = "SUPERSEDE"
 
 
 def current_edge_map() -> dict[str, str] | None:
@@ -192,7 +196,13 @@ def check_receipt(
               f"real extractor ({extractor.get('module')}.{extractor.get('qualname')})")
 
     # ── E4-LANE: the product (llm) lane ─────────────────────────────────
-    posture = (receipt.get("resolved_config") or {}).get("extractor_posture")
+    # A non-dict `resolved_config` is a MALFORMED receipt, not a crash: the
+    # documented contract is that every refusal names a rule (`2` is reserved
+    # for an unreadable FILE). `runner.validate_receipt` rejects the shape on
+    # the write side; the checker has to name it on the read side too.
+    resolved_config = receipt.get("resolved_config")
+    posture = (resolved_config.get("extractor_posture")
+               if isinstance(resolved_config, dict) else None)
     if posture == PRODUCT_LANE:
         _pass(rules, "E4-LANE", f"product lane (extractor_posture={posture})")
     else:
@@ -299,6 +309,30 @@ def check_receipt(
                   "— the committed nodes are not in the eventId-keyed retrieval "
                   "layer (the silent-drop signature #2552 closed)")
 
+        # ── E4-FORMING: a wired edge names the operator node(s) that ────
+        # formed it. Without this rule `persisted` is VACUOUS for an empty
+        # list — "every operator node that formed the edge is eventId-stamped"
+        # is satisfied by zero of them, which is the same shape as the
+        # historical silent drop (`operator_counts` silently `{}`) that #2552
+        # closed. A SUPERSEDE rides the point-level CORRECTS edge and commits
+        # no operator node, so it is the ONE kind exempt from the requirement.
+        if edge.get("expected_kind") != POINT_LEVEL_KIND:
+            forms = edge.get("forms_found")
+            op_ids = edge.get("edge_op_ids")
+            if not (isinstance(forms, list) and forms):
+                _fail(rules, "E4-FORMING",
+                      f"{edge_id} ({edge.get('expected_kind')}): edge_correct "
+                      f"with forms_found={forms!r} — the receipt does not say "
+                      "what form the edge took, so `persisted` cannot be "
+                      "checked against a node that was supposed to carry it")
+            if not (isinstance(op_ids, list) and op_ids):
+                _fail(rules, "E4-FORMING",
+                      f"{edge_id} ({edge.get('expected_kind')}): edge_correct "
+                      f"with edge_op_ids={op_ids!r} — an empty list makes "
+                      "'every forming operator is retrievable' true of nothing "
+                      "(legal ONLY for a SUPERSEDE, which rides the "
+                      "point-level CORRECTS)")
+
         # ── E4-REFS: pre/post-commit endpoint refs, per side ────────────
         endpoints = edge.get("endpoints")
         if not isinstance(endpoints, dict):
@@ -356,6 +390,74 @@ def check_receipt(
               f"operator_audit.operators_total={total!r} — a completed product-lane "
               "capture of a corpus carrying planted operators must commit at least "
               "one operator node")
+
+    # ── E4-NUMERATOR: the PUBLISHED numbers must BE the graded rows ─────
+    # The two published numerators are what a reader quotes ("15/15"), and
+    # nothing else in the receipt is read before them. Left unbound, a receipt
+    # can certify a false 15/15 while its own rows say 2/15 — the exact
+    # "numerator restated as evidence" class this tool exists to refuse.
+    row_correct = sum(1 for e in results.values()
+                      if isinstance(e, dict) and e.get("edge_correct"))
+    row_content_ok = sum(
+        1 for e in results.values()
+        if isinstance(e, dict)
+        and e.get("verdict") not in ("from_content_missing", "to_content_missing")
+    )
+    published_correct = audit.get("edge_correct")
+    published_content_ok = audit.get("content_ok")
+    summary["row_edge_correct"] = row_correct
+    summary["row_content_ok"] = row_content_ok
+    for field, published, computed in (
+        ("edge_correct", published_correct, row_correct),
+        ("content_ok", published_content_ok, row_content_ok),
+    ):
+        if isinstance(published, bool) or not isinstance(published, int):
+            _fail(rules, "E4-NUMERATOR",
+                  f"operator_audit.{field}={published!r} — the receipt does not "
+                  f"publish a numerator the rows can be bound to (the graded "
+                  f"rows say {computed}); an unpublished number is the one a "
+                  "reader has to take on trust")
+        elif published != computed:
+            _fail(rules, "E4-NUMERATOR",
+                  f"operator_audit.{field}={published} but the per-edge rows say "
+                  f"{computed} — the published numerator is not the graded "
+                  "result (a numerator that is not derived from its rows is "
+                  "exactly the restatement #9077 exists to refuse)")
+        else:
+            _pass(rules, "E4-NUMERATOR",
+                  f"{field} {published} == the per-edge rows")
+
+    # The per-session duplicate is a SECOND place the same claim is published
+    # (the operator lane reads it, and `runner` renders it into the notes), so
+    # it is cross-checked rather than trusted: two copies that disagree is a
+    # self-contradicting artifact whichever one is right.
+    for entry in receipt.get("session_results") or []:
+        if not isinstance(entry, dict):
+            _fail(rules, "E4-NUMERATOR",
+                  "session_results[]: not an object — the per-session duplicate "
+                  "cannot be bound to the per-edge rows")
+            continue
+        session_id = entry.get("session_id") or "?"
+        for planted in entry.get("planted_operators") or []:
+            if not isinstance(planted, dict):
+                _fail(rules, "E4-NUMERATOR",
+                      f"session_results[{session_id!r}].planted_operators: "
+                      "entry is not an object")
+                continue
+            edge_id = planted.get("id")
+            row = results.get(edge_id)
+            if not isinstance(row, dict):
+                _fail(rules, "E4-NUMERATOR",
+                      f"session_results[{session_id!r}] names {edge_id!r}, which "
+                      "the per-edge verdicts do not carry — the duplicate and "
+                      "the graded rows are not the same edge set")
+                continue
+            for key in ("verdict", "edge_correct", "expected_kind"):
+                if planted.get(key) != row.get(key):
+                    _fail(rules, "E4-NUMERATOR",
+                          f"{edge_id}: session_results says {key}="
+                          f"{planted.get(key)!r} while the graded row says "
+                          f"{row.get(key)!r} — one artifact, two answers")
 
     if named_misses:
         _pass(rules, "E4-CAUSE",

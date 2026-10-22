@@ -35,6 +35,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.eval.write_path import corpus, grading, runner, schema  # noqa: E402
+from tortoise.ids import content_hash  # noqa: E402
+
+
+def _payload_id(content: str) -> str:
+    """The PAYLOAD id a point with ``content`` is emitted under.
+
+    Deliberately NOT ``grading._pre_commit_ref``: asking the function under
+    test to compute its own expected value makes the #4716 id-space claim
+    unfalsifiable (a ``_pre_commit_ref`` that returns a constant leaves every
+    assertion below green). This is the independent oracle — the same
+    content-addressed id ``extractor_v2._content_id("pt", ...)`` emits.
+    """
+    return f"pt_{content_hash(content)[:62]}"
 
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 import operator_receipt_check as checker  # noqa: E402
@@ -112,7 +125,14 @@ def _receipt(edges: list[dict] | None = None, **over) -> dict:
         "operator_audit": {
             "planted": len(edges),
             "edge_correct": sum(1 for e in edges if e.get("edge_correct")),
-            "content_ok": len(edges),
+            # ``grading.operator_audit`` defines content_ok as "the verdict is
+            # not a content miss", so the fixture derives it the same way — a
+            # fixture that hard-coded ``len(edges)`` here would disagree with
+            # its own rows and (correctly) red E4-NUMERATOR.
+            "content_ok": sum(
+                1 for e in edges
+                if e.get("verdict") not in ("from_content_missing", "to_content_missing")
+            ),
             "operators_total": 7,
             "operators_provenanced": 7,
             "results": {e["id"]: e for e in edges},
@@ -430,9 +450,10 @@ def test_grading_emits_per_edge_refs_persistence_and_no_cause():
     for side, content in (("from", FOOT), ("to", CLAIM)):
         ref = detail["endpoints"][side][0]
         # The committed node kept its content-addressed payload id here, so the
-        # #4716 re-key did NOT fire — `remapped` must say so, honestly.
-        assert ref["pre_ref"] == grading._pre_commit_ref(content)
-        assert ref["post_ref"] == grading._pre_commit_ref(content)
+        # #4716 re-key did NOT fire — `remapped` must say so, honestly. The
+        # expectation is the INDEPENDENT oracle, not the function under test.
+        assert ref["pre_ref"] == _payload_id(content)
+        assert ref["post_ref"] == _payload_id(content)
         assert ref["remapped"] is False
         assert ref["resolves"] is True
 
@@ -636,5 +657,11 @@ def test_checker_rejects_an_edge_without_its_verdict(field):
         # An empty op-id list is legal ONLY for a SUPERSEDE (it rides the
         # point-level CORRECTS). Pinned here because a checker that silently
         # accepted it for an operator-kind edge would pass a receipt whose
-        # edge was graded but never found.
-        assert "E4-SHAPE" not in _failures(_check(receipt))
+        # edge was graded but never found — which is how `persisted` becomes
+        # vacuous (`all(oid in provenanced for oid in [] or [])` is True).
+        assert "E4-FORMING" in _failures(_check(receipt))
+        # ...and the exemption is real, not a gap: the same receipt with the
+        # point-level kind is accepted on this axis.
+        supersede = _receipt([_edge("op_a", kind="SUPERSEDE")])
+        supersede["operator_audit"]["results"]["op_a"][field] = []
+        assert "E4-FORMING" not in _failures(_check(supersede))
