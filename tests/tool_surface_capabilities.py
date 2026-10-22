@@ -975,17 +975,26 @@ def write_classification_violations(entries, mcp_src: str | None = None) -> list
         # 2a-double-prime (#9576): a mutation that lives OUTSIDE the sdk.py boundary
         # is invisible to `sdk_graph_mutators()`, so `reached_writes` above is empty
         # and NOTHING else in this function can see the tool deleting rows — the
-        # surface reports clean (#9576's measurement). A read-hinted entry that
-        # reaches one of those operations must therefore be DECLARED, with its
+        # surface reports clean (#9576's measurement). An entry on the READING side
+        # that reaches one of those operations must therefore be DECLARED, with its
         # reason, in `RETENTION_CARVEOUTS`. Without this arm the ledger was a
         # comment: a new read-classified tool purging through another module was
         # caught by nothing.
+        #
+        # The predicate is the SAME WIDTH as the sibling arm below (`annotations is
+        # None or readOnlyHint is not False`), not `readOnlyHint is True` (#9576
+        # review round 3): a read key is admitted on `writes`, NOT on the hint, and
+        # `ToolAnnotations()` defaults `readOnlyHint` to None — so a hint-unset
+        # entry is still callable by a `graphs:read` key while a hint-True test
+        # would let it through silently. Current entries all set the hint (the
+        # registry's constructors do), so this widens the FUTURE coverage the arm
+        # claims rather than changing today's verdict.
         out_of_boundary = (
             handler_operations(e.name, mcp_src).operations
             & set(OUT_OF_BOUNDARY_MUTATORS)
         )
-        if out_of_boundary and e.annotations is not None \
-                and e.annotations.readOnlyHint is True \
+        if out_of_boundary and (e.annotations is None
+                                or e.annotations.readOnlyHint is not False) \
                 and e.name not in RETENTION_CARVEOUTS:
             out.append(
                 f"{e.name}: read-only annotation but its handler reaches "

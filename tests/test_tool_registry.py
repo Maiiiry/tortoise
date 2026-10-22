@@ -1489,6 +1489,35 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
                       if e.name == "tortoise_create_point")
         assert create.annotations.readOnlyHint is False
 
+    def test_a_hint_unset_reader_is_still_caught(self, monkeypatch):
+        """A read key is admitted on `writes`, NOT on the hint — and
+        `ToolAnnotations()` defaults `readOnlyHint` to None (review round 3). So the
+        arm must be as wide as its sibling's `annotations is None or readOnlyHint
+        is not False`; an `is True` test would let exactly the tool this arm exists
+        for through silently."""
+        import dataclasses
+
+        import tool_surface_capabilities as tsc
+        from mcp.types import ToolAnnotations
+
+        # A real read tool whose handler resolution is real (`query`), declared as
+        # an out-of-boundary mutation for the probe, with the hint stripped to the
+        # `ToolAnnotations()` default of None.
+        monkeypatch.setitem(tsc.OUT_OF_BOUNDARY_MUTATORS, "query",
+                            "probe: pretend a mutation lives outside sdk.py")
+        real = next(e for e in tsc.served_registry() if e.name == "tortoise_query")
+        hint_unset = dataclasses.replace(real, annotations=ToolAnnotations())
+        assert hint_unset.annotations.readOnlyHint is None  # the premise
+        violations = tsc.write_classification_violations([hint_unset])
+        assert any("out-of-boundary mutation" in v and "tortoise_query" in v
+                   for v in violations), violations
+        # …and with the carve-out declared, the same entry is clean.
+        monkeypatch.setitem(tsc.RETENTION_CARVEOUTS, "tortoise_query",
+                            "probe: declared")
+        assert not any("out-of-boundary" in v for v in
+                       tsc.write_classification_violations([hint_unset])), (
+            "a declared carve-out must silence the arm")
+
     def test_a_second_undeclared_purger_is_caught(self, monkeypatch):
         """Mutation 2: dropping the carve-out makes the REAL tool fail.
 

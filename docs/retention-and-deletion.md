@@ -264,10 +264,10 @@ existing delete paths.
 "link or be a named constant" rule.
 
 **The purge rides the read surface (#9576).** The retention pass is
-interval-gated and LAZY — it runs from `TortoiseSDK.poll_events`, i.e. from the
-`tortoise_events_poll` MCP tool, which is `readOnlyHint: true` and needs only
-`graphs:read`. So a read-only key can cause a `DETACH DELETE`. That is
-deliberate and recorded, not an oversight:
+interval-gated and LAZY — it runs from `TortoiseSDK.poll_events`, which is what
+the `tortoise_events_poll` MCP tool (and the REST events poll) call. That tool is
+`readOnlyHint: true` and needs only `graphs:read`, so a read-only key can cause a
+`DETACH DELETE`. That is deliberate and recorded, not an oversight:
 
 > **OVERRIDES:** `readOnlyHint: true` ⇒ the call deletes nothing — the poll
 > purges `:GraphEvent` rows the store owns, on a timer, idempotently.
