@@ -64,6 +64,29 @@ raw HTML out of the body (E2E-5 asserts DB body stays clean markdown).
 `[[toc]]` / `[[video: …]]` markers, the transcript convention and the reciprocal
 internal link — is the authoring contract: [`docs/blog-authoring.md`](../../../docs/blog-authoring.md).
 
+## Author identity (#1383)
+
+Every post carries an **Author name** (`blog_posts.author`, `text NOT NULL`) and
+an optional **Author image URL** (`blog_posts.author_image_url`, `text NULL`).
+The editor exposes both (`PostEditor` → SaveFormFields → `buildSaveRecord` →
+create/patch), a new post prefills them with `DEFAULT_AUTHOR` /
+`DEFAULT_AUTHOR_IMAGE_URL`, and a blank name falls back to `DEFAULT_AUTHOR`.
+
+- **There is ONE author name, in four places that must agree:** the DB `author`
+  DEFAULT (migration `20261021000001`), `DEFAULT_AUTHOR` in
+  `website/functions/blog/_lib.ts` (the SSR renderer's fallback), the agent API's
+  insert default (`website/functions/blog/api/posts/[[path]].ts`) and
+  `DEFAULT_AUTHOR` in `src/lib/blog-api.ts`. A default that disagrees with the
+  renderer fallback prints two different names for the same post depending on
+  which path wrote it — that is how every post shipped as the anonymous
+  `'Tortoise team'` before this change.
+- **`NULL` avatar is a first-class value, not a failure.** The article byline
+  then renders the NAME ALONE — no `<img>`, no empty circle (`authorBylineHtml`
+  in `_lib.ts`). It is deliberately not `''`: an empty string is not nullish and
+  would emit `<img src="">`, a broken image. A blank field saves as `NULL`.
+- **Structured data** is `author: {"@type": "Person", name, image}` with
+  `image` OMITTED when there is no avatar, never `null`.
+
 ## ElDato port
 
 Editor UX ported from the ElDato repo (private checkout), attribution comments

@@ -30,7 +30,7 @@
 //     per-isolate; unit-tested at lowered thresholds).
 
 import {
-  type Env, validUrl, SITE_URL,
+  type Env, validUrl, SITE_URL, DEFAULT_AUTHOR,
 } from "../../_lib.ts";
 import {
   META_TITLE_MAX, META_DESCRIPTION_MAX, EXCERPT_MAX, TAGS_MAX, TAG_LEN_MAX,
@@ -98,6 +98,7 @@ interface PostInput {
   meta_title?: unknown;
   meta_description?: unknown;
   author?: unknown;
+  author_image_url?: unknown;
   hold_for_review?: unknown;
   status?: unknown;
 }
@@ -151,6 +152,9 @@ function validateCreate(input: PostInput): { ok: true; value: CreateValues } | {
   const author = str(input.author);
   if (author && author.length > 100) errors.author = "author max 100 chars";
 
+  const authorImage = str(input.author_image_url);
+  if (authorImage && !validUrl(authorImage)) errors.author_image_url = "author_image_url must be an absolute https/http URL";
+
   if (status === "published" && input.hold_for_review === true) errors.hold_for_review = "hold_for_review cannot be combined with status=published";
 
   if (input.tags !== undefined && input.tags !== null) {
@@ -176,6 +180,7 @@ function validateCreate(input: PostInput): { ok: true; value: CreateValues } | {
       meta_title: metaTitle ?? null,
       meta_description: metaDesc ?? null,
       author: author ?? null,
+      author_image_url: authorImage ?? null,
       hold_for_review: typeof input.hold_for_review === "boolean" ? input.hold_for_review : false,
       status,
     },
@@ -192,6 +197,7 @@ interface CreateValues {
   meta_title: string | null;
   meta_description: string | null;
   author: string | null;
+  author_image_url: string | null;
   hold_for_review: boolean;
   status: PostStatus;
 }
@@ -199,7 +205,7 @@ interface CreateValues {
 function validatePatch(input: PostInput): { ok: true; value: PatchValues } | { ok: false; errors: Record<string, string> } {
   const errors: Record<string, string> = {};
   const value: PatchValues = {};
-  const stringKeys = ["title", "body", "excerpt", "cover_image_url", "meta_title", "meta_description", "author"] as const;
+  const stringKeys = ["title", "body", "excerpt", "cover_image_url", "meta_title", "meta_description", "author", "author_image_url"] as const;
   for (const k of stringKeys) {
     if (input[k] !== undefined && input[k] !== null && typeof input[k] !== "string") {
       errors[k] = "must be a string";
@@ -234,6 +240,15 @@ function validatePatch(input: PostInput): { ok: true; value: PatchValues } | { o
     if (cover === "") value.cover_image_url = null;
     else if (!validUrl(cover)) errors.cover_image_url = "cover_image_url must be an absolute https/http URL";
     else value.cover_image_url = cover;
+  }
+
+  // `""` clears the avatar to NULL, which is what makes the byline fall back to
+  // the name alone — never `''`, which is not nullish and would emit <img src="">.
+  const authorImage = str(input.author_image_url);
+  if (authorImage !== null) {
+    if (authorImage === "") value.author_image_url = null;
+    else if (!validUrl(authorImage)) errors.author_image_url = "author_image_url must be an absolute https/http URL";
+    else value.author_image_url = authorImage;
   }
 
   if (input.tags !== undefined) {
@@ -283,6 +298,7 @@ interface PatchValues {
   meta_title?: string | null;
   meta_description?: string | null;
   author?: string | null;
+  author_image_url?: string | null;
   hold_for_review?: boolean;
   status?: PostStatus;
 }
@@ -336,7 +352,12 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     tags: v.value.tags,
     meta_title: v.value.meta_title,
     meta_description: v.value.meta_description,
-    author: v.value.author ?? "Tortoise team",
+    author: v.value.author ?? DEFAULT_AUTHOR,
+    // `""` is NOT a value here: it is not nullish, so storing it would emit
+    // <img src=""> on the byline. The admin path already trims blank to NULL;
+    // an agent sending an explicit empty string gets the same NULL (the PATCH
+    // path does this too, so the two write paths cannot disagree).
+    author_image_url: v.value.author_image_url || null,
     status: v.value.status,
     hold_for_review: v.value.hold_for_review,
     created_by: agent.agentName,
