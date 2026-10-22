@@ -1284,18 +1284,19 @@ def declared_set_violations(entries, sdk_src: str | None = None) -> list[str]:
         if op not in methods:
             out.append(f"INTERNAL_PATH_READERS entry {op!r} does not resolve")
     # RETENTION_CARVEOUTS and OUT_OF_BOUNDARY_MUTATORS are LIVE (#9576): a carved-out
-    # tool that no longer exists, no longer claims the read hint, or no longer
-    # reaches the operation it was carved out for is a record that stopped
-    # describing the code, and it must be deleted deliberately rather than left to
-    # read as a standing decision.
+    # tool that no longer exists, has moved to a WRITING tier, or no longer reaches
+    # the operation it was carved out for is a record that stopped describing the
+    # code, and it must be deleted deliberately rather than left to read as a
+    # standing decision. (⚠️ NOT "no longer claims the read hint": a `maintenance`
+    # move drops the hint and KEEPS the carve-out — see the arm below.)
     #
     # ⚠️ SUBSET SEMANTICS: `entries` may be a synthetic subset (`without_dream` and
     # `without` in `tests/test_tool_registry.py` pass "served set minus one tool"),
     # so an absent tool proves NOTHING on its own — the file's own
     # `NON_SDK_WRITER_BINDINGS` idiom is to skip a missing tool rather than report
-    # it. Reporting on absence would make a future
-    # probe aimed at `tortoise_events_poll` emit "delete the decision record", which
-    # is the opposite of this ledger's purpose. Liveness is therefore decided against
+    # it. Reporting on absence would make a future probe aimed at
+    # `tortoise_events_poll` emit `delete the carve-out (#9576)` — i.e. delete the
+    # decision record — which is the opposite of this ledger's purpose. Liveness is therefore decided against
     # the SERVED set, not against whatever subset the caller handed in: an entry that
     # is missing here but present there is a filtered call, not a dead declaration.
     served_names = {e.name for e in served_registry()}
