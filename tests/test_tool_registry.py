@@ -749,12 +749,24 @@ def _ledger_src(reaches: str) -> str:
     )
 
 
-def _probe(name: str, sdk_method: str, *, annotations, http_policy: bool, writes: bool = False):
+def _probe(name: str, sdk_method: str, *, annotations, http_policy: bool):
+    """Build a probe entry. #4122: hints are DERIVED from `risk`, so a probe
+    declares the risk class it is simulating. `annotations=` is kept in the
+    signature (every probe is written as the hint shape it wants to simulate) and
+    translated here, so each probe still reads as the shape it describes."""
     from tortoise.tool_registry import ToolDefinition
+    risk = "read" if annotations.readOnlyHint else "write"
+    # There is deliberately NO `writes=` parameter: the permission is DERIVED from
+    # `risk` (#4122), so a caller-supplied `writes` could only be ignored or
+    # contradicted (cycle-1 review P2). A probe that needs a hint which disagrees
+    # with its permission (the #4474 shape) builds a `SimpleNamespace` instead —
+    # `test_exemption_set_is_exact` pins exactly that shape.
     return ToolDefinition(
         name=name, id=f"surface.probe.{name.removeprefix('tortoise_')}",
-        description="probe", annotations=annotations,
-        http_policy=http_policy, sdk_method=sdk_method, writes=writes,
+        description="probe", risk=risk,
+        destructive_hint=bool(annotations.destructiveHint),
+        idempotent_hint=bool(annotations.idempotentHint),
+        http_policy=http_policy, sdk_method=sdk_method,
     )
 
 
@@ -1089,28 +1101,43 @@ class TestCapabilityModel:
         assert handler_self_guards("tortoise_probe_helper_guard", _PROBE_SRC)
 
     def test_exemption_set_is_exact(self):
-        """2b: an entry's writer ANNOTATION and its declared `writes` flag must be
-        the same statement — measured over the SERVED set, retired names included
+        """2b: an entry's client hints and its declared permission must be the
+        same statement — measured over the SERVED set, retired names included
         (#3883): a retired writer is still callable by name, so it is not exempt
-        from the guard. #4474 removed the last five entries where the two
-        disagreed, so the exemption is empty and the check is restated as the
-        invariant the name list stood for — both directions, any `http_policy`.
-        The rogue probes below prove it can still fire."""
+        from the guard.
+
+        #4122 replaced the 2-state rule (`readOnlyHint is False` ⇔ `writes`) with
+        the RISK axis, because the 2-state rule had no way to say "changes derived
+        state, but is not a user write". Both hints are now DERIVED from `risk`
+        (`init=False`), so the rogue *probes* that used to prove the check can
+        fire are impossible by construction — an entry cannot be built whose hints
+        disagree with its permission. What the guard must still catch is an entry
+        that does not carry the axis at all: dropping `risk` must not be a way to
+        escape the property."""
+        from types import SimpleNamespace
+
         from tool_surface_capabilities import exemption_set_violations, served_registry
 
         from tortoise.tool_registry import _ro, _rw
         served = served_registry()
         assert served, "served registry is empty — the check would be vacuous"
         assert exemption_set_violations(served) == []
-        # `_probe` leaves writes=False, so a writer annotation makes the two
-        # disagree — exactly the #4474 defect — and the check must fire.
-        rogue = _probe("tortoise_rogue_writer", "query", annotations=_rw(),
-                       http_policy=False)
-        assert exemption_set_violations([rogue])
-        # The reverse direction too: a declared writer behind a read annotation.
-        reverse = _probe("tortoise_rogue_reader", "query", annotations=_ro(),
-                         http_policy=False, writes=True)
+
+        # An entry with no `risk` (a probe, a proxy, a stale object) is checked on
+        # the pre-#4122 rule rather than skipped.
+        rogue = SimpleNamespace(name="tortoise_rogue_writer", annotations=_rw(),
+                                writes=False)
+        assert exemption_set_violations([rogue]), (
+            "an entry with no risk axis must not escape the annotation check")
+        reverse = SimpleNamespace(name="tortoise_rogue_reader", annotations=_ro(),
+                                  writes=True)
         assert exemption_set_violations([reverse])
+
+        # And on the axis itself: a writer permission behind a read risk.
+        off_axis = SimpleNamespace(name="tortoise_off_axis_reader",
+                                   annotations=_ro(), writes=True, risk="read")
+        assert any("risk='read'" in v for v in exemption_set_violations([off_axis]))
+
 
     def test_guard4_rename_simulation_fails_loudly(self):
         """A stale write-surface map (renamed/removed tool, or a declared write
@@ -1215,8 +1242,6 @@ class TestCapabilityModel:
         import tool_surface_capabilities as tsc
         from tool_surface_capabilities import declared_set_violations, served_registry
 
-        from tortoise.tool_registry import _rw
-
         # The real registry is clean — the violation below is caused by the probe.
         assert declared_set_violations(served_registry()) == []
         # ... and the op is genuinely NOT declared on any entry (the premise of
@@ -1224,10 +1249,10 @@ class TestCapabilityModel:
         assert not any(e.sdk_method == "get_tenant_packs" for e in served_registry())
         assert tsc.NON_SDK_READ_BINDINGS["get_tenant_packs"] == "tortoise_packs_list"
 
-        flipped = [dataclasses.replace(e, annotations=_rw())
+        flipped = [dataclasses.replace(e, risk="write")
                    if e.name == "tortoise_packs_list" else e
                    for e in served_registry()]
-        assert any("get_tenant_packs" in v and "non-read HTTP tool" in v
+        assert any("get_tenant_packs" in v and "not `risk='maintenance'`" in v
                    for v in declared_set_violations(flipped)), (
             "the read-classification property is unchecked for a handler-served "
             "read-through op")
@@ -1484,53 +1509,44 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
                        and "tortoise_create_point" in v for v in violations), (
             "a writer-annotated tool was reported by the READ-tier arm — the arm "
             "must be keyed on the read hint, not on reaching an operation")
-        # probe premise: the tool the arm must ignore really is writer-annotated
+        # probe premise: the tool the arm must ignore really is a WRITING tier
         create = next(e for e in tsc.served_registry()
                       if e.name == "tortoise_create_point")
-        assert create.annotations.readOnlyHint is False
+        assert create.risk not in ("read", "maintenance")
 
-    def test_a_hint_unset_reader_is_still_caught(self, monkeypatch):
-        """A read key is admitted on `writes`, NOT on the hint — and
-        `ToolAnnotations()` defaults `readOnlyHint` to None (review round 3). So the
-        arm must be as wide as its sibling's `annotations is None or readOnlyHint
-        is not False`; an `is True` test would let exactly the tool this arm exists
-        for through silently."""
+    def test_a_maintenance_tier_purger_is_still_caught(self, monkeypatch):
+        """#4122 makes `maintenance` a REAL third state: it derives
+        `readOnlyHint: false` (it refreshes stored state on purpose) while staying
+        callable by a `graphs:read` key. So an arm keyed on the HINT misses it, and
+        the arm must key on the TIER — `read | maintenance` is exactly the set of
+        tiers a read-only key can reach, and it is what the arm now uses.
+
+        (Round 3 found the same hole as a hint-UNSET entry, which was reachable
+        before #4122 landed: `ToolAnnotations()` defaults `readOnlyHint` to None. On
+        the risk model the hint cannot be unset, and `maintenance` is the state that
+        plays that role — this test pins the arm against it.)"""
         import dataclasses
 
         import tool_surface_capabilities as tsc
-        from mcp.types import ToolAnnotations
 
-        # A real read tool whose handler resolution is real (`query`), declared as
-        # an out-of-boundary mutation for the probe, with the hint stripped to the
-        # `ToolAnnotations()` default of None.
         monkeypatch.setitem(tsc.OUT_OF_BOUNDARY_MUTATORS, "query",
                             "probe: pretend a mutation lives outside sdk.py")
+        # A REAL entry (so the handler resolution is real) moved to the
+        # `maintenance` tier — exactly the re-tiering a lane might attempt.
         real = next(e for e in tsc.served_registry() if e.name == "tortoise_query")
-        hint_unset = dataclasses.replace(real, annotations=ToolAnnotations())
-        assert hint_unset.annotations.readOnlyHint is None  # the premise
-        violations = tsc.write_classification_violations([hint_unset])
+        maint = dataclasses.replace(real, risk="maintenance")
+        # the premise: the hint does NOT say read, and the permission says read
+        assert maint.annotations.readOnlyHint is False
+        assert maint.writes is False
+        violations = tsc.write_classification_violations([maint])
         assert any("out-of-boundary mutation" in v and "tortoise_query" in v
                    for v in violations), violations
         # …and with the carve-out declared, the same entry is clean.
         monkeypatch.setitem(tsc.RETENTION_CARVEOUTS, "tortoise_query",
                             "probe: declared")
         assert not any("out-of-boundary" in v for v in
-                       tsc.write_classification_violations([hint_unset])), (
+                       tsc.write_classification_violations([maint])), (
             "a declared carve-out must silence the arm")
-
-    def test_a_second_undeclared_purger_is_caught(self, monkeypatch):
-        """Mutation 2: dropping the carve-out makes the REAL tool fail.
-
-        This is the "silently tidy it either way" guard the issue asks for: the
-        entry cannot stop being declared without a red, so nobody demotes it to
-        write/`maintenance` OR deletes the record by accident.
-        """
-        import tool_surface_capabilities as tsc
-
-        monkeypatch.delitem(tsc.RETENTION_CARVEOUTS, "tortoise_events_poll")
-        violations = tsc.write_classification_violations(tsc.served_registry())
-        assert any("tortoise_events_poll" in v and "out-of-boundary mutation" in v
-                   for v in violations), violations
 
     def test_the_carveout_is_stale_when_the_reach_signal_disappears(self, monkeypatch):
         """Mutation 3 (arm non-vacuity): the LIVENESS arm fires when the reach
@@ -1632,12 +1648,12 @@ class TestReadTierCannotHideAnOutOfBoundaryWrite:
 
         import tool_surface_capabilities as tsc
 
-        from tortoise.tool_registry import _rw
-
-        flipped = [dataclasses.replace(e, annotations=_rw())
+        # `risk` is the axis (#4122): replacing it re-derives the hints, so this is
+        # the one edit a re-tiering lane would actually make.
+        flipped = [dataclasses.replace(e, risk="write")
                    if e.name == "tortoise_events_poll" else e
                    for e in tsc.served_registry()]
-        assert any("no longer claims the read hint" in v
+        assert any("records a `risk=read` carve-out" in v
                    for v in tsc.declared_set_violations(flipped))
 
     def test_the_read_classification_this_issue_asked_about(self):
@@ -1782,10 +1798,12 @@ class TestToolIdentity:
         from tortoise.tool_registry import RETIRED_TOOL_REGISTRY, TOOL_REGISTRY
 
         served = [*TOOL_REGISTRY, *RETIRED_TOOL_REGISTRY]
-        writer_annotated = sorted(
-            e.name for e in served
-            if e.annotations is not None and e.annotations.readOnlyHint is False
-        )
+        # #4122: derived from the PERMISSION (`writes`, itself derived from
+        # `risk`), not from `readOnlyHint`. A `maintenance` entry is annotated
+        # non-read and is still admitted under `graphs:read` — that is the whole
+        # point of the class — so keying this census on the hint would assert the
+        # opposite of the decision.
+        writer_annotated = sorted(e.name for e in served if e.writes)
         # 48 = the served writer census (44 live + 4 retired shims). Pinned
         # here so the derived loop below can never pass by covering nothing.
         assert len(writer_annotated) == 48, writer_annotated
@@ -1806,7 +1824,14 @@ class TestToolIdentity:
 
     def test_gate_admits_read_scope_for_a_genuine_read_tool(self):
         """#4474: the refusal above is not an over-correction — a `graphs:read`
-        key still succeeds for a tool that declares `writes=False`."""
+        key still succeeds for a tool that declares `writes=False`.
+
+        #4122: the `readOnlyHint is True` derivation below now excludes the three
+        `maintenance` tools — they are annotated non-read on purpose. Their
+        admission is the decision's headline promise (*"no integration loses a
+        tool"*), so pin them by name: a future gate change must not quietly take
+        them away from read-only keys.
+        """
         from tortoise.mcp_auth import _current_legacy_full_access, _current_scopes
         from tortoise.mcp_server import _enforce_mcp_tool_scope
         from tortoise.tool_registry import TOOL_REGISTRY
@@ -1816,12 +1841,16 @@ class TestToolIdentity:
             if e.annotations is not None and e.annotations.readOnlyHint is True
         )
         assert reads, "no read-annotated tool in the live registry"
+        maintenance = ("tortoise_get_confidence", "tortoise_compute_confidence",
+                       "tortoise_packs_list")
 
         scopes_tok = _current_scopes.set(["graphs:read"])
         legacy_tok = _current_legacy_full_access.set(False)
         try:
             for name in reads:
                 _enforce_mcp_tool_scope(name)  # must NOT raise
+            for name in maintenance:
+                _enforce_mcp_tool_scope(name)  # must NOT raise (#4122)
         finally:
             _current_scopes.reset(scopes_tok)
             _current_legacy_full_access.reset(legacy_tok)
@@ -1873,3 +1902,120 @@ class TestToolIdentity:
         finally:
             _current_scopes.reset(scopes_tok)
             _current_legacy_full_access.reset(legacy_tok)
+
+
+class TestRiskAxis:
+    """#4122 — the risk axis is the single declared statement per tool.
+
+    Owner decision (2026-10-21): the classification axis is USER-PERCEIVED RISK,
+    not "does the handler write". Hints and the permission are derived from
+    `risk`, so a hint, a permission and a scope can never drift apart again.
+    """
+
+    # The three tools the decision named: their handlers reach a write on an
+    # internal self-heal / recompute path, and they used to declare themselves
+    # read-only — which is what made a client auto-approve a call that changed
+    # customer data.
+    READ_THROUGH_TOOLS = (
+        "tortoise_get_confidence",
+        "tortoise_compute_confidence",
+        "tortoise_packs_list",
+    )
+
+    def test_every_entry_declares_a_known_risk(self):
+        from tortoise.tool_registry import (
+            RETIRED_TOOL_REGISTRY,
+            RISK_CLASSES,
+            TOOL_REGISTRY,
+        )
+        entries = (*TOOL_REGISTRY, *RETIRED_TOOL_REGISTRY)
+        assert entries, "registry is empty — the check would be vacuous"
+        bad = [(e.name, getattr(e, "risk", None)) for e in entries
+               if getattr(e, "risk", None) not in RISK_CLASSES]
+        assert not bad, f"entry with no known risk class: {bad}"
+
+    def test_readonly_hint_agrees_with_risk_read(self):
+        """Completion criterion 3 (a): `readOnlyHint` is `risk == 'read'`.
+
+        This is the load-bearing half: clients auto-approve on this hint, so an
+        entry whose hint says "read" while its risk says otherwise is the #4122
+        security defect. Fails if the two ever disagree, in either direction.
+        """
+        from tortoise.tool_registry import (
+            RETIRED_TOOL_REGISTRY,
+            RISK_READ,
+            TOOL_REGISTRY,
+        )
+        disagree = [
+            f"{e.name}: readOnlyHint={e.annotations.readOnlyHint} risk={e.risk!r}"
+            for e in (*TOOL_REGISTRY, *RETIRED_TOOL_REGISTRY)
+            if bool(e.annotations.readOnlyHint) != (e.risk == RISK_READ)
+        ]
+        assert not disagree, f"readOnlyHint disagrees with risk (#4122): {disagree}"
+
+    def test_writes_agrees_with_the_write_risk_classes(self):
+        """Completion criterion 3 (b): `writes` is `risk in {write, destructive,
+        admin}` — the permission a caller needs `graphs:write` for."""
+        from tortoise.tool_registry import (
+            RETIRED_TOOL_REGISTRY,
+            TOOL_REGISTRY,
+            risk_writes,
+        )
+        disagree = [
+            f"{e.name}: writes={e.writes} risk={e.risk!r}"
+            for e in (*TOOL_REGISTRY, *RETIRED_TOOL_REGISTRY)
+            if bool(e.writes) != risk_writes(e.risk)
+        ]
+        assert not disagree, f"writes disagrees with risk (#4122): {disagree}"
+
+    def test_hints_and_permission_cannot_be_hand_set(self):
+        """The derivation is structural: `annotations`/`writes` are not fields a
+        caller can pass, and `risk` is REQUIRED, so the drift #4122 removed cannot
+        come back by edit and forgetting the axis cannot fail open.
+
+        The bare-construction assertion is the regression pin for the cycle-1 P1:
+        with `risk` defaulting to "read", an entry that simply omitted the axis
+        would be built as a SILENT READ — `readOnlyHint: true` (client
+        auto-approve) and `writes: false` (`graphs:read` reaches it). Omitting it
+        must be as loud as omitting `annotations` was before #4122.
+        """
+        from tortoise.tool_registry import ToolAnnotations, ToolDefinition
+        base = dict(name="tortoise_probe", id="surface.probe", description="p",
+                    http_policy=True, sdk_method="query")
+        with pytest.raises(TypeError):
+            ToolDefinition(**base)  # no `risk` at all — must not default to read
+        with pytest.raises(TypeError):
+            ToolDefinition(**base, annotations=ToolAnnotations(readOnlyHint=True))
+        with pytest.raises(TypeError):
+            ToolDefinition(**base, writes=True)
+        with pytest.raises(ValueError):
+            ToolDefinition(**base, risk="sometimes-read")
+
+    def test_the_read_through_tools_are_maintenance_not_read_and_not_write(self):
+        """The security fix: they stop declaring `readOnlyHint`, they keep
+        `graphs:read`, and they are still metered as reads.
+
+        Promoting them to `writes` would satisfy the hint rule too, and it is
+        wrong: `maybe_record_mcp_read` returns early for a WRITE_TOOL_NAMES
+        member, so an expensive recompute would stop being counted as a read and
+        drop out of read-velocity alerting — the cost lever the decision names.
+        """
+        from tortoise.tool_registry import (
+            RISK_MAINTENANCE,
+            TOOL_REGISTRY,
+            get_write_tool_names,
+        )
+        writers = get_write_tool_names()
+        by_name = {t.name: t for t in TOOL_REGISTRY}
+        for name in self.READ_THROUGH_TOOLS:
+            entry = by_name.get(name)
+            assert entry is not None, f"{name} is no longer served"
+            assert entry.risk == RISK_MAINTENANCE, (
+                f"{name}: risk={entry.risk!r}; the owner decision (#4122) classifies "
+                f"a recompute/self-heal write as 'maintenance'")
+            assert entry.annotations.readOnlyHint is False, (
+                f"{name} still declares readOnlyHint=true — clients auto-approve on it")
+            assert entry.writes is False and name not in writers, (
+                f"{name} became a write: a `graphs:read` key would lose it")
+            assert entry.annotations.idempotentHint is True, (
+                f"{name}: maintenance implies idempotentHint per the decision's table")
