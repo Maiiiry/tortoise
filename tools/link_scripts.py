@@ -71,10 +71,22 @@ Usage
 """
 from __future__ import annotations
 
+import sys
+
+# #5128: refuse a <3.12 interpreter before the imports below — this file is a
+# `tools/` entry point, and the guard must precede every other import so a
+# scheduled/hand invocation on an old interpreter fails with the documented
+# message instead of an ImportError from a 3.12-only construct.
+if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
+    raise SystemExit(
+        f"tools/link_scripts.py requires Python >= 3.12 (got "
+        f"{sys.version_info[0]}.{sys.version_info[1]}) — run it as "
+        f"`uv run python tools/link_scripts.py`"
+    )
+
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 
 EXIT_REACHABLE = 0
