@@ -853,6 +853,27 @@ console.log("the AGENT publish API keeps the same author contract (#1383 — the
     DEFAULT_AUTHOR,
     "...and the row carries the real author, not the retired anonymous default",
   );
+  // ⛔ The avatar default must follow the NAME default (#1383). The admin editor
+  // prefills DEFAULT_AUTHOR_IMAGE_URL, so a post created here WITHOUT the field
+  // would otherwise render name-only while the same author's editor-written post
+  // renders an avatar — the byline still depending on which path wrote the post,
+  // which is the defect this change removes for the name. The agent is the
+  // primary writer on this surface, so this is the common case, not a corner.
+  assertEq(
+    noAuthor.inserted[0]?.author_image_url,
+    DEFAULT_AUTHOR_IMAGE_URL,
+    "an agent publish that OMITS the avatar gets the shipped one — the same byline the editor prefills",
+  );
+
+  // An explicit `""` is still a clear-to-NULL (see the `blank` case above), and a
+  // post by a DIFFERENT author never inherits the shipped avatar.
+  const otherAuthor = await publish({ title: "T", slug: "author-guest", author: "Someone Else" });
+  assertEq(otherAuthor.status, 201, "a guest author can be published without an image");
+  assertEq(
+    otherAuthor.inserted[0]?.author_image_url,
+    null,
+    "a post NOT by the shipped author gets NO avatar (the shipped avatar is not a global default)",
+  );
 }
 
 console.log("the shipped avatar exists, and is the URL the migration backfills (#1383)");
@@ -892,6 +913,43 @@ console.log("the shipped avatar exists, and is the URL the migration backfills (
   assert(
     migration.includes(`'Daniel Ospina'`),
     "the migration's author default matches the renderer's DEFAULT_AUTHOR",
+  );
+}
+
+console.log("the apply RECIPE is the atomic one (#1383 — `psql -f` is not one transaction)");
+{
+  // The migration toggles `blog_posts_set_updated_at` OFF around the backfill and
+  // back ON. That pair is only atomic when the file is applied as ONE simple query
+  // (CLI `db push`, Management API, the PGlite harness). `psql -f` autocommits PER
+  // STATEMENT, so an abort halfway commits the DISABLE and never reaches the ENABLE
+  // — updated_at then stops moving for every blog post, silently. The guarantee
+  // therefore lives in the recipe, so the recipe is what gets guarded: a reworded
+  // runbook that drops `--single-transaction` or the ledger step re-opens the hole
+  // with every other test still green.
+  const norm = (s) => s.replace(/\s+/g, " ");
+  const readme = norm(readFileSync(new URL("../supabase/README.md", import.meta.url), "utf8"));
+  const mig = norm(
+    readFileSync(
+      new URL("../supabase/migrations/20261021000001_blog_author_identity.sql", import.meta.url),
+      "utf8",
+    ),
+  );
+
+  assert(
+    mig.includes("psql --single-transaction"),
+    "the migration STATES the apply precondition (without it the DISABLE/ENABLE pair is not atomic)",
+  );
+  assert(
+    readme.includes("psql --single-transaction"),
+    "the runbook's out-of-band apply uses `psql --single-transaction`, never a bare `psql -f`",
+  );
+  assert(
+    readme.includes("ON_ERROR_STOP=1"),
+    "...and stops at the first error instead of pressing on past it",
+  );
+  assert(
+    readme.includes("supabase migration repair --linked --status applied"),
+    "the runbook RECORDS the applied version — psql writes the schema, not the ledger, and `check-migration-drift` is fail-closed",
   );
 }
 

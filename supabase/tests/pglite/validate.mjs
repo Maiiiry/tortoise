@@ -207,17 +207,26 @@ for (const f of files) {
       `);
     }
     if (f === '20261021000001_blog_author_identity.sql') {
-      // #1383: seed the two rows the migration's deploy-time BACKFILL acts on.
+      // #1383: seed the THREE rows the migration's deploy-time BACKFILL acts on.
       // A backfill is already history when a suite runs, so without this seed the
       // suite could only assert the column's shape and the whole backfill could
       // be deleted with the harness still green (the #4216/#3036/#3027 pattern).
       //
-      //  * anon  — carries the RETIRED default 'Tortoise team', plus an explicit
-      //            updated_at and the three audit columns. After the migration:
-      //            author + image rewritten, updated_at and the audit columns
-      //            untouched (the trigger is disabled around the UPDATE).
-      //  * named — a deliberately-set author. After the migration: unchanged, so
-      //            the backfill's guard cannot be over-broad.
+      //  * anon              — carries the RETIRED default 'Tortoise team', plus an
+      //                        explicit updated_at and the three audit columns.
+      //                        After the migration: author + image rewritten,
+      //                        updated_at and the audit columns untouched (the
+      //                        trigger is disabled around the UPDATE).
+      //  * named             — a deliberately-set author. After the migration:
+      //                        unchanged, so the backfill's guard cannot be
+      //                        over-broad.
+      //  * named-null-image  — ALREADY carries the real author but no avatar, so
+      //                        only the SECOND pass can give it one (pass 1's guard
+      //                        is `author = 'Tortoise team'`). Without this row,
+      //                        deleting pass 2 left the whole harness green — the
+      //                        first pass covered the anon row, and the suite's
+      //                        post-migration INSERT row proves the opposite of what
+      //                        pass 2 does.
       await db.exec(`
         INSERT INTO public.blog_posts
           (slug, title, author, status, created_at, updated_at, created_by, reviewed_by)
@@ -228,6 +237,11 @@ for (const f of files) {
           (slug, title, author, status, created_at, updated_at)
         VALUES ('1383-preseed-named', '1383 preseed named', 'Someone Else', 'draft',
                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO public.blog_posts
+          (slug, title, author, status, created_at, updated_at)
+        VALUES ('1383-preseed-named-null-image', '1383 preseed named null image',
+                'Daniel Ospina', 'draft',
+                '2026-02-02T00:00:00Z', '2026-02-02T00:00:00Z');
       `);
     }
     await db.exec(sql);

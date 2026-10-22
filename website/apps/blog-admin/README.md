@@ -84,6 +84,15 @@ create/patch), a new post prefills them with `DEFAULT_AUTHOR` /
   then renders the NAME ALONE — no `<img>`, no empty circle (`authorBylineHtml`
   in `_lib.ts`). It is deliberately not `''`: an empty string is not nullish and
   would emit `<img src="">`, a broken image. A blank field saves as `NULL`.
+- **The avatar default is applied on BOTH write paths.** The editor prefills
+  `DEFAULT_AUTHOR_IMAGE_URL`, and the agent API (the primary writer on this
+  surface) inherits the same avatar when `author_image_url` is OMITTED and the
+  post is by the shipped author — otherwise the rendered byline would still
+  depend on which path wrote the post, which is exactly the defect the name half
+  removes. An explicit `""` on either path clears to `NULL` (name-only byline).
+  The v1 field contract lives in
+  [`03-plan.md` §6](../../../docs/epics/2026-08-27-tortoise-blog-cms/03-plan.md)
+  and in the route's header comment (`api/posts/[[path]].ts`).
 - **Structured data** is `author: {"@type": "Person", name, image}` with
   `image` OMITTED when there is no avatar, never `null`.
 

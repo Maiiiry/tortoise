@@ -9,12 +9,23 @@
 -- HOW THE ONE-TIME BACKFILL IS TESTED AT ALL: a migration's deploy-time UPDATE
 -- is already history by the time a suite runs, so asserting "the backfill works"
 -- afterwards would need the migration's own text replayed — which proves nothing
--- about what the DEPLOY did. The harness therefore seeds two rows IMMEDIATELY
+-- about what the DEPLOY did. The harness therefore seeds three rows IMMEDIATELY
 -- BEFORE this migration is applied (validate.mjs, the #4216 precedent):
---   * `1383-preseed-anon`  — author = 'Tortoise team' (the RETIRED default), with
---                            an explicit updated_at and audit columns;
---   * `1383-preseed-named` — author = 'Someone Else' (deliberately set).
--- The assertions below then read what the migration actually did to them.
+--   * `1383-preseed-anon`            — author = 'Tortoise team' (the RETIRED
+--                                      default), with an explicit updated_at and
+--                                      audit columns;
+--   * `1383-preseed-named`           — author = 'Someone Else' (deliberately set);
+--   * `1383-preseed-named-null-image` — author = 'Daniel Ospina' with NO avatar,
+--                                      which ONLY the backfill's second pass can
+--                                      fill (pass 1's guard is 'Tortoise team').
+-- The assertions below then read what the migration actually did to them, so
+-- deleting EITHER UPDATE reddens — the two passes have separate coverage.
+--
+-- The trigger state is asserted too (`pg_trigger.tgenabled`): deleting the
+-- re-enable would leave updated_at frozen for every blog post from that deploy
+-- forward, and no other assertion here can see it — a backfilled row whose
+-- updated_at did NOT move looks identical whether the trigger was re-enabled or
+-- left off for good.
 -- ============================================================================
 
 CREATE SCHEMA IF NOT EXISTS tests;
@@ -88,6 +99,47 @@ SELECT tests.assert(
 SELECT tests.assert(
   (SELECT author_image_url FROM public.blog_posts WHERE slug = '1383-preseed-named') IS NULL,
   '1383: ...and that row keeps its NULL image (the name-alone byline)');
+
+-- Second pass — a row that ALREADY carried the real author but had no avatar.
+-- Pass 1 cannot touch it (`author = 'Tortoise team'`), so this is the only
+-- assertion that can red when the second UPDATE is deleted.
+SELECT tests.assert(
+  (SELECT author FROM public.blog_posts WHERE slug = '1383-preseed-named-null-image') = 'Daniel Ospina',
+  '1383: the second pass leaves an already-correct author name alone');
+
+SELECT tests.assert(
+  (SELECT author_image_url FROM public.blog_posts WHERE slug = '1383-preseed-named-null-image')
+    = 'https://tortoise.premiselabs.co/blog/author-daniel-ospina.jpg',
+  '1383: the second pass gives the avatar to a post that already carried the byline (name-only → avatar; deleting this UPDATE reddens)');
+
+SELECT tests.assert(
+  (SELECT updated_at FROM public.blog_posts WHERE slug = '1383-preseed-named-null-image')
+    = '2026-02-02 00:00:00+00'::timestamptz,
+  '1383: ...and the second pass did not bump updated_at either (the trigger stays off for both passes)');
+
+-- ── 2b. The updated_at trigger is ENABLED again ────────────────────────────
+-- `tgenabled = 'O'` is "enabled, fires on origin". Deleting the migration's
+-- `ENABLE TRIGGER` leaves 'D' here: updated_at silently stops moving for every
+-- blog post from that deploy forward, so the article page's "Updated …" line
+-- and the 30-minute no-cache window (`isRecentlyEdited`) freeze forever with no
+-- error anywhere. Nothing else in the harness can see that — `20260827000001`
+-- only counts the trigger's EXISTENCE (a DROP, not a DISABLE), and a backfilled
+-- row whose updated_at did not move looks the same either way.
+SELECT tests.assert(
+  (SELECT tgenabled FROM pg_trigger
+    WHERE tgname = 'blog_posts_set_updated_at'
+      AND tgrelid = 'public.blog_posts'::regclass) = 'O',
+  '1383: blog_posts_set_updated_at is ENABLED again after the backfill (deleting the ENABLE TRIGGER reddens here)');
+
+-- ...and it really is a BEFORE UPDATE trigger, which is what makes the
+-- untouched-updated_at assertions above mean "disabled for the backfill" and
+-- not "the trigger does nothing anyway".
+UPDATE public.blog_posts SET title = title WHERE slug = '1383-preseed-named';
+
+SELECT tests.assert(
+  (SELECT updated_at FROM public.blog_posts WHERE slug = '1383-preseed-named')
+    > '2026-01-01 00:00:00+00'::timestamptz,
+  '1383: after the migration the trigger DOES bump updated_at on an UPDATE (so the frozen timestamps above prove the disable, not an inert trigger)');
 
 -- ── 3. Behaviour of the new defaults on write ──────────────────────────────
 INSERT INTO public.blog_posts (slug, title)

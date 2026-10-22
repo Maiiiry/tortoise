@@ -28,9 +28,21 @@
 //   - slug immutable; archived posts reject all PATCHes AND DELETEs (409/400 terminal).
 //   - Rate limit: 120 req/min + 2,000 req/day per key (in-memory counter —
 //     per-isolate; unit-tested at lowered thresholds).
+//
+// Author identity (#1383 — part of the same v1 contract, additive):
+//   - `author?: string` (≤100 chars) is the byline NAME. Omitted →
+//     `DEFAULT_AUTHOR` ('Daniel Ospina', the shipped author), never the retired
+//     anonymous 'Tortoise team'.
+//   - `author_image_url?: string` is the byline AVATAR and must be an absolute
+//     http(s) URL (a relative/`javascript:`/`data:` value is 400). On CREATE,
+//     omitting it inherits the shipped avatar when the post is by the shipped
+//     author (so an agent-written post and an editor-written post render the
+//     SAME byline) and NULL otherwise; an explicit `""` clears it to NULL, which
+//     renders the name alone. On PATCH, `""` clears it and omission leaves it
+//     untouched (a partial update).
 
 import {
-  type Env, validUrl, SITE_URL, DEFAULT_AUTHOR,
+  type Env, validUrl, SITE_URL, DEFAULT_AUTHOR, DEFAULT_AUTHOR_IMAGE_URL,
 } from "../../_lib.ts";
 import {
   META_TITLE_MAX, META_DESCRIPTION_MAX, EXCERPT_MAX, TAGS_MAX, TAG_LEN_MAX,
@@ -343,6 +355,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
 
   const now = new Date().toISOString();
   const isDirect = v.value.status === "published";
+  const author = v.value.author ?? DEFAULT_AUTHOR;
   const row = {
     slug,
     title: v.value.title,
@@ -352,12 +365,22 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     tags: v.value.tags,
     meta_title: v.value.meta_title,
     meta_description: v.value.meta_description,
-    author: v.value.author ?? DEFAULT_AUTHOR,
-    // `""` is NOT a value here: it is not nullish, so storing it would emit
-    // <img src=""> on the byline. The admin path already trims blank to NULL;
-    // an agent sending an explicit empty string gets the same NULL (the PATCH
-    // path does this too, so the two write paths cannot disagree).
-    author_image_url: v.value.author_image_url || null,
+    author,
+    // The avatar default follows the NAME default, and the two cases are
+    // deliberately different (#1383):
+    //  * OMITTED (`null` here) → the shipped avatar when the post is by the
+    //    shipped author, exactly as the editor prefills it. The admin path and
+    //    the agent path must not produce different bylines for the same author
+    //    ("an avatar on 4 posts and none on 2"), which is the defect class this
+    //    change removes for the name — so it must not be reintroduced for the
+    //    image. A post by ANY OTHER author gets NULL (name-alone byline).
+    //  * EXPLICIT `""` → NULL, never '': '' is not nullish, so storing it would
+    //    emit <img src=""> on the byline. An explicit empty value is an explicit
+    //    "no avatar" (the PATCH path does the same, so the write paths agree).
+    author_image_url:
+      v.value.author_image_url === null
+        ? (author === DEFAULT_AUTHOR ? DEFAULT_AUTHOR_IMAGE_URL : null)
+        : v.value.author_image_url || null,
     status: v.value.status,
     hold_for_review: v.value.hold_for_review,
     created_by: agent.agentName,

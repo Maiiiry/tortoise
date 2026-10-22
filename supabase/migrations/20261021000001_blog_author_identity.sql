@@ -49,12 +49,30 @@ COMMENT ON COLUMN public.blog_posts.author IS
 -- ---------------------------------------------------------------------------
 -- Backfill: attribution only.
 --
--- The updated_at trigger is disabled for the duration and re-enabled below. An
--- attribution fix is NOT an editorial edit: bumping updated_at would print
--- "Updated <today>" beside every backfilled byline (the article page renders it
--- whenever updated_at != published_at) and open the 30-minute no-cache window
--- (`isRecentlyEdited`) on each of them. Both statements run in ONE transaction
--- with the UPDATE, so the trigger cannot be left disabled.
+-- The updated_at trigger is disabled for the duration and re-enabled at the end
+-- of this section. An attribution fix is NOT an editorial edit: bumping
+-- updated_at would print "Updated <today>" beside every backfilled byline (the
+-- article page renders it whenever updated_at != published_at) and open the
+-- 30-minute no-cache window (`isRecentlyEdited`) on each of them.
+--
+-- ⛔ ATOMICITY HERE IS A PRECONDITION OF THE APPLY PATH, NOT A PROPERTY OF THIS
+-- FILE. The DISABLE … ENABLE pair is only in ONE transaction when the whole file
+-- is sent as ONE simple query — `supabase db push`, the Management API's
+-- single-query endpoint, and the PGlite harness's `db.exec` all do (each wraps
+-- the batch in one implicit transaction). A bare `psql -f file.sql` does NOT: it
+-- autocommits PER STATEMENT, so if an UPDATE fails (a lock timeout, a dropped
+-- connection, an operator Ctrl-C) the DISABLE is already committed and the
+-- ENABLE is never reached — leaving blog_posts_set_updated_at off for every blog
+-- write afterwards, silently ("Updated …" stops moving, the 30-minute no-cache
+-- window never opens again, and nothing reports it).
+--
+-- Apply this file with `psql --single-transaction -v ON_ERROR_STOP=1 …`, or via
+-- the CLI / the workflow — never a bare `psql -f`. Do NOT add BEGIN;/COMMIT;
+-- instead: the CLI has already opened a transaction, so a nested BEGIN only
+-- warns, and the inner COMMIT would END the CLI's transaction early.
+-- `supabase/tests/20261021000001_blog_author_identity.sql` asserts the trigger is
+-- ENABLED (`pg_trigger.tgenabled = 'O'`) after this migration, so removing the
+-- ENABLE below reddens in the harness.
 -- ---------------------------------------------------------------------------
 ALTER TABLE public.blog_posts DISABLE TRIGGER blog_posts_set_updated_at;
 
