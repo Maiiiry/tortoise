@@ -655,8 +655,19 @@ def check(record: dict, *, repo: Path,
         # while the gate still reported one number deciding E4. By this arm's
         # own rule E4's row must carry the SAME denominator the receipt
         # computed, and absence is the same non-agreement as a wrong value.
-        if measured and isinstance(receipt, dict) and _count(e4_den):
-            if "denominator" not in receipt:
+        if measured and _count(e4_den):
+            if not isinstance(receipt, dict):
+                # ⛔ ABSENT OR NON-OBJECT IS THE SAME FINDING (#9089 review cycle 9):
+                # deleting the whole receipt block bypassed the arm cycle 8 tightened for a
+                # missing KEY, so `15/15` stood with no second copy at all while the gate called
+                # the table sound. There is no receipt on a REFUSED run, and this arm only asks
+                # its question of a MEASURED row, so the shipped table is untouched.
+                f.add("V10", "rows[E4]",
+                      f"E4 is MEASURED ({e4_den}) but the run carries no "
+                      f"e4_receipt object ({receipt!r}) — the row's number has "
+                      "no second copy in the same log, and 'one number decides "
+                      "E4' is exactly what this arm refuses to accept on trust")
+            elif "denominator" not in receipt:
                 f.add("V10", "rows[E4]",
                       f"the run's e4_receipt carries no denominator while the "
                       f"row's is {e4_den} — the row's number is unbacked, and "

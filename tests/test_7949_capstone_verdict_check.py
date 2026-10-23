@@ -426,6 +426,28 @@ def test_a_receipt_with_no_denominator_key_does_not_back_the_rows_number():
     assert any("carries no denominator" in m for m in msgs), msgs
 
 
+def test_a_measured_e4_with_no_receipt_at_all_is_a_finding():
+    """V10: absence covers the whole block, not just one key (#9089 review cycle 9).
+
+    Tightening the arm for a receipt that lacks a `denominator` key left the
+    broader shape open: deleting `run.e4_receipt` entirely (or making it a
+    string) skipped the arm, so `15/15` stood with NO second copy and the gate
+    still called the table sound. The probe always writes the block on its
+    COMPLETED path, so only a hand-edited/newer-shape table reaches this — which
+    is exactly the copy V10 exists to police.
+    """
+    for broken in (None, "15/15", [15]):
+        receipt = probe.e4_receipt({"s4_merge": {"s2_items": 15,
+                                               "kept_from_s2": 14}})
+        rec = _completed_record(receipt)
+        if broken is None:
+            del rec["run"]["e4_receipt"]
+        else:
+            rec["run"]["e4_receipt"] = broken
+        msgs = _messages(rec)
+        assert any("no second copy" in m for m in msgs), (broken, msgs)
+
+
 def test_a_boolean_receipt_denominator_against_a_numeric_row_is_a_finding():
     """A copy that is not a number cannot AGREE with the row's (#9089 cycle 2).
 
