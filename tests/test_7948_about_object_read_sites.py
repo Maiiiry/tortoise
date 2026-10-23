@@ -2747,12 +2747,21 @@ def test_the_door_attribution_refuses_a_door_that_reaches_another_reader():
 #: worst single row. Inputs are the TABLE (whose doors change only when the
 #: document does) rather than the 99-tool registry, so a new tool does not move
 #: these — which is what makes them pinnable.
+#: Re-derived 2026-10-23 at base `79c13050c`: 69 -> 70, and the RISE is
+#: POPULATION, not a looser relation — this file leaves `_rows()`, `_reach`,
+#: `_doors` and `_door_reaches` untouched (`git diff origin/main..HEAD` on this
+#: file changes none of them), and `origin/main` itself measures 70 against the
+#: pinned 69, i.e. a base commit added a (row, table-door) pair under a ceiling
+#: that was pinned before it. The worst row is UNCHANGED at 17, which is the
+#: discriminator: a loosened predicate widens many cells and lifts that figure.
+#: Measured at this head: 19 customer-callable rows x 22 table doors, accepted
+#: 70, worst row 22 accepting 17/22.
 #: Re-derived 2026-10-21 when rows 34-37 landed: 63 -> 69. The added
 #: pairs are NEW rows with their own doors (`TortoiseSDK.traverse`,
 #: `TortoiseSDK.ingest`), not a looser relation — no existing row's accepted set
 #: grew, and no existing row gained a door, which is what distinguishes this from
 #: the tripwire's failure mode.
-_ACCEPTED_PAIRS_AT_THIS_HEAD = 69
+_ACCEPTED_PAIRS_AT_THIS_HEAD = 70
 #: 15 -> 17 on 2026-10-21: the TABLE's door set grew by the two SDK doors the new
 #: call-time rows name, and `_hop_query` (an all-edge walk) legitimately reaches
 #: more of a larger set. It is the same relation over a larger population, not a
