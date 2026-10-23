@@ -1368,10 +1368,15 @@ class TestDocsPageAndSkillConfig:
         # The unconditional form must be absent from BOTH sides: it is the shape
         # the resolution contract falsifies, so the module must not state it and
         # the page must not quote it.
-        #   (NOTE: `PACK_CONSEQUENCE.unconfigured` / `packCountLine` still render
-        #   "the full catalog applies" for ANY `configured: false` graph, which is
-        #   wrong for a starter-seeded default graph — pre-existing product copy
-        #   on main, out of this change's scope, tracked as #9691.)
+        #   (FIXED in #9691: `packCountLine` and `PACK_CONSEQUENCE.unconfigured`
+        #   now hang the catalog sentence on `packs.js::usesCatalogUnion` —
+        #   `configured: false` AND zero records — so a starter-seeded default
+        #   graph gets the "packs it already holds" line instead. The remaining
+        #   residual is the record-count DERIVATION: it cannot see a tombstone
+        #   the catalog arm offers as `available`. That shape is REACHABLE after
+        #   a rebuild — `:PackSelection` is not a projection config class, so the
+        #   tombstoned `:PackInstall` survives and the marker does not — and the
+        #   durable fix is to enrol the marker, not this copy.)
         assert "only stops new classifications" not in disable, (
             "PACK_CONSEQUENCE.disable must not state the consequence "
             "unconditionally — the resolution contract re-admits a namespace "
