@@ -103,7 +103,7 @@ a **prose table in the issue body** and in `05-decompose.md`; it never establish
 relation. Any audit that reads the sub-issue relation field — the obvious mechanical query — reports
 **zero children for a fully decomposed epic**. This is the most likely explanation for "8 of 10 open
 epics have thin or zero child issues", and it is a fleet-wide measurement instrument defect, not eight
-under-planned epics. Filed separately as a bug (see §7).
+under-planned epics. Filed as **#9701** (see §7).
 
 ---
 
@@ -239,7 +239,7 @@ create **nothing** and instead fix edges/labels. Listed for the owner gate.
 | 4 | **#1404** test-design integration-surface map | O: close the S1–S8 verification map the children cite / I: every surface has an assigned layer / T: cited by #1416/#1419 checklists | OPEN |
 | 5 | **#2702** `cal`/`bct` envelope contract | O: fix the empty-position envelope class / I: long-prompt deadline class no longer aborts calibration / T: calibration leg clean | CLOSED 2026-09-12 — no action |
 | 6 | *(new, optional)* re-label #1416 not-launch-relevant → launch-relevant | O: reflect the reclassification trigger in labels / I: one label change with the 01-align trigger quoted / T: n/a | — |
-| 7 | *(new, mandated)* fleet audit instrument: sub-issue relation | O: make epic→child linkage read reliably by audits / I: an audit of epics reports true child counts / T: §2 evidence | filed with this PR's report |
+| 7 | *(new, mandated)* fleet audit instrument: sub-issue relation | O: make epic→child linkage read reliably by audits / I: an audit of epics reports true child counts / T: §2 evidence | **#9701** (filed 2026-10-22) |
 
 **MECE check:** (1) is execution + claim re-file, (2) is comparator data, (3) is verification, (4) is the
 verification basis, (5) is closed history — no two own the same artifact. (1) and (2) touch the same
