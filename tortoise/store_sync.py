@@ -177,9 +177,11 @@ def run_sweep(
             if post is None:
                 if not api_key:
                     receipt["spool"] = {
-                        "skipped": "no_credential",
+                        "status": "no_credential",
                         "detail": "no API key — the spool half was not drained",
                     }
+                    # A substrate that was NOT drained is not a success.
+                    receipt["ok"] = False
                 else:
                     from tortoise.__main__ import _session_post  # noqa: PLC0415
 

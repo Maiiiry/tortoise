@@ -517,6 +517,17 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     }
     // Piece 6: the session id comes from the header, ONLY.
     const sessionId = scan.headerId;
+    if (!sessionId && scan.headerIndex === -1 && scan.partial) {
+      // The header line itself is half-written (a kill during Pi's
+      // truncate-then-rewrite). That is the partial-tail rule, not a defect:
+      // defer it and leave the cursor where it is. A permanently red sweep for
+      // one torn historical file would be noise, not signal.
+      receipt.files.push({
+        path, action: "partial", offset: plan.offset, delivered: 0, attempts: 0,
+        reason: "header_incomplete",
+      });
+      continue;
+    }
     if (!sessionId) {
       receipt.errors.push(`${path}: no session header id — refused (never invented)`);
       receipt.files.push({
@@ -545,6 +556,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         updatedAt: now(),
       };
       state.files[path] = advance;
+      checkpoint();
       receipt.files.push({
         path,
         sessionId,
@@ -573,6 +585,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     });
 
     if (dryRun) {
+      receipt.shipped += 1;
       receipt.files.push({
         path,
         sessionId,
@@ -641,8 +654,9 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         attemptedAt: now(),
         failures: 0,
       };
-      receipt.shipped += 1;
       shippedThisRun += 1;
+      checkpoint();
+      receipt.shipped += 1;
       receipt.files.push({
         path,
         sessionId,
@@ -678,8 +692,9 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         attemptedAt: now(),
         failures: (prior?.failures ?? 0) + 1,
       };
-      receipt.deadLettered += 1;
       shippedThisRun += 1;
+      receipt.deadLettered += 1;
+      checkpoint();
       receipt.dropped += turns.length;
       receipt.files.push({
         path,
