@@ -110,6 +110,13 @@ uv run python eval/how-to-use-tortoise/step1/setup.py \
     --id contradicting_claim --db /tmp/ax-eval/contradicting_claim.db --fresh
 ```
 
+`--fresh` deletes, so it refuses anything it cannot positively identify as its
+own graph: a **directory** (an embedded `TORTOISE_DB_PATH` is always a file, so
+a directory is a mistyped `--db`), a file with no `.ax-setup.json` marker
+beside it, or a symlink. It exits non-zero naming the reason and deletes
+nothing, so a one-level-short `--db` cannot cost the directory it points at
+(#9695). The marker is written by `setup.py` itself when it seeds.
+
 The instrument's scoring rules are pinned by
 `tests/test_ax_write_eval.py` — no database, no network, no embedding model:
 

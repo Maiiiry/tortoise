@@ -33,6 +33,19 @@ def _load_tool():
 axe = _load_tool()
 
 
+def _load_setup():
+    spec = importlib.util.spec_from_file_location(
+        "ax_step1_setup", GOLD.parent / "setup.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+step1_setup = _load_setup()
+
+
 def _record(nodes=(), edges=(), operators=(), sources=(), mitigations=()):
     nodes = list(nodes)
     counts = {layer: 0 for layer in axe.LAYERS}
@@ -946,6 +959,109 @@ def test_the_incremental_inputs_all_state_their_before_graph():
     assert f"objectKind {seeded_kind.group(1)}" in note, (
         f"the gold's before-state note disagrees with setup.py: {note!r}"
     )
+
+
+def test_fresh_refuses_a_mistyped_directory_and_deletes_nothing(tmp_path):
+    """#9695 P1: `--fresh` must refuse a typed path it cannot positively identify.
+
+    An embedded graph is always a FILE (`tortoise/config.py`: TORTOISE_DB_PATH is
+    "file path (canonical for embedded)"), so a directory is the mistyped-`--db`
+    shape — and the doc's reproduce block shows `--db <path> --fresh` side by
+    side, inviting exactly that copy-edit. Before this guard the deletion branch
+    was `shutil.rmtree(p) if p.is_dir() else p.unlink()`, i.e. an operator typo
+    deleted an arbitrary tree with no confirmation and no ownership check.
+
+    This test fails on that code: the sentinel is gone and no SystemExit is
+    raised, so it cannot regress into a silent `rmtree` again.
+    """
+    mistaken = tmp_path / "ax-eval"  # a directory: `--db` typed one level short
+    mistaken.mkdir()
+    sentinel = mistaken / "contradicting_claim.db"
+    sentinel.write_text("a graph — or anything else its owner cannot recreate")
+
+    with pytest.raises(SystemExit) as exc:
+        step1_setup.prepare(str(mistaken), "contradicting_claim", fresh=True)
+
+    assert "refusing --fresh" in str(exc.value), exc.value
+    assert sentinel.read_text() == (
+        "a graph — or anything else its owner cannot recreate"
+    ), "the guard refused AFTER deleting inside the directory"
+    assert not list(mistaken.glob("*" + step1_setup.MARKER_SUFFIX))
+
+
+def test_fresh_refuses_a_graph_file_this_tool_did_not_create(tmp_path):
+    """A file alone is not proof of ownership: the marker is the allow-list.
+
+    Deleting on "the operator typed a path" is the class of bug that costs a
+    database, so an unmarked file must survive `--fresh` untouched.
+    """
+    foreign = tmp_path / "torchvision-cache.db"
+    foreign.write_text("someone else's artifact at a path that looks like a db")
+
+    with pytest.raises(SystemExit) as exc:
+        step1_setup.prepare(str(foreign), "duplicate_entity", fresh=True)
+
+    assert "marker" in str(exc.value), exc.value
+    assert foreign.exists(), "an unmarked file was deleted by --fresh"
+
+
+def test_fresh_deletes_the_graph_this_tool_claimed(tmp_path):
+    """The guard must not disable the feature: our own db is still replaceable."""
+    db = tmp_path / "duplicate_entity.db"
+    step1_setup.prepare(str(db), "duplicate_entity", fresh=False)
+    claim = json.loads(step1_setup.marker_path(db).read_text())
+    assert claim["tool"] == step1_setup.TOOL_ID
+    assert claim["db"] == str(db)
+    assert claim["input"] == "duplicate_entity"
+    db.write_text("the seeded before-graph")
+
+    step1_setup.prepare(str(db), "duplicate_entity", fresh=True)
+
+    assert not db.exists(), "--fresh no longer deletes the tool's own graph"
+    assert step1_setup.marker_path(db).is_file(), (
+        "the re-run must re-claim the path so the next --fresh can identify it"
+    )
+
+
+def test_fresh_refuses_a_marker_that_names_another_artifact(tmp_path):
+    """A copied marker is not ownership: it must name THIS path and THIS tool."""
+    elsewhere = tmp_path / "elsewhere.db"
+    elsewhere.write_text("x")
+    db = tmp_path / "decision_request.db"
+    db.write_text("x")
+    step1_setup.marker_path(db).write_text(
+        json.dumps({"tool": step1_setup.TOOL_ID, "db": str(elsewhere)})
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        step1_setup.prepare(str(db), "decision_request", fresh=True)
+
+    assert "another artifact" in str(exc.value), exc.value
+    assert db.exists(), "a marker naming another path authorised the deletion"
+
+
+def test_fresh_refuses_a_symlink_so_the_typed_path_is_the_deleted_path(tmp_path):
+    """`--db link.db` must not delete whatever the link resolves to."""
+    real = tmp_path / "real.db"
+    step1_setup.prepare(str(real), "duplicate_entity", fresh=False)
+    real.write_text("keep me")
+    link = tmp_path / "link.db"
+    link.symlink_to(real)
+
+    with pytest.raises(SystemExit) as exc:
+        step1_setup.prepare(str(link), "duplicate_entity", fresh=True)
+
+    assert "symlink" in str(exc.value), exc.value
+    assert real.read_text() == "keep me"
+
+
+def test_a_uri_db_never_takes_the_destructive_path(tmp_path, monkeypatch):
+    """A docker:// URI names a server, not a local artifact — nothing to delete."""
+    monkeypatch.chdir(tmp_path)
+    step1_setup.prepare(
+        "docker://:pw@localhost:6379/eval", "duplicate_entity", fresh=True
+    )
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_the_committed_gold_file_has_ten_inputs_with_pairwise_confusions():

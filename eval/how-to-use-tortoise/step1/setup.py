@@ -16,6 +16,11 @@ run record can be read back against them.
 Usage:
     uv run python eval/how-to-use-tortoise/step1/setup.py \
         --id duplicate_entity --db /tmp/ax-eval/duplicate_entity.db
+
+``--fresh`` deletes, so it is guarded: it refuses a directory (an embedded
+DB_PATH is always a FILE, so a directory is the mistyped-``--db`` shape) and it
+refuses any file that does not carry the ``.ax-setup.json`` marker this tool
+writes beside the db it seeds. A typo therefore refuses instead of deleting.
 """
 
 from __future__ import annotations
@@ -23,8 +28,89 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
+from datetime import UTC, datetime
 from pathlib import Path
+
+TOOL_ID = "ax_write_eval.step1.setup"
+MARKER_SUFFIX = ".ax-setup.json"
+
+
+def marker_path(db: Path) -> Path:
+    """The ownership marker written beside a db this tool seeded."""
+    return db.with_name(db.name + MARKER_SUFFIX)
+
+
+def _is_uri(db: str) -> bool:
+    return db.startswith(("docker://", "redis://", "rediss://"))
+
+
+def _refuse(db: str, why: str) -> None:
+    raise SystemExit(
+        f"refusing --fresh for --db {db!r}: {why}.\n"
+        "NOTHING was deleted. --fresh only removes a graph this tool created "
+        f"(it writes {MARKER_SUFFIX} beside the db it seeds), because a path "
+        "the operator merely typed cannot prove what it names (#9695). "
+        "Pass the db this tool seeded, or remove the file yourself."
+    )
+
+
+def _delete_own_graph(db: str, given: Path, target: Path) -> None:
+    """Delete ``target`` only if it is positively identified as our own graph.
+
+    Every check is allow-list shaped: the target must BE the expected artifact
+    (a regular file, carrying a marker this tool wrote, naming this path). A
+    directory is the mistyped-``--db`` shape — an embedded graph is a file
+    (``tortoise/config.py``) — so it can never be legitimately deleted here.
+    """
+    if given.is_symlink():
+        _refuse(db, "it is a symlink, so the path typed is not the path deleted")
+    if target.is_dir():
+        _refuse(db, "it is a directory, and an embedded graph is always a FILE")
+    if not target.is_file():
+        _refuse(db, "it is not a regular file")
+    marker = marker_path(target)
+    if not marker.is_file():
+        _refuse(db, f"it carries no {MARKER_SUFFIX} marker")
+    try:
+        claim = json.loads(marker.read_text())
+    except (OSError, ValueError) as exc:
+        _refuse(db, f"its {MARKER_SUFFIX} marker is unreadable ({exc})")
+    claimed = Path(str(claim.get("db", "")))
+    if claim.get("tool") != TOOL_ID or claimed != target:
+        _refuse(db, f"its {MARKER_SUFFIX} marker names another artifact")
+    target.unlink()
+
+
+def _claim(target: Path, input_id: str) -> None:
+    """Write the ownership marker BEFORE the graph exists.
+
+    Claiming first is what makes an interrupted seed still recoverable: the next
+    ``--fresh`` run can prove the half-written file is ours.
+    """
+    marker_path(target).write_text(
+        json.dumps(
+            {
+                "tool": TOOL_ID,
+                "db": str(target),
+                "input": input_id,
+                "claimed_at": datetime.now(UTC).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def prepare(db: str, input_id: str, *, fresh: bool) -> None:
+    """Make ``db`` ready to seed, deleting an existing graph ONLY if it is ours."""
+    if _is_uri(db):
+        return
+    given = Path(db).expanduser()
+    target = given.resolve()
+    if fresh and target.exists():
+        _delete_own_graph(db, given, target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _claim(target, input_id)
 
 
 def _open(db: str):
@@ -100,14 +186,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--id", required=True)
     ap.add_argument("--db", required=True)
-    ap.add_argument("--fresh", action="store_true", help="delete the db first")
+    ap.add_argument(
+        "--fresh",
+        action="store_true",
+        help="delete the db first (refused unless this tool created it)",
+    )
     args = ap.parse_args()
 
-    if not args.db.startswith(("docker://", "redis://", "rediss://")):
-        p = Path(args.db)
-        if args.fresh and p.exists():
-            shutil.rmtree(p) if p.is_dir() else p.unlink()
-        p.parent.mkdir(parents=True, exist_ok=True)
+    prepare(args.db, args.id, fresh=args.fresh)
     minted = seed(args.id, args.db)
     print(json.dumps({"input": args.id, "db": args.db, "minted": minted}, indent=2))
     return 0
