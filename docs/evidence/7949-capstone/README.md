@@ -276,8 +276,15 @@ python docs/evidence/7949-capstone/probes/capstone_run.py \
 python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone.log --require-green
 ```
 
-`--head <sha>` (optional) measures at a commit other than the worktree's current `HEAD`
-— a re-run against a tagged commit. It is validated, not trusted: 7-40 lowercase hex
-digits that resolve to a commit in this repo, refused before G0 otherwise. Every row is
-stamped with it and the gate resolves the pre-registration's ancestry against it, so an
+`--head <sha>` (optional) **re-stamps** the run at another commit of the SAME TREE — a
+re-run against a tag, or the same tree checked out elsewhere. It is validated, not
+trusted: 7-40 lowercase hex digits that resolve to a commit in this repo, AND whose
+`^{tree}` is byte-identical to the worktree's `HEAD^{tree}`; refused before G0
+otherwise. A commit with a DIFFERENT tree is a different program, so measuring it is
+not an override — check that revision out and run there. Every row is stamped with
+the value and the gate resolves the pre-registration's ancestry against it, so an
 unusable value cannot reach a shipped log.
+
+A checkout with no resolvable `HEAD` commit (unborn HEAD, or not a git repo) is
+refused the same way: a table whose rows carry the literal string `HEAD` is red by
+this repo's own `V3` rule.

@@ -88,11 +88,15 @@ Run:
         | tee docs/evidence/7949-capstone/capstone.log
     python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone.log
 
-``--head <sha>`` measures at a commit that is NOT the worktree's current HEAD
-(a re-run against a tagged commit). It is validated like a row sha — 7-40
-lowercase hex digits that resolve to a commit here — and an unusable value is
-REFUSED before G0, because every row is stamped with it and V5 resolves the
-pre-registration's ancestry against it.
+``--head <sha>`` RE-STAMPS the run at another commit of the SAME TREE (a tag, or
+this tree checked out elsewhere) — it does not measure different code. It is
+validated like a row sha (7-40 lowercase hex digits that resolve to a commit
+here) AND its ``^{tree}`` must equal the worktree's ``HEAD^{tree}``: a commit
+whose tree differs is a different program, so it is REFUSED — check that
+revision out and run there instead. A checkout with no resolvable ``HEAD``
+commit is refused too. Every refusal happens before G0, because every row is
+stamped with the value and V5 resolves the pre-registration's ancestry against
+it.
 """
 from __future__ import annotations
 
@@ -493,17 +497,21 @@ def _git(*args: str) -> subprocess.CompletedProcess:
 def resolve_head(override: str | None) -> tuple[str, str]:
     """The commit this run is measured at, and why an override is unusable.
 
-    ``--head`` exists for ONE case: measuring a commit that is not the
-    worktree's current ``HEAD`` (a re-run against a tagged commit, or the same
-    tree checked out elsewhere). It is the single value every row is stamped
-    with and the value V5's ancestry rule resolves against the
-    pre-registration, so an override is held to the same test as a row sha in
-    ``tools/capstone_verdict_check.py`` (V3): it must LOOK like a sha AND
-    resolve to a commit in this repo. Anything else refuses instead of being
-    written into a shipped evidence file (the pre-fix code stamped it verbatim).
+    ``--head`` exists for ONE case: re-stamping a run at a commit that is not the
+    worktree's current ``HEAD`` but describes the SAME TREE (a re-run against a tag, or
+    the same tree checked out elsewhere). It is the single value every row is stamped
+    with and the value V5's ancestry rule resolves against the pre-registration, so an
+    override is held to the same test as a row sha in
+    ``tools/capstone_verdict_check.py`` (V3): it must LOOK like a sha, resolve to a
+    commit in this repo, and name the tree this process actually executed. Anything
+    else refuses instead of being written into a shipped evidence file (the pre-fix
+    code stamped it verbatim, and a `git rev-parse HEAD` in an unborn-HEAD repo wrote
+    the literal string ``HEAD``).
 
     Returns ``(head, error)``; ``error`` is empty exactly when ``head`` is
-    usable. With no override the worktree's ``HEAD`` is used as before.
+    usable. With no override the worktree's ``HEAD`` is used as before, but it is
+    VALIDATED too: a repo whose ``HEAD`` does not resolve to a commit cannot stamp a
+    table, because a row stamped ``HEAD`` is red by V3.
 
     ⛔ On an UNUSABLE override ``head`` is the worktree's ``HEAD``, never the
     string ``"unknown"``: the refusal still emits a TABLE, and the acceptance
@@ -511,18 +519,27 @@ def resolve_head(override: str | None) -> tuple[str, str]:
     git rev-parse can resolve would replace the shipped log with one this
     repo's own gate (V3) reds. The refusal IS a fact measured at this
     checkout, so that is the sha it carries; the rejected override survives in
-    the refusal reason.
+    the refusal reason. When the worktree itself has no resolvable ``HEAD`` there
+    is no such fact, so ``"unknown"`` is returned WITH an error — the run refuses
+    before G0 and no unstampable table is offered as an override result.
     """
+    head_sha = _git("rev-parse", "--verify", "HEAD").stdout.strip()
+    if not HEAD_SHA_RE.match(head_sha or ""):
+        return "unknown", (
+            "this checkout has no HEAD that resolves to a commit (unborn HEAD, or not a "
+            "git work tree) — every row of the table is stamped with the measured commit "
+            "and V5 resolves the pre-registration's ancestry against it, so there is no "
+            "honest value to stamp; check out a commit and re-run")
     if override is None:
-        return _git("rev-parse", "HEAD").stdout.strip() or "unknown", ""
+        return head_sha, ""
     if not HEAD_SHA_RE.match(override):
-        return _git("rev-parse", "HEAD").stdout.strip() or "unknown", (
+        return head_sha, (
             f"--head {override!r} is not a commit sha (7-40 lowercase hex "
             "digits) — every row is stamped with it and V5 resolves the "
             "pre-registration's ancestry against it, so a free-text override "
             "would make the provenance chain unattributable")
     if _git("cat-file", "-e", f"{override}^{{commit}}").returncode != 0:
-        return _git("rev-parse", "HEAD").stdout.strip() or "unknown", (
+        return head_sha, (
             f"--head {override!r} does not resolve to a commit in this repo — "
             "an unresolvable sha cannot be the commit this run was measured "
             "at (pass the full sha, or drop --head to use the worktree HEAD)")
@@ -538,7 +555,7 @@ def resolve_head(override: str | None) -> tuple[str, str]:
     head_tree = _git("rev-parse", "HEAD^{tree}").stdout.strip()
     override_tree = _git("rev-parse", f"{override}^{{tree}}").stdout.strip()
     if not head_tree or override_tree != head_tree:
-        return _git("rev-parse", "HEAD").stdout.strip() or "unknown", (
+        return head_sha, (
             f"--head {override!r} is a DIFFERENT tree from this checkout's HEAD — the run "
             "executes the code that is here, so stamping its rows with a revision it never "
             "ran on would make the provenance chain claim a measurement nobody took (a tag or "
@@ -727,9 +744,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", default=None,
                     help="also write the log here (stdout always gets it)")
     ap.add_argument("--head", default=None,
-                    help="measure at this commit instead of the worktree HEAD "
-                         "(must be a 7-40 hex sha that resolves to a commit "
-                         "here; every row is stamped with it)")
+                    help="re-stamp the run at another commit of the SAME tree "
+                         "(a tag, or this tree checked out elsewhere) — must be "
+                         "a 7-40 hex sha that resolves to a commit here whose "
+                         "^{tree} equals this worktree's HEAD^{tree}; every row "
+                         "is stamped with it")
     return ap
 
 

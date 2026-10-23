@@ -1786,6 +1786,28 @@ def test_a_head_override_naming_a_different_tree_is_refused(tmp_path, monkeypatc
     assert err == "" and head == same_tree, (head, err)
 
 
+def test_a_checkout_with_no_resolvable_head_is_refused(tmp_path, monkeypatch):
+    """#9089 review P2: an unborn HEAD has no commit to stamp, and `HEAD` is not one.
+
+    `git rev-parse HEAD` in a fresh `git init` prints the literal string `HEAD`
+    and exits 128, so `.stdout.strip() or "unknown"` yielded `HEAD` — and
+    `emit_log` then stamped the table's `head` and EVERY row's `sha` with it. The
+    emitted table is red by this repo's own V3 rule, and the documented
+    `| tee docs/evidence/7949-capstone/capstone.log` would replace the shipped
+    evidence with an artifact the repo reds. The docstring promises the string
+    `"unknown"` never reaches a stamp without an error; this pins it.
+    """
+    repo = tmp_path / "unborn"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True,
+                   capture_output=True)
+    monkeypatch.setattr(probe, "ROOT", repo)
+    head, err = probe.resolve_head(None)
+    assert err, (head, err)
+    assert head == "unknown", head
+    assert not probe.HEAD_SHA_RE.match(head), head
+
+
 def test_a_resolvable_head_override_is_what_the_rows_are_stamped_with(tmp_path):
     """The legitimate use stays legitimate: a real commit IS the measured head.
 
