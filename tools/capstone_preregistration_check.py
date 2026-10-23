@@ -175,8 +175,13 @@ VALUE_TRAILING = ",;."
 
 #: The capstone verdict bundle's machine record, as the log carries it. Read from the LOG's own
 #: bytes — never from a pin — so a log edited into a scored one cannot keep riding an exemption.
+#: ⛔ The markers are matched as COUNTS first: `capstone_verdict_check.extract_block` refuses a log
+#: carrying more than one block ("`capstone_run.py | tee -a capstone.log` is enough" to make two),
+#: and a reader that took the FIRST block would exempt a log whose SECOND block carries the number.
+CAPSTONE_BEGIN = "=== CAPSTONE-VERDICT-BEGIN ==="
+CAPSTONE_END = "=== CAPSTONE-VERDICT-END ==="
 CAPSTONE_RECORD = re.compile(
-    r"=== CAPSTONE-VERDICT-BEGIN ===\s*(\{.*?\})\s*=== CAPSTONE-VERDICT-END ===",
+    re.escape(CAPSTONE_BEGIN) + r"\s*(\{.*?\})\s*" + re.escape(CAPSTONE_END),
     re.DOTALL,
 )
 
@@ -672,9 +677,16 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
     missing status is a REFUSAL to exempt, never a pass.
     """
     try:
-        text = log.read_text()
+        text = log.read_text(errors="replace")
     except OSError as exc:
         return False, f"cannot be read ({exc})"
+    begins, ends = text.count(CAPSTONE_BEGIN), text.count(CAPSTONE_END)
+    if (begins, ends) != (1, 1):
+        return False, (
+            f"carries {begins} BEGIN and {ends} END verdict markers — a log with more than one "
+            "block can hide a number in the block this reader did not take, so an ambiguous "
+            "record is a refusal (the same rule `capstone_verdict_check.extract_block` applies)"
+        )
     match = CAPSTONE_RECORD.search(text)
     if not match:
         return False, "carries no capstone machine record, so it cannot prove it measured nothing"
@@ -684,6 +696,28 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
         return False, f"its machine record is not JSON ({exc})"
     if not isinstance(record, dict):
         return False, "its machine record is not an object"
+    # ⛔ The schema is PINNED, not inferred. Without it the whole "self-healing" argument is bounded
+    # by a shape nothing validated: a `capstone-verdict-v2` that relocated the number (a `value`
+    # or `ratio` field) would be exempted rather than refused. An unrecognised schema is a shape
+    # this predicate cannot read, so it is a refusal.
+    # Resolved BOTH ways on purpose: this module is imported as `tools.capstone_preregistration_check`
+    # in tests and run as a SCRIPT in CI (`python3 tools/capstone_preregistration_check.py`, which
+    # puts `tools/` on sys.path[0] and knows no package). Either spelling must find the sibling —
+    # and a sibling that cannot be found is a refusal, never a pass.
+    try:
+        import capstone_verdict_check as _cvc  # script invocation
+    except ImportError:
+        try:
+            from tools import capstone_verdict_check as _cvc  # package invocation
+        except Exception:
+            return False, (
+                "the capstone verdict check could not be imported, so its schema is unknown")
+    expected_schema = _cvc.SCHEMA
+    if record.get("schema") != expected_schema:
+        return False, (
+            f"its machine record declares schema {record.get('schema')!r}, not {expected_schema!r} "
+            "— a shape this predicate cannot read is a refusal, not an exemption"
+        )
     rows = record.get("rows")
     if not isinstance(rows, list) or not rows:
         return False, "its machine record carries no rows"
@@ -717,8 +751,14 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def check_ordering(prereg: Path, logs: list[Path], pins: dict | None = None) -> list[str]:
+def check_ordering(prereg: Path, logs: list[Path], pins: dict | None = None,
+                   exempted: list[str] | None = None) -> list[str]:
     """``[]`` when every log is either after the registration or provably unscored.
+
+    ``exempted``, when given, is APPENDED with the name of every log the content arm exempted
+    (#9089). It is not decoration: an ordering violation that was WAIVED must be visible, or the
+    green line reads exactly like a log that was ordered — the silent-green shape this tool exists
+    to refuse (see the ``--no-git``/``--no-corpus`` rule ninety lines below).
 
     Raises ``HistoryUnavailable`` (a ``CheckError``) when this checkout is shallow: with a grafted
     tip the comparison cannot be evaluated at all, and a wrong verdict is worse than no verdict.
@@ -799,6 +839,8 @@ def check_ordering(prereg: Path, logs: list[Path], pins: dict | None = None) -> 
                 # A log that provably produced NO number cannot have been scored against
                 # thresholds chosen after it was read. Re-asked of the content on every run, so
                 # the moment it gains a number this gate reds it again (#9089).
+                if exempted is not None:
+                    exempted.append(log.name)
                 continue
             failures.append(
                 f"{log.name}: added at {log_epoch} which is not strictly after the "
@@ -953,6 +995,11 @@ def check_machine_record(directory: Path, pins: dict) -> list[str]:
             "frozen by the run probe, so the forbidden denominator may not appear here either"
         )
 
+    # ⚠️ This field is the PINNED class only (`pre_existing_unscored_logs`): it is frozen with the
+    # record, and a log the ordering check exempts on its CONTENT (see
+    # `_log_declares_no_measurement`) structurally cannot join it — the pins' own bounds require a
+    # `prereg=UNPREREGISTERED` vocabulary and no post-registration touch. The content-exempted set is
+    # reported per run instead (`ordering_exempt`), never restated into this frozen record (#9089).
     exempt = sorted(_pins_mapping(pins, "pre_existing_unscored_logs"))
     if sorted(_list(record, "unscored_runs_before_this_registration", MACHINE_RECORD)) != exempt:
         failures.append(
@@ -1132,7 +1179,9 @@ def run(directory: Path, use_git: bool = True, use_corpus: bool = True) -> dict:
     report["evidence_logs"] = [p.name for p in logs]
     if use_git:
         try:
-            failures += check_ordering(prereg, logs, pins)
+            content_exempt: list[str] = []
+            failures += check_ordering(prereg, logs, pins, content_exempt)
+            report["ordering_exempt"] = sorted(content_exempt)
             ordering = "verified"
         except HistoryUnavailable as exc:
             # The THIRD outcome: neither a pass nor an ordering failure. Folding it into either is
@@ -1248,7 +1297,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"FAIL — {len(report['failures'])} problem(s):")
             for f in report["failures"]:
                 print(f"  - {f}")
-        print(f"machine record run-order claim: {report['run_order_claim']}")
+        exempt_note = ""
+        if report.get("ordering_exempt"):
+            exempt_note = (f" (exempt by CONTENT, measured nothing: "
+                           f"{', '.join(report['ordering_exempt'])})")
+        print(f"machine record run-order claim: {report['run_order_claim']}{exempt_note}")
     return 0 if report["ok"] else 1
 
 

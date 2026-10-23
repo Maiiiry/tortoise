@@ -2103,3 +2103,31 @@ def test_a_row_that_blames_the_landed_pre_registration_says_it_landed():
         assert blamed, (prereg_ok, rows)
         for row in blamed:
             assert "#9075 LANDED (#9507)" in row["note"], (prereg_ok, row["note"])
+
+
+def test_the_probes_line_citations_resolve_too():
+    """The README is pinned; the PROBE carried the same numbers with no pin at all.
+
+    #9089 review P2: the probe docstring cites the same entry point and the same eight step call
+    sites, and `test_the_readmes_line_citations_resolve_to_the_symbols_they_name` reads only
+    `README.md` — so a merge-up that moves `sdk.py` re-stales the probe silently, which is exactly
+    how the earlier rounds went stale. Same check, other file.
+    """
+    probe = PROBE.read_text()
+    sdk = (_REPO / "tortoise/sdk.py").read_text().splitlines()
+    extractor = (_REPO / "tortoise/extractor_v2.py").read_text().splitlines()
+
+    entry = re.search(r"``sdk\.py:(\d+)``, called at ``:(\d+)``", probe)
+    assert entry, "the probe's sdk.py cite moved; re-derive it, do not drop the pin"
+    def_line, call_line = (int(n) for n in entry.groups())
+    assert sdk[def_line - 1].lstrip().startswith("def _extract_session_v2("), (
+        f"probe cites the def at sdk.py:{def_line}, which is {sdk[def_line - 1].strip()!r}")
+    assert "self._extract_session_v2(" in sdk[call_line - 1], (
+        f"probe cites the call at sdk.py:{call_line}, which is {sdk[call_line - 1].strip()!r}")
+
+    module_cite = re.search(r"``extractor_v2\.py:(\d+)``", probe)
+    assert module_cite, "the probe's extractor_v2 entry cite is gone"
+    module_line = int(module_cite.group(1))
+    assert extractor[module_line - 1].lstrip().startswith("def extract_session_v2("), (
+        f"probe cites the entry point at extractor_v2.py:{module_line}, which is "
+        f"{extractor[module_line - 1].strip()!r}")

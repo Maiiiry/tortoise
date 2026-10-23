@@ -2230,19 +2230,23 @@ def test_the_ci_pin_still_catches_a_shallow_checkout():
 
 
 def _capstone_body(*, run_status="REFUSED", prereg_status="ABSENT",
-                   numerator=None, denominator=None) -> str:
+                   numerator=None, denominator=None, schema=None, blocks=1) -> str:
     """A capstone log whose machine record is the only thing the exemption may read."""
+    from tools import capstone_verdict_check as cvc
+
     record = {
-        "schema": "capstone-verdict/1",
+        # The REAL schema, imported: the exemption pins it, so a fixture with an invented one would
+        # test a shape the gate refuses (#9089 review P2).
+        "schema": schema if schema is not None else cvc.SCHEMA,
         "prereg": {"status": prereg_status, "sha": "0" * 40},
         "run": {"status": run_status, "steps_observed": [], "steps_required": ["S0"]},
         "rows": [{"criterion": "E1", "verdict": "BLOCKED", "numerator": numerator,
                   "denominator": denominator, "blocked_by": "#9075"}],
     }
-    return ("# capstone\n"
-            "=== CAPSTONE-VERDICT-BEGIN ===\n"
-            f"{json.dumps(record, indent=2, sort_keys=True)}\n"
-            "=== CAPSTONE-VERDICT-END ===\n")
+    block = ("=== CAPSTONE-VERDICT-BEGIN ===\n"
+             f"{json.dumps(record, indent=2, sort_keys=True)}\n"
+             "=== CAPSTONE-VERDICT-END ===\n")
+    return "# capstone\n" + block * blocks
 
 
 def test_a_log_that_proves_it_measured_nothing_needs_no_ordering(tmp_path, monkeypatch):
@@ -2283,15 +2287,23 @@ def test_the_content_arm_stops_covering_the_log_the_moment_it_could_score(
     assert "does not prove it measured nothing" in failures[0], failures
 
 
-def test_the_content_arm_refuses_to_exempt_anything_it_cannot_read():
-    """Fail-closed: a missing/!JSON/rowless record is a REFUSAL, never a pass."""
+def test_the_content_arm_refuses_to_exempt_anything_it_cannot_read(tmp_path):
+    """Fail-closed: a missing/!JSON/rowless/ambiguous record is a REFUSAL, never a pass.
+
+    The last two arms are the ones a reviewer measured (#9089 review P1/P2): a log carrying TWO
+    verdict blocks (reachable by `capstone_run.py | tee -a capstone.log`) could hide a number in
+    the block the reader did not take, and an unrecognised schema is a shape this predicate cannot
+    read — so both refuse rather than reading the shape they happen to understand.
+    """
     for body in (
         "no machine record here\n",
         "=== CAPSTONE-VERDICT-BEGIN ===\n{not json\n=== CAPSTONE-VERDICT-END ===\n",
         "=== CAPSTONE-VERDICT-BEGIN ===\n{}\n=== CAPSTONE-VERDICT-END ===\n",
         _capstone_body().replace('"status": "REFUSED"', '"status": ""'),
+        _capstone_body(blocks=2),
+        _capstone_body(schema="capstone-verdict-v2"),
     ):
-        path = PREREG_DIR.parent / "_probe_body.log"
+        path = tmp_path / "_probe_body.log"
         path.write_text(body)
         try:
             ok, why = check._log_declares_no_measurement(path)
@@ -2304,3 +2316,19 @@ def test_the_shipped_capstone_log_proves_it_measured_nothing():
     """The real artefact, on the real file — this is what unblocks the required check."""
     ok, why = check._log_declares_no_measurement(PREREG_DIR / "capstone.log")
     assert ok, why
+
+
+def test_an_exempted_log_is_named_in_the_report_not_waived_silently(tmp_path, monkeypatch):
+    """A waived ordering violation must be VISIBLE (#9089 review P2).
+
+    The tool's own rule, ninety lines from the exemption: a system that reads as fully checked
+    while one half never ran is the silent-green shape this tool exists to refuse. An exempted log
+    makes the ordering line GREEN, so the name has to travel with it — otherwise the next lane
+    cannot tell an ordered log from a waived one.
+    """
+    repo = _repo(tmp_path, monkeypatch)
+    log = _write_log(repo, "capstone.log", epoch=1_700_000_000, body=_capstone_body())
+    prereg = _write_and_commit(repo, check.PREREG_NAME, epoch=1_700_000_100)
+    exempted: list[str] = []
+    assert check.check_ordering(prereg, [log], None, exempted) == []
+    assert exempted == ["capstone.log"], exempted

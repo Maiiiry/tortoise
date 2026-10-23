@@ -24,7 +24,7 @@ the corrected reading:
    ``:7980``), ``search_graph`` (S3, ``:7996``), ``run_s4`` (the gap filler,
    ``:8017``), and ``execute_embed`` (S5+S6, ``:8216``). Line numbers re-derived
    at ``13ad17c8c`` — the merge-up of ``origin/main``, which moved ``sdk.py``
-   under the cites a SECOND time while this branch was open (the pre-merge
+   under the cites again while this branch was open (the merge before this one
    numbers were right at their own head): the symbol is authoritative and the
    line is a convenience, which is how the pin's earlier numbers went stale
    here. So the capstone drives

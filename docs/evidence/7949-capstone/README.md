@@ -12,9 +12,14 @@ aboutObjects: "#7949, #9080, #9075, #9076, #9077, #9116, #5199, #7947, EXTRACTOR
 # Capstone evidence — `#7949` / `#9080` (extractor-v4, E1–E5)
 
 **Measured at:** `027c8c1ab` on branch `feat/9080-tm` (2026-10-20, after merging `origin/main` at `78ef670d3`). **Blast
-radius — the 13 files this branch touches** (`git diff --name-only origin/main...HEAD`):
+radius — the files this branch touches** (`git diff --name-only origin/main...HEAD`; the COUNT is
+deliberately not restated here — it changed twice while this was open, and a stale integer in the
+one paragraph a reviewer bounds the PR by is worse than no integer):
 the bundle itself (`docs/evidence/7949-capstone/**`, `tools/capstone_verdict_check.py`,
-`tests/test_7949_capstone_verdict_check.py`); its registration (`config/ci-surfaces.yml`
+`tests/test_7949_capstone_verdict_check.py`) **and the ordering gate that judges it**
+(`tools/capstone_preregistration_check.py` + `tests/test_capstone_preregistration_9075.py`, added
+in the `#9089` review round: the gate now exempts this bundle's log on its CONTENT, so a reviewer
+who bounds this PR by its own reading must see it); its registration (`config/ci-surfaces.yml`
 `core`/`tier1`/`durations` arms, `docs/00_index.md`); the selection edits
 `tools/ci_selection.py` + `tests/test_ci_selection.py` **remove** a `CORE_ALSO`
 row this branch had added and could not justify (the bundle prefix
@@ -140,7 +145,7 @@ claims below are STALE, which is what the capstone run is built on:
    as an open question. It resolves YES: `TortoiseSDK.capture_session` →
    `sdk._extract_session_v2` (`sdk.py:11397`; called at `:10434`) →
    `extractor_v2.extract_session_v2` (`extractor_v2.py:7767`), which calls, in one pass
-   (line numbers re-derived at `13ad17c8c`, the THIRD merge-up of `origin/main` whose
+   (line numbers re-derived at `13ad17c8c`, the merge-up of `origin/main` whose
    `sdk.py`/`extractor_v2.py` commits moved the def, its call site and every step below
    under the previous cites — +317 lines for the `sdk.py` pair, +36 for the extractor def
    and +39 for every call site below; the symbol is authoritative and the line is a
