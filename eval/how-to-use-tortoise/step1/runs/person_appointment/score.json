@@ -45,10 +45,11 @@
     },
     {
       "item": "joined Northwind Logistics",
-      "expected": "event",
-      "written": "Point:statement",
-      "node": "Marta Reyes joined Northwind Logistics as CFO on 2026-09-08.",
-      "verdict": "LAYER"
+      "expected": "event:roleCreated|occurrence",
+      "written": "Event:employmentStart",
+      "node": "Marta Reyes joins Northwind Logistics as CFO",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
     },
     {
       "item": "reports to",
@@ -87,15 +88,17 @@
       "fix": "re-file as subject; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
     },
     {
-      "severity": "P0",
+      "severity": "P1",
       "item": "joined Northwind Logistics",
-      "finding": "LAYER confusion: expected event, written as Point ('Marta Reyes joined Northwind Logistics as CFO on 2026-09-08.') \u2014 \u00a74.5/\u00a73.5 Subject\u2192Event\u2192Object: the appointment is the dated occurrence; the employment edge is current state",
-      "fix": "re-file as event; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+      "layer": "Event",
+      "kind": "employmentstart",
+      "finding": "UNDECLARED kind 'employmentstart' on a Event ('Marta Reyes joins Northwind Logistics as CFO') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Event kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['note']; Object: ['organization', 'role']; Event: ['employmentStart']",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['note']; Object: ['organization', 'role']",
       "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
@@ -121,13 +124,8 @@
     ],
     "Object": [
       "organization",
-      "organization",
-      "role",
       "role",
       "role"
-    ],
-    "Event": [
-      "employmentStart"
     ]
   },
   "packs": [
@@ -139,8 +137,8 @@
     "venture"
   ],
   "severity_counts": {
-    "P0": 3,
-    "P1": 3,
+    "P0": 2,
+    "P1": 4,
     "P2": 0
   }
 }

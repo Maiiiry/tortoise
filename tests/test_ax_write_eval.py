@@ -278,6 +278,72 @@ def test_supersession_must_leave_a_superseded_node_behind():
     assert any("superseded" in f["finding"] for f in result["findings"])
 
 
+def test_the_graph_wide_census_reports_what_the_gold_never_names():
+    """Deleting the census used to leave every test green while 8 of the findings vanished.
+
+    The census is what keeps a run from reading clean: `score()` audits the nodes
+    the gold names, so a gold that happens to match says nothing about the rest of
+    the graph.
+    """
+    gold = _gold(
+        {"id": "x", "expect": [{"item": "churn", "layer": "point", "kind": ["statement"]}]}
+    )
+    doc = _record(
+        nodes=[
+            _node("Point", "churn was 3.2%", kind="statement"),
+            _node("Point", "dashboard double-counted an account", kind="incident"),
+        ]
+    )
+    result = axe.score(doc, gold, "x")
+    census = [f for f in result["findings"] if f["finding"].startswith("graph-wide")]
+    assert len(census) == 1
+    assert result["kind_census"] == {"Point": ["incident"]}
+    # the negative control: a kind already reported against a gold ITEM is not
+    # counted a second time by the census
+    gold2 = _gold(
+        {"id": "x", "expect": [{"item": "churn", "layer": "point", "kind": ["statement"]}]}
+    )
+    doc2 = _record(nodes=[_node("Point", "churn was 3.2%", kind="incident")])
+    result2 = axe.score(doc2, gold2, "x")
+    assert result2["kind_census"] == {}
+
+
+def test_two_homes_is_a_P1_and_absence_is_a_P0():
+    """A review found three P0s accusing an absence the graph disproved.
+
+    When the expected layer ALSO carries the item, the finding is "one fact, two
+    layers" — weaker than an absence, and differently instructive — so the
+    instrument must say which of the two it is.
+    """
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {"item": "marta reyes joined northwind logistics", "layer": "event",
+                 "kind": ["roleCreated", "occurrence"]},
+                {"item": "tobias lund", "layer": "subject", "kind": ["naturalPerson"]},
+            ],
+        }
+    )
+    two_homes = _record(
+        nodes=[
+            _node(
+                "Event",
+                "Marta Reyes joins Northwind Logistics as its new Chief Financial "
+                "Officer this week, the company confirmed on Tuesday",
+                kind="occurrence",
+            ),
+            # the exact-name Point wins `_match`; the Event still carries the item
+            _node("Point", "marta reyes joined northwind logistics", kind="statement"),
+            _node("Point", "Tobias Lund is the CEO", kind="statement"),
+        ]
+    )
+    result = axe.score(two_homes, gold, "x")
+    verdicts = {row["item"]: row["verdict"] for row in result["item_rows"]}
+    assert verdicts["marta reyes joined northwind logistics"] == "TWO-HOMES"
+    assert verdicts["tobias lund"] == "LAYER"
+
+
 def test_the_committed_gold_file_has_ten_inputs_with_pairwise_confusions():
     """Step 1's own contract: ten representative inputs, each naming the ADJACENT pair."""
     gold = json.loads(GOLD.read_text())
@@ -327,11 +393,11 @@ def test_the_reported_totals_match_the_committed_records():
         totals["P0"] += record["severity_counts"]["P0"]
         totals["P1"] += record["severity_counts"]["P1"]
         with_p0 += 1 if record["severity_counts"]["P0"] else 0
-    assert totals == {"P0": 18, "P1": 28}, f"report claims 18/28, records say {totals}"
-    assert with_p0 == 7, f"report claims 7 of 10 inputs carry a P0, records say {with_p0}"
+    assert totals == {"P0": 13, "P1": 33}, f"report claims 13/33, records say {totals}"
+    assert with_p0 == 6, f"report claims 6 of 10 inputs carry a P0, records say {with_p0}"
     doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
-    assert "18 P0 and 28 P1" in doc, "the evidence doc's headline drifted from the records"
-    assert "7 of 10 inputs" in doc
+    assert "13 P0 and 33 P1" in doc, "the evidence doc's headline drifted from the records"
+    assert "6 of 10 inputs" in doc
 
 
 @pytest.mark.parametrize("layer", axe.LAYERS)

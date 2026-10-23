@@ -114,12 +114,15 @@ def _pack_vocab() -> dict[str, set[str]]:
     # read off its own attributes (`object_kinds` / `event_kinds` / …), so a
     # rename in the manifest schema fails loudly here instead of quietly
     # reporting every pack kind as undeclared.
+    # The manifest schema declares object/event/point kinds (plus a document
+    # `document_kinds` genre axis it does not use for nodes); it has NO
+    # subject-kind or source-kind list, so those two layers simply have no pack
+    # axis — stated here rather than silently asking for an attribute that does
+    # not exist.
     attrs = {
         "Object": "object_kinds",
         "Event": "event_kinds",
         "Point": "point_kinds",
-        "Source": "source_kinds",
-        "Subject": "subject_kinds",
     }
     for pack in registry.packs.values():
         ns = pack.namespace
@@ -147,7 +150,6 @@ def _pack_vocab() -> dict[str, set[str]]:
 def _vocab() -> dict[str, frozenset[str]]:
     """The CORE declared vocabularies, imported — never re-spelled here."""
     from tortoise.pack_registry import (
-        CANONICAL_DOCUMENT_KINDS,
         CANONICAL_EVENT_KINDS,
         CANONICAL_OBJECT_KINDS,
         CANONICAL_POINT_KINDS,
@@ -165,7 +167,10 @@ def _vocab() -> dict[str, frozenset[str]]:
         kind.split(":", 1)[1] for kind in subject_kind_names() if kind.startswith("core:")
     )
     return {
-        "Point": frozenset(CANONICAL_POINT_KINDS) | frozenset(CANONICAL_DOCUMENT_KINDS - CANONICAL_DOCUMENT_KINDS),  # documentKind is its own axis
+        # `documentKind` is its OWN axis (genre, §5) and is deliberately not a
+        # pointKind: folding `CANONICAL_DOCUMENT_KINDS` in here would bless the
+        # exact confusion the research input measures.
+        "Point": frozenset(CANONICAL_POINT_KINDS),
         "Object": canonical_object_kinds(CANONICAL_OBJECT_KINDS),
         "Event": frozenset(CANONICAL_EVENT_KINDS),
         "Source": registered_source_types() | frozenset(SOURCE_KIND_DEFAULTS),
@@ -340,6 +345,24 @@ def record(uri_or_path: str) -> dict:
 # ── scoring ────────────────────────────────────────────────────────────────
 
 
+_SUFFIXES = ("ings", "ing", "ied", "ies", "ed", "es", "al", "ly", "s")
+
+
+def _stem(word: str) -> str:
+    """Crude stem, so `join`/`joins`/`joined` and `renew`/`renewal` compare equal.
+
+    Without it the matcher reads "joined Northwind Logistics" (item) against an
+    Event named "… joins Northwind Logistics …" as a MISS and reports a layer
+    failure on a write that was right — measured on three committed runs. A real
+    stemmer is a dependency this eval does not need; the failure mode it removes
+    is a plural/tense mismatch, and that is what this covers.
+    """
+    for suffix in _SUFFIXES:
+        if len(word) > len(suffix) + 3 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
 def _tokens(text: str) -> set[str]:
     """Significant tokens of a node's text.
 
@@ -350,7 +373,7 @@ def _tokens(text: str) -> set[str]:
     in the node — score as a miss (both were measured on committed runs).
     """
     words = re.findall(r"[a-z0-9$%]+", text.lower())
-    return {w for w in words if len(w) >= 2 and w not in _STOP}
+    return {_stem(w) for w in words if len(w) >= 2 and w not in _STOP}
 
 
 def _norm(text: str) -> str:
@@ -433,6 +456,27 @@ def _match(
     return best, best_score, dups
 
 
+def _expected_layer_twin(item: str, nodes: list[dict], layer: str) -> dict | None:
+    """A node on the EXPECTED layer that also names this item, if any.
+
+    A lower bar than `_match` (a third of the item's stems, at least two of
+    them): the question here is not "which node is the item" but "does the layer
+    the gold asked for carry it at all", and a differently-worded Event ("… joins
+    …" vs "… joined …") still carries it.
+    """
+    want = _tokens(item)
+    if len(want) < 2:
+        return None
+    best, best_hit = None, 0
+    for node in nodes:
+        if node["layer"].lower() != layer.lower() or node["is_operator"]:
+            continue
+        hit = len(want & _tokens(node["text"]))
+        if hit >= 2 and hit >= len(want) / 3 and hit > best_hit:
+            best, best_hit = node, hit
+    return best
+
+
 def score(record_doc: dict, gold: dict, input_id: str) -> dict:
     entry = next((i for i in gold["inputs"] if i["id"] == input_id), None)
     if entry is None:
@@ -492,6 +536,35 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             continue
 
         if best["layer"].lower() != layer.lower():
+            # TWO HOMES vs ONE WRONG HOME. If the expected layer ALSO carries a
+            # node naming this item, the item was not filed on the wrong layer —
+            # it was filed TWICE, and neither copy answers alone (the Object can
+            # never be "what is true now" while a Point holds the same fact, and
+            # vice versa). That is a real finding, but a weaker one than "the
+            # occurrence has no Event at all", and reporting it as an absence
+            # accuses the agent of something its graph disproves.
+            twin = _expected_layer_twin(item, nodes, layer)
+            if twin is not None:
+                add(
+                    "P1",
+                    item,
+                    f"two homes: {best['layer']} {best['text'][:50]!r} holds this "
+                    f"item, and so does {layer} {twin['text'][:50]!r} — one fact, two "
+                    f"layers, so neither answers alone",
+                    f"keep the {layer} node and express the {best['layer']} reading "
+                    f"as a claim ABOUT it (§3 edges), never as a second home",
+                )
+                item_rows.append(
+                    {
+                        "item": item,
+                        "expected": layer,
+                        "written": f"BOTH {layer}:{twin['kind'] or '(none)'} and "
+                        f"{best['layer']}:{best['kind'] or '(none)'}",
+                        "node": best["text"][:80],
+                        "verdict": "TWO-HOMES",
+                    }
+                )
+                continue
             add(
                 "P0",
                 item,
@@ -694,17 +767,20 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
     # whose two gold items both landed and whose other nodes carried undeclared
     # kinds). The census keeps "clean" honest.
     census: dict[str, list[str]] = {}
-    reported = {
-        (f.get("layer"), (f.get("kind") or "").lower()) for f in findings if f.get("kind")
+    # The census exists to catch what the GOLD did not name, so it skips the
+    # nodes a gold item already resolved to (`item_rows[*]["node"]`). Keying it
+    # on kind-bearing findings instead let a gold-named node — already reported
+    # as a layer P0 — contribute its kind to the census, which overstated the
+    # class on two inputs.
+    named_texts = {
+        row.get("node") for row in item_rows if row.get("node")
     }
     for node in nodes:
         if node["is_operator"]:
             continue
         if kind_status(node["layer"], node["kind"]) != "UNDECLARED":
             continue
-        # Do not double-count a kind already reported against a gold item: the
-        # census exists to catch what the gold did NOT name.
-        if (node["layer"], (node["kind"] or "").lower()) in reported:
+        if node["text"][:80] in named_texts:
             continue
         census.setdefault(node["layer"], []).append(node["kind"] or "(none)")
     if census:

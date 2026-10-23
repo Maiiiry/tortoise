@@ -24,8 +24,9 @@
     {
       "item": "killing the self-serve tier",
       "expected": "event",
-      "written": "(nothing)",
-      "verdict": "MISSING"
+      "written": "BOTH event:meeting and Point:decision",
+      "node": "The self-serve tier is being killed. Decision made 2026-09-14 by Dana (CEO), eff",
+      "verdict": "TWO-HOMES"
     },
     {
       "item": "Dana",
@@ -76,10 +77,10 @@
       "fix": "use a declared Object kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
-      "severity": "P0",
+      "severity": "P1",
       "item": "killing the self-serve tier",
-      "finding": "expected event \u2014 no node represents it (best overlap 0.38)",
-      "fix": "the item was absorbed into prose or written under a name nothing can find"
+      "finding": "two homes: Point 'The self-serve tier is being killed. Decision made' holds this item, and so does event 'Pricing & self-serve decision meeting' \u2014 one fact, two layers, so neither answers alone",
+      "fix": "keep the event node and express the Point reading as a claim ABOUT it (\u00a73 edges), never as a second home"
     },
     {
       "severity": "P1",
@@ -108,7 +109,7 @@
     {
       "severity": "P0",
       "item": "80% chance we slip a week",
-      "finding": "expected point \u2014 no node represents it (best overlap 0.25)",
+      "finding": "expected point \u2014 no node represents it (best overlap 0.38)",
       "fix": "the item was absorbed into prose or written under a name nothing can find"
     },
     {
@@ -170,8 +171,8 @@
     "venture"
   ],
   "severity_counts": {
-    "P0": 2,
-    "P1": 7,
+    "P0": 1,
+    "P1": 8,
     "P2": 0
   }
 }

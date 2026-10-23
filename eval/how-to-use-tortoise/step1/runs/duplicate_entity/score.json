@@ -31,10 +31,11 @@
     },
     {
       "item": "renew in January",
-      "expected": "event",
-      "written": "Point:statement",
-      "node": "Northwind Logistics confirmed on 2026-10-04 that it will renew in January 2027.",
-      "verdict": "LAYER"
+      "expected": "event:occurrence|milestone",
+      "written": "Event:customerCommitment",
+      "node": "Northwind Logistics confirmed January renewal (2026-10-04)",
+      "fuzzy": true,
+      "verdict": "KIND-UNDECLARED"
     }
   ],
   "findings": [
@@ -47,15 +48,17 @@
       "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
-      "severity": "P0",
+      "severity": "P1",
       "item": "renew in January",
-      "finding": "LAYER confusion: expected event, written as Point ('Northwind Logistics confirmed on 2026-10-04 that it will renew in Janu') \u2014 a confirmed future occurrence \u2014 the state ('renewal status') folds from it",
-      "fix": "re-file as event; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+      "layer": "Event",
+      "kind": "customercommitment",
+      "finding": "UNDECLARED kind 'customercommitment' on a Event ('Northwind Logistics confirmed January renewal (202') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Event kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['contract']; Event: ['customerCommitment']",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['contract']",
       "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
@@ -77,9 +80,6 @@
   "kind_census": {
     "Source": [
       "contract"
-    ],
-    "Event": [
-      "customerCommitment"
     ]
   },
   "packs": [
@@ -91,8 +91,8 @@
     "venture"
   ],
   "severity_counts": {
-    "P0": 1,
-    "P1": 2,
+    "P0": 0,
+    "P1": 3,
     "P2": 0
   }
 }

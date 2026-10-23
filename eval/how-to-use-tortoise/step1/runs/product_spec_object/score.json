@@ -16,9 +16,9 @@
     {
       "item": "ship the memory API",
       "expected": "object",
-      "written": "Point:target",
+      "written": "BOTH object:plan and Point:target",
       "node": "The beta memory API ships on 2026-11-15 (plan v2 ship target).",
-      "verdict": "LAYER"
+      "verdict": "TWO-HOMES"
     },
     {
       "item": "40% of beta orgs",
@@ -50,10 +50,10 @@
   ],
   "findings": [
     {
-      "severity": "P0",
+      "severity": "P1",
       "item": "ship the memory API",
-      "finding": "LAYER confusion: expected object, written as Point ('The beta memory API ships on 2026-11-15 (plan v2 ship target).') \u2014 \u00a75 commitment-state: a plan is an Object; the milestone date is the state's window, not a belief",
-      "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+      "finding": "two homes: Point 'The beta memory API ships on 2026-11-15 (plan v2 s' holds this item, and so does object 'Beta memory API plan v1' \u2014 one fact, two layers, so neither answers alone",
+      "fix": "keep the object node and express the Point reading as a claim ABOUT it (\u00a73 edges), never as a second home"
     },
     {
       "severity": "P0",
@@ -106,8 +106,8 @@
     "venture"
   ],
   "severity_counts": {
-    "P0": 3,
-    "P1": 1,
+    "P0": 2,
+    "P1": 2,
     "P2": 0
   }
 }

@@ -16,9 +16,9 @@
     {
       "item": "moving the ingestion workers from Celery to Temporal",
       "expected": "event",
-      "written": "Point:decision",
+      "written": "BOTH event:occurrence and Point:decision",
       "node": "Approve moving the ingestion workers from Celery to Temporal (requested 2026-09-",
-      "verdict": "LAYER"
+      "verdict": "TWO-HOMES"
     },
     {
       "item": "sub-5-minute end-to-end ingestion latency",
@@ -44,10 +44,10 @@
   ],
   "findings": [
     {
-      "severity": "P0",
+      "severity": "P1",
       "item": "moving the ingestion workers from Celery to Temporal",
-      "finding": "LAYER confusion: expected event, written as Point ('Approve moving the ingestion workers from Celery to Temporal (requeste') \u2014 the REQUEST is an ask for a resolution \u2014 the record that it was asked at a moment is a timeline Event",
-      "fix": "re-file as event; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+      "finding": "two homes: Point 'Approve moving the ingestion workers from Celery t' holds this item, and so does event 'Decision request raised: approve Celery->Temporal ' \u2014 one fact, two layers, so neither answers alone",
+      "fix": "keep the event node and express the Point reading as a claim ABOUT it (\u00a73 edges), never as a second home"
     },
     {
       "severity": "P0",
@@ -70,7 +70,7 @@
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Point: ['criterion', 'evidence', 'option']",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Point: ['criterion', 'option']",
       "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
@@ -98,8 +98,7 @@
     "Point": [
       "option",
       "criterion",
-      "criterion",
-      "evidence"
+      "criterion"
     ]
   },
   "packs": [
@@ -111,8 +110,8 @@
     "venture"
   ],
   "severity_counts": {
-    "P0": 4,
-    "P1": 1,
+    "P0": 3,
+    "P1": 2,
     "P2": 0
   }
 }
