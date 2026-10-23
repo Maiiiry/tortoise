@@ -4687,8 +4687,12 @@ def test_the_module_filter_is_a_strict_superset_of_the_anchored_form():
       of the corpus.
 
     The derivation pin in `test_the_module_filter_admits_a_split_traversal`
-    (`24` keys / `36` rows) is the second measuring assertion: it is what proves
-    the widening added no site.
+    (`25` keys / `38` rows) is the second measuring assertion: it is what proves
+    the widening added no site. ⚠️ The figure moved from `24`/`36` when main gained
+    two new all-edge walks — `decide_wiring.py::find_operators` (two sites: the
+    operator's outgoing hop and its target count) is the one that grew both keys;
+    it was re-DERIVED from the tree by running the census, not retyped, and the
+    site now owns a §13 row (row 39).
     """
     census = _call_time_census()
     universe = census._universe()
@@ -4769,8 +4773,8 @@ def test_the_module_filter_admits_a_split_traversal():
     # what proves none of them contributed a site — a module admitted and then
     # deriving nothing costs a parse, not a false claim.
     sites = census._empty_pattern_sites()
-    assert (len(sites), sum(len(lines) for lines in sites.values())) == (24, 36), (
-        "the empty-pattern derivation moved off 24 symbol keys / 36 site rows "
+    assert (len(sites), sum(len(lines) for lines in sites.values())) == (25, 38), (
+        "the empty-pattern derivation moved off 25 symbol keys / 38 site rows "
         f"({len(sites)} keys, "
         f"{sum(len(lines) for lines in sites.values())} rows). The register's "
         "`sites` counts and BOTH completeness directions are stated against "

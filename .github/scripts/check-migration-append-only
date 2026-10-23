@@ -77,8 +77,9 @@
 #            ⚠ The answer is a SNAPSHOT, not a reservation: two lanes scanning in
 #            the same minute read the same maximum and pick the same "next"
 #            version — which is how 20261023000001 was double-booked
-#            (blog_indexnow vs record_session_narrative). Re-run the scan at
-#            merge time and expect a rebase to move your version up.
+#            (record_session_narrative vs blog_author_backfill_atomic #9707).
+#            Re-run the scan at merge time and expect a rebase to move your
+#            version up.
 #
 # The check logic lives in this SHARED script (not inline YAML) so the
 # hermetic pytest suite exercises the shipped logic, not a Python copy.

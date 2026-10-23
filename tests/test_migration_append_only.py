@@ -8,6 +8,7 @@ test exercises the shipped logic (not a Python copy). Two modes:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -694,3 +695,70 @@ def test_approved_live_forward_renumber_still_allowed():
     r = _run_script_with_token("diff", d, base, versions=["20260813000098"])
     assert r.returncode == 0, r.stdout
     assert "exception" in r.stdout.lower(), r.stdout
+
+
+#: The header's double-booking EXAMPLE, as the guard states it: the version and the
+#: two migrations that both claimed it. The paragraph exists so a lane trusts it when
+#: picking a prefix (#9680), so a party that is not one of the racers is worse than no
+#: example at all: a lane reading `blog_indexnow` there concludes the `20261023` peer
+#: was THIS migration (which has since been renumbered) and that `20261023000001` is
+#: therefore free — while `#9707` is still open on it. That is the double-booking the
+#: paragraph exists to prevent, reintroduced by its own evidence.
+#: The header is a comment block, so the example is read from the text with the
+#: leading `#` markers stripped (the paragraph wraps mid-sentence). The second party
+#: may carry a trailing reference — `blog_author_backfill_atomic #9707` — because an
+#: open PR is where a still-unmerged racer legitimately lives.
+_COMMENT_PREFIX = re.compile(r"(?m)^#\s?")
+_DOUBLE_BOOKED = re.compile(
+    r"which is how (\d{14}) was double-booked\s*\(\s*(\w+)\s+vs\s+(\w+?)[\s#()\d]*\)",
+    re.S,
+)
+
+
+def _shipped_version(stem_fragment: str) -> str | None:
+    """The version this repo's tree carries for a migration whose basename names it."""
+    found = sorted(
+        p.name.split("_", 1)[0]
+        for p in (REPO_ROOT / MIG).glob(f"*_{stem_fragment}*.sql")
+    )
+    return found[0] if found else None
+
+
+def test_the_double_booking_example_names_actual_racers():
+    """The header's example must not name a migration the tree ships at ANOTHER version.
+
+    A party to the example that the tree carries at a DIFFERENT version is the
+    fail-open shape, not a typo: it tells a lane that the version's real holder was
+    this migration and that the peer has moved, so the version is free. Measured on
+    the shipped header before the #9693 review: it named `blog_indexnow` at
+    `20261023000001`, while this repo's `blog_indexnow` migration has only ever been
+    `20261022000001`/`20261024000001` — and `20261023000001` is held by
+    `record_session_narrative` on `main` and by `#9707` (`blog_author_backfill_atomic`)
+    still open. Pre-fix this test reds; the fix is to name the actual pair.
+    """
+    header = _COMMENT_PREFIX.sub("", SCRIPT.read_text(encoding="utf-8"))
+    match = _DOUBLE_BOOKED.search(header)
+    assert match, (
+        "the guard header no longer states the double-booking example in the form "
+        "`which is how <version> was double-booked (<a> vs <b>)` — if the wording "
+        "moved, re-point this test rather than deleting it: the paragraph is the "
+        "only place a lane is told the scan's answer is a snapshot"
+    )
+    version, first, second = match.group(1), match.group(2), match.group(3)
+    assert first != second, (
+        f"the header's double-booking example names `{first}` twice — it must name "
+        "two DIFFERENT migrations, or it is not evidence of a race"
+    )
+    wrong = [
+        f"`{name}` is the leaf of a migration this tree ships at "
+        f"{_shipped_version(name)}, not at the double-booked {version}"
+        for name in (first, second)
+        if (shipped := _shipped_version(name)) is not None and shipped != version
+    ]
+    assert not wrong, (
+        f"the header's double-booking example for {version} names a party the tree "
+        "carries at another version:\n  "
+        + "\n  ".join(wrong)
+        + "\nA lane that trusts it concludes the real holder has moved and takes the "
+        "version. Name the migrations that actually raced."
+    )
