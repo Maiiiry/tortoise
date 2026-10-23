@@ -51,7 +51,10 @@ from tortoise.cypher_guard import (  # #3595 `=~` guard — the ONE seam
     tolerates_altered_numbers,  # #7174/#5011: the replay/apply exemption
 )
 from tortoise.env_truthy import FALSY, env_flag  # #4097: the declared truthy contract
-from tortoise.retry import MEMORY_CEILING_OWNERSHIP_CONSTRAINT  # #9532: ONE ownership authority
+from tortoise.retry import (  # #9532: ONE ownership authority; #7357: ONE "reached" rule
+    MEMORY_CEILING_OWNERSHIP_CONSTRAINT,
+    ceiling_reading_drift,
+)
 from tortoise.index_catalogue import (  # #3154/#522/#3441: the ONE presence check
     index_catalogue_has_field,
     index_row_has_field,
@@ -10926,15 +10929,18 @@ class FalkorProjection(
             # tolerance — a 1-byte or 4 KiB shortfall is the reading, not a
             # different cause — and only a shortfall WIDER than it is treated as
             # evidence that the ceiling is not the explanation.
-            # #7392 cycle 6 — the tolerance's measured half is the ABSOLUTE
-            # floor; the 1% arm is a heuristic that must not scale unbounded,
-            # because at 1 TiB it would swallow 10 GiB of genuine headroom and
-            # print the ceiling sentence for a reading that is far from it —
-            # the over-claim direction, which is the unsafe one (its remedy is
-            # `--maxmemory`). Capped at 1 MiB: the false-negative direction is
-            # safe, because the below branch withholds nothing and asks for a
-            # re-read.
-            drift = max(64 << 10, min(cap // 100, 1 << 20))
+            #
+            # ⚠️ THE TOLERANCE IS NOT THIS MODULE'S (#7357 review P2). The SDK's
+            # hedge note TELLS an operator how to decide the same question from
+            # an `INFO memory` read of their own, so the rule has two readers and
+            # lived in two places — and they had already drifted: the note said
+            # "used_memory has reached", with no tolerance, which withdraws the
+            # remedy at a genuine ceiling reading 40 KiB under the cap. THIS
+            # message calls `retry.ceiling_reading_drift`; the note DESCRIBES the
+            # same rule (it holds an exception, not a reading), so a correction to
+            # these numbers must move the note's prose too — nothing makes that
+            # happen by itself, and the bound/unbound list below says so.
+            drift = ceiling_reading_drift(cap)
             if cap <= 2 * drift:
                 # #7392 cycle 7 — a tolerance larger than the ceiling's own
                 # scale makes the below branch UNREACHABLE and prints "has
@@ -11001,17 +11007,44 @@ class FalkorProjection(
         # the pair is bound by `MEMORY_CEILING_OWNERSHIP_CONSTRAINT` below and
         # must not disagree about the remedy either.
         #
-        # #7392 review P1 — what that binding does NOT yet cover: the pair is
-        # bound on the PROHIBITION and on the ceiling remedy, but NOT on whether
-        # a ceiling exists. `tortoise/retry.py::explain_memory_ceiling` still
-        # asserts "it has reached its configured dataset limit (`maxmemory`)"
-        # for any `redis.exceptions.OutOfMemoryError` (its classifier admits the
-        # CLASS, not just the wording), so on a ceiling-less instance the note
-        # and the `cap <= 0` branch above state opposite facts. Measured and
-        # recorded on #7357 (issuecomment-6341756094) — the note is that
-        # issue's deliverable, so it is fixed there, not here; this comment is
-        # the pointer so the next reader does not read the sentence above as
-        # proof that the two already agree.
+        # #7392 review P1 — the gap that binding did NOT cover, now closed on
+        # #7357: the pair was bound on the PROHIBITION and on the remedy, but
+        # NOT on whether a ceiling exists. `tortoise/retry.py::
+        # explain_memory_ceiling` used to assert "it has reached its configured
+        # dataset limit (`maxmemory`)" for any `redis.exceptions.OutOfMemoryError`
+        # (its classifier admits the CLASS, not just the wording), so on a
+        # ceiling-less instance the note and the `cap <= 0` branch above stated
+        # opposite facts (measured and recorded on #7357,
+        # issuecomment-6341756094). The note now branches on
+        # `_chain_names_the_ceiling`: the ceiling sentence needs the engine's own
+        # sentence in the exception, and a class-only refusal is told what the
+        # message does establish plus how to READ whether a ceiling exists.
+        #
+        # ⚠️ WHAT THIS PAIR ACTUALLY SHARES, enumerated, so this cannot be read
+        # as more than it is (#7357, cycle 4 — an earlier draft of this comment
+        # said more than the code held):
+        #   BOUND: the #2981 PROHIBITION, composed from the one constant in
+        #     `tortoise/retry.py`.
+        #   BOUND: the "ceiling was REACHED" rule, via `ceiling_reading_drift`
+        #     — this message CALLS it, the SDK note DESCRIBES it (it holds an
+        #     exception, not a reading). The note's WORDING is pinned by the
+        #     hedge-arm test, not by the drift-value test.
+        #   NOT BOUND: the knob's HOMES. `_CEILING_REMEDY_HOMES` is composed by
+        #     the note ONLY; this message carries its own wording of the same
+        #     two homes in four places. A third home must be added to all of
+        #     them, and nothing reddens if it is not.
+        #   NOT BOUND: the `cap <= 2 * drift` SCALE GUARD below, which only a
+        #     reader HOLDING a reading can apply. At a cap small enough for it
+        #     to fire (under ~128 KiB) this message says "does not show the
+        #     ceiling being reached" where the note's advice would still say to
+        #     raise it. Unreachable with any instance this repo runs — the
+        #     smallest is the 1 MiB lane container — and left stated rather than
+        #     papered over.
+        #   NOT BOUND: the CLASSIFICATION. `_WRITE_REFUSAL_MARKERS` does not
+        #     match a class-only `OOM …` reply, so such a refusal can still fall
+        #     through to the rebuild advice in `_backend_failure_message` — the
+        #     #2981 direction. A separate seam with its own measurement,
+        #     deliberately not widened here.
         return (
             "DB refused writes on open: the graph is INTACT but "
             f"{lead}. This is NOT "
