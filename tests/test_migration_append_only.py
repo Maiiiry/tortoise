@@ -768,38 +768,49 @@ def _example_problems(
       the paragraph. The claim being checked is "these were the two claimants", not
       "these are their versions today".
     """
-    match = _DOUBLE_BOOKED.search(header)
-    if not match:
+    matches = list(_DOUBLE_BOOKED.finditer(header))
+    if not matches:
         return [
             "the guard header no longer states the double-booking example in the form "
             "`which is how <version> was double-booked (<a> vs <b>)` — if the wording "
             "moved, re-point this test rather than deleting it: the paragraph is the "
             "only place a lane is told the scan's answer is a snapshot"
         ]
-    version = match.group(1)
-    parties = [(match.group(2), match.group(3)), (match.group(4), match.group(5))]
     problems: list[str] = []
-    if parties[0][0] == parties[1][0]:
-        problems.append(
-            f"the header's double-booking example names `{parties[0][0]}` twice — it "
-            "must name two DIFFERENT migrations, or it is not evidence of a race"
+    # EVERY occurrence is read, not just the first (`finditer`, never `search`).
+    # `search` would read the first example and leave a second, wrong one unread
+    # behind it — a false PASS of exactly the shape `_stated_counts` in the sibling
+    # census guard was fixed for (a count stated twice, one copy read). One example
+    # is the normal case, so the label is only disambiguated when there are more.
+    for index, match in enumerate(matches, start=1):
+        where = (
+            f"example {index} of {len(matches)}"
+            if len(matches) > 1
+            else "the header's double-booking example"
         )
-    for name, pr in parties:
-        if pr:
-            continue
-        observed = shipped(name)
-        if observed is None:
+        version = match.group(1)
+        parties = [(match.group(2), match.group(3)), (match.group(4), match.group(5))]
+        if parties[0][0] == parties[1][0]:
             problems.append(
-                f"`{name}` is named as a racer for {version}, but no migration in "
-                "this tree carries that name and no PR reference says where it "
-                "lives — cite the open PR (`name #1234`) or name a migration that "
-                "exists"
+                f"{where} names `{parties[0][0]}` twice — it "
+                "must name two DIFFERENT migrations, or it is not evidence of a race"
             )
-        elif observed != version:
-            problems.append(
-                f"`{name}` is the leaf of a migration this tree ships at {observed}, "
-                f"not at the double-booked {version}"
-            )
+        for name, pr in parties:
+            if pr:
+                continue
+            observed = shipped(name)
+            if observed is None:
+                problems.append(
+                    f"{where}: `{name}` is named as a racer for {version}, but no "
+                    "migration in this tree carries that name and no PR reference "
+                    "says where it lives — cite the open PR (`name #1234`) or name a "
+                    "migration that exists"
+                )
+            elif observed != version:
+                problems.append(
+                    f"{where}: `{name}` is the leaf of a migration this tree ships "
+                    f"at {observed}, not at the double-booked {version}"
+                )
     return problems
 
 

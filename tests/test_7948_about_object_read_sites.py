@@ -2277,6 +2277,46 @@ def test_the_prose_counts_match_the_table():
     )
 
 
+def test_a_row_that_names_a_door_without_being_counted_declares_the_undercount():
+    """The headline figure's own caveat must be GUARDED, not narrated.
+
+    Row 38 (`domain_validators.py::validate_portfolio_shape`) is served through MCP
+    `tortoise_validate_domain` / SDK `validate_domain`, yet it is classed `ops audit`
+    because the door-attribution arm cannot follow the `@domain_validator` decorator
+    registry — so §13's headline customer-callable figure is an UNDERCOUNT, and the
+    table cell is the only place that says so. Before this arm the figure was
+    asserted by the arm above while the caveat was not: deleting the disclosure left
+    every arm green and the number reading as complete.
+
+    The obligation is CONTENT-based, not row-number-based: any row that names a door
+    and is not counted must carry the word in its own cell. A new door-serving row
+    therefore cannot be added to the undercount by silence, and a deleted caveat
+    cannot be absorbed by the count it qualifies.
+    """
+    uncounted_with_doors = [
+        row
+        for row in _rows()
+        if _reach(row) != "customer-callable"
+        and (
+            _DOOR_MCP.search(str(row["reach"]))
+            or _DOOR_SDK.search(str(row["reach"]))
+            or _DOOR_REST.search(str(row["reach"]))
+        )
+    ]
+    silent = [
+        f"row {row['n']} ({row['module']}::{row['symbol']})"
+        for row in uncounted_with_doors
+        if "UNDERCOUNT" not in str(row["reach"]).upper()
+    ]
+    assert not silent, (
+        "these §13 rows name a door in their reach cell but are NOT counted in the "
+        f"customer-callable figure, and do not say so: {silent} — state the "
+        "undercount, and what makes the row unverifiable, in the row's own cell: the "
+        "headline figure is asserted, and an unguarded caveat beside an asserted "
+        "number is the copy that rots."
+    )
+
+
 # ── 5. every customer-callable row reaches a declared door ─────────────────
 
 #: A door, as a customer-callable reach cell declares one. The three forms are
@@ -4688,12 +4728,14 @@ def test_the_module_filter_is_a_strict_superset_of_the_anchored_form():
       of the corpus.
 
     The derivation pin in `test_the_module_filter_admits_a_split_traversal`
-    (`25` keys / `38` rows) is the second measuring assertion: it is what proves
-    the widening added no site. ⚠️ The figure moved from `24`/`36` when main gained
-    two new all-edge walks — `decide_wiring.py::find_operators` (two sites: the
-    operator's outgoing hop and its target count) is the one that grew both keys;
-    it was re-DERIVED from the tree by running the census, not retyped, and the
-    site now owns a §13 row (row 39).
+    carries the pair — it is the authority, and no figure is restated here, because
+    a second copy of a count rots on the next pass (the sibling arm at
+    `test_a_walk_is_bounded_only_by_a_fact_that_NAMES_IT` stopped restating it for
+    exactly this reason). ⚠️ The figure last moved when main gained two new all-edge
+    walks — `decide_wiring.py::find_operators` (two sites: the operator's outgoing
+    hop and its target count) is the one that grew both keys; it was re-DERIVED from
+    the tree by running the census, not retyped, and the site now owns a §13 row
+    (row 39).
     """
     census = _call_time_census()
     universe = census._universe()
