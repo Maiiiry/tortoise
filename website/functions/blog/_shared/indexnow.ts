@@ -293,13 +293,21 @@ async function stampSubmittedAt(env: Env, id: string, nowMs: number, url: string
  *
  * NEVER THROWS — the caller has already answered 200 and the post is live.
  * A failure here is a log line about a notification, never a failed publish.
+ *
+ * RETURNS the decision (#9803) so a caller can report it instead of guessing:
+ * "submitted" | "skipped-unreadable" | "skipped-window". The agent API ignores
+ * the value; the admin-editor endpoint (`api/notify-publish.ts`) answers with
+ * it. It is an OUTCOME, not a status — every arm is a normal result, and the
+ * only way to fail is to throw, which this function does not do.
  */
+export type NotifyOutcome = "submitted" | "skipped-unreadable" | "skipped-window";
+
 export async function notifyPublished(input: {
   env: Env;
   id: string;
   url: string;
   nowMs: number;
-}): Promise<void> {
+}): Promise<NotifyOutcome> {
   const { env, id, url, nowMs } = input;
   try {
     const lastSubmittedAt = await readSubmittedAt(env, id, url);
@@ -307,20 +315,23 @@ export async function notifyPublished(input: {
       // Not an error: an edit that never reached this path, a state we cannot
       // read, or a real submission inside the window. Logged so "why did
       // nothing go out?" has an answer in the Cloudflare log.
+      const outcome: NotifyOutcome = lastSubmittedAt === undefined ? "skipped-unreadable" : "skipped-window";
       if (lastSubmittedAt !== undefined) {
         console.log(`[indexnow] skipped (submitted ${lastSubmittedAt}): ${url}`);
       }
-      return;
+      return outcome;
     }
     await submitUrl(url);
     // Stamped on the ATTEMPT, whatever its outcome: a vendor outage must not
     // turn every subsequent re-publish into another attempt, and there is no
     // retry in this path by design.
     await stampSubmittedAt(env, id, nowMs, url);
+    return "submitted";
   } catch {
     // Belt and braces. Everything above is already fail-soft; this guarantees a
     // future edit cannot turn a notification into an unhandled rejection in a
     // background task.
     console.warn(`[indexnow] unexpected failure: ${url}`);
+    return "skipped-unreadable";
   }
 }

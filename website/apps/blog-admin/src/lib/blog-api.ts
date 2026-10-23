@@ -360,6 +360,45 @@ export async function purgePostCache(slug: string): Promise<void> {
   return run;
 }
 
+// ── IndexNow on publish (#9803) ───────────────────────────────────────────
+// Best-effort, server-side only (admin-gated /blog/api/notify-publish). The
+// editor writes status directly to Supabase, so it bypasses the agent API's
+// publish transition — which was the ONLY place IndexNow fired. This is the
+// editor's seam onto the same submission path: the endpoint re-reads the row
+// with the service role and refuses an unpublished slug (409), so the browser
+// cannot nominate a URL.
+//
+// Fired on `mode === 'publish'` — including "publish again" on an already-live
+// post, which is the explicit "this URL changed" case the 24h window exists to
+// make safe. Fail-open: a notification never blocks or fails a save.
+let notifyInFlight = new Map<string, Promise<void>>();
+
+export async function notifyPublished(slug: string): Promise<void> {
+  if (!slug) return;
+  const key = slug;
+  const existing = notifyInFlight.get(key);
+  if (existing) return existing;
+  const run = (async () => {
+    try {
+      // #3501/#4171: no token to attach — the HttpOnly `__Host-session` cookie
+      // rides along on this same-origin request, and the app-origin /blog/api
+      // proxy attaches the server-minted credential upstream.
+      await fetch('/blog/api/notify-publish', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug }),
+      });
+    } catch {
+      // fail-open — a missed notification is never a failed publish
+    } finally {
+      notifyInFlight.delete(key);
+    }
+  })();
+  notifyInFlight.set(key, run);
+  return run;
+}
+
 // ── AI generation (#1861 generate-seo, #1863 generate-cover) ─────────────
 // Server-side only (admin-gated /blog/api/*, reached through the app-origin
 // same-origin proxy #4171 — the browser never holds the credential).

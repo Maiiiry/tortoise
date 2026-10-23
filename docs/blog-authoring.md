@@ -198,17 +198,28 @@ Google's crawl latency — Google's equivalent is Search Console's request-index
 separate, authenticated API that is not wired up. Do not report this feature as "indexing on
 Google".
 
-**What fires it.** Only the transition to published through the agent API
-(`PATCH /blog/api/posts/:slug` with `status: "published"`). It submits **one** URL — the article's
-canonical URL — in the background, so the publish never waits for it.
+**What fires it.** Two callers reach the same submission path:
+
+1. **The agent API's publish transition** — `PATCH /blog/api/posts/:slug` with `status: "published"`
+   (`api/posts/[[path]].ts`).
+2. **The editor's publish button** — `POST /blog/api/notify-publish { slug }` (#9803). The admin SPA
+   writes status straight to Supabase, so it never passes through the agent API; without this endpoint
+   nothing fired for the human who publishes. The endpoint does not write the post: it re-reads the row
+   with the service role and answers **409 `not_published`** for anything not live, so a slug from the
+   browser can never nominate a draft URL.
+
+It submits **one** URL — the article's canonical URL — in the background, so the publish never waits
+for it. Both callers share `_shared/indexnow.ts`: one rule, two doors.
 
 **Never fired:**
 
-- writing a draft;
+- writing a draft (from either caller);
 - **creating a post directly as `published`** — `POST /blog/api/posts` with `status: "published"` is a
   publish transition, but the notification belongs to the PATCH transition. Publish a draft with
-  PATCH if you want the submission;
-- editing an article that is already published;
+  PATCH if you want the submission (the editor's publish save does notify, via the endpoint above);
+- editing an article that is already published **through the agent API**. The editor's publish button
+  does notify on a re-publish — that is the explicit "this URL changed" case, and the 24-hour window
+  below is what makes it safe;
 - unpublishing;
 - re-publishing the same URL within 24 hours (`blog_posts.indexnow_submitted_at` records the last
   attempt);
@@ -238,8 +249,11 @@ the shapes the path produces:
 | `skipped (state unreadable, no row)` | the row was gone when the stamp was read (a concurrent delete) | nothing — but note the state was unknown, so nothing was submitted |
 | `unexpected failure` | a bug-shaped error inside the notification | file it; the publish itself already succeeded |
 
-⚠️ **A publish from the admin console is not submitted.** The console writes the status change
-directly to Supabase and never reaches the agent API that fires the notification.
+⚠️ **The admin console reaches the notification through its own endpoint.** The console writes the
+status change directly to Supabase, so it never passes through the agent API — the editor therefore
+calls `POST /blog/api/notify-publish { slug }` after a publish save (#9803). That endpoint answers
+**409 `not_published`** for anything not live, so it cannot be used to nominate a draft URL. If you
+publish by editing the row directly in Supabase, nothing is submitted.
 
 ⚠️ **Known limit of the 24-hour window.** The stamp is per post *row* and is read before the
 submission and written after it. Two publish transitions of the same post that overlap (both read the
