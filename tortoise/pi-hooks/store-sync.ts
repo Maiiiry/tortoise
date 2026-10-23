@@ -725,18 +725,23 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     const compacted = window.some((w) => w.type === "compaction");
     const priorWindow = prior?.lastWindow ?? 0;
     if (compacted && priorWindow > 0 && turns.length < priorWindow) {
-      state.files[path] = {
-        offset: plan.offset,
-        sessionId,
-        dev: identity.dev,
-        ino: identity.ino,
-        headerSha: scan.headerSha,
-        delivered: priorDelivered,
-        lastWindow: priorWindow,
-        updatedAt: prior?.updatedAt ?? 0,
-        attemptedAt: now(),
-        failures: (prior?.failures ?? 0) + 1,
-      };
+      // A dry run reports the refusal WITHOUT persisting it (see the dry-run
+      // contract above): the report is the whole product of that mode.
+      if (!dryRun) {
+        state.files[path] = {
+          offset: plan.offset,
+          sessionId,
+          dev: identity.dev,
+          ino: identity.ino,
+          headerSha: scan.headerSha,
+          delivered: priorDelivered,
+          lastWindow: priorWindow,
+          updatedAt: prior?.updatedAt ?? 0,
+          attemptedAt: now(),
+          failures: (prior?.failures ?? 0) + 1,
+        };
+        checkpoint();
+      }
       receipt.shrunk += 1;
       receipt.files.push({
         path,
@@ -752,7 +757,6 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
           `(${turns.length} turns vs ${priorWindow} already delivered — a ` +
           "/compact cut; shipping it would delete the turns past the new window)",
       );
-      checkpoint();
       continue;
     }
 

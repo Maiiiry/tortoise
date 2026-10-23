@@ -712,6 +712,23 @@ test("a /compact SHRINK is refused, never shipped (it would delete filed turns)"
   // DISCRIMINATION: the guard is the ONLY reason this file is not shipped; the
   // plan for it is `ship` (the file grew), so a missing guard posts here.
   assert.equal(second.calls.length, 0);
+
+  // And a DRY RUN reports the same refusal without persisting anything: the
+  // shrink branch used to write the cursor + checkpoint unconditionally, which
+  // would have re-introduced a durable side effect in "read-only" mode.
+  const beforeDry = readFileSync(cursorPath(cursorDir), "utf8");
+  const dry = stubFetch([200]);
+  const dryReceipt = await runStoreSync({
+    sessionDir: root, cursorDir, fetchImpl: dry, dryRun: true, ...FAST,
+  });
+  assert.equal(dry.calls.length, 0);
+  assert.equal(dryReceipt.shrunk, 1, "a dry run still REPORTS the refusal");
+  assert.equal(dryReceipt.files[0].reason, "window_shrunk");
+  assert.equal(
+    readFileSync(cursorPath(cursorDir), "utf8"),
+    beforeDry,
+    "the dry run must not rewrite the cursor store",
+  );
 });
 
 test("a no-turns window is COUNTED as examined-but-awaiting, never as shipped", async () => {
