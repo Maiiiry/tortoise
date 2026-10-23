@@ -62,9 +62,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
-import pytest
 
 from tests._verdict import NODE_FLOOR_STRIP_TYPES, require_node_floor
 
@@ -250,9 +249,7 @@ def test_v3b_vendor_rejection_is_reported_as_submit_failed():
 
 
 def test_v4_inside_the_window_nothing_is_submitted():
-    from datetime import datetime, timedelta, timezone
-
-    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    recent = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     out = _run({
         "row": {"slug": "agent-memory", "status": "published"},
         "body": {"slug": "agent-memory"},
@@ -271,7 +268,7 @@ def test_v5_unreadable_row_is_503_not_a_publish_failure():
     assert out["submissions"] == []
 
 
-def test_v5b_malformed_body_is_400():
+def test_v5d_malformed_body_is_400():
     out = _run({"body": "{not json"})
     assert out["status"] == 400
     assert out["submissions"] == []

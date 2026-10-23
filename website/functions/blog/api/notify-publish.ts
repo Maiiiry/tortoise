@@ -105,7 +105,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   const live = row.status === "published" && row.hold_for_review === false;
   if (!live) {
     // Deliberate, and not softened: no retraction exists in this protocol.
-    return json({ error: "not_live", status: row.status, hold_for_review: row.hold_for_review === true }, 409);
+    return json({ error: "not_live", status: row.status, hold_for_review: row.hold_for_review ?? null }, 409);
   }
 
   const url = `${SITE_URL}/blog/${slug}`;

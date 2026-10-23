@@ -297,7 +297,14 @@ export type NotifyOutcome =
  * `INDEXNOW_WINDOW_MS` PER ROW — non-atomically, and not keyed by URL; the
  * constant documents the two escapes (overlapping transitions of one row, and a
  * deleted-and-recreated slug). Called from the agent API's publish transition
- * inside `waitUntil`, so the publish response never waits on the vendor.
+ * inside `waitUntil` — so THAT publish response never waits on the vendor — and
+ * called SYNCHRONOUSLY from `api/notify-publish.ts`, which does await it. Two
+ * callers, one rule: the wait behaviour belongs to the caller, not to this.
+ *
+ * #9803: the console's four call sites are `save.ts` (editor publish save, both
+ * create and re-publish) plus `blog-api.ts`'s `publishPost` (the drafts-queue
+ * Publish) and `clearHoldPost`; all three user actions reach this through the
+ * one endpoint, and the endpoint re-checks "live" before calling here.
  *
  * ⛔ This is the ONLY submission path in the codebase, and it takes ONE url. A
  * bulk/backfill loop does not belong in a publish handler (#9680 item 5): the

@@ -380,17 +380,24 @@ export async function purgePostCache(slug: string): Promise<void> {
 // with the service role and refuses an unpublished slug (409), so the browser
 // cannot nominate a URL.
 //
-// Fired on `mode === 'publish'` — including "publish again" on an already-live
-// post, which is the explicit "this URL changed" case the 24h window exists to
-// make safe. Fail-open: a notification never blocks or fails a save.
+// Triggered by the THREE console write paths that can make a row publishable:
+// the editor form's publish save (`save.ts`, including "publish again"), the
+// drafts-queue one-click Publish (`publishPost`), and clearing a hold
+// (`clearHoldPost`). Fail-open: a notification never blocks or fails a save.
+//
+// Repeat calls are SERIALISED, not dropped. The pair that makes dropping visible
+// is queue-Publish-then-clear-hold: the first submission is refused 409
+// `not_live` (the row is held), and the clear-hold is the transition that
+// actually makes it live — returning the in-flight promise would leave that
+// publish unsubmitted with nothing logged. Dedupe buys nothing here anyway: the
+// endpoint re-checks the row and the 24h window server-side.
 let notifyInFlight = new Map<string, Promise<void>>();
 
 export async function notifyPublished(slug: string): Promise<void> {
   if (!slug) return;
   const key = slug;
-  const existing = notifyInFlight.get(key);
-  if (existing) return existing;
-  const run = (async () => {
+  const previous = notifyInFlight.get(key) ?? Promise.resolve();
+  const run = previous.then(async () => {
     try {
       // #3501/#4171: no token to attach — the HttpOnly `__Host-session` cookie
       // rides along on this same-origin request, and the app-origin /blog/api
@@ -404,9 +411,11 @@ export async function notifyPublished(slug: string): Promise<void> {
     } catch {
       // fail-open — a missed notification is never a failed publish
     } finally {
-      notifyInFlight.delete(key);
+      // only the LAST request in the chain clears the slot; an earlier one
+      // finishing must not delete a successor's entry
+      if (notifyInFlight.get(key) === run) notifyInFlight.delete(key);
     }
-  })();
+  });
   notifyInFlight.set(key, run);
   return run;
 }

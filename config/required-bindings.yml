@@ -104,7 +104,7 @@ projects:
         envs: [production]
         note: >-
           server-side blog writes. The explicit ``503 not_configured`` sites are
-          website/functions/blog/api/posts/[[path]].ts (2),
+          website/functions/blog/api/posts/[[path]].ts (3),
           website/functions/blog/api/purge.ts, .../generate-cover.ts,
           .../generate-seo.ts and .../notify-publish.ts (#9803).
           website/functions/blog/_shared/admin-auth.ts reads

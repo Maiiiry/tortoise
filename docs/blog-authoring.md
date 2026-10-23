@@ -198,21 +198,28 @@ Google's crawl latency — Google's equivalent is Search Console's request-index
 separate, authenticated API that is not wired up. Do not report this feature as "indexing on
 Google".
 
-**What fires it.** Two callers reach the same submission path:
+**What fires it.** Two callers reach the same submission path — the agent API, and the console (which
+has four call sites across three user actions):
 
 1. **The agent API's publish transition** — `PATCH /blog/api/posts/:slug` with `status: "published"`
    (`api/posts/[[path]].ts`).
-2. **The editor's publish button** — `POST /blog/api/notify-publish { slug }` (#9803). The admin SPA
-   writes status straight to Supabase, so it never passes through the agent API; without this endpoint
-   nothing fired for the human who publishes. The endpoint does not write the post: it re-reads the row
-   with the service role and answers **409 `not_live`** for anything not live, so a slug from the
-   browser can never nominate a draft URL. **"Live" is two columns**: `status = 'published'` AND
-   `hold_for_review = false`. A held post has the status but is filtered out of every public surface,
-   so its URL answers 404 — the endpoint answers **409 `not_live`** for it rather than submitting a dead
-   URL. Clearing a hold on a published post is the mirror transition, and the console notifies there too.
+2. **The console**, which writes status straight to Supabase with supabase-js and therefore never
+   passes through the agent API. Every console write that can make a row publishable notifies, via
+   `POST /blog/api/notify-publish { slug }` (#9803):
+   - the **editor form's publish save** — including "publish again" on an already-live post;
+   - the **drafts-queue one-click Publish** (`publishPost`) — the path the agent-draft backlog is
+     actually published through;
+   - **clearing a hold** on a published post (`clearHoldPost`) — the transition that makes a held
+     post's URL live, since the hold itself is not cleared by publishing.
+
+   The endpoint does not write the post: it re-reads the row with the service role and answers **409
+   `not_live`** for anything not live, so a slug from the browser can never nominate a draft URL.
+   **"Live" is two columns**: `status = 'published'` AND `hold_for_review = false`. A held post has the
+   status but is filtered out of every public surface, so its URL answers 404 — the endpoint refuses it
+   rather than submitting a dead URL.
 
 It submits **one** URL — the article's canonical URL — in the background, so the publish never waits
-for it. Both callers share `_shared/indexnow.ts`: one rule, two doors.
+for it. The agent API and the console share `_shared/indexnow.ts`: one rule, both doors.
 
 **Never fired:**
 
