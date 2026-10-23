@@ -1492,6 +1492,94 @@ def get_tool_by_name() -> dict[str, ToolDefinition]:
 
 # ── Adapters ────────────────────────────────────────────────────
 
+# ── #9340: the optional `graph` tool argument ─────────────────
+#
+# The owner's 2026-10-22 decision on #9340 makes the graph a TOOL ARGUMENT,
+# not a token claim: a graph is working context inside one workspace, so a
+# connector selects it per call and the token stays (user, workspace, scope).
+# The resolver + the reachability check live in `tortoise.mcp_auth`
+# (`apply_graph_target`); these two declarations are the SURFACE half — which
+# tools advertise the argument, and what the schema says it means — and they
+# live here because this module owns the tool surface.
+#
+# **OVERRIDES:** the tenant-level consent scope used by most MCP connectors (a
+# `graph_id` claim minted at consent) — see the decision comment on #9340 and
+# `mcp_auth.apply_graph_target`'s note; binding the graph at consent would make
+# a four-graph account addressable only by four connections and force a
+# re-consent on every graph switch.
+
+#: Tools that must NOT advertise (nor honour) the `graph` argument: they
+#: already name a graph explicitly (`graph_id`), address the WORKSPACE rather
+#: than a graph, or are the discovery surface itself. ONE constant, read by
+#: both the schema extension below and `mcp_server._apply_graph_argument`, so
+#: the advertised set and the honoured set cannot drift apart.
+#:
+#: ⛔ The WORKSPACE-level entries are not a judgement call: each one calls
+#: `mcp_server._reject_graph_bound_mcp_org_surface`, which refuses whenever a
+#: graph is selected. Advertising `graph` there would mean a connector that
+#: selects a graph uniformly (the whole point of the argument) silently loses
+#: pack install, sources management and every onboarding tool — and would be
+#: told its credential is graph-bound when it is not. `tests/
+#: test_9340_graph_tool_argument.py` derives exactly this set from the source
+#: and reds if a new `_reject_graph_bound_mcp_org_surface` caller is added
+#: without an entry here.
+GRAPH_ARGUMENT_EXCLUDED: frozenset[str] = frozenset({
+    "tortoise_list_graphs",          # the discovery surface — lists them all
+    "tortoise_graph_set_recording",  # names its target with `graph_id`
+    "tortoise_org_create",           # provisions the WORKSPACE
+    # workspace-level state (packs / sources / onboarding) — see the note above
+    "tortoise_pack_install",
+    "tortoise_packs_list",
+    "tortoise_manage_sources",
+    "tortoise_onboarding_state",
+    "tortoise_onboarding_seed",
+    "tortoise_onboarding_demo_create",
+    "tortoise_onboarding_session_recording",
+    "tortoise_onboarding_github_connect",
+    "tortoise_onboarding_github_status",
+    "tortoise_onboarding_github_index",
+})
+
+GRAPH_ARGUMENT_DESCRIPTION = (
+    "Optional graph to act on. Omitted = the workspace's default graph. "
+    "Accepts, in order of preference: the graph's id, the namespace string "
+    "tortoise_list_graphs returns for it (e.g. `org_<workspace>_<graph_id>`), "
+    "or its name when that name is unique in this workspace. An unknown, "
+    "ambiguous, deleted or other-workspace graph is refused. A HOSTED "
+    "workspace connection only: a stdio or self-host server has no workspace "
+    "graph set, so it refuses this argument rather than guessing a target."
+)
+
+
+def _with_graph_argument(tool: Any, name: str) -> Any:
+    """Advertise the optional `graph` parameter on a registered tool (#9340).
+
+    Applied to the registered Tool's JSON schema, never to the handler's
+    signature: `served_attributes` / the code fingerprint in
+    `config/surface-manifest.yml` are derived from the HANDLER, and a per-tool
+    signature edit would re-stamp every row of an owner-reviewed baseline for
+    one uniform argument. The parameter is honoured centrally, at the single
+    dispatch point (`mcp_server._apply_graph_argument`), so this declaration
+    and the behaviour cannot disagree.
+
+    `GRAPH_ARGUMENT_EXCLUDED` tools keep their schema untouched; a caller that
+    sends the argument to one of them is refused centrally, so an excluded tool
+    never silently ignores it.
+    """
+    if name in GRAPH_ARGUMENT_EXCLUDED:
+        return tool
+    parameters = dict(getattr(tool, "parameters", None) or {})
+    properties = dict(parameters.get("properties") or {})
+    if "graph" in properties:
+        return tool
+    properties["graph"] = {
+        "type": "string",
+        "description": GRAPH_ARGUMENT_DESCRIPTION,
+    }
+    parameters["properties"] = properties
+    return tool.model_copy(update={"parameters": parameters})
+
+
 class FastMCPAdapter:
     """Register all TOOL_REGISTRY entries on a FastMCP instance via add_tool().
 
@@ -1566,6 +1654,7 @@ class FastMCPAdapter:
                 description=entry.description,
                 annotations=entry.annotations,
             )
+            tool = _with_graph_argument(tool, entry.name)
             self._mcp.add_tool(tool)
 
 

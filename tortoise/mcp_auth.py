@@ -232,6 +232,292 @@ def _get_org_sdk() -> TortoiseSDK:
     return sdk
 
 
+# ── #9340: the graph is a TOOL ARGUMENT, not a token claim ────────────
+#
+# The owner's 2026-10-22 decision on #9340 supersedes requirements 1 and 5 of
+# that issue: a graph is working context INSIDE one identity, not a tenant
+# boundary, so it is selected per call rather than frozen into the token.
+#
+#   resource URL  → the WORKSPACE (unchanged, RFC 8707 §3 path component)
+#   token         → (user, workspace, scope) — unchanged, no migration
+#   tool argument → the GRAPH, defaulting to the workspace's default graph
+#
+# **OVERRIDES:** the tenant-level consent scope used by most MCP connectors (a
+# `graph_id` claim minted at consent) — a graph is context within a workspace,
+# so binding it at consent would make one account's four graphs addressable
+# only by four connections and would force a re-consent (and a token
+# re-issue) every time a user switched graph. The owner decision is recorded on
+# #9340 (comment "DECISION (2026-10-22): the graph is a **tool argument**, not
+# a token claim").
+#
+# Two properties of this resolver are load-bearing, and both are re-checked on
+# EVERY call — never cached at resolution time:
+#
+#   1. **The reachable set is the token's workspace only.** An id belonging to
+#      another workspace must read as "not reachable from this workspace",
+#      never as a hit: an unfiltered list plus an unchecked argument is a plain
+#      IDOR (a token for workspace A naming workspace B's graph).
+#   2. **A soft-deleted graph stops resolving.** `graph_list` omits deleted
+#      rows, so the next call after a delete refuses instead of falling back
+#      to the default graph — a live connection must never keep reading a
+#      graph the user deleted.
+
+from tortoise.tool_registry import (  # noqa: E402, I001
+    GRAPH_ARGUMENT_DESCRIPTION as _GRAPH_ARGUMENT_DESCRIPTION,
+    GRAPH_ARGUMENT_EXCLUDED as _GRAPH_ARGUMENT_EXCLUDED,
+)
+
+#: MCP tools that must NOT advertise (or honour) the `graph` argument: they
+#: already name a graph explicitly (`graph_id`), address the WORKSPACE rather
+#: than a graph, or are the discovery surface itself. The declaration lives in
+#: `tortoise.tool_registry` (that module owns the surface); it is re-exported
+#: here because this is where the resolution lives, and ONE import site is
+#: what keeps the advertised set and the honoured set from drifting.
+GRAPH_ARGUMENT_EXCLUDED = _GRAPH_ARGUMENT_EXCLUDED
+GRAPH_ARGUMENT_DESCRIPTION = _GRAPH_ARGUMENT_DESCRIPTION
+
+
+class GraphTargetError(ValueError):
+    """A `graph` argument named no graph this caller may reach (#9340).
+
+    Raised — never swallowed — because the two silent alternatives are both
+    wrong: falling back to the default graph reads/writes the wrong graph with
+    no signal, and an empty result is indistinguishable from a graph that is
+    genuinely empty. The message names what the caller CAN reach so the
+    refusal teaches.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.code = "invalid_graph"
+
+
+def _describe_graph(row: dict) -> str:
+    """One graph as a caller can act on it: `name (graph_id)`."""
+    gid = row.get("graph_id")
+    name = row.get("name") or gid
+    return f"{name!r} ({gid})"
+
+
+def _active(rows: list[dict], org_id: str) -> list[dict]:
+    """The rows a `graph` argument may name, for THIS workspace and ACTIVE.
+
+    Two filters, both load-bearing:
+
+    * **the workspace** — `graph_list(org_id)` is already org-scoped, but this
+      does not TRUST the reader: a row that declares a different ``org_id`` is
+      dropped here, so a future reader change (or any row that slips into an
+      org-scoped read) cannot turn this resolver into the IDOR the decision
+      names — a token for workspace A opening workspace B's graph through a
+      namespace nobody re-checked.
+    * **the tombstone** — the Supabase reader already omits deleted custom
+      graphs; the registry lane can still carry a deleted status, and a
+      soft-deleted graph must stop resolving on the NEXT call (a live
+      connector must not keep reading a graph the user deleted).
+
+    A row that declares NO ``org_id`` is kept: the resolver's job is to refuse
+    an explicitly foreign row, not to invent a tenancy claim a reader never
+    made (both shipped readers do set it).
+    """
+    return [r for r in rows if isinstance(r, dict)
+            and (r.get("status") or "active") == "active"
+            and r.get("org_id") in (None, org_id)]
+
+
+def reachable_graph_rows(org_id: str, *, sdk: TortoiseSDK | None = None) -> list[dict]:
+    """The ACTIVE graphs of `org_id` — the only set a `graph` argument may name.
+
+    `graph_list` is the control-plane reader (Supabase `graphs` table / selfhost
+    registry Graph nodes). The `status` filter here is what carries the
+    tombstone guarantee into the registry lane, whose rows may still be present
+    with a deleted status.
+
+    `sdk` is injectable so a test can pin the reachable set without a database.
+    """
+    if not org_id:
+        return []
+    reader = sdk if sdk is not None else _get_org_sdk()
+    rows = reader.graph_list(org_id)
+    return _active(rows, org_id) if isinstance(rows, list) else []
+
+
+def resolve_graph_target(org_id: str, ref: str, *,
+                         rows: list[dict] | None = None) -> dict:
+    """Resolve one `graph` argument to a row this caller may reach (#9340).
+
+    Resolution order is the owner-decided rule, and the order is the point:
+    an **id** always wins over a name, and a **name** resolves only when it is
+    unique within the token's workspace. A name matching two graphs is refused
+    with the candidates, because picking one silently is a wrong-graph write
+    the caller cannot detect — the failure class this feature is most likely
+    to cause.
+
+    Raises :class:`GraphTargetError` for anything that is not exactly one
+    reachable graph: unknown id/name, a name matching several, a graph that is
+    soft-deleted (absent from the reachable set), and a graph belonging to
+    another workspace (indistinguishable from unknown ON PURPOSE — the refusal
+    must not confirm that another tenant's graph id exists).
+    """
+    ref = ref.strip() if isinstance(ref, str) else None
+    if ref is None:
+        # The advertised schema says `string`, but that schema is descriptive:
+        # nothing validates it on this path (the handler signature does not
+        # declare the argument). An int/list/object here would otherwise raise
+        # AttributeError out of the dispatch and be classified a SERVER error
+        # rather than the bad-argument refusal it is.
+        raise GraphTargetError(
+            "The `graph` argument must be a graph id or name (a string). "
+            "Omit it to use this workspace's default graph.")
+    # An injected row set is filtered HERE too, so the tenancy + tombstone
+    # rules hold on both entry points rather than depending on which one the
+    # caller used.
+    reachable = _active(reachable_graph_rows(org_id) if rows is None else rows,
+                        org_id)
+    names = ", ".join(_describe_graph(r) for r in reachable) or "none"
+    if not ref:
+        raise GraphTargetError(
+            "The `graph` argument is empty. Omit it to use this workspace's "
+            f"default graph, or pass one of: {names}.")
+    # 1. id — exact, and allowed to win over a name that happens to collide.
+    for row in reachable:
+        if ref == row.get("graph_id"):
+            return row
+    # 2. namespace — the storage spelling `graph_list` returns, so a caller
+    #    that read it from `tortoise_list_graphs` can pass it straight back.
+    for row in reachable:
+        if row.get("namespace") and ref == row["namespace"]:
+            return row
+    # 3. name — only when unique, case-insensitively (a user types a name, not
+    #    its casing). Several matches is a REFUSAL, not a guess.
+    wanted = ref.casefold()
+    by_name = [r for r in reachable
+               if (r.get("name") or "").casefold() == wanted]
+    if len(by_name) == 1:
+        return by_name[0]
+    if len(by_name) > 1:
+        raise GraphTargetError(
+            f"Graph name {ref!r} matches {len(by_name)} graphs in this "
+            f"workspace: {', '.join(_describe_graph(r) for r in by_name)}. "
+            "Pass the graph id instead.")
+    raise GraphTargetError(
+        f"No graph {ref!r} is reachable from this workspace. "
+        f"Reachable graphs: {names}.")
+
+
+def plan_graph_target(ref: Any) -> dict | None:
+    """Resolve + authorise a `graph` argument — and DO the I/O, changing nothing.
+
+    Split from :func:`use_graph_target` because the dispatch seam is an async
+    coroutine: `reachable_graph_rows` is a control-plane read (in the Supabase
+    lane, up to three PostgREST round trips on a synchronous client), so it must
+    run OFF the event loop. A ContextVar `.set()` inside `asyncio.to_thread`
+    would die with the thread's context copy, so the read rides the thread and
+    the ScopeVars are applied back on the loop — hence two functions rather than
+    one. `apply_graph_target` keeps the synchronous pairing for tests and any
+    caller already on a worker thread.
+
+    Raises :class:`GraphTargetError` for every refusal (all of them BEFORE any
+    ContextVar moves, so a refused argument cannot half-scope a request).
+    """
+    if ref is None:
+        return None
+    org_id = _current_org_id.get()
+    if not org_id or org_id == SELFHOST_ORG_ID:
+        # No workspace to resolve against: stdio/self-host has no control-plane
+        # graph set, so a name cannot be checked. Refusing beats attaching a
+        # connection to a graph the caller did not choose.
+        raise GraphTargetError(
+            "The `graph` argument requires a hosted workspace connection "
+            "(an OAuth or tenant-key MCP session) — this transport has no "
+            "graph set to resolve it against. Omit `graph` to use the "
+            "default graph.")
+    row = resolve_graph_target(org_id, ref)
+    bound = _current_graph_id.get()
+    if bound and bound != row.get("graph_id"):
+        # A graph-bound API key is ALREADY narrowed to one graph. Honouring a
+        # `graph` argument here would widen a credential past its mint — and
+        # this check comes BEFORE the default-graph early return, because
+        # otherwise a bound key asking for the workspace default would be told
+        # "default" while every call kept reading its own graph: the silent
+        # wrong-graph outcome, with the caller's intent freshly confirmed.
+        raise GraphTargetError(
+            "This credential is bound to one graph and cannot be re-targeted "
+            f"by a `graph` argument (requested {_describe_graph(row)}).")
+    if (row.get("kind") or "") == "default":
+        return row
+    graph_id = row.get("graph_id")
+    namespace = row.get("namespace")
+    if not graph_id or not namespace:
+        # `_get_org_sdk()` opens a custom graph only from the PAIR; with either
+        # half missing it would fall through to the workspace default, i.e.
+        # read the wrong graph under a custom graph's name.
+        raise GraphTargetError(
+            f"Graph {_describe_graph(row)} cannot be opened: it is missing its "
+            "graph id or its storage namespace. Omit `graph` to use the "
+            "default graph.")
+    return row
+
+
+def use_graph_target(plan: dict | None) -> dict | None:
+    """Apply a :func:`plan_graph_target` result to THIS request. No I/O.
+
+    A resolved CUSTOM graph sets the same two ContextVars the credential
+    resolution sets (`_current_graph_id` / `_current_graph_namespace`), so
+    `_get_org_sdk()` opens that graph through the SAME seam — no second way to
+    open a graph, and every tool benefits without a per-tool change.
+
+    The resolved DEFAULT graph deliberately sets nothing: `graph_list` returns
+    the workspace namespace for it, and opening that by graph name would be a
+    second, subtly different construction of the graph the untouched path
+    already opens. "default" therefore means byte-identical behaviour — and a
+    `None` plan (no argument) means the same thing.
+    """
+    if plan is None or (plan.get("kind") or "") == "default":
+        return plan
+    _current_graph_id.set(plan.get("graph_id"))
+    _current_graph_namespace.set(plan.get("namespace"))
+    return plan
+
+
+def apply_graph_target(ref: str | None) -> dict | None:
+    """Synchronous convenience: plan + use, for callers already off the loop.
+
+    The async dispatch seam MUST use the two halves separately (see
+    :func:`plan_graph_target`); tests and worker-thread callers use this.
+    """
+    return use_graph_target(plan_graph_target(ref))
+
+
+def record_tenant_for_graph(plan: dict | None) -> tuple[str, str] | None:
+    """The record tenant a SELECTED custom graph implies, or None (#9340).
+
+    An org-wide credential (OAuth — the connection this feature exists for) has
+    no `graph_id` at resolution time, so `_record_tenant_scope` in
+    `OrgResolutionMiddleware` installs none and an armed record write is refused
+    `no_tenant`. A graph selected per call DOES carry a control-plane
+    `public.graphs` row — the very row the resolver just read — so the tenant is
+    nameable and must be carried, or the write lands in graph X while its record
+    row is refused (or, under a declared single-tenant env pair, filed under
+    graph Y). That divergence is the same silent-wrong-target class this issue
+    exists to close.
+
+    The DEFAULT graph is deliberately still None: it need not have a row, and
+    naming it is #9188's open question — the same deferral the credential path
+    makes.
+    """
+    if plan is None or (plan.get("kind") or "") == "default":
+        return None
+    org_id = _current_org_id.get()
+    graph_id = plan.get("graph_id")
+    if not org_id or not graph_id:
+        return None
+    from tortoise.record_writer import record_tenant_for
+    from tortoise.supabase_control import is_supabase_enabled
+
+    return record_tenant_for({"org_id": org_id, "graph_id": graph_id},
+                             control_plane_ids=is_supabase_enabled())
+
+
 # ── HTTP tool allow-list (derived from registry; #454) ────────────────
 # New tools are EXCLUDED from the tenant HTTP surface unless registered with
 # http_policy=True in tool_registry.py. Zero manual sync — see #454.
