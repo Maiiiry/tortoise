@@ -153,14 +153,14 @@ steps are decisions rather than rules.
 | **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it, but the node says "probability" where the item says "chance" — a synonym, leaving 3 of 4 stems and a 0.375 partial score under the 0.5 floor) and product spec: v1's dates. Both are itemised below |
 | **Truth vs relevance** | 1 input, 2 facets | contradicting claim: no NAND **and** a mitigation applied. One root failure, counted as two findings and stated as one failure |
 | **NAND where nothing contradicts** | 1 | meeting: one NAND operator with two edges (onto the comms plan, onto the slip forecast). A judgment call, and the instrument treats it as a finding because a contradiction operator on a claim nobody attacked computes a wrong confidence |
-| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Of the other nine, eight wrote their own Source (the correction's was seeded by the fixture) and **seven stamped the edge with `create_point(extractedFrom=[url])`** — the create argument, not a separate `create_edge` call, which the structural verb refuses for this predicate. Two runs (correction, person appointment) reached provenance through `create_edge("wasDerivedFrom"|"references", …)` instead, and the instrument credits any provenance edge with a Source endpoint — so the fixture's stated measurable ("does the agent find the create argument") is **not** what the class measures |
+| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Of the other nine, eight wrote their own Source (the correction's was seeded by the fixture) and **seven stamped the edge with `create_point(extractedFrom=[url])`** — the create argument, not a separate `create_edge` call, which the structural verb refuses for this predicate. Two runs (correction, person appointment) reached provenance through `create_edge("wasDerivedFrom"|"references", …)` instead, and the instrument credits any provenance edge with a Source endpoint. So the question this class was meant to answer — *does the agent find the create argument* — is **not** what it measures, and the two `create_edge` runs score as clean provenance |
 | **Duplicate identity** | 0 | the one input built to produce a duplicate produced none: the alias was folded onto the existing Object. This is the measurable the document must keep |
 
 ### Instrument limitations and corrections, stated rather than hidden
 
 This section exists because **three rounds of fresh-context review found the
-instrument lying about its own subject** (and a fourth found the sentences below
-still quoting the pre-fix causes), and the numbers above are what remains
+instrument lying about its own subject** (and a fourth found two unpinned gates
+plus five sentences still quoting the pre-fix causes), and the numbers above are what remains
 after every fix. The corrections are recorded, not quietly absorbed: a
 measurement artifact that hides its own revisions teaches the wrong thing.
 
@@ -220,6 +220,19 @@ Round 3:
     existed). The class counts are pinned to the records now, not just the
     headline.
 
+Round 4:
+14. **The re-score gate did not cover the case its docstring named.** Two
+    *compensated* edits — one record gaining a wrong-but-declared kind while
+    another loses one — leave the totals and every class aggregate intact, so the
+    report's per-input table could contradict the records with the whole suite
+    green. The per-input counts are pinned now, table row and record together.
+15. **The bar was `ratio < 0.6` while the doc said two thirds** — equal up to four
+    stems, divergent from five. Compared as `hit * 3 < 2 * len(want)` now, with a
+    two-sided test at the boundary.
+16. **Five sentences still quoted pre-fix causes** (the provenance count in the
+    outline, the 80% forecast's kind class, a "measurable" the gold never stated,
+    the tie-break justification, the round count). Corrected against the records.
+
 Still true, and stated as a limit rather than a rule: the matcher is token
 overlap with a crude stemmer, and **the class table above is the MACHINE
 reading**. Two of its verdicts are known to be the matcher's, and they are
@@ -229,7 +242,9 @@ itemised here rather than subtracted from the headline:
   Point ("Priya estimates an 80% probability …"), i.e. the *expected* layer. The
   cause is a synonym: `chance` vs `probability` leaves 3 of 4 stems, and a
   partial overlap scores `0.5 × 3/4 = 0.375`, under the 0.5 acceptance floor.
-  Human reading: correct layer, undeclared kind.
+  Human reading: correct layer, and a **pack-declared** kind (`estimate`, which
+  the pm pack declares) where the item is a `statement` — the wrong-but-declared
+  class, not the invented-kind class.
 * product spec, "v1 said 2026-10-15" — reported **absent**. v1's dates live on
   Points, and the v1 Object was superseded; human reading: the state is on the
   wrong layer, which is the same lesson as the two Points that *were* caught.

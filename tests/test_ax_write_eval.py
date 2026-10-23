@@ -526,7 +526,53 @@ def test_the_reported_totals_match_the_committed_records():
         with_p0 += 1 if record["severity_counts"]["P0"] else 0
     assert totals == {"P0": 14, "P1": 32}, f"report claims 14/32, records say {totals}"
     assert with_p0 == 6, f"report claims 6 of 10 inputs carry a P0, records say {with_p0}"
+    # PER-INPUT pin. The totals and the class aggregates cannot see a COMPENSATED
+    # pair of record edits (one input gaining a finding as another loses one), so
+    # the report's per-input table could contradict the records with the suite
+    # green. This is the table, value by value.
+    per_input = {
+        record["input"]: (
+            record["severity_counts"]["P0"],
+            record["severity_counts"]["P1"],
+        )
+        for record in (
+            json.loads(path.read_text())
+            for path in sorted((GOLD.parent / "runs").glob("*/score.json"))
+        )
+    }
+    assert per_input == {
+        "portfolio_update": (2, 5),
+        "meeting_transcript": (2, 7),
+        "research_paper": (0, 4),
+        "decision_request": (3, 2),
+        "correction_existing_claim": (0, 1),
+        "duplicate_entity": (0, 3),
+        "regulatory_filing": (0, 2),
+        "person_appointment": (2, 4),
+        "contradicting_claim": (3, 2),
+        "product_spec_object": (2, 2),
+    }, f"the report's per-input table drifted from the records: {per_input}"
+
     doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
+    cells = {
+        "portfolio_update": (1, "portfolio update"),
+        "meeting_transcript": (2, "meeting transcript"),
+        "research_paper": (3, "research paper"),
+        "decision_request": (4, "decision request"),
+        "correction_existing_claim": (5, "correction to a claim"),
+        "duplicate_entity": (6, "duplicate entity"),
+        "regulatory_filing": (7, "regulatory filing"),
+        "person_appointment": (8, "person appointment"),
+        "contradicting_claim": (9, "contradicting claim"),
+        "product_spec_object": (10, "product spec"),
+    }
+    for input_id, (row_index, cell) in cells.items():
+        p0, p1 = per_input[input_id]
+        expected_row = f"| {row_index} | {cell} | {p0} | {p1} |"
+        assert expected_row in doc, (
+            f"the doc's table row for {input_id} is not {expected_row!r} — the "
+            f"report and the records disagree"
+        )
     assert "14 P0 and 32 P1" in doc, "the evidence doc's headline drifted from the records"
     assert "6 of 10 inputs" in doc
 
