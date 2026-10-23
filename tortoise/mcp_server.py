@@ -158,9 +158,14 @@ def _validation_error_kind(exc: PydanticValidationError) -> str:
 def _classify_mcp_call_error(exc: BaseException) -> tuple[str, str | None]:
     """Map a dispatch exception to (status, error_kind).
 
-    validation_error → pydantic argument-validation failures (raised raw or
-        wrapped by fastmcp's ValidationError, whose __cause__ carries the
-        pydantic errors); error_kind = '<error_type>:<field>'.
+    validation_error → an ARGUMENT refusal: pydantic argument-validation
+        failures (raised raw or wrapped by fastmcp's ValidationError, whose
+        __cause__ carries the pydantic errors) with error_kind =
+        '<error_type>:<field>'; a `graph` argument that names no reachable
+        graph (`mcp_auth.GraphTargetError`, raised as a `ToolError` carrying its
+        own machine-readable `code`) with error_kind = that code, e.g.
+        `invalid_graph` — the caller's input, not a server fault, so it must
+        not be bucketed with `exec_error`.
     auth_error → AuthorizationError.
     exec_error → everything else; error_kind = the exception class name,
         unwrapping fastmcp's ToolError/FastMCPError wrapper to the underlying
@@ -183,6 +188,14 @@ def _classify_mcp_call_error(exc: BaseException) -> tuple[str, str | None]:
             kind_exc = kind_exc.__cause__
         else:
             break
+    if isinstance(kind_exc, _mcp_auth.GraphTargetError):
+        # #9340: the `graph` argument named no graph this caller may reach.
+        # That is a CALLER-side argument refusal, not a server fault: bucketing
+        # it as `exec_error / ToolError` made the class unmeasurable (and left
+        # `GraphTargetError.code` written by nobody), so "how often do
+        # connectors send an invalid graph" — the question this new surface most
+        # needs to answer — was unanswerable from the mcp_tool_call series.
+        return "validation_error", getattr(kind_exc, "code", None) or "invalid_graph"
     return "exec_error", type(kind_exc).__name__
 
 
@@ -1373,8 +1386,12 @@ async def _resolve_graph_argument(ref: str | None,
     except _mcp_auth.GraphTargetError as exc:
         # ToolError → an is_error tool result carrying the actionable message
         # (naming the graphs the caller CAN reach), the same shape the budget
-        # refusal above uses.
-        raise ToolError(str(exc)) from None
+        # refusal above uses. The CAUSE is kept deliberately (`from exc`, not
+        # `from None`): `_classify_mcp_call_error` unwraps it to
+        # `GraphTargetError` and records the refusal as an ARGUMENT error
+        # (`validation_error / invalid_graph`) instead of an un-coded
+        # `exec_error / ToolError` no series can count.
+        raise ToolError(str(exc)) from exc
     _mcp_auth.use_graph_target(plan)
     tenant = _mcp_auth.record_tenant_for_graph(plan)
     if tenant is not None:

@@ -31,6 +31,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from typing import Any
 
+from fastmcp.exceptions import AuthorizationError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -205,6 +206,20 @@ def _get_org_sdk() -> TortoiseSDK:
         ensure_selfhost_event_log()
     gid = _current_graph_id.get()
     ns = _current_graph_namespace.get()
+    if gid and not ns:
+        # A graph-BOUND credential whose storage namespace did not resolve must
+        # not be served the workspace DEFAULT graph. Both producers document
+        # this half-resolved state as fail-closed: `supabase_control.
+        # _graph_namespace_for` returns None on a missing `graphs` row OR on any
+        # read exception, and `sdk.apikey_verify` returns None on a missing
+        # `:Graph` node. The REST lane refuses the identical state (403
+        # GRAPH_NOT_FOUND), so falling through to line below would open the
+        # default graph with a graph-scoped key — silently, on the lane where
+        # every other cross-graph move is an explicit refusal.
+        raise AuthorizationError(
+            "This credential is bound to a graph whose storage namespace could "
+            "not be resolved. Retry the call; if it persists, mint a key for "
+            "the graph again.")
     if gid and ns:
         # #7951 P0: pass the journal so `_get_proj`'s `_bind_journal` ARMS
         # §17.1's guard on THIS lane. Without it the MCP surface built a

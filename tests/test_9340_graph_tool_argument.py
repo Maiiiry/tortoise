@@ -601,6 +601,62 @@ def test_the_dispatch_resolution_is_bounded_and_refuses_legibly(monkeypatch):
         mcp_auth._current_org_id.reset(org)
 
 
+class TestTheRefusalIsMeasurable:
+    """A refused `graph` is a CALLER error, and the series must be able to say so.
+
+    `GraphTargetError` carries `code = "invalid_graph"`; the dispatch turned it
+    into a bare `ToolError` (`from None`), so `_classify_mcp_call_error` saw no
+    cause and recorded `exec_error / ToolError` — the caller's argument error
+    bucketed with server faults, and the one question this new surface has to
+    answer ("how often do connectors send an invalid graph?") unanswerable from
+    the same `mcp_tool_call` series the repo justifies its policies from.
+    """
+
+    def test_a_refused_graph_is_a_coded_validation_error(self, monkeypatch):
+        monkeypatch.setattr(mcp_auth, "reachable_graph_rows", lambda org_id: OWN_ROWS)
+        org = mcp_auth._current_org_id.set(ORG_A)
+
+        async def _dispatch():
+            stack = contextlib.ExitStack()
+            try:
+                await mcp_server._resolve_graph_argument("g_nowhere", stack)
+            finally:
+                stack.close()
+
+        try:
+            with pytest.raises(ToolError) as excinfo:
+                asyncio.run(_dispatch())
+        finally:
+            mcp_auth._current_org_id.reset(org)
+        assert mcp_server._classify_mcp_call_error(excinfo.value) == (
+            "validation_error", "invalid_graph"), (
+            "a refused `graph` must be an identifiable argument refusal, not "
+            "an un-coded server fault")
+
+
+def test_a_bound_credential_with_no_resolved_namespace_never_reads_the_default():
+    """A HALF-resolved graph credential must fail closed, as REST does.
+
+    `supabase_control._graph_namespace_for` and `sdk.apikey_verify` both return
+    `None` on a missing row OR a failed read, and both document that as
+    fail-closed; the REST lane refuses the identical state (403
+    GRAPH_NOT_FOUND). `_get_org_sdk()` used to fall through to
+    `namespace=<org>`, i.e. open the workspace DEFAULT graph with a
+    graph-scoped key — silently, on the one lane where every other
+    cross-graph move is an explicit refusal.
+    """
+    tokens = [mcp_auth._current_org_id.set(ORG_A),
+              mcp_auth._current_graph_id.set("g_fund_a")]
+    try:
+        assert mcp_auth._current_graph_namespace.get() is None
+        with pytest.raises(mcp_auth.AuthorizationError) as excinfo:
+            mcp_auth._get_org_sdk()
+        assert "storage namespace could not be resolved" in str(excinfo.value)
+    finally:
+        mcp_auth._current_graph_id.reset(tokens[1])
+        mcp_auth._current_org_id.reset(tokens[0])
+
+
 def test_a_lookup_timeout_is_not_misreported_as_our_budget(monkeypatch):
     """A control-plane `TimeoutError` is not a breach of the TRANSPORT budget.
 
