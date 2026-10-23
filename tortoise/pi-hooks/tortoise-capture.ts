@@ -1,4 +1,4 @@
-// tortoise-hook-version: 6
+// tortoise-hook-version: 7
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
@@ -40,6 +40,13 @@
 // shipped bytes move. `session verify`'s "it captures with older logic"
 // wording is imprecise for this one generation; the classification and the
 // repair it prompts are right.
+//
+// Generation 7 (#3515): `session_start` now also starts the STORE-SYNC
+// BACKSTOP — a detached one-shot `tortoise store-sync` that drains Pi's own
+// session `.jsonl` (the death modes this hook cannot see: SIGKILL, crash,
+// closed terminal), excluding the live session. Behaviour moved, so the
+// generation moves with it: an already-installed generation-6 copy must read as
+// STALE, or the box keeps the hook-only seam that loses killed sessions.
 //
 // Generation 5 (#2100): the drain is now BOUNDED and never runs on the turn's
 // critical path, a quota refusal is a NAMED per-box state instead of a silent
@@ -106,6 +113,7 @@ import {
 } from "node:fs";
 import { homedir, hostname, userInfo } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { spawn } from "node:child_process";
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -307,6 +315,11 @@ export type FetchLike = (
  */
 export const _CREDENTIAL_MODE_WARNED = new Set<string>();
 
+/** #3515 piece 5: the CLI the sweep looks for, and a once-per-process flag so a
+ *  machine without it warns ONE time instead of on every session start. */
+export const CANDIDATE_CLIS = ["tortoise"];
+let _SWEEP_UNAVAILABLE_WARNED = false;
+
 /**
  * #5109 (the capture-hook half): say so when a credential store is
  * group/other-readable.
@@ -479,7 +492,15 @@ export function modelLabel(model: unknown): string | undefined {
  *  refuses is a 422, a 422 is classified PERMANENT, and the drain then unlinks
  *  the entry's turn log — the only copy. Normalising here makes that refusal
  *  unreachable from either spool leg. */
-const CLIENT_CAPTURED_AT_SOURCES = new Set(["cli_observed", "file_mtime", "unknown"]);
+const CLIENT_CAPTURED_AT_SOURCES = new Set([
+  "cli_observed",
+  // #3515 piece 12: the store-sync backstop's clock is the JSONL entry's own
+  // `timestamp` — its own member, because recording it as `file_mtime` would
+  // state a provenance the value does not have.
+  "entry_timestamp",
+  "file_mtime",
+  "unknown",
+]);
 
 /** #7708: the CLOSED producer-lane vocabulary, mirroring the server's
  *  `hosted_api._SESSION_CAPTURE_LANE_VALUES` (the set that produces the 422).
@@ -2444,6 +2465,17 @@ export interface CaptureDeps {
   bounds?: SpoolBounds;
   /** Clock seam for backoff-window tests. */
   now?: () => number;
+  /**
+   * #3515 piece 5: the recovery SWEEP seam. On `session_start` the extension
+   * asks the store-sync backstop to drain Pi's own `.jsonl` files (the death
+   * modes the in-process hook cannot see: SIGKILL, crash, closed terminal).
+   *
+   * Injected so the behavioral suite never spawns a real `tortoise` process,
+   * and so a machine with no Python install reports the skip instead of
+   * pretending the sweep ran. `undefined` in production means the real
+   * detached spawn.
+   */
+  sweepImpl?: (excludeSessionId?: string) => void;
 }
 
 function log(message: string): void {
@@ -2682,6 +2714,48 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
       .catch((err) => warn(`spool flush error: ${err instanceof Error ? err.message : String(err)}`));
   };
 
+  /**
+   * #3515 piece 5 — invoke the store-sync backstop, DETACHED.
+   *
+   * Why a spawn and not an implementation here: the backstop already exists as
+   * `tortoise/pi-hooks/store-sync.ts` (per-file cursor, branch window,
+   * advance-on-2xx) and re-implementing it inside the extension would be the
+   * second capture path this architecture exists to forbid. Why detached and
+   * unref'd: `session_start` is AWAITED by Pi, so the sweep must not be on the
+   * startup path — a network drain there is the #2100 failure (a lane that
+   * looked dead while it drained).
+   *
+   * A machine with no `tortoise` CLI has nothing to sweep with, and says so
+   * ONCE — never silently. (Pi itself always has `node`; a Python CLI is only
+   * present on a machine that installed the package.)
+   */
+  const sweepStoreSync = (excludeSessionId?: string): void => {
+    if (deps.sweepImpl) {
+      try {
+        deps.sweepImpl(excludeSessionId);
+      } catch (err) {
+        warn(`store-sync sweep (injected) failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+    try {
+      const args = ["store-sync", "--no-spool"];
+      if (excludeSessionId) args.push("--exclude-session-id", excludeSessionId);
+      const child = spawn(CANDIDATE_CLIS[0], args, { detached: true, stdio: "ignore" });
+      child.on("error", () => {
+        if (_SWEEP_UNAVAILABLE_WARNED) return;
+        _SWEEP_UNAVAILABLE_WARNED = true;
+        warn("store-sync sweep: no `tortoise` CLI on PATH — killed/crashed sessions "
+          + "are only caught when it is installed (`tortoise store-sync`)");
+      });
+      child.unref();
+    } catch {
+      if (_SWEEP_UNAVAILABLE_WARNED) return;
+      _SWEEP_UNAVAILABLE_WARNED = true;
+      warn("store-sync sweep could not be started");
+    }
+  };
+
   /** The one health line. Cheap enough to print per session start (a spool scan,
    *  no network), and the only surface that distinguishes a BLOCKED box from an
    *  idle one in a lane log that otherwise produced 259 B. */
@@ -2738,6 +2812,15 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
     setImmediate(() => {
       logHealth();
       drain("session_start", { excludeSessionId: current || undefined });
+      // #3515 piece 5: the recovery sweep over Pi's OWN session log. It runs
+      // here because this is the one moment the product is guaranteed to be
+      // alive and idle — and it is a SPAWN, not a scheduler: fires once per
+      // start, detached, and never awaited (Pi awaits `session_start`, so a
+      // sweep in the handler would put a network drain on the startup path).
+      // `excludeSessionId` is load-bearing for the same reason the spool drain
+      // excludes the live session: filing THIS session now would make the
+      // server skip extraction for every turn after this point.
+      sweepStoreSync(current || undefined);
     });
   });
 

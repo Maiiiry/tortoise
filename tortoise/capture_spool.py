@@ -1012,7 +1012,11 @@ def list_spool_metas(root: Path) -> tuple[list[dict], list[dict]]:
 # the server refuses is a 422, and a 422 is classified PERMANENT, so the drain
 # would unlink the entry's turn log — the only copy. Normalising here makes that
 # refusal unreachable from either spool leg.
-CLIENT_CAPTURED_AT_SOURCES = frozenset({"cli_observed", "file_mtime", "unknown"})
+CLIENT_CAPTURED_AT_SOURCES = frozenset(
+    # #3515 piece 12: `entry_timestamp` is the store-sync backstop's own clock —
+    # the JSONL entry's `timestamp`, not the file mtime and not an observation
+    # instant. Mirrors `hosted_api._SESSION_CAPTURED_AT_SOURCE_VALUES`.
+    {"cli_observed", "entry_timestamp", "file_mtime", "unknown"})
 
 # #7708: the PRODUCER-lane vocabulary, a CLOSED set at the server
 # (`hosted_api._SESSION_CAPTURE_LANE_VALUES`). Mirrored here for the same reason

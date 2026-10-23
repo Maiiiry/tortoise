@@ -11,6 +11,13 @@ scripts.
 |---|---|
 | `tortoise-capture.ts` | the extension — install-probe on `session_start`, session filing on `session_shutdown` |
 | `tortoise-capture.test.ts` | behavioral tests (`node --test tortoise/pi-hooks/tortoise-capture.test.ts`) |
+| `store-sync.ts` | **#3515 — the store-sync BACKSTOP.** Reads Pi's own session `.jsonl` with a per-file cursor and ships it as `capture_lane: "store_sync"` through the SAME payload builder as the hook. Covers the death modes the in-process hook cannot see (SIGKILL, crash, closed terminal). Run by `tortoise store-sync`; also spawned detached on `session_start`, excluding the live session |
+| `cursor-store.ts` | the per-file cursor: `tmp`+`fsync`+`rename`, a last-good `.bak`, and a **fail-closed** load. Advance-on-2xx ONLY, never on read |
+| `store-sync.test.mjs` | the backstop's unit rows (`node --test tortoise/pi-hooks/store-sync.test.mjs`) — cursor math, partial tail, truncation/replacement, the shared branch contract, backoff classification |
+
+The architecture these implement — the Pi lifecycle guarantees **as measured**, the
+thirteen required pieces, the four exclusions and the two-part verification — is
+`docs/architecture/PI-CAPTURE-ARCHITECTURE.md`.
 
 ## Install (done by the product, not by hand)
 

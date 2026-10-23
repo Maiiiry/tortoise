@@ -845,6 +845,51 @@ test("session_start fires the install-probe with NO conversation content", async
   assert.deepEqual(calls[0].body, { harness: "pi" });
 });
 
+test("#3515: session_start invokes the store-sync SWEEP once, excluding the live session", async () => {
+  const pi = mockPi();
+  const { fetchImpl } = mockFetch([{ ok: true }]);
+  const swept: Array<string | undefined> = [];
+  tortoiseCapture(pi as never, {
+    ...hermeticDeps(fetchImpl),
+    sweepImpl: (excludeSessionId) => swept.push(excludeSessionId),
+  });
+  await pi.handlers.session_start(undefined, mockCtx({ entries: [], sessionId: "sid-live" }) as never);
+  await new Promise((resolve) => setImmediate(resolve));
+  // Piece 5: the backstop over Pi's own log fires on start...
+  assert.equal(swept.length, 1, "exactly one sweep per session_start (no poller)");
+  // ...and it must NOT include the session that is live right now: filing it
+  // now makes the server skip extraction for every turn after this point.
+  assert.equal(swept[0], "sid-live");
+});
+
+test("#3515: a sweep that THROWS cannot break session_start", async () => {
+  const pi = mockPi();
+  const { fetchImpl } = mockFetch([{ ok: true }]);
+  tortoiseCapture(pi as never, {
+    ...hermeticDeps(fetchImpl),
+    sweepImpl: () => {
+      throw new Error("spawn failed");
+    },
+  });
+  // The sweep runs inside `setImmediate`, so a throw from it cannot reach the
+  // handler's own promise: asserting on that promise would pass even with NO
+  // guard (measured). The guard's real contract is "no UNCAUGHT exception", so
+  // this row watches the process-level surface instead.
+  const uncaught: unknown[] = [];
+  const onUncaught = (err: unknown): void => {
+    uncaught.push(err);
+  };
+  process.on("uncaughtException", onUncaught);
+  try {
+    await pi.handlers.session_start(undefined, mockCtx({ entries: [] }) as never);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("uncaughtException", onUncaught);
+  }
+  assert.deepEqual(uncaught, [], "a throwing sweep must be caught, not escape into Pi");
+});
+
 test("session_start resolves WITHOUT awaiting the probe (Pi awaits the handler at startup)", async () => {
   const pi = mockPi();
   // A probe fetch that never settles — models a BLACKHOLED endpoint (SYN

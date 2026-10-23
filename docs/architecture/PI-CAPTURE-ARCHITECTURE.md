@@ -1,0 +1,310 @@
+---
+title: "Pi capture architecture — the hybrid (in-process hook + store-sync backstop)"
+type: architecture
+domain: platform
+doc_status: current
+created: 2026-10-23
+ownedBy: epistemic-team
+aboutSubjects: epistemic-team
+aboutObjects: tortoise, pi
+issue: daniel-ospina/tortoise#3515
+objective: daniel-ospina/tortoise#1714
+---
+
+# Pi capture architecture — the hybrid
+
+**This note REPLACES the spike-framing verdict** on Pi capture. #3515's title says
+`RUN FIRST` because the shape pinned here is what every later capture task builds
+on: a one-off demonstration that capture *can* work is not the deliverable, and a
+design that only works when a quota happens to be available is not the pinned
+architecture either.
+
+Pinned in one sentence: **an in-process hook for promptness and attribution, plus a
+store-sync backstop that reads Pi's own per-entry `.jsonl` with a per-file cursor** —
+two producers of the SAME payload through the SAME builder, distinguished only by a
+persisted `capture_lane` marker.
+
+---
+
+## 1. What Pi guarantees — measured, not asserted
+
+Every row below was checked against Pi's shipped source **and** against a live `pi`
+process on 2026-10-23. The "how" column is the method; a claim with no method is a
+claim to re-measure, not to trust.
+
+| # | Guarantee | How it was verified |
+|---|---|---|
+| L1 | The session file is `~/.pi/agent/sessions/--<cwd>--/<timestamp>_<uuid>.jsonl`; the header `id` **equals** the filename UUID. | Read a live file's first line: `{"type":"session","version":3,"id":"01a168e1-…","timestamp":…}` and matched the id to the filename. `session-format.md` §File Location + `session-manager.js::newSession` (the filename is built from the id). |
+| L2 | **No file exists until the first assistant message.** Entries are buffered in memory before that; on the first assistant message the whole buffer + header is written at once (`openSync(file,"wx")`). | Live run with `PI_CODING_AGENT_SESSION_DIR` pointed at an empty dir, a 50 ms watcher: the file **first appeared at t=23.2 s with 6 lines / 2,656 B** — i.e. only after the first assistant turn, and as one bulk write. Code: `_persist` returns early while `!hasAssistant`. |
+| L3 | After that, **one append per entry** (`appendFileSync`), monotonically growing. | Same watcher, remainder of the run: 6→7 lines at t=28.4, 8 at 29.9, 9 at 35.0, 10 at 36.7 (2,656→2,941→3,602→3,890→4,561 B). Never shrank. |
+| L4 | The log is a **tree** (`id`/`parentId`); `/branch`-style navigation abandons a branch **in the same file**, and `/compact` appends a `compaction` entry carrying `firstKeptEntryId`. | `session-format.md` §Session Version + `session-manager.js::appendMessage` (every entry takes `parentId = leafId`), `appendCompaction`. Live file carried `session`, `model_change`, `thinking_level_change`, `message`, `custom_message` kinds with `id`/`parentId` on all but the header. |
+| L5 | **No `fsync` anywhere in the persist path** ⇒ durable against process death (a `write(2)` reached the page cache), **not** against power loss. | `session-manager.js`: `appendFileSync` / `writeFileSync` only; no `fsync` import. |
+| L6 | The file **can shrink**: `_rewriteFile()` truncates (`openSync(path,"w")`) then rewrites — on a version migration at load, on a label change, and when resuming an empty explicit `--session` file. | `_rewriteFile` + its three call sites (`_loadEntries`, label changes, `_setSessionFile`). This is why the cursor must treat "cursor > file size" as a **normal** case, not an anomaly. |
+| L7 | `session_shutdown` fires on quit / Ctrl-C / Ctrl-D / SIGHUP / SIGTERM and **is awaited**; it does **not** fire on SIGKILL or a crash. | `extensions.md` §Lifecycle; `dist/core/extensions/runner.js` awaits each handler. Measured the consequence: a `pi -p` **SIGKILLed** at ~20 s left **10 complete entries, ending in a newline** on disk — and the shutdown hook never ran. |
+| L8 | `agent_end` is **not** the end of a session (auto-retry, auto-compact-and-retry, queued follow-ups); `agent_settled` is the settled signal. | `extensions.md:569`. |
+| L9 | `--no-session` persists nothing. | `sessions.md` §Session Storage. |
+
+**The two rows that decide the architecture are L2 and L7.** L2 means a
+file-reading backstop can say nothing about a session that has not yet produced an
+assistant message. L7 means an in-process hook can say nothing about a session that
+died. Neither half covers the other's hole, which is the entire argument for the
+hybrid.
+
+---
+
+## 2. The previous verdict, claim by claim
+
+The verdict this note replaces framed the question as a **spike**: *can a Pi
+session be captured?* — and answered it with a hand-built demonstration. The
+spike framing is rejected (epic plan v3.2 §B3). What matters is whether the
+**shipped** path captures, on the death modes users actually hit, with evidence a
+reader can re-run. Every claim in the old framing, re-measured:
+
+| Claim in the old framing | What is actually true | Evidence |
+|---|---|---|
+| "Capture works: the hook posts and the server stores the session." | True **for one death mode** — a clean quit. The hook is `session_shutdown`-only in `reflect-hook.ts` (`reason === "quit"`), and the Pi extension files at `agent_end` fire-and-forget. | `reflect-hook.ts` handler gate; `tortoise-capture.ts` `postCapture(...)` not awaited. |
+| "A demonstration proves the architecture." | False. A demonstration is a **transport** result: it says nothing about a SIGKILL, a crash, or a dead hook. That failure (`the check greens with a dead hook`) is what §6's part (ii)+(c) exists to end. | §6 below; `Session.capture_lane` is the only discriminator. |
+| "The fallback spool is the durable record." | Half true. The spool (`~/.tortoise/session-events/`) is durable **but nothing retries it into silence for the hookless case** — measured on this machine: **2,266 records / 15 MB across 7 daily files**, and the per-session `entries/` dir is empty. (The issue's `~22,640` figure is stale for this tree — re-measured, not repeated.) | `cat ~/.tortoise/session-events/*.jsonl \| wc -l` = 2266; `du -sh` = 15M. |
+| "`session_id` can be generated by the producer." | False and dangerous. A fork/resume mints a **new file with a new UUID**; a generated id double-writes one conversation as two Sessions, or mis-attributes turns. Pinned: **both lanes read the header `id`; neither generates one** (piece 6). | `newSession` (id → filename) + `_loadEntries` (`sessionId = header.id`). Test: `test_the_cli_never_invents_a_session_id`, `test_a_file_with_no_session_header_id_is_REFUSED`. |
+| "A byte/line cursor over the log is sufficient." | False — the log is a **tree** (L4). A cursor over the byte stream ships abandoned branches as live turns. Pinned: one shared branch contract (`activeBranch` + `cutAtCompaction`). | `test_activeBranch_ships_the_LIVE_chain_only`; `test_a_compaction_entry_cuts_the_window_at_firstKeptEntryId`. |
+| "A probe proves the install." | True for **transport only**: network, auth, endpoint, payload shape. It cannot prove the hook fires. | §6 part (i) — measured live: `{"ok":true,"status":200}` against `api.premiselabs.co`. |
+| "`install_probe_{harness}` is emitted today." | It is emitted by the extension on `session_start`; the server-side key exists (`hosted_api.py`). Nothing in the old framing read it **back**, which is why part (i) requires 2xx **and** a server-side read-back. | `postInstallProbe` call site; §6. |
+| "Capture is on." (implicit) | It is **off** on this box, by policy not by defect — see §8. | Live: `Hosted tortoise capture OFF (cloud-not-enabled)`. |
+
+---
+
+## 3. Current gaps that the hybrid closes
+
+| Gap | Where | Consequence |
+|---|---|---|
+| Hook fires on `session_shutdown{reason:"quit"}` only | `agent-infra/extensions/reflect-hook.ts` | `/new`, `/resume`, `/fork`, `/reload`, Ctrl-C, kill: nothing filed. |
+| Pi extension files at `agent_end` **fire-and-forget** | `tortoise/pi-hooks/tortoise-capture.ts` | An immediate quit can cut the POST; the local spool lands, and nothing re-sends it. |
+| Nothing reads Pi's own `.jsonl` | — (this note's subject) | A SIGKILLed session (measured: 10 durable entries) is never filed. |
+| No cursor anywhere | — | A re-read of a log either duplicates unboundedly or, worse, "remembers" nothing. |
+
+---
+
+## 4. The pinned hybrid, and what each half alone loses
+
+**Hook alone loses** every session that ended without a hook: SIGKILL, crash,
+closed terminal, a hook that was never trusted/installed. It also cannot re-read
+history, so a single refused POST at the wrong moment is a permanent loss.
+
+**Store-sync alone loses** the promptness and the attribution: it can only read what
+Pi flushed (L2 — nothing before the first assistant message), it cannot see the
+process's own identity observations, and its `client_captured_at` is a *log* clock,
+not an observation clock. It also gives the product no in-session signal that capture
+is working, which is exactly the "looks dead while it works" failure the health line
+exists to fix.
+
+**Together** each supplies what the other cannot, and neither is a second capture
+path: the backstop imports the hook's `buildCapturePayload` / `extractTurns` /
+`postCapture`, so the two lanes cannot drift into two payload shapes. A test pins
+that import (`test_the_worker_does_not_carry_a_second_payload_builder`).
+
+**One recorded consequence of that sharing (found in review, not yet resolved).**
+The two lanes agree on the payload *shape* but can disagree on *content* after a
+`/compact`: the backstop's window is strictly shorter (cut at
+`compaction.firstKeptEntryId`), while the hook's payload grows. The turn store's
+shorter-re-capture rule **DELETES the turns beyond the new window** (`sdk.py`, the
+#1920 behaviour, journaled as a delete) — so a post-compaction backstop ship can
+remove turns the hook filed. Recovery is the journal, not the Session. Pinned as a
+defect to fix (post the union of shipped + kept, or refuse a shrinking window); it
+is deliberately NOT papered over here.
+
+**The one field that distinguishes them** is the persisted `capture_lane`
+(`hook` | `store_sync`). Without it the two lanes POST byte-identical payloads and a
+hook-liveness check **cannot fail** — a store-sync-only run would green it with a
+dead hook.
+
+---
+
+## 5. The required pieces
+
+The issue's set is **thirteen** (its earlier revision said five; numbers are stable
+and are not renumbered). Status against the tree at this commit:
+
+| # | Piece | Status |
+|---|---|---|
+| 1 | Durable local record appended **per turn** | **landed before this lane** — `capture_spool.py` appends only the new turns per capture; the extension spools per snapshot. |
+| 2 | **A cursor per session file, advance-on-2xx only** | **built here** — `cursor-store.ts` + `store-sync.ts`. |
+| 3 | A retrying sync worker with **bounded** backoff | **built here** — `BACKOFF_MS` (5 attempts, ≤20 s), `MAX_ATTEMPTS` derived from it. |
+| 4 | At-least-once delivery keyed by an **idempotency key** | **landed before this lane** — the server MERGEs turn Points on `{session_id}_t{i}`; the worker re-ships the window and relies on that MERGE. |
+| 5 | **Recovery sweep on next start** — spool **and** unsynced files | **built here** — `tortoise store-sync` (one command, both substrates) + a detached one-shot spawn from the extension's `session_start`, excluding the live session. |
+| 6 | `session_id` from the **on-disk header id only** | **built here** for the backstop; the hook already passes the session's own id. A file with no header id is **refused**, never given a generated one. |
+| 7 | Sweep-vs-hook concurrency guard, server-side extraction claim + lease TTL | **NOT built by this lane** — it is a server change (a claim keyed by `_session_capture_event_id` with a lease ≥ the ~819 s extraction deadline) and it is **the next task**, not a silent drop. Until it lands, a sweep+live-hook race can run extraction twice; the captures themselves converge (idempotent MERGE). Recorded in §9. |
+| 8 | Persisted **lane/provenance** marker, end to end | **landed before this lane** — `SessionRequest.capture_lane`, the set-only-when-present MERGE, `capture_spool.CAPTURE_LANES`, the TS mirror, and `test_capture_lane_3516.py`. The backstop **stamps `store_sync`**. |
+| 9 | **Cursor-past-EOF / file-replaced** handling | **built here** — `planFile`: `cursor_past_eof` → re-read from offset 0; `file_replaced` (dev/ino) and `header_changed` (header sha) likewise. Never a silent skip. |
+| 10 | Bounded sweep rate + spool cap | **built here for the sweep** — `MAX_FILES_PER_RUN = 50` **files shipped** per run (the remainder drains next run), `MAX_REQUESTS_PER_RUN = 200`. The spool cap is the existing count/byte bound in `capture_spool.DEFAULT_BOUNDS` (no TTL — the owner ruled the spool is kept until the user deletes it). |
+| 11 | Backoff exhaustion retains; restarts do not multiply; permanent 4xx → stall + dead-letter, non-blocking | **built here** — retention keeps the cursor at the last good offset and persists `failures`; a permanent 4xx writes a dead-letter row (folded to one row per file, capped at 500), advances past it, and **counts the drop** so a later file still ships. |
+| 12 | Clock source per lane | **landed before this lane** (`cli_observed` / `file_mtime` / `unknown`); **extended here** with `entry_timestamp` — the store-sync lane stamps the **log entry's own** `timestamp`, in unix seconds, under its own source name so the floor can tell the three clocks apart. Server vocabulary, the `capture_spool` mirror and the TS mirror move together; a test pins the TS mirror against the server's set. |
+| 13 | **ONE shared turn-window / branch contract** | **built here** as `activeBranch` + `cutAtCompaction` (leaf → root via `parentId`, cut at `compaction.firstKeptEntryId`, no positional ids ever). The Python backfill reader (`session_import.parsers.parse_pi`) is **NOT yet branch-aware** — it walks lines — so the contract has one consumer and one known non-conformant reader, recorded in §9 rather than claimed. |
+
+### Cursor semantics under concurrency — the four pinned cases
+
+| Case | Behaviour | Discriminating test |
+|---|---|---|
+| **Half-written trailing line** | The cursor never crosses a line's terminating newline, so the partial line is neither parsed (garbage) nor skipped (loss). It ships whole on the next pass. | `a partial trailing line is NOT consumed and NOT lost`; `a half-written tail neither ships garbage nor blocks the next run` (process level). Mutation control: making the cursor jump to `buf.length` reds 3 rows. |
+| **Restart** | The cursor is written `tmp`+`fsync`+`rename`, with the previous good copy kept as `.bak`. A restart resumes at the same byte and **POSTs nothing** for an up-to-date file. | `the cursor SURVIVES a restart and neither re-emits nor skips`; `test_cursor_survives_a_restart_and_does_not_re_emit` (two processes, zero POSTs on the second). |
+| **Corrupt cursor** | Fails **closed to the last good offset** (`.bak`), with the recovery recorded — never 0 (duplicate storm) and never EOF (silent loss). | `a CORRUPT cursor fails closed to the last good offset (recorded, not silent)`. |
+| **Truncation / rotation / replacement** | `cursor > file_size` (L6), an inode change, or a changed header sha ⇒ **re-read from the header and re-ship**, reason recorded. | `planFile re-anchors to the header on cursor > file_size`; `…when the file is REPLACED under the same path`; `test_a_truncated_file_is_re_anchored_not_silently_skipped`. Mutation control: deleting the past-EOF branch reds the planFile row. |
+
+Two workers over one file cannot corrupt the cursor (single `rename`), and both may
+POST the same window: the server's turn MERGE is the idempotency boundary.
+
+---
+
+## 6. Verification — two parts, and both can fail
+
+A probe is a synthetic POST. It proves **transport** — network, auth, endpoint,
+payload shape — and cannot prove the hook fires on a real session. So the
+verification is two parts, and **one without the other is the failure this issue
+exists to end**.
+
+### Part (i) — transport, with a server-side read-back
+
+*Fire the install probe; require **2xx AND a server-side key read-back**.*
+
+Measured live on 2026-10-23 against `api.premiselabs.co` through the **shipped**
+`postInstallProbe`: `{"ok":true,"status":200}`. The read-back half is asserted at
+process level against a real HTTP collector
+(`test_part_i_install_probe_reaches_the_server_and_is_read_back`: the server holds
+`{"harness":"pi"}`, which is the evidence — the client's own success is not).
+
+### Part (ii) — store-proven capture of a REAL session
+
+*After the first real session: assert a synced record whose `session_id` equals the
+header `id` of an actual `~/.pi/agent/sessions/**/*.jsonl`, stamped with the
+**hook** lane (not the backstop alone).*
+
+The three additions that make it **falsifiable** (all pinned in the issue):
+
+- **(a) Negative control** — with capture disabled/uninstalled the check MUST FAIL.
+  A check that also passes with capture off measures the worker, not the install.
+- **(b) Timestamp floor** — the matched record's `client_captured_at` must be
+  strictly after the install time (±5 min tolerance), with a pre-install negative
+  fixture and a floor-mutation control (delete the floor ⇒ the verdict must change).
+- **(c) Hook liveness** — a store-sync-only run with the hook stubbed no-op must
+  report the hook **NOT live**. Only the persisted `capture_lane` makes this
+  falsifiable; a lane-absent record reports **not confirmed**, never "live".
+
+**Status, stated precisely — this is NOT a completed part (ii).**
+
+- **(a), (b) and (c) are NOT BUILT.** No negative control, no pre-install floor
+  fixture, no floor-mutation control, and no hook-liveness check exists in the
+  tree. §9 carries them as the next task with the same names the issue uses.
+- What DOES exist is the **first half of part (ii)'s evidence**, at process level:
+  a real file from `~/.pi/agent/sessions/` reaches a real collector with
+  `session_id == header.id` and `capture_lane == "store_sync"`
+  (`test_part_ii_a_real_pi_session_file_is_captured_and_attributed`). That proves
+  the **backstop** captures a real session and attributes it. It does **not**
+  prove the **hook** is live — the assertion in that test is
+  `lane == "store_sync"`, i.e. exactly the record part (ii) says must NOT be
+  sufficient on its own. Read it as the backstop's proof, not as part (ii).
+- The row **skips** when the machine has no Pi session directory, so on a bare CI
+  runner it contributes nothing. It is an ops check there.
+
+**Status on this machine:** the live attempt is **environmentally blocked**, not
+failing — see §8. It is quoted there rather than reported as a pass.
+
+---
+
+## 7. Install — the symlink requirement, and what it became
+
+The issue asks: *enforce symlinked installs and assert the resolved target at
+startup, because hand-copied directories diverge silently on agent-infra updates.*
+
+That requirement targeted the **agent-infra-hosted** extension. After #3512 the Pi
+producer is **product-owned** (`tortoise/pi-hooks/tortoise-capture.ts`, shipped
+inside the Python package and installed by `HARNESS_INSTALL.pi`), and the
+divergence it feared is now **structurally impossible in the same way**: the
+installed file is a **copy of a shipped artifact**, and the installer asserts its
+bytes (`capture_install` atomic write + byte-equality `status`) so a drift is
+*reported*, not silent. Making it a symlink into `site-packages` would be worse: an
+upgrade that moves the package would dangle the symlink and lose capture entirely.
+
+What remains and is **not** done here: an explicit **startup assert of the resolved
+path** on the *user's* machine (as opposed to the installer's byte check). It is
+recorded in §9 — it needs a decision about fail-loud vs warn on a machine whose
+extension was installed by an older product version, which is a product-policy
+decision, not a mechanism.
+
+---
+
+## 8. GUARANTEED vs NOT GUARANTEED
+
+| GUARANTEED by the hybrid | NOT GUARANTEED |
+|---|---|
+| Per-turn durable local record (hook path) | Anything on **SIGKILL / power loss** — no shutdown hook, and Pi never `fsync`s (L5) |
+| Every session file shipped, even after kill/crash (store-sync) | Turns before the **first assistant message** — the file does not exist yet (L2, measured) |
+| Ship resumes from a per-file cursor after restart, and does not re-emit | **`--no-session`** sessions — nothing persisted, out of scope (L9) |
+| At-least-once delivery, idempotent server-side (`{session_id}_t{i}`) | Exactly-once delivery (explicitly not attempted) |
+| Recovery sweep drains spool + unsynced files on next start | A **tree** log shipped by a naive byte cursor without branch awareness (L4 — solved here by the branch contract, not by the cursor) |
+| A permanently-refused file is dead-lettered and **counted**, never blocking later turns | Extraction exactly once under a sweep-vs-hook race (piece 7 — next task) |
+
+### Environmental constraints measured on this machine (NOT architecture)
+
+- **Hosted capture is OFF on this box**: the second producer (`reflect-hook`) reports
+  `Hosted tortoise capture OFF (cloud-not-enabled)` — its config carries
+  `"cloud": false`. Live, this session.
+- **The hosted API refuses captures with a quota ceiling**: a real store-sync attempt
+  on a real session file answered
+  `HTTP 402 — {"code":"quota_exceeded","message":"Team points limit reached: 25000 in use + 6 estimated for this capture exceeds 25000 …"}`.
+  The worker did the right thing: **cursor retained at 0, `dropped: 0`,
+  `deadLettered: 0`** — a 402 is a refusal of the moment, not of the bytes, so the
+  turns survive and ship when the ceiling lifts. A capture path that only works
+  because a quota happens to be available is not the pinned architecture; this is
+  recorded as an environment fact, never designed around.
+- The `tortoise` **Python CLI** has no credential on this box (`~/.tortoise/credentials.json`
+  absent), so `tortoise session probe` refuses; the Pi extension's own config path is
+  what part (i) used.
+
+---
+
+## 9. Deliberately NOT built (the four exclusions), and how they would be earned
+
+Each is a thing this architecture could plausibly grow. Each is **not** built, and
+the price of building it is named, because this repo has repeatedly paid for
+machinery built *around* behaviour instead of making the behaviour trustworthy.
+
+1. **Exactly-once semantics.** Not built. At-least-once + an idempotent server MERGE
+   on `{session_id}_t{i}` already converges, and the residual duplicate costs one
+   MERGE write. *To be justified:* a measured case where a duplicate is **not**
+   absorbed — e.g. a side effect per POST that the MERGE does not cover (extraction
+   is the known one, and it is piece 7's claim, not a reason for exactly-once).
+2. **A distributed broker / queue.** Not built. The substrate is a file on one
+   machine and the consumer is a process on the same machine; a broker adds a
+   service and a failure mode to a problem that has one writer and one reader.
+   *To be justified:* more than one shipping host needing to consume one session's
+   log, or a measured fan-out the local sweep cannot bound.
+3. **Per-turn `fsync`.** Not built. Pi itself does not `fsync` (L5), so fsyncing our
+   own spool would raise durability *above* the source of truth and buy nothing
+   against the death mode the backstop exists for (process death is already
+   covered by the page cache; power loss loses Pi's log too, so the log half has
+   nothing to ship). *To be justified:* a measurement showing the spool survives a
+   failure the log does not — i.e. we would have to be *strictly* more durable than
+   Pi for a reason the product can name.
+4. **Event sourcing.** Not built. There is no replay requirement, no audit
+   requirement at this layer, and no consumer asking for a fact log; capture is a
+   delivery problem, and delivery needs a cursor and an idempotency key, not a
+   ledger. *To be justified:* a named consumer that must reconstruct "what did this
+   agent know at time T" — which would be a **different** product surface
+   (`docs/architecture/STORAGE-ARCHITECTURE.md` is its home), not a capture change.
+
+**And a fifth non-build, made explicit because it is the one this issue's own
+brief warns about:** no **scheduler or poller**. The sweep runs on a session start
+and on demand; a loop that polls the session directory is machinery standing in for
+a behaviour (`session_start` already happens) and would compete with the hook for
+the server's admission pool.
+
+### Recorded remainders (not silent drops)
+
+- **Piece 7** — the server-side extraction claim + lease: the next task. Its test
+  set is already named in the issue.
+- **Piece 13's second consumer** — `session_import.parsers.parse_pi` (the backfill
+  reader) is not branch-aware. It is a **different invocation** (an explicit
+  import), so it does not overwrite live turns; making it call the same contract is
+  a follow-up.
+- **Startup resolution assert** on the user's machine — §7.
+- **Part (ii)'s falsifiers (a)/(b)/(c)** — §6.
+- **A monotone window across a `/compact`** — §4's recorded consequence.

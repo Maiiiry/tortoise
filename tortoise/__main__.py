@@ -11663,6 +11663,31 @@ def _flush_pending_capture_notice() -> None:
     mark_capture_notice_shown()
 
 
+def _cmd_store_sync(args) -> int:
+    """``tortoise store-sync`` — the #3515 recovery sweep (spool + Pi log).
+
+    Credential resolution is BEST-EFFORT and happens here only so the spool
+    half can reuse the shared POST path; the log half's worker resolves its own
+    config (it is also runnable on a machine with no Python tortoise install).
+    A host with no credential still runs the sweep and says so — the sweep is
+    the one place that must never be silent about a substrate it skipped.
+    """
+    from tortoise.store_sync import main as _store_sync_main
+
+    api_key = None
+    api_url = None
+    try:
+        _cfg_path, _config, api_key, api_url = _resolve_transmit_config()
+    except _ConfigError:
+        # A corrupt config must not make the sweep a no-op (the #3963 lesson:
+        # a broken config once turned the capture mechanism of record silent).
+        # The log half needs no config at all to READ and to re-anchor cursors.
+        pass
+    args.api_key = api_key
+    args.api_url = api_url
+    return _store_sync_main(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     import os as _os  # noqa: I001
     from tortoise.config import SUPPORTED_URI_SCHEMES
@@ -11821,6 +11846,35 @@ def main(argv: list[str] | None = None) -> int:
                          "umask within that 0700 directory")
     rb.add_argument("--json", action="store_true",
                     help="Machine-readable JSON output")
+    # #3515 piece 5: the recovery SWEEP, as one command. It drains BOTH
+    # substrates — the capture spool (through the same `flush_spool` every other
+    # drain uses) and Pi's own session log (through the store-sync worker's
+    # per-file cursor) — because a sweep that drains one and not the other
+    # leaves half the death modes unhandled. Named at the TOP level, not under
+    # `session`, because it is pinned that way in the epic (§4 #3515 / §5) and
+    # the pin is what the tests drive.
+    ss = sp.add_parser(
+        "store-sync",
+        help="Recovery sweep: drain the capture spool AND any unsynced Pi "
+             "session .jsonl files (per-file cursor) — #3515")
+    ss.add_argument("--session-dir", default=None,
+                    help="Pi session directory (default: ~/.pi/agent/sessions)")
+    ss.add_argument("--cursor-dir", default=None,
+                    help="Cursor store directory (default: ~/.tortoise/store-sync)")
+    ss.add_argument("--file", action="append", default=None,
+                    help="Sync only this session file (repeatable)")
+    ss.add_argument("--max-files", type=int, default=None,
+                    help="Bound this run to N session files (the rest drains next run)")
+    ss.add_argument("--max-requests", type=int, default=None,
+                    help="Bound this run to N POST attempts")
+    ss.add_argument("--exclude-session-id", default=None,
+                    help="Skip this session id (the one LIVE right now — filing it "
+                         "would make the server skip extraction for later turns)")
+    ss.add_argument("--no-spool", action="store_true",
+                    help="Skip the spool half (log half only)")
+    ss.add_argument("--dry-run", action="store_true",
+                    help="Plan only — POST nothing, move no cursor")
+    ss.add_argument("--json", action="store_true", help="Machine-readable receipt")
     # #9556 / R8: the record → cache RESTORE. A sibling of `record-reconcile`
     # and deliberately NOT a `--from-record` flag on `rebuild`: `rebuild`'s
     # `--dir` is the journal the replay reads, so a flag that silently makes it
@@ -12456,6 +12510,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_record_backup(args)
     elif args.cmd == "record-restore":
         return _cmd_record_restore(args)
+    elif args.cmd == "store-sync":
+        return _cmd_store_sync(args)
     elif args.cmd == "backfill":
         _cmd_backfill(args)
         return 0

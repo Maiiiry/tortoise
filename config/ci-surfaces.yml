@@ -4458,6 +4458,14 @@ surfaces:
   # for the very change it guards (neither this Python guard nor the
   # extension's `node --test` suite ran). Dual-registered with `onboarding`.
   - test_pi_capture_hooks.py
+  # #3515: the store-sync BACKSTOP — `tortoise/pi-hooks/store-sync.ts` +
+  # `cursor-store.ts`, driven through `tortoise store-sync` (a `__main__.py`
+  # subcommand) as a PROCESS. Same selection reasoning as the sibling directly
+  # above: `tortoise/pi-hooks/` matches no SOURCE_PATTERNS entry, so a
+  # worker-only change selects `core` via the `tortoise/` fallback, and this is
+  # the arm that runs BOTH this guard and the node suite. Dual-registered with
+  # `onboarding` (the install path a user's machine takes).
+  - test_store_sync_worker.py
   # #3512: this pins the RECORD of the Pi seam's home (the epic #1714 plan and
   # `tortoise/pi-hooks/README.md`) against the tree — the plan named
   # `tortoise/pi-extension/` for months while the artifact that ships lives at
@@ -5168,6 +5176,7 @@ surfaces:
   - test_onboarding_w6_capture_disclosure.py  # #2002 (W6): docker-lane first-capture disclosure + Settings view/delete (DE2E-11)
   - test_onboarding_w6_member_authz.py  # #2002 (W6): dual-auth member-authz on the Settings view/delete leg (lane-agnostic)
   - test_pi_capture_hooks.py
+  - test_store_sync_worker.py  # #3515: the store-sync backstop (spool + Pi log) and its per-file cursor
   - test_retention_promise.py  # #4179: website/privacy.html horizon + canonical-doc link
   - test_signup_form_safety.py
   # #3485/#3559: dual-registered with `api` (cross-surface registration is
