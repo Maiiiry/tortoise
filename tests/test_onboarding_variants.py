@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,22 @@ ARCHIVE_VARIANTS_DIR = ARCHIVE_DIR / "variants"
 PUBLIC_SKILLS = (REPO_ROOT / "website" / "apps" / "dashboard" / "public"
                  / "skills")
 MIRROR_SKILL = PUBLIC_SKILLS / "tortoise-onboarding" / "SKILL.md"
+
+# Docs-origin copy (tortoise.premiselabs.co/skills/<name>/SKILL.md). The docs
+# page itself links the `.skill` archives, and a same-origin <a download> is what
+# names the saved file, so the archives live on the same origin as the page that
+# offers them. The DASHBOARD card links the same URLs cross-origin, where
+# `download` is IGNORED — that path relies on `website/_headers` pinning
+# `/skills/*.skill` to Content-Type octet-stream + Content-Disposition
+# attachment, so it downloads instead of rendering.
+DOCS_SKILL = (REPO_ROOT / "website" / "skills" / "tortoise-onboarding"
+              / "SKILL.md")
+
+# The three sha256-pinned served skills (config/served-skills-upstream.yml) get a
+# docs-origin copy for the same reason: the ChatGPT card hands them over as
+# installable skills, and a one-click download must be SAME-ORIGIN.
+SERVED_SKILL_NAMES = ("how-to-use-tortoise", "tortoise-decide",
+                      "tortoise-file-finding")
 
 # The archived prompt's per-harness headers (variants from epic #529).
 ARCHIVED_HARNESSES = ("claude-code", "codex", "cursor", "pi")
@@ -129,11 +146,71 @@ def test_m8_deploy_mirror_matches_canonical():
     SKILL.md (drift-proofing — the old stage_variants concat guarantee
     carried forward).
 
-    #3673: there are exactly TWO tracked copies (the third is gitignored build
-    output), so this is a two-source parity gate and not a one-file no-op gate.
+    #3673: every tracked copy is compared to the canonical one, so this is a
+    parity gate and not a one-file no-op gate. #9660 added a THIRD tracked copy
+    (the docs-origin download artifact); the gate covers it too, so the copy the
+    user downloads cannot drift from the care the other two get.
     Watched failing in BOTH directions — a canonical-only edit and a served-only
     edit each exit non-zero — then restored to green."""
     assert_copies_parity(LIVE_SKILL, MIRROR_SKILL)
+    assert_copies_parity(LIVE_SKILL, DOCS_SKILL)
+
+@pytest.mark.parametrize("name", SERVED_SKILL_NAMES)
+def test_9660_docs_download_copy_matches_the_served_skill(name):
+    """#9660: the ChatGPT card downloads these from the DOCS origin (a
+    cross-origin <a download> is ignored by browsers), so each docs copy must be
+    the same bytes the dashboard serves. The upstream pin lives in
+    config/served-skills-upstream.yml; this closes the last hop, docs-origin
+    copy vs served copy, byte for byte."""
+    served = PUBLIC_SKILLS / name / "SKILL.md"
+    docs_copy = REPO_ROOT / "website" / "skills" / name / "SKILL.md"
+    assert_copies_parity(served, docs_copy)
+
+
+#: Every skill the ChatGPT card hands over, archive included.
+SKILL_ARCHIVE_NAMES = SERVED_SKILL_NAMES + ("tortoise-onboarding",)
+
+
+@pytest.mark.parametrize("name", SKILL_ARCHIVE_NAMES)
+def test_9660_skill_archive_holds_exactly_its_own_skill(name):
+    """#9660: the card hands over a `.skill` archive, not a `SKILL.md`.
+
+    The ChatGPT uploader enforces the filename — a file named
+    `tortoise-file-finding.md` is refused with "Choose a .zip, .skill, or
+    SKILL.md file" — so four skills cannot ship as four `SKILL.md` downloads:
+    they collide in the user's Downloads folder and the renamed copies are
+    rejected. The archive (verified accepted by the live uploader) carries the
+    skill folder, so each file keeps its own name.
+
+    Two properties this pins, both observed in the live UI:
+    * exactly ONE skill per archive — a `.zip` holding four skill folders is
+      rejected ("Couldn't upload this skill"), so merging them must fail here;
+    * the entry is `<name>/SKILL.md` at the archive root, with the skill's own
+      frontmatter `name`, which is how the uploader derives the skill name.
+
+    Built by tools/build_skill_archives.py; a source edit without a rebuild
+    fails here rather than shipping a stale skill to users.
+    """
+    archive = REPO_ROOT / "website" / "skills" / f"{name}.skill"
+    source = REPO_ROOT / "website" / "skills" / name / "SKILL.md"
+    assert archive.is_file(), (
+        f"missing skill archive: {archive} — run "
+        "python3 tools/build_skill_archives.py")
+    with zipfile.ZipFile(archive) as zf:
+        entries = [i.filename for i in zf.infolist() if not i.is_dir()]
+        assert entries == [f"{name}/SKILL.md"], (
+            f"{archive.name} must hold exactly one skill (got {entries}); "
+            "one archive = one skill — the uploader rejects a multi-skill zip")
+        payload = zf.read(f"{name}/SKILL.md")
+    assert payload == source.read_bytes(), (
+        f"stale archive: {archive.name} drifted from {source} — run "
+        "python3 tools/build_skill_archives.py")
+    declared = re.search(r"^name:\s*(\S+)\s*$",
+                         payload.decode("utf-8").split("---")[1], re.M)
+    assert declared and declared.group(1) == name, (
+        f"{name}.skill frontmatter name must be {name!r} (got "
+        f"{declared.group(1) if declared else None!r}); the uploader names the "
+        "skill from it")
 
 
 def test_parity_gate_fails_closed_on_a_missing_or_unreadable_copy(tmp_path):
@@ -196,11 +273,32 @@ def test_4365_served_document_sends_chatgpt_to_a_path_that_exists():
     `test_m8_deploy_mirror_matches_canonical`, so this covers both copies."""
     skill = LIVE_SKILL.read_text(encoding="utf-8")
     assert "chatgpt.com/plugins" in skill, (
-        "the served document must name the ChatGPT Developer-mode path")
+        "the served document must name the ChatGPT connector surface")
+    # #9660: the note carried OpenAI's OLD path (Settings → Security and login →
+    # Developer mode, then a Developer-mode app). Read off a signed-in Plus
+    # account on 2026-10-23 that page has no Developer-mode switch at all and the
+    # connector is created from `Plugins → Add → Add custom MCP server`. An agent
+    # that receives this document is told which surface to open, so the stale
+    # path sends it hunting a toggle that does not exist.
+    for stale in ("Security and login", "Scan Tools", "Developer-mode app"):
+        assert stale not in skill, (
+            f"the served document must not carry the retired ChatGPT path {stale!r} "
+            "(#9660)")
+    assert "Add custom MCP server" in skill, (
+        "the served document must name the real connector entry point (#9660)")
     assert "ChatGPT tab" not in skill, (
         "the served document must not name the retired dashboard ChatGPT tab")
-    assert "no ChatGPT surface in the dashboard chooser" in skill, (
-        "the served document must state that there is no ChatGPT chooser surface")
+    # #9660 OWNER RULING (2026-10-23): the chooser DOES carry a ChatGPT
+    # surface now (the exclusion above was reversed), so the document must say
+    # so — while keeping the docs page as the reference copy. This replaces the
+    # old "there is no ChatGPT chooser surface" pin, which is now false.
+    assert "no ChatGPT surface in the dashboard chooser" not in skill, (
+        "the served document still claims ChatGPT is absent from the dashboard "
+        "chooser — the #9660 owner ruling added it")
+    assert "dashboard's connect step (the ChatGPT" in skill, (
+        "the served document must tell a ChatGPT user it has a dashboard surface")
+    assert "tortoise.premiselabs.co/docs#chatgpt" in skill, (
+        "the served document must still point at the reference copy of those steps")
 
 
 def test_5153_served_document_pins_the_canonical_mcp_key_variable():

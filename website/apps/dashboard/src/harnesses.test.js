@@ -90,15 +90,16 @@ test('#3430: the ONE rendered config block survives; the unrendered per-harness 
 // #2912: the wizard's two-level chooser is a UI grouping over the SAME leaf
 // vocabulary — this pins that invariant (a family/surface id that is not a real
 // leaf would render a chooser entry with no payload behind it).
-test('#2912: HARNESS_FAMILIES groups the leaf vocabulary (Claude 3 + Codex 2 + Cursor/Pi)', () => {
-  assert.deepEqual(HARNESS_FAMILY_IDS, ['claude', 'codex', 'cursor', 'pi'])
+test('#2912: HARNESS_FAMILIES groups the leaf vocabulary (Claude 3 + Codex 2 + Cursor/Pi/ChatGPT)', () => {
+  // #9660 owner ruling: 'chatgpt' joined as a single-choice family.
+  assert.deepEqual(HARNESS_FAMILY_IDS, ['claude', 'codex', 'cursor', 'pi', 'chatgpt'])
   const surfaceIds = HARNESS_FAMILIES.flatMap((f) => f.surfaces.map((s) => s.id))
   const claude = HARNESS_FAMILIES.find((f) => f.id === 'claude')
   const codex = HARNESS_FAMILIES.find((f) => f.id === 'codex')
   assert.deepEqual(claude.surfaces.map((s) => s.id), ['claude', 'claude-desktop', 'claude-web'])
   assert.deepEqual(codex.surfaces.map((s) => s.id), ['codex', 'codexDesktop'])
-  // Cursor/Pi are single-choice: family id == leaf id, no surface row.
-  for (const id of ['cursor', 'pi']) {
+  // Cursor/Pi/ChatGPT are single-choice: family id == leaf id, no surface row.
+  for (const id of ['cursor', 'pi', 'chatgpt']) {
     assert.deepEqual(HARNESS_FAMILIES.find((f) => f.id === id).surfaces, [])
   }
   // Every chooser id resolves to a real leaf — 'codexDesktop' is the ONE
@@ -107,11 +108,12 @@ test('#2912: HARNESS_FAMILIES groups the leaf vocabulary (Claude 3 + Codex 2 + C
     assert.ok(HARNESS_ORDER.includes(id) || id === 'codexDesktop',
       `${id} must be a real leaf (HARNESS_ORDER member or the Codex Desktop surface)`)
   }
-  // The families cover the wizard's whole leaf surface (chatgpt is OAuth-only).
+  // The families cover the wizard's whole leaf surface — since the #9660 owner
+  // ruling that is EVERY leaf, chatgpt included (it used to be the exception).
   const covered = new Set([
     ...HARNESS_FAMILIES.flatMap((f) => (f.surfaces.length ? f.surfaces.map((s) => s.id) : [f.id])),
   ])
-  for (const h of HARNESS_ORDER.filter((h) => h !== 'chatgpt')) {
+  for (const h of HARNESS_ORDER) {
     assert.ok(covered.has(h), `${h} must be reachable from the chooser`)
   }
 })
@@ -121,7 +123,7 @@ test('#2912: family resolution + preferred surface + display names', () => {
   assert.equal(harnessFamilyOf('claude-web').id, 'claude')
   assert.equal(harnessFamilyOf('codexDesktop').id, 'codex')
   assert.equal(harnessFamilyOf('cursor').id, 'cursor')
-  assert.equal(harnessFamilyOf('chatgpt'), null)
+  assert.equal(harnessFamilyOf('chatgpt').id, 'chatgpt')  // #9660 owner ruling
   const claude = HARNESS_FAMILIES.find((f) => f.id === 'claude')
   const cursor = HARNESS_FAMILIES.find((f) => f.id === 'cursor')
   // re-clicking the active family keeps the user's surface (non-destructive)
@@ -158,6 +160,11 @@ test('#2936: analyticsHarnessOf maps the UI-only leaf, and refuses the unattribu
   assert.equal(analyticsHarnessOf('codexDesktop'), 'codex')
   // A leaf with no attributable value returns null, so the caller emits
   // NOTHING — never a value the server drops (and reports, #3821).
+  // #9660 owner ruling: chatgpt IS a chooser leaf now, but it stays
+  // DELIBERATELY non-attributable — its beacons emit nothing, because
+  // attribution needs a member in the server's session vocabulary and #1701
+  // recorded that ChatGPT never files a session. Reachable ≠ attributable; the
+  // two are pinned separately (harnesses.test.js + the cross-surface contract).
   assert.equal(HARNESS_ANALYTICS_ALIASES.chatgpt, null)
   assert.equal(analyticsHarnessOf('chatgpt'), null)
   // The identity-valued leaves (the server's own vocabulary) are unchanged.
@@ -177,12 +184,17 @@ test('#2936: analyticsHarnessOf maps the UI-only leaf, and refuses the unattribu
     ...HARNESS_FAMILIES.flatMap((f) => f.surfaces.map((s) => s.id)),
   ])
   assert.deepEqual([...chooserLeaves].sort(),
-    ['claude', 'claude-desktop', 'claude-web', 'codex', 'codexDesktop', 'cursor', 'pi'],
+    ['chatgpt', 'claude', 'claude-desktop', 'claude-web', 'codex', 'codexDesktop', 'cursor', 'pi'],
     'the chooser leaf population moved — re-check the analytics mapping for the new leaf')
   for (const leaf of chooserLeaves) {
+    if (leaf === 'chatgpt') continue  // #1701: deliberately inert (see above)
     assert.ok(analyticsHarnessOf(leaf) != null,
       `${leaf} is reachable from the chooser but has no analytics value — the beacon would emit nothing`)
   }
+  // Exactly ONE chooser leaf may be non-attributable, and it is named here so a
+  // second one cannot appear unnoticed (#9660: the exception moved from "unreachable
+  // leaf" to "reachable but inert").
+  assert.deepEqual([...chooserLeaves].filter((l) => analyticsHarnessOf(l) == null), ['chatgpt'])
 })
 
 test('#2328/#2329: Codex Desktop variant — terminal-less config path, .agents/skills, no .codex/skills', () => {
@@ -271,12 +283,33 @@ test('DE2E-5: teach-human harnesses are key-less OAuth on BOTH connector surface
 })
 
 test('#1701 DE2E-5: chatgpt is the key-less OAuth harness — steps + skills-as-prompt copy', () => {
-  // connector steps (rendered above the snippet) name the Developer-mode
-  // surface and the OAuth choice; the URL is the NO-slash form
+  // #9660: the connector steps name the CURRENT surface. Read off OpenAI's live
+  // UI on 2026-10-23 (Plus account): `Plugins → Add → Add custom MCP server` is
+  // the entry point, there is NO Developer-mode prerequisite and no such toggle
+  // in Settings, and the creation dialog has NO "Scan Tools" button. The OAuth
+  // grant is a separate `Connect` on the installed plugin's detail page. The
+  // retired literals are asserted ABSENT (see the `stale` list below — it names
+  // every one of them exactly, including the old step 2, so a partial regression
+  // is caught, not just the step-1 form).
   const steps = HARNESS_STEPS('chatgpt', KEY)
-  assert.ok(Array.isArray(steps) && steps.length >= 7, 'chatgpt step list present')
-  assert.ok(steps.some((s) => typeof s === 'string' && s.includes('Developer mode')), 'steps: Developer mode')
+  assert.ok(Array.isArray(steps) && steps.length >= 6, 'chatgpt step list present')
+  assert.ok(steps.some((s) => typeof s === 'string' && s.includes('Add custom MCP server')),
+    'steps: the custom-MCP-server entry point (#9660)')
+  assert.ok(steps.some((s) => typeof s === 'string' && s.includes('Create as a plugin')),
+    'steps: the creation dialog\'s primary button (#9660)')
+  assert.ok(steps.some((s) => typeof s === 'string' && s.includes('settings/plugins-settings')),
+    'steps: where the installed plugin (and its Connect) lives (#9660)')
+  assert.ok(steps.some((s) => typeof s === 'string' && s.includes('View details')),
+    'steps: the observed control on the plugin row (#9660)')
+  assert.ok(steps.some((s) => typeof s === 'string' && s.includes('Upload from your computer')),
+    'steps: the skills hand-off is ChatGPT\'s own Upload flow (#9660)')
+  assert.ok(steps.some((s) => typeof s === 'string' && s.includes('Connect')),
+    'steps: the OAuth grant is a separate act (#9660)')
   assert.ok(steps.some((s) => typeof s === 'string' && s.includes('chatgpt.com/plugins')), 'steps: plugins surface')
+  for (const stale of ['Security and login', 'Scan Tools', 'Developer mode', '+ button', 'Developer-mode app']) {
+    assert.ok(!steps.some((s) => typeof s === 'string' && s.includes(stale)),
+      `steps: must not carry the retired path ${JSON.stringify(stale)} (#9660)`)
+  }
   const urlStep = steps.find((s) => typeof s === 'object' && s.copy === 'https://api.premiselabs.co/mcp')
   assert.ok(urlStep, 'steps: MCP URL copy step (exact, no slash)')
   assert.ok(steps.some((s) => typeof s === 'string' && s.includes('OAuth')), 'steps: OAuth choice named')
@@ -285,15 +318,16 @@ test('#1701 DE2E-5: chatgpt is the key-less OAuth harness — steps + skills-as-
   const prompt = HARNESS_INSTALL.chatgpt()
   assert.equal(prompt, HARNESS_INSTALL['claude-web'](), 'claude-web and chatgpt share the identical workflows body')
   assert.match(prompt, /Follow these workflows/, 'prompt: workflows marker')
-  // #3430: the self-contained `UNIVERSAL_COMMAND.chatgpt` block was rendered
-  // nowhere — chatgpt has no chooser surface at all (#2698 deleted its tab,
-  // #2912's families exclude it) and its live carrier is the setup docs page
-  // (website/docs.html#chatgpt). Only the LIVE half is asserted here.
+  // #3430: the self-contained `UNIVERSAL_COMMAND.chatgpt` block is rendered
+  // nowhere — chatgpt's live surfaces are the dashboard connect journey (#9660)
+  // and the setup docs page (website/docs.html#chatgpt). Only the LIVE half is
+  // asserted here.
   assert.equal(CANONICAL_MCP_URL, 'https://api.premiselabs.co/mcp')
   assert.ok(urlStep, 'the rendered steps carry the canonical no-slash URL')
   assert.equal(HARNESS_COPY_LABEL.chatgpt, 'Copy prompt')
   assert.equal(HARNESS_CONTINUE_LABEL.chatgpt, "I've connected it — Continue →")
-  assert.ok(HARNESS_INTRO.chatgpt && HARNESS_INTRO.chatgpt.includes('paste the prompt'), 'chatgpt intro points at the chat paste')
+  assert.ok(HARNESS_INTRO.chatgpt && HARNESS_INTRO.chatgpt.includes('skill you installed above'), 'chatgpt intro names the installed skill')
+  assert.ok(HARNESS_INTRO.chatgpt.includes('paste the prompt below instead'), 'chatgpt intro keeps the paste as the fallback (#9660)')
   // session capture: disabled-with-reason (cloud-hosted — no local signal)
   assert.equal(HARNESS_CAPTURE_SUPPORT.chatgpt, false)
   assert.ok(HARNESS_CAPTURE_REASON.chatgpt && HARNESS_CAPTURE_REASON.chatgpt.length > 0,

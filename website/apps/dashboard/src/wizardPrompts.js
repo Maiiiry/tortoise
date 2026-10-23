@@ -18,6 +18,7 @@ import {
   HARNESS_NAMES,
   MCP_URL,
   ONBOARDING_INSTRUCTIONS_URL,
+  servedSkillUrl,
   SKILLS_INSTALL_URL,
   SKILLS_LIST,
   WORKFLOWS_PROMPT,
@@ -59,10 +60,10 @@ export function wizardPromptText(harness, step, key, mode) {
   // the four config-writing prompts below inline it, and the two Claude
   // connector leaves (Claude Desktop/Web — which never ran the installer and
   // have no skills directory) get it in the workflows prompt body
-  // (wizardWorkflowsText). ChatGPT has NO surface in this chooser (#2912's
-  // HARNESS_FAMILIES excludes it — #2698 had already deleted its flat tab),
-  // so it has no delivery path in THIS wizard at all. Its LIVE carrier is the
-  // public setup docs page (#4836): website/docs.html#chatgpt.
+  // (wizardWorkflowsText). #9660 OWNER RULING (2026-10-23) reverses the earlier
+  // "ChatGPT has NO surface in this chooser" state: chatgpt is a live
+  // single-choice family, so it gets its own prompt below and the served docs
+  // row (website/docs.html#chatgpt) is its reference copy, not its only carrier.
   // One constant (harnesses.js) for the URL, one (ONBOARDING_INSTRUCTIONS) for
   // the sentence.
   const onboardingInstructions = ONBOARDING_INSTRUCTIONS
@@ -99,6 +100,23 @@ export function wizardPromptText(harness, step, key, mode) {
   // verify/file step in the conversation; the workflows body rides
   // wizardWorkflowsText below.
   if (harness === 'claude-desktop' || harness === 'claude-web') {
+    if (step === 2) return WIZARD_STEP2_TEXT
+  }
+  // #9660 owner ruling: ChatGPT Web. Its connector is added in ChatGPT's own
+  // UI (the dashboard cannot do it), and its skills arrive as `.skill` uploads,
+  // so the prompt's job is the FIRST JOB — read the method it just installed,
+  // follow the onboarding instructions, then verify + file the first memory.
+  // No key line: HARNESS_OAUTH, and a connector surface never carries one.
+  if (harness === 'chatgpt') {
+    // #2361 anchor: the live wizard copy says "memory"/"memories", never the
+    // node word — the ratchet in overview.test.js scans this file (comments
+    // included), and the node word is the WRONG mental model for the user
+    // anyway: to them the graph holds memories.
+    // The skill is installable and SKIPPABLE (the step above offers the paste as
+    // the alternative), so this sentence may not assert that it is installed —
+    // a skipper would copy a first job that tells its agent to read a file it
+    // does not have. Name the served document as the fallback instead.
+    if (step === 1) return `You have Tortoise connected over MCP (the tortoise_* tools).\nRead the how-to-use-tortoise skill before your first write — it is the source of truth for how to add memories, the links between them, and when to use which. If it is not installed, read it at ${servedSkillUrl('how-to-use-tortoise')} first.\n${onboardingInstructions}\n${WIZARD_STEP2_TEXT}`
     if (step === 2) return WIZARD_STEP2_TEXT
   }
   return ''
