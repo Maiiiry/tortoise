@@ -672,6 +672,52 @@ test("a 401/403 RETAINS the cursor — a rotated key must not drop a session", a
   assert.deepEqual(fixed.calls[0].body.conversation.map((t) => t.content), ["before the rotation"]);
 });
 
+test("the deploy-order DOWNGRADE still re-sends when `failures` has saturated", async () => {
+  // The tolerance exists so a server that has not yet learned
+  // `client_captured_at_source=entry_timestamp` does not dead-letter a real
+  // session. It spends the CURRENT attempt on the downgraded re-send — which is
+  // only sound if a later iteration carries the turns. `startAttempt` resumes at
+  // the persisted `failures`, saturated at `BACKOFF_MS.length - 1` after any
+  // outage of a few sweeps (402 quota, 401/403/407, 409, 429, 5xx, transport all
+  // retain AND increment it), so at the ceiling the body ran exactly ONCE: the
+  // `continue` ended the loop, `decision` stayed "retain", and the downgraded
+  // payload was never sent — forever, for exactly the state it was written for.
+  const root = tmp("sessions-downgrade-");
+  const cursorDir = tmp("cursor-downgrade-");
+  const path = sessionFixture(root, "s.jsonl", [
+    HEADER("sid-downgrade"), entry("a", null, "user", "ship me anyway"),
+  ]);
+
+  // An outage saturates the persisted budget, then the outage ends and the
+  // server turns out not to know the new member yet.
+  await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: stubFetch([503]), ...FAST });
+  const saturated = loadCursor(cursorDir).state;
+  saturated.files[path].failures = BACKOFF_MS.length - 1;
+  assert.equal(saveCursor(cursorDir, saturated).ok, true);
+  assert.equal(loadCursor(cursorDir).state.files[path].failures, BACKOFF_MS.length - 1);
+
+  const seen = [];
+  const deployOrder = async (url, init) => {
+    const body = JSON.parse(init.body);
+    seen.push(body.client_captured_at_source);
+    const stale = body.client_captured_at_source === "entry_timestamp";
+    return {
+      ok: !stale,
+      status: stale ? 422 : 200,
+      json: async () => (stale
+        ? { detail: "unknown field client_captured_at_source" }
+        : {}),
+    };
+  };
+  const receipt = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: deployOrder, ...FAST });
+
+  assert.deepEqual(seen, ["entry_timestamp", "unknown"], (
+    "the downgraded re-send must still happen at the retry ceiling"
+  ));
+  assert.equal(receipt.shipped, 1, "the turns are carried, not stranded as `retained`");
+  assert.equal(loadCursor(cursorDir).state.files[path].offset, statSync(path).size);
+});
+
 test("a /compact SHRINK is refused, never shipped (it would delete filed turns)", async () => {
   const root = tmp("sessions-shrink-");
   const cursorDir = tmp("cursor-shrink-");

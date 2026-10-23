@@ -3363,6 +3363,23 @@ def test_every_capture_artifact_ships_in_the_wheel():
             f"{artifact} is not matched by any package-data pattern "
             f"{patterns} — a wheel install would fail resolving it")
 
+    # #3515: the store-sync backstop is run FROM THE PACKAGE (`tortoise
+    # store-sync` executes `worker_path()`), not copied by an installer, so it
+    # is deliberately not a `CAPTURE_SEAM` entry and the seam loop above cannot
+    # reach it. A wheel without either file makes the recovery sweep answer
+    # `worker_status: "worker_missing"` on the one production invocation, which
+    # the extension spawns with `stdio: "ignore"` — silent, on the failure this
+    # sweep exists to prevent. The guard MUST evaluate the wheel patterns:
+    # `test_store_sync_worker.py::test_the_worker_artifact_exists_…` asserts on
+    # GIT-TRACKED source paths, so it stays green with both `package-data` rows
+    # deleted and covers nothing here (the vacuous-guard class of #1349/#2938).
+    for rel in ("pi-hooks/store-sync.ts", "pi-hooks/cursor-store.ts"):
+        assert covered(rel), (
+            f"{rel} is not matched by any package-data pattern {patterns} — a "
+            "wheel install would ship a `tortoise store-sync` that cannot run")
+        assert (_REPO_ROOT / "tortoise" / rel).is_file(), (
+            f"{rel} is declared as package data but does not exist")
+
 
 # The shipped install-contract generations, one per wizard-offered harness.
 # The marker is what makes a stale installed seam detectable, so it MUST be

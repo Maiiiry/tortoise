@@ -175,8 +175,11 @@ tortoise = ["config/routing.yaml", "../tests/sample_transcript.txt",
           # copied by an installer — `tortoise store-sync` runs it from the
           # PACKAGE — so a wheel without either file makes the recovery sweep
           # silently unable to start, which is the loss the sweep exists to
-          # prevent. `tests/test_store_sync_worker.py` fails if either is
-          # missing (the artifact guard).
+          # prevent. The guard is
+          # `tests/test_capture_install.py::test_every_capture_artifact_ships_in_the_wheel`,
+          # which evaluates THESE patterns against the tree; the row in
+          # `tests/test_store_sync_worker.py` asserts on source paths and cannot
+          # red a lost `package-data` entry.
           "pi-hooks/store-sync.ts",
           "pi-hooks/cursor-store.ts",
           # #2121: the Hermes seam ships as a directory PLUGIN (`tortoise

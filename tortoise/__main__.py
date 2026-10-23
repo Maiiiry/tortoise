@@ -11883,7 +11883,8 @@ def main(argv: list[str] | None = None) -> int:
                          "POSTs turns, so it needs capture consent "
                          "(TORTOISE_CAPTURE=1); the log half does not")
     ss.add_argument("--dry-run", action="store_true",
-                    help="Plan only — POST nothing, move no cursor")
+                    help="Plan only — POST nothing, drain no spool entry, "
+                         "move no cursor")
     ss.add_argument("--json", action="store_true", help="Machine-readable receipt")
     # #9556 / R8: the record → cache RESTORE. A sibling of `record-reconcile`
     # and deliberately NOT a `--from-record` flag on `rebuild`: `rebuild`'s

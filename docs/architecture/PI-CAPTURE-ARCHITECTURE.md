@@ -163,9 +163,10 @@ and are not renumbered). Status against the tree at this commit:
 
 Two workers over one file cannot corrupt the cursor (single `rename`), and both may
 POST the same window: the server's turn MERGE is the idempotency boundary.
-`--dry-run` is genuinely read-only: it POSTs nothing, moves no offset, and does not
-create the cursor store — including on the branch where the window holds no shippable
-turn yet.
+`--dry-run` is genuinely read-only for **BOTH halves**: it POSTs nothing, drains no
+spool entry (so no `filed_key` / backoff / terminal stamp is written — the plan
+stays reproducible), moves no offset, and does not create the cursor store —
+including on the branch where the window holds no shippable turn yet.
 
 ---
 

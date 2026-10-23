@@ -671,6 +671,54 @@ def test_the_spool_half_reports_no_credential_without_posting(monkeypatch, tmp_p
     assert receipt["ok"] is False, "a substrate that was NOT drained is not a success"
 
 
+def test_a_dry_run_drains_NO_spool_entry_and_stamps_NOTHING(monkeypatch, tmp_path):
+    """`--dry-run` is "Plan only — POST nothing, move no cursor" (`--help`).
+
+    `dry_run` reached `run_worker` and nothing else, so the DEFAULT (spool on)
+    mode uploaded every spooled transcript — a real `flush_spool` transport, not
+    a stub — and then stamped the entry's outcome (`filed_key`, backoff, or a
+    terminal marker). The plan could not even be reproduced afterwards: the
+    entries it reported on had changed.
+
+    The spool is snapshotted byte-for-byte, so this reds on ANY mutation (a POST
+    is only the loudest one) — and the follow-up real sweep proves the entry is
+    still filable, i.e. nothing was consumed.
+
+    MUTATION THAT REDS THIS: drop the `spool and dry_run` branch in `run_sweep`.
+    """
+    from tortoise.store_sync import run_sweep
+
+    posted: list[dict] = []
+
+    def post(payload):
+        from tortoise.capture_spool import PostOutcome
+        posted.append(payload)
+        return PostOutcome(ok=True, status=200, body={})
+
+    monkeypatch.setenv("TORTOISE_CAPTURE", "1")
+    root = _spool_fixture(monkeypatch, tmp_path, session_ids=("sess-dry",))
+
+    def snapshot() -> dict[str, bytes]:
+        return {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in sorted(root.rglob("*"))
+            if p.is_file()
+        }
+
+    before = snapshot()
+    receipt = run_sweep(spool=True, dry_run=True, post=post, node="/nonexistent/node")
+    assert posted == [], "a plan-only run POSTed spooled transcript turns"
+    assert receipt["spool"]["status"] == "dry_run", receipt["spool"]
+    assert snapshot() == before, "a plan-only run mutated the spool it was reporting on"
+
+    # And the entry is untouched, not merely quiet: a REAL sweep still files it.
+    real = run_sweep(spool=True, post=post, node="/nonexistent/node")
+    assert [p["session_id"] for p in posted] == ["sess-dry"], (
+        "the dry run consumed the entry it was supposed to report on"
+    )
+    assert real["spool"]["filed"] == 1
+
+
 def test_both_halves_honour_exclude_session_id_and_file(monkeypatch, tmp_path):
     """`--exclude-session-id` reaches the SPOOL leg too.
 

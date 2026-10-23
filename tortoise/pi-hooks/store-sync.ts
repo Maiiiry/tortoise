@@ -827,6 +827,17 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         decision = "retain";
         log("store-sync: server does not know client_captured_at_source=entry_timestamp — " +
           "re-sending with 'unknown' (the floor is DISABLED for this record, not passed)");
+        // The downgraded RE-SEND is not a schedule attempt, so it must not
+        // CONSUME one. `startAttempt` resumes at the persisted `failures`, which
+        // saturates at the ceiling (`BACKOFF_MS.length - 1`) after any outage of
+        // a few sweeps — 402 quota, 401/403/407, 409, 429, 5xx and transport all
+        // retain and all increment it. At the ceiling this loop body runs exactly
+        // ONCE, so `continue` ended the loop with `decision` still "retain": the
+        // downgraded payload was never sent, forever, which is precisely the
+        // state the tolerance was written for. Rewind one slot (at most once per
+        // run — `downgradedSource` is the guard) so the re-send happens on the
+        // same budget slot.
+        i = Math.max(i - 1, 0);
         continue;
       }
       if (decision !== "retain" || res.ok) break;

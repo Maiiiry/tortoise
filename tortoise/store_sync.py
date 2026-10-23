@@ -208,6 +208,13 @@ def run_sweep(
 
     ``post``/``spool=False`` exist so tests can drive either half in isolation
     (a spool drain with a stubbed transport must not reach the network).
+
+    ``dry_run`` is honoured by BOTH halves. The log half already reported
+    without moving a cursor; the spool half used to be drained regardless, so a
+    command advertised as "Plan only — POST nothing, move no cursor" uploaded
+    every spooled transcript and stamped `filed_key` / backoff / terminal
+    markers into the spool — an irreversible mutation of the very substrate the
+    plan was asked to REPORT on, which made the plan unreproducible.
     """
     receipt: dict[str, Any] = {"spool": None, "log": None, "ok": True}
     # `--file` names ONE session file for the LOG half; for the spool half the
@@ -218,7 +225,20 @@ def run_sweep(
     only_session_id: str | None = None
     if files and len(files) == 1:
         only_session_id = _session_id_from_filename(files[0])
-    if spool:
+    if spool and dry_run:
+        # No transport, no consent read, no spool mutation: a plan-only run must
+        # leave the spool byte-identical (`flush_spool` POSTs each entry and then
+        # stamps the entry's outcome, so merely "filing nothing on success" is
+        # not enough — the stamp IS the mutation). The entries a real run would
+        # file are still there afterwards; nothing is counted as drained.
+        receipt["spool"] = {
+            "status": "dry_run",
+            "detail": (
+                "plan only — the spool half was not drained; nothing was posted "
+                "and no spool entry was stamped"
+            ),
+        }
+    elif spool:
         try:
             # #3615: this command POSTs spooled turns, so it carries the SAME
             # consent gate as `session capture` / `session drain` /
