@@ -330,8 +330,28 @@ def _landed_suffix(cid: str) -> str:
             "reading an issue's state")
 
 
+def evidence_path(out: Path | None) -> str:
+    """The artifact a row CITES — where THIS run actually wrote.
+
+    ⛔ The rows used to carry a hard-coded ``EVIDENCE_DIR / "capstone.log"``
+    regardless of ``--out`` (the open review P1 on this file): a run written to
+    ``capstone-<sha>.log`` produced a table whose every row pointed at
+    ``capstone.log``, so the gate's V4 resolved to a DIFFERENT file that existed
+    for unrelated reasons and the citation proved nothing. Worse, the README
+    tells a scored re-run to write somewhere else precisely so it does not red the
+    ordering check — a citation that ignores ``--out`` silently undoes that.
+
+    ``--out`` absent means the operator is using the issue's own acceptance
+    command (``… | tee docs/evidence/7949-capstone/capstone.log``), which is the
+    one case where the tee target is the artifact: the log goes to stdout and the
+    tee writes it there.
+    """
+    return str(out) if out is not None else str(EVIDENCE_DIR / "capstone.log")
+
+
 def refused_rows(reason: str, *, prereg_ok: bool,
-                 prereg_unread: bool = False) -> list[dict]:
+                 prereg_unread: bool = False,
+                 evidence: str | None = None) -> list[dict]:
     """The 5 rows of a REFUSED run.
 
     A refusal cannot make a row green, so every row is non-green and names its
@@ -376,7 +396,7 @@ def refused_rows(reason: str, *, prereg_ok: bool,
             "criterion": cid,
             "verdict": verdict,
             "evidence_kind": "refusal",
-            "evidence": str(EVIDENCE_DIR / "capstone.log"),
+            "evidence": evidence or str(EVIDENCE_DIR / "capstone.log"),
             "sha": None,          # filled by emit_log with the run head
             "numerator": None,
             "denominator": None,
@@ -389,7 +409,7 @@ def refused_rows(reason: str, *, prereg_ok: bool,
 
 
 def completed_rows(*, head: str, corpus_sha: str,
-                   receipt: dict) -> list[dict]:
+                   receipt: dict, evidence: str | None = None) -> list[dict]:
     """The 5 rows of a COMPLETED run (G6).
 
     ⛔ Reached ONLY after G0 read the frozen pre-registration, so no row here
@@ -415,7 +435,8 @@ def completed_rows(*, head: str, corpus_sha: str,
         rows.append({
             "criterion": cid, "verdict": "BLOCKED",
             "evidence_kind": "measurement",
-            "evidence": str(EVIDENCE_DIR / "capstone.log"), "sha": head,
+            "evidence": evidence or str(EVIDENCE_DIR / "capstone.log"),
+            "sha": head,
             # ⛔ E4's row carries the receipt's OWN numbers. `numerator` /
             # `denominator` used to be None for every row while the receipt sat
             # in `run.e4_receipt` and in the note — so the gate's V10 ("a
@@ -783,7 +804,8 @@ def main(argv: list[str] | None = None) -> int:
         test_post_g0_refusals_record_the_preregistration_as_read.
         """
         rows = refused_rows(reason, prereg_ok=prereg_ok,
-                            prereg_unread=prereg_unread)
+                            prereg_unread=prereg_unread,
+                            evidence=evidence_path(out))
         # Three states, because there are three facts: G0 read it (OK), G0
         # looked and it was not there (ABSENT), or the gate stopped BEFORE G0 —
         # in which case `ABSENT` would assert something this run never checked.
@@ -915,7 +937,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # G6 — per-criterion evidence
     receipt = e4_receipt(result.get("stats") or {})
-    rows = completed_rows(head=head, corpus_sha=sha, receipt=receipt)
+    rows = completed_rows(head=head, corpus_sha=sha, receipt=receipt,
+                          evidence=evidence_path(out))
     sys.stdout.write(emit_log(
         head=head,
         prereg={"sha": args.prereg, "status": "OK",

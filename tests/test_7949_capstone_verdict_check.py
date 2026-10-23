@@ -1392,9 +1392,19 @@ def test_run_refuses_without_a_preregistration_and_emits_a_clean_table(tmp_path)
     """G0 refuses at HEAD: no commit carries the pre-registration artifact.
 
     This is the SHIPPED outcome (README: 5/5 rows not green). The assertion is
-    not "it fails" — it is "it fails AND the table it leaves behind is one the
-    checker accepts": a refusal that produced an unparseable log would let the
-    next lane mistake silence for a verdict.
+    not "it fails" — it is "it fails AND the table it leaves behind says what the
+    checker needs to read": a refusal that produced an unparseable log would let
+    the next lane mistake silence for a verdict.
+
+    ⛔ THE CITATION IS THE P1 (#9089 review): every row used to carry a hard-coded
+    ``EVIDENCE_DIR/capstone.log`` whatever ``--out`` said, so a run written to
+    ``capstone-<sha>.log`` produced a table whose rows pointed at a DIFFERENT file
+    that existed for unrelated reasons — the citation proved nothing. The rows now
+    cite the artifact this run actually wrote, and here that artifact is OUTSIDE
+    the repo (``tmp_path``), so the gate's V4 refuses the citation with the honest
+    reason. That is the correct verdict, not a regression: an artifact the repo
+    does not carry cannot be reviewed later. V4 is the ONLY finding — the table is
+    otherwise sound — and ``--require-green`` still answers "not closeable".
     """
     corpus = tmp_path / "corpus.json"
     corpus.write_text(json.dumps([{"role": "user", "content": "hello"}]))
@@ -1405,10 +1415,39 @@ def test_run_refuses_without_a_preregistration_and_emits_a_clean_table(tmp_path)
     record = cvc.extract_block(out.read_text())
     assert record["run"]["status"] == "REFUSED"
     assert record["run"]["steps_observed"] == []
-    findings = cvc.check(record, repo=_REPO,
-                         require_green=False)
-    assert not findings, findings.render()
+    # the P1: the rows cite THIS run's artifact
+    assert {row["evidence"] for row in record["rows"]} == {str(out)}
+    findings = cvc.check(record, repo=_REPO, require_green=False)
+    codes = sorted({code for code, _w, _m in findings.items})
+    assert codes == ["V4"], findings.render()
     assert "V9" in _codes(record, require_green=True)
+
+
+def test_a_row_cites_the_output_path_it_was_actually_written_to(tmp_path):
+    """P1 pin on the PURE half: no path is hard-coded anywhere in the rows.
+
+    ``evidence_path`` is the one place the citation is decided. Repo-relative
+    stays repo-relative (so the gate can resolve it), and the no-``--out`` case
+    falls back to the acceptance command's own ``tee`` target — the single case
+    where that path IS the artifact.
+    """
+    import os
+
+    assert probe.evidence_path(None) == str(probe.EVIDENCE_DIR / "capstone.log")
+    relative = probe.EVIDENCE_DIR / "capstone-measured-test.log"
+    assert probe.evidence_path(relative) == str(relative)
+    rows = probe.refused_rows("x", prereg_ok=True, evidence=str(relative))
+    assert {row["evidence"] for row in rows} == {str(relative)}
+    completed = probe.completed_rows(
+        head=HEAD, corpus_sha="c" * 64,
+        receipt={"numerator": 1, "denominator": 15, "denominator_is_4": False},
+        evidence=str(relative))
+    assert {row["evidence"] for row in completed} == {str(relative)}
+    # and the default (no --out) is the shipped path, which is what the
+    # acceptance command's `| tee` writes
+    default_rows = probe.refused_rows("x", prereg_ok=True)
+    assert {row["evidence"] for row in default_rows} == {
+        os.path.join(str(probe.EVIDENCE_DIR), "capstone.log")}
 
 
 def _frozen_prereg(**over) -> dict:
@@ -1776,7 +1815,14 @@ def test_a_free_text_head_override_is_refused_before_it_is_stamped(tmp_path):
     # table this repo's own gate (V3) reds.
     assert record["head"] == HEAD, record["head"]
     assert {row["sha"] for row in record["rows"]} == {HEAD}
-    assert not [c for c in _codes(record) if c in ("V3", "V4", "V6")], _codes(record)
+    # ⛔ V4 IS EXPECTED HERE, and only here (#9089 review P1). Every row now cites
+    # the artifact THIS run wrote, and `--out` is a tmp path outside the repo — so
+    # the gate refuses the citation with the honest reason (an artifact the repo
+    # does not carry cannot be reviewed later). The provenance rules this test
+    # guards are V3 (sha SHAPE) and V6 (a named blocker): those must stay clean.
+    assert {row["evidence"] for row in record["rows"]} == {str(out)}
+    codes = _codes(record)
+    assert not [c for c in codes if c in ("V3", "V6")], codes
 
 
 def test_a_head_that_does_not_resolve_is_refused(tmp_path):
@@ -2177,8 +2223,11 @@ def test_a_prereg_record_that_is_not_an_object_is_refused_not_a_traceback(
     assert "not an object" in record["run"]["reason"], record["run"]["reason"]
     # The refusal is a G0 refusal — the prereg was looked at and unusable.
     assert record["prereg"]["status"] == "ABSENT"
-    assert not cvc.check(record, repo=_REPO, require_green=False), (
-        "the refusal table must parse")
+    # ⛔ V4 IS EXPECTED: the rows cite the artifact this run actually wrote (the
+    # P1), which is a tmp file outside the repo. Everything ELSE must parse.
+    assert {row["evidence"] for row in record["rows"]} == {str(out)}
+    findings = cvc.check(record, repo=_REPO, require_green=False)
+    assert not [item for item in findings.items if item[0] != "V4"], findings.render()
     assert "V9" in _codes(record, require_green=True)
 
 
@@ -2300,3 +2349,145 @@ def test_the_probes_line_citations_resolve_too():
     assert extractor[module_line - 1].lstrip().startswith("def extract_session_v2("), (
         f"probe cites the entry point at extractor_v2.py:{module_line}, which is "
         f"{extractor[module_line - 1].strip()!r}")
+
+
+# ── V7 across a multi-artifact table (the capstone's own rows) ────────────
+
+def _e1e2_corpus_sha() -> str:
+    """The digest ``e1-e2.log`` records for the corpus IT measured.
+
+    Read from the artifact, never typed: the point of these tests is that a row's
+    declared corpus is checked against the file, so a hard-coded digest here would
+    be the same unverifiable claim one level up.
+    """
+    text = (_REPO / "docs/evidence/7949-capstone/e1-e2.log").read_text()
+    match = re.search(r"corpus_sha256=([0-9a-f]{64})", text)
+    assert match, "e1-e2.log no longer records its corpus digest"
+    return match.group(1)
+
+
+def _measured_row(**over) -> dict:
+    """A NON-GREEN measured row citing a real artifact on ANOTHER corpus."""
+    row = {
+        "criterion": "E1", "verdict": "RED", "evidence_kind": "measurement",
+        "evidence": "docs/evidence/7949-capstone/e1-e2.log",
+        "sha": HEAD, "numerator": 2, "denominator": 15,
+        "corpus_sha256": _e1e2_corpus_sha(),
+        "sibling": None, "blocked_by": "#8503",
+        "note": "measured on the #9076 arm run, whose corpus is not the frozen one",
+    }
+    row.update(over)
+    return row
+
+
+def _multi_artifact_record(row: dict | None = None) -> dict:
+    rec = _record()
+    rec["corpus"] = {"path": "tests/eval/write_path", "sha256": "f" * 64}
+    rec["rows"] = [dict(r) for r in rec["rows"]]
+    rec["rows"][0] = row or _measured_row()
+    return rec
+
+
+def test_a_non_green_row_on_another_corpus_must_declare_that_revision():
+    """A row whose number comes from a DIFFERENT artifact must say so.
+
+    The capstone's rows do not all come from one run: E1/E2 cite #9076's arm run
+    and E4 an operator receipt, and neither measured the corpus the capstone run
+    froze. Refusing those rows outright would hide the only numbers they have;
+    accepting them on the row's word would let any red row name any corpus. So the
+    row DECLARES the revision, and the declaration is checked against the artifact.
+    """
+    codes = _codes(_multi_artifact_record())
+    assert "V7" in codes, codes
+
+
+def test_a_declared_corpus_the_artifact_never_records_is_refused():
+    """The declaration must be SUPPORTED by the cited file, not merely asserted.
+
+    Without this arm a row could invent ``artifact_corpus_sha256`` and pass — the
+    declaration would be one more unverifiable claim, which is the exact shape V4
+    exists to refuse for the artifact itself.
+    """
+    row = _measured_row(artifact_corpus_sha256="a" * 64)
+    codes = _codes(_multi_artifact_record(row))
+    assert "V7" in codes, codes
+
+
+def test_a_declared_corpus_that_disagrees_with_the_row_is_refused():
+    """One number decides a row's corpus, and two copies that differ pick neither."""
+    row = _measured_row(artifact_corpus_sha256="b" * 64)
+    row["corpus_sha256"] = _e1e2_corpus_sha()
+    codes = _codes(_multi_artifact_record(row))
+    assert "V7" in codes, codes
+
+
+def test_a_non_green_row_declaring_the_artifacts_own_corpus_is_clean():
+    """The honest shape passes: the digest the row declares IS in the artifact."""
+    record = _multi_artifact_record(_measured_row(
+        artifact_corpus_sha256=_e1e2_corpus_sha()))
+    codes = _codes(record)
+    assert "V7" not in codes, codes
+
+
+def test_the_declaration_arm_never_relaxes_GREEN():
+    """A GREEN row on another corpus is refused WHATEVER it declares.
+
+    This is the line the multi-artifact arm must not cross: a green row on a
+    corpus the run did not freeze is the failure V7 exists for, and a declaration
+    cannot buy it. (GREEN also needs 8 observed steps + a completed run, so this
+    record reds on V5 as well — V7 is the code under test.)
+    """
+    row = _measured_row(
+        verdict="GREEN", blocked_by=None,
+        artifact_corpus_sha256=_e1e2_corpus_sha(),
+        corpus_sha256=_e1e2_corpus_sha())
+    record = _multi_artifact_record(row)
+    record["run"] = {"status": "COMPLETED", "steps_observed": list(cvc.STEPS)}
+    record["prereg"] = {"sha": HEAD, "status": "OK",
+                        "artifact": "docs/evidence/7949-capstone/preregistration.json"}
+    codes = _codes(record)
+    assert "V7" in codes, codes
+
+
+def test_a_refused_measurement_is_not_a_red_row():
+    """E1's own shape: a proxy number that cannot be scored is BLOCKED, not RED.
+
+    The e1-e2 artifact's 25 Objects are under the frozen floor of 30, so the
+    record's own ``below_floor`` rule makes the measurement REFUSED — "neither a
+    pass nor a fail". A table that wrote RED there would report a verdict the
+    measurement is not entitled to; a table that wrote GREEN would be worse. The
+    shard this pins is the vocabulary: ``REFUSED`` must never leave the probe as
+    RED or GREEN.
+    """
+    measure = _load_measure_probe()
+    result = measure.outcome(measured=True, below_floor=True, passed=False,
+                             bar="after <= 0.5 x before", value="25 objects")
+    assert measure.verdict_word(result) == "BLOCKED", result
+
+
+def _load_measure_probe():
+    """Load the MEASUREMENT probe by path (the evidence dir is hyphenated)."""
+    path = _REPO / "docs/evidence/7949-capstone/probes/capstone_measure.py"
+    spec = _ilu.spec_from_file_location("capstone_measure_7949", str(path))
+    assert spec and spec.loader
+    module = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_corpus_prefix_alone_is_not_a_different_corpus():
+    """`sha256:<hex>` and `<hex>` are ONE revision, not two.
+
+    The record, `e1-e2.log` and the operator receipt each spell the digest their
+    own way. A raw string comparison reported such a row as "measured on another
+    corpus" and demanded a declaration for a formatting difference — a false
+    finding on a correct table, which is the direction this gate must never take.
+    """
+    digest = "d" * 64
+    record = _record()
+    record["corpus"] = {"path": "tests/eval/write_path", "sha256": f"sha256:{digest}"}
+    record["rows"] = [dict(r) for r in record["rows"]]
+    record["rows"][2] = _measured_row(criterion="E3", evidence="docs/evidence/7949-capstone/e1-e2.log",
+                                     corpus_sha256=digest, numerator=1, denominator=2)
+    codes = _codes(record)
+    assert "V7" not in codes, codes

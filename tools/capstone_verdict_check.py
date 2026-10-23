@@ -59,7 +59,15 @@ marked green off closed children, with no artifact at all. This closes that.
         a ``refusal`` row must cite a capstone log that carries that row
     V7  a measurement row's ``corpus_sha256`` equals the log's corpus sha —
         "every green row cites an evidence file whose before/after denominators
-        are the same corpus" — and the LOG must name a corpus to compare with
+        are the same corpus" — and the LOG must name a corpus to compare with.
+        A NON-GREEN row may cite an artifact measured on a DIFFERENT corpus
+        revision (E1/E2 cite the #9076 run, E4 cites an operator receipt whose
+        ``corpus_hash`` is not the frozen ``fixtures_hash``); it must then
+        DECLARE that revision in ``artifact_corpus_sha256``, the declaration must
+        equal the row's own ``corpus_sha256``, and the digest must appear IN the
+        cited artifact's text — so the claim is checked against the artifact
+        instead of trusted. GREEN never takes this path (V7's first arm): a green
+        row on another corpus is exactly what this rule exists to refuse.
     V8  a row naming a ``sibling`` must match that sibling's numerator AND
         denominator — the denominators are carried, not restated
     V9  --require-green (the EPIC's closing rule): 5/5 GREEN
@@ -158,6 +166,41 @@ def _count_key(value: object) -> tuple:
     if _count(value):
         return (True, value)
     return (False, type(value).__name__, repr(value))
+
+
+def _corpus_digest(value: object) -> str | None:
+    """A corpus digest as BARE lowercase hex, or ``None`` when it is not one.
+
+    The record and the artifacts each spell the same digest their own way
+    (``preregistration.json`` writes ``sha256:<hex>``; ``e1-e2.log`` writes
+    ``corpus_sha256=<hex>``), so a string comparison across them would red a
+    correct declaration on the prefix alone. Normalising here — rather than at
+    each call site — keeps the equality test about the DIGEST.
+
+    A value that is not a 64-digit hex string is not a digest, and returning
+    ``None`` for it is what makes V7 report an unusable declaration instead of
+    comparing two strings that were never digests.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value[len("sha256:"):] if value.startswith("sha256:") else value
+    return text if re.fullmatch(r"[0-9a-f]{64}", text) else None
+
+
+def _same_corpus(a: object, b: object) -> bool:
+    """Two corpus spellings of the SAME revision?
+
+    ``preregistration.json`` writes ``sha256:<hex>``, ``e1-e2.log`` writes
+    ``corpus_sha256=<hex>`` and an operator receipt writes ``sha256:<hex>`` — three
+    spellings, one digest. Comparing the raw strings would report a row as
+    "measured on a different corpus" on the prefix alone, which is the opposite of
+    what this rule is for. Where either value is not a digest at all, the raw
+    comparison stands (and the callers above have already reported the shape).
+    """
+    left, right = _corpus_digest(a), _corpus_digest(b)
+    if left is not None and right is not None:
+        return left == right
+    return a == b
 
 
 def _non_object_blocks(record: dict) -> list[tuple[str, str]]:
@@ -597,12 +640,63 @@ def check(record: dict, *, repo: Path,
                                    "its corpus (corpus.sha256 is null) — "
                                    "without it the row's corpus cannot be "
                                    "checked against anything")
-            elif row_corpus != corpus.get("sha256"):
+            elif _same_corpus(row_corpus, corpus.get("sha256")):
+                pass
+            elif verdict == "GREEN":
                 f.add("V7", where, f"corpus_sha256 {row_corpus!r} != the log's "
                                    f"{corpus.get('sha256')!r} — two corpora "
                                    "cannot share one verdict")
+            else:
+                # ⛔ A MULTI-ARTIFACT TABLE, CHECKED RATHER THAN TRUSTED. This
+                # bundle's numbers do not all come from one run: E1/E2 come from
+                # #9076's arm run and E4 from an operator receipt, and neither
+                # was measured on the corpus THIS run froze (their own records
+                # say which corpus they ran — `corpus_sha256=` in e1-e2.log,
+                # `corpus_hash` in the receipt). Refusing those rows outright
+                # would hide the only numbers E1/E2/E4 have; accepting them on
+                # the row's word would let any red row name any corpus. So the
+                # row DECLARES the artifact's revision and the declaration is
+                # verified against the ARTIFACT ITSELF — a stronger test than the
+                # one it replaces, and unreachable for a GREEN row (the arm above
+                # keeps green strict).
+                declared = row.get("artifact_corpus_sha256")
+                digest = _corpus_digest(declared)
+                if digest is None:
+                    f.add("V7", where,
+                          f"corpus_sha256 {row_corpus!r} is not the log's corpus "
+                          f"({corpus.get('sha256')!r}), so the row must declare "
+                          "the artifact's own revision in "
+                          f"artifact_corpus_sha256 (got {declared!r}) — an "
+                          "undeclared corpus is what 'two corpora cannot share "
+                          "one verdict' refuses")
+                elif _corpus_digest(row_corpus) != digest:
+                    f.add("V7", where,
+                          f"artifact_corpus_sha256 ({declared!r}) disagrees with "
+                          f"the row's corpus_sha256 ({row_corpus!r}) — the row "
+                          "must name ONE corpus for its number")
+                elif ev_path is None:
+                    pass  # V4 already reported the unusable evidence path
+                else:
+                    try:
+                        cited_text = (repo / ev_path).read_text(errors="replace")
+                    except OSError:
+                        cited_text = None
+                    if cited_text is None:
+                        pass  # V4 owns an unreadable artifact
+                    elif digest not in cited_text:
+                        f.add("V7", where,
+                              f"artifact_corpus_sha256 {digest} does not appear "
+                              f"in the cited artifact {evidence!r} — a declared "
+                              "corpus the artifact itself never records is a "
+                              "declaration nothing supports")
+                    elif not (isinstance(row.get("note"), str)
+                              and row.get("note", "").strip()):
+                        f.add("V7", where,
+                              "a row measured on a different corpus revision "
+                              "must say so in its note — the reader cannot see "
+                              "it from two digests")
         elif row_corpus and corpus.get("sha256") and \
-                row_corpus != corpus.get("sha256"):
+                not _same_corpus(row_corpus, corpus.get("sha256")):
             f.add("V7", where, "corpus_sha256 disagrees with the log's corpus")
 
     # ── V10 E4's own failing condition ────────────────────────────────
