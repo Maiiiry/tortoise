@@ -58,6 +58,18 @@
 #            are NEVER exempt (#2240 scope (c)+(a), never (b)); neither is a
 #            change to an APPLIED version (#1001).
 #
+#            ⚠ CHOOSING A NEW PREFIX — `prefix` only sees the tree it is handed
+#            and `diff` bounds a rename's DESTINATION against BASE_VERSION_MAX
+#            and REMOTE_MAX, so two branches can each pick the same "next free"
+#            version and both pass on their own (#9680: 20261022000001 was taken
+#            twice that way, and #9693/#9638/#9600 then raced for 20261023+).
+#            Scan the OPEN heads, not just the base tree, before you pick:
+#              git for-each-ref --format='%(refname)' refs/remotes/origin \
+#                | while read -r r; do git ls-tree -r --name-only "$r" \
+#                    supabase/migrations/; done \
+#                | grep -oE '/[0-9]+_' | tr -d '/_' | sort -u | tail -5
+#            and take a version strictly above the highest one you find there.
+#
 # The check logic lives in this SHARED script (not inline YAML) so the
 # hermetic pytest suite exercises the shipped logic, not a Python copy.
 #
