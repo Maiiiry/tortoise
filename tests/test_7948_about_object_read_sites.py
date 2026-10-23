@@ -4111,9 +4111,10 @@ def test_a_walk_is_bounded_only_by_a_fact_that_NAMES_IT():
 
     All three shipped green, and every other net stayed quiet too: the site count
     cannot move (the copy is on the registered line, so it is the same
-    `(symbol, line)` site), and the census's `24 keys / 36 rows` derivation is
-    unchanged. So the fact has to NAME the walk — its own relationship variable —
-    and not merely sit beside it.
+    `(symbol, line)` site), and the census derivation is unchanged (the pin below
+    carries the pair — it is the authority, and no figure is restated here, because
+    a second copy of a count rots on the next pass). So the fact has to NAME the
+    walk — its own relationship variable — and not merely sit beside it.
 
     ⚠️ **The converse is deliberate, not an oversight:** REUSING a variable name is
     not a second walk. Inside one arm, `MATCH (s)-[r]->(n) MATCH (x)-[r]->(y)` binds

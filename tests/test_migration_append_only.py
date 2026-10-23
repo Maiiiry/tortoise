@@ -1,9 +1,16 @@
-"""Hermetic tests for .github/scripts/check-migration-append-only (#1095).
+"""Tests for .github/scripts/check-migration-append-only (#1095).
 
 Builds fixture git repos and drives the SHARED script via subprocess so the
 test exercises the shipped logic (not a Python copy). Two modes:
 - prefix: duplicate prefixes + non-conforming filenames
 - diff: append-only (M/R/D rejected, A allowed) against a base SHA
+
+⚠ Not ALL of this file is hermetic, and the exceptions say so in their own
+docstrings rather than leaving the reader to discover it: the arms that guard the
+header's `CHOOSING A NEW PREFIX` paragraph and the `<version>_<leaf>` mentions in
+this repo's prefix guidance read THIS checkout. In a sparse checkout without
+`supabase/migrations/` they red — read that as the missing tree it is, not as a
+bad guard header. Everything else builds its own fixture repo in `$TMPDIR`.
 """
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -705,12 +713,14 @@ def test_approved_live_forward_renumber_still_allowed():
 #: therefore free — while `#9707` is still open on it. That is the double-booking the
 #: paragraph exists to prevent, reintroduced by its own evidence.
 #: The header is a comment block, so the example is read from the text with the
-#: leading `#` markers stripped (the paragraph wraps mid-sentence). The second party
-#: may carry a trailing reference — `blog_author_backfill_atomic #9707` — because an
-#: open PR is where a still-unmerged racer legitimately lives.
+#: leading `#` markers stripped (the paragraph wraps mid-sentence). A party may carry
+#: a trailing PR reference — `blog_author_backfill_atomic #9707` — and that marker is
+#: load-bearing rather than decorative: it is the ONLY honest way to name a racer that
+#: is not in the tree, because an open PR's claim lives on a branch, not in `main`.
 _COMMENT_PREFIX = re.compile(r"(?m)^#\s?")
+_PARTY = r"(\w+)(?:\s*#(\d+))?"
 _DOUBLE_BOOKED = re.compile(
-    r"which is how (\d{14}) was double-booked\s*\(\s*(\w+)\s+vs\s+(\w+?)[\s#()\d]*\)",
+    rf"which is how (\d{{14}}) was double-booked\s*\(\s*{_PARTY}\s+vs\s+{_PARTY}\s*\)",
     re.S,
 )
 
@@ -724,41 +734,202 @@ def _shipped_version(stem_fragment: str) -> str | None:
     return found[0] if found else None
 
 
-def test_the_double_booking_example_names_actual_racers():
-    """The header's example must not name a migration the tree ships at ANOTHER version.
+def _versions_for_leaf(leaf: str) -> set[str]:
+    """Every version this tree ships for the EXACT migration leaf `leaf`.
 
-    A party to the example that the tree carries at a DIFFERENT version is the
-    fail-open shape, not a typo: it tells a lane that the version's real holder was
-    this migration and that the peer has moved, so the version is free. Measured on
-    the shipped header before the #9693 review: it named `blog_indexnow` at
-    `20261023000001`, while this repo's `blog_indexnow` migration has only ever been
-    `20261022000001`/`20261024000001` — and `20261023000001` is held by
-    `record_session_narrative` on `main` and by `#9707` (`blog_author_backfill_atomic`)
-    still open. Pre-fix this test reds; the fix is to name the actual pair.
+    Exact, not a substring glob: a guidance scan keyed on substrings would red a
+    fixture name that merely contains a real leaf (`_a` inside `_alpha`).
+    """
+    return {
+        p.name.split("_", 1)[0]
+        for p in (REPO_ROOT / MIG).glob("*.sql")
+        if p.name.split("_", 1)[-1].removesuffix(".sql") == leaf
+    }
+
+
+def _example_problems(
+    header: str, shipped: Callable[[str], str | None] = _shipped_version
+) -> list[str]:
+    """What is wrong with the header's double-booking example — empty when it is right.
+
+    The rule, and why each half exists:
+
+    * A party the tree ships at a version OTHER than the double-booked one is the
+      fail-open shape (#9693's first wording): a lane concludes the real holder has
+      moved and takes the version.
+    * A party the tree does not ship at all must CITE ITS PR (`name #1234`). Without
+      a reference the example is unverifiable prose — the reader cannot tell "not
+      merged yet" from "never existed" — and it certifies nothing.
+    * A party that DOES cite a PR is deliberately NOT version-checked. That is the
+      post-merge state of every live race: once `#9707` lands its renumbered file,
+      its version is legitimately no longer the double-booked one, and requiring the
+      two to agree would red `main` the moment the racer fixed itself — a false red
+      with no repair, since the example cannot be made true again without rewriting
+      the paragraph. The claim being checked is "these were the two claimants", not
+      "these are their versions today".
+    """
+    match = _DOUBLE_BOOKED.search(header)
+    if not match:
+        return [
+            "the guard header no longer states the double-booking example in the form "
+            "`which is how <version> was double-booked (<a> vs <b>)` — if the wording "
+            "moved, re-point this test rather than deleting it: the paragraph is the "
+            "only place a lane is told the scan's answer is a snapshot"
+        ]
+    version = match.group(1)
+    parties = [(match.group(2), match.group(3)), (match.group(4), match.group(5))]
+    problems: list[str] = []
+    if parties[0][0] == parties[1][0]:
+        problems.append(
+            f"the header's double-booking example names `{parties[0][0]}` twice — it "
+            "must name two DIFFERENT migrations, or it is not evidence of a race"
+        )
+    for name, pr in parties:
+        if pr:
+            continue
+        observed = shipped(name)
+        if observed is None:
+            problems.append(
+                f"`{name}` is named as a racer for {version}, but no migration in "
+                "this tree carries that name and no PR reference says where it "
+                "lives — cite the open PR (`name #1234`) or name a migration that "
+                "exists"
+            )
+        elif observed != version:
+            problems.append(
+                f"`{name}` is the leaf of a migration this tree ships at {observed}, "
+                f"not at the double-booked {version}"
+            )
+    return problems
+
+
+def test_the_double_booking_example_names_actual_racers():
+    """The header's example must not name a renamed-away party as a claimant.
+
+    Measured on the shipped header before the #9693 review: it named `blog_indexnow`
+    at `20261023000001`, while this repo's `blog_indexnow` migration has only ever
+    been `20261022000001`/`20261024000001` — and `20261023000001` is held by
+    `record_session_narrative` on `main` and by `#9707`
+    (`blog_author_backfill_atomic`) still open. Pre-fix this test reds; the fix is to
+    name the actual pair, with the unmerged half's PR cited.
     """
     header = _COMMENT_PREFIX.sub("", SCRIPT.read_text(encoding="utf-8"))
-    match = _DOUBLE_BOOKED.search(header)
-    assert match, (
-        "the guard header no longer states the double-booking example in the form "
-        "`which is how <version> was double-booked (<a> vs <b>)` — if the wording "
-        "moved, re-point this test rather than deleting it: the paragraph is the "
-        "only place a lane is told the scan's answer is a snapshot"
-    )
-    version, first, second = match.group(1), match.group(2), match.group(3)
-    assert first != second, (
-        f"the header's double-booking example names `{first}` twice — it must name "
-        "two DIFFERENT migrations, or it is not evidence of a race"
-    )
-    wrong = [
-        f"`{name}` is the leaf of a migration this tree ships at "
-        f"{_shipped_version(name)}, not at the double-booked {version}"
-        for name in (first, second)
-        if (shipped := _shipped_version(name)) is not None and shipped != version
-    ]
-    assert not wrong, (
-        f"the header's double-booking example for {version} names a party the tree "
-        "carries at another version:\n  "
-        + "\n  ".join(wrong)
+    problems = _example_problems(header)
+    assert not problems, (
+        "the guard header's double-booking example does not hold against this tree:\n  "
+        + "\n  ".join(problems)
         + "\nA lane that trusts it concludes the real holder has moved and takes the "
-        "version. Name the migrations that actually raced."
+        "version. Name the migrations that actually raced, and cite the PR for a "
+        "racer that is not in the tree yet."
+    )
+
+
+def test_the_double_booking_rule_reds_on_a_party_shipped_at_another_version():
+    """Non-vacuity: the wording this test was written for must still red.
+
+    `blog_indexnow` is carried at `20261024` here, so naming it as a `20261023`
+    claimant is exactly the fail-open the paragraph was added to prevent.
+    """
+    header = (
+        "which is how 20261023000001 was double-booked "
+        "(blog_indexnow vs record_session_narrative #9707)."
+    )
+    shipped = {
+        "blog_indexnow": "20261024000001",
+        "record_session_narrative": "20261023000001",
+    }
+    problems = _example_problems(header, shipped.get)
+    assert any("blog_indexnow" in p and "20261024000001" in p for p in problems), (
+        f"the rule accepted a party the tree carries at another version: {problems}"
+    )
+
+
+def test_the_double_booking_rule_survives_the_racer_landing():
+    """The time bomb: an open racer that lands RENUMBERED must not red this suite.
+
+    `#9707` cannot merge at `20261023000001` (`main` already holds it), so it must
+    renumber. When it does, its leaf is shipped at a version that is no longer the
+    double-booked one — and before this rule was scoped, that turned this file into a
+    false red on `main`, on the very PR that repairs the collision. The PR reference
+    is what licenses the mismatch, so a header that keeps it stays green either way.
+    """
+    header = (
+        "which is how 20261023000001 was double-booked "
+        "(record_session_narrative vs blog_author_backfill_atomic #9707)."
+    )
+    shipped = {
+        "record_session_narrative": "20261023000001",
+        "blog_author_backfill_atomic": "20261025000001",  # #9707 after its renumber
+    }
+    assert _example_problems(header, shipped.get) == [], (
+        "a cited open racer that has since landed at a different version reds the "
+        "example — the false red this rule exists to avoid"
+    )
+
+
+def test_the_double_booking_rule_refuses_an_uncited_party_the_tree_does_not_ship():
+    """The converse hole: a party with no PR and no file certifies nothing.
+
+    `shipped is None` used to be skipped outright, so a header could name a
+    migration that never existed and still pass — which is exactly the "not merged
+    yet / never existed" ambiguity the example is supposed to resolve.
+    """
+    header = (
+        "which is how 20261023000001 was double-booked "
+        "(record_session_narrative vs total_nonsense)."
+    )
+    shipped = {"record_session_narrative": "20261023000001"}
+    problems = _example_problems(header, shipped.get)
+    assert any("total_nonsense" in p for p in problems), (
+        f"an uncited, non-existent party passed the rule: {problems}"
+    )
+
+
+#: The files whose prefix guidance a lane reads before choosing a version. A
+#: `<version>_<leaf>` mention in their PROSE that the tree no longer carries at that
+#: version is a stale pointer with the same harm as a stale example: the reader greps
+#: the version, finds nothing, and cannot tell whether the guidance or the tree is
+#: wrong. Code is deliberately out of scope — a fixture may legitimately construct a
+#: hypothetical duplicate pair out of real leaf names, which is not a claim about the
+#: tree, while a comment is.
+_PREFIX_GUIDANCE = (
+    SCRIPT,
+    REPO_ROOT / "tests" / "test_migration_drift_gate.py",
+)
+_MIG_MENTION = re.compile(r"\b(\d{14})_([a-z0-9_]+)")
+
+
+def _prose_lines(path: Path) -> list[tuple[int, str]]:
+    """The `#`-comment lines of a file — the half that states claims about the tree."""
+    return [
+        (n, line)
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if line.lstrip().startswith("#")
+    ]
+
+
+def test_prefix_guidance_names_no_version_the_tree_no_longer_carries():
+    """A renamed migration must not be named at the version it was renumbered away from.
+
+    Checks a prose mention only when the tree ships a migration with that exact leaf,
+    so fixture names and historical prose that names a leaf without a version are both
+    out of scope. `#9693` renumbered `blog_indexnow` off `20261022000001`, and a
+    guidance comment still pairing them is the stale pointer this arm reds.
+    """
+    problems = []
+    for path in _PREFIX_GUIDANCE:
+        for lineno, line in _prose_lines(path):
+            for version, leaf in _MIG_MENTION.findall(line):
+                versions = _versions_for_leaf(leaf)
+                if versions and version not in versions:
+                    problems.append(
+                        f"{path.relative_to(REPO_ROOT)}:{lineno}: names "
+                        f"`{version}_{leaf}`, but the tree ships that migration at "
+                        f"{sorted(versions)}"
+                    )
+    assert not problems, (
+        "prefix guidance points at a version this tree no longer carries:\n  "
+        + "\n  ".join(problems)
+        + "\nName the version the file actually sits at, or drop the figure — a "
+        "renamed migration makes the old pairing unverifiable."
     )

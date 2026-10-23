@@ -68,12 +68,29 @@
 #            invisible to a remote-only scan, which is the gap that reports live
 #            work as free (#4256; `tools/who-is-on.sh --inventory` is the
 #            supported verb for it):
+#              git fetch --prune origin
 #              git for-each-ref --format='%(refname)' refs/heads \
 #                refs/remotes/origin \
-#                | while read -r r; do git ls-tree -r --name-only "$r" \
+#                | while read -r r; do git ls-tree -r --name-only --full-tree "$r" \
 #                    supabase/migrations/; done \
 #                | grep -oE '/[0-9]+_' | tr -d '/_' | sort -u | tail -5
 #            and take a version strictly above the highest one you find there.
+#            ⚠ Three ways this prints a CONFIDENT WRONG ANSWER — all three are
+#            the "an unavailable answer is not a clean answer" rule, applied to a
+#            scan instead of to the applied set:
+#              * `git fetch` first. `refs/remotes/origin` is a cache of the LAST
+#                fetch, so a stale one answers with an old maximum and reads
+#                clean; `--prune` also stops a deleted lane branch from claiming
+#                a version forever.
+#              * `--full-tree` is not decoration: `ls-tree`'s pathspec is
+#                cwd-relative, and the natural cwd when you are editing a
+#                migration is `supabase/` — where the same command prints
+#                NOTHING and still exits 0.
+#              * An EMPTY answer is a FAILED SCAN, not a free prefix (same rule
+#                as `prefix` mode, and as `diff`'s unverified token: "An empty
+#                reading is not trusted either").
+#            No ref scan can see an uncommitted working-tree migration or another
+#            lane's checkout, so run `tools/who-is-on.sh --inventory` for that half.
 #            ⚠ The answer is a SNAPSHOT, not a reservation: two lanes scanning in
 #            the same minute read the same maximum and pick the same "next"
 #            version — which is how 20261023000001 was double-booked

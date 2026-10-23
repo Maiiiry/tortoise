@@ -498,9 +498,11 @@ def test_diagnosis_reaches_the_duplicate_branch_without_a_blocking_member():
     assert "note: 'repo-ahead' means prod has no" in r.stdout, r.stdout
     assert "produces exactly this report" not in r.stdout, r.stdout
     # The rename operand is the ACTUAL second file (the fixture's names are
-    # descriptive on purpose — the repo's duplicates all are, e.g.
-    # 20261022000001_blog_indexnow / _record_session_capture_redactions_integer),
-    # carries the migrations path so it runs from the repo root, and the
+    # descriptive on purpose, as this repo's own duplicates were: `20261022000001`
+    # carried two files — `_blog_indexnow` and
+    # `_record_session_capture_redactions_integer` — until `#9693` renumbered the
+    # first one apart, which is why this gate keys on the prefix and not on the
+    # leaf). It carries the migrations path so it runs from the repo root, and the
     # destination is the one the command uses.
     assert (
         "git mv supabase/migrations/20260813000005_second.sql"
