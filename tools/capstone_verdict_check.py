@@ -42,7 +42,15 @@ marked green off closed children, with no artifact at all. This closes that.
         with ALL eight steps observed in one pass. Its ancestry half (evidence
         does not predate the pre-registration) is answerable only where the
         measured commit is still reachable — see V11 for why that is reported
-        rather than fatal by default
+        rather than fatal by default.
+        ⛔ THE ANCESTRY INVARIANT HAS ONE OWNER: the commit-level form of it
+        ("the registration's add-commit strictly precedes every SCORED evidence
+        log") belongs to `tools/capstone_preregistration_check.py::check_ordering`,
+        which `changes` runs on every PR. V5's half is the ROW-level reading of
+        the same rule (a GREEN row's cited sha must not predate the frozen
+        registration), and it fires only for GREEN rows — which is why a bundle
+        can pass here and still red there (#9089 review P2). Do not grow a third
+        copy of this rule: change `check_ordering` and let this row reference it.
     V6  non-green requires a named blocker (``#NNN``) — *name the blocking issue*;
         a ``refusal`` row must cite a capstone log that carries that row
     V7  a measurement row's ``corpus_sha256`` equals the log's corpus sha —

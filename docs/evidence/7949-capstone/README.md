@@ -138,24 +138,24 @@ claims below are STALE, which is what the capstone run is built on:
    runner is now this probe rather than nothing.
 3. **⚠️ CORRECTED — a single entry point CAN drive all eight steps.** The body asks this
    as an open question. It resolves YES: `TortoiseSDK.capture_session` →
-   `sdk._extract_session_v2` (`sdk.py:11080`; called at `:10117`) →
-   `extractor_v2.extract_session_v2` (`extractor_v2.py:7731`), which calls, in one pass
-   (line numbers re-derived at `5767d04ac`, the merge-up of `origin/main` whose
+   `sdk._extract_session_v2` (`sdk.py:11397`; called at `:10434`) →
+   `extractor_v2.extract_session_v2` (`extractor_v2.py:7767`), which calls, in one pass
+   (line numbers re-derived at `13ad17c8c`, the THIRD merge-up of `origin/main` whose
    `sdk.py`/`extractor_v2.py` commits moved the def, its call site and every step below
-   under the previous cites — the def 308 lines, the call site 335; this is the SECOND
-   time `main` moved them while this branch was open, and the symbol is authoritative
-   while the line is a convenience, which is how the pin's earlier numbers went stale
-   here):
+   under the previous cites — +317 lines for the `sdk.py` pair, +36 for the extractor def
+   and +39 for every call site below; the symbol is authoritative and the line is a
+   convenience, which is why `tests/test_7949_capstone_verdict_check.py` re-resolves them
+   against the tree on every run):
 
    | step | call site | witness the probe reads | on the receipt? |
    |---|---|---|---|
-   | S0 READ | `_edus_from_conversation` `:7839` | `stats["edus"]`, `stats["chunks"]` | ✅ |
-   | S1 NARRATE | `run_s1` `:7872` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
-   | S2.1 EXTRACT | `run_s2` `:7896` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
-   | S2.2 VET | `_run_vet_pass` `:7925` | `result["vet"]` | ❌ **#9116** |
-   | S2.3 CLASSIFY | `_apply_classify_kinds` `:7941` | `result["classify_later"]` | ❌ **#9116** |
-   | S3 RESOLVE | `search_graph` `:7957` | `result["search"]` | ❌ **#9116** |
-   | S5 CONNECT | `execute_embed` `:8177` (+ `run_s4` `:7978` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
+   | S0 READ | `_edus_from_conversation` `:7878` | `stats["edus"]`, `stats["chunks"]` | ✅ |
+   | S1 NARRATE | `run_s1` `:7911` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
+   | S2.1 EXTRACT | `run_s2` `:7935` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
+   | S2.2 VET | `_run_vet_pass` `:7964` | `result["vet"]` | ❌ **#9116** |
+   | S2.3 CLASSIFY | `_apply_classify_kinds` `:7980` | `result["classify_later"]` | ❌ **#9116** |
+   | S3 RESOLVE | `search_graph` `:7996` | `result["search"]` | ❌ **#9116** |
+   | S5 CONNECT | `execute_embed` `:8216` (+ `run_s4` `:8017` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
    | S6 COMMIT | `execute_embed` payload | `result["payload"]` | ❌ **#9116** |
 
    So the capstone drives the **real entry point**, which is what the epic's phrase *"the
@@ -177,9 +177,9 @@ claims below are STALE, which is what the capstone run is built on:
    | issue | title (truncated) | state |
    |---|---|---|
    | `#9075` | pre-register the capstone corpus, split and scoring BEFORE any E1–E5 run | **CLOSED COMPLETED** — landed as `#9507` (`a6085af84`); the record is in this directory. Re-read 2026-10-22 at the merge-up `5767d04ac` |
-   | `#9076` | E1+E2 on one run — volume falls, correctness preserved | **OPEN** |
-   | `#9077` | E4 on the real extraction leg — wired AND persisted, no monkeypatch | **OPEN** |
-   | `#5199` | the version anchor stops at Points — `:Object`/`:Event` not version-scoped | **OPEN** |
+   | `#9076` | E1+E2 on one run — volume falls, correctness preserved | **CLOSED COMPLETED** (2026-10-21T22:51Z) — still not a row's verdict: the run predates the closure, so E1/E2 stay `UNPREREGISTERED` until the probe is RE-RUN |
+   | `#9077` | E4 on the real extraction leg — wired AND persisted, no monkeypatch | **CLOSED COMPLETED** (2026-10-22T05:34Z) — E4 still cannot be measured against the landed record: no SCORED pass has been run |
+   | `#5199` | the version anchor stops at Points — `:Object`/`:Event` not version-scoped | **CLOSED COMPLETED** (2026-10-21T05:06Z) — E3 stays `BLOCKED` until a registered run measures it |
    | `#7947` | the raw-vs-narrative measurement — D3's falsifier | **CLOSED COMPLETED** (2026-10-19) |
    | `#9116` | the run's G5 cannot observe 4 of its 8 steps — `capture_session`'s receipt carries no step surface | **OPEN** |
 

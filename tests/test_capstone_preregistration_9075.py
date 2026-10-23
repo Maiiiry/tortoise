@@ -2224,3 +2224,83 @@ def test_the_ci_pin_still_catches_a_shallow_checkout():
     assert "fetch-depth" in " ".join(violations), (
         f"the strict pin must refuse a shallow checkout by name; got {violations}"
     )
+
+
+# ── the content-based arm: a log that PROVES it measured nothing (#9089) ─────
+
+
+def _capstone_body(*, run_status="REFUSED", prereg_status="ABSENT",
+                   numerator=None, denominator=None) -> str:
+    """A capstone log whose machine record is the only thing the exemption may read."""
+    record = {
+        "schema": "capstone-verdict/1",
+        "prereg": {"status": prereg_status, "sha": "0" * 40},
+        "run": {"status": run_status, "steps_observed": [], "steps_required": ["S0"]},
+        "rows": [{"criterion": "E1", "verdict": "BLOCKED", "numerator": numerator,
+                  "denominator": denominator, "blocked_by": "#9075"}],
+    }
+    return ("# capstone\n"
+            "=== CAPSTONE-VERDICT-BEGIN ===\n"
+            f"{json.dumps(record, indent=2, sort_keys=True)}\n"
+            "=== CAPSTONE-VERDICT-END ===\n")
+
+
+def test_a_log_that_proves_it_measured_nothing_needs_no_ordering(tmp_path, monkeypatch):
+    """THE FIX (#9089): history put the log first, and the log carries NO number at all.
+
+    `capstone.log` is added before `PRE-REGISTRATION.md` because it was written before the repo
+    required a registration (#9507). The ordering rule protects a NUMBER from thresholds written
+    afterwards; a log whose own machine record says `prereg.status=ABSENT`, `run.status=REFUSED`
+    and `numerator/denominator: null` on every row has no number to launder. It is exempt on its
+    CONTENT, re-asked every run — not by pinning the file name.
+    """
+    repo = _repo(tmp_path, monkeypatch)
+    log = _write_log(repo, "capstone.log", epoch=1_700_000_000, body=_capstone_body())
+    prereg = _write_and_commit(repo, check.PREREG_NAME, epoch=1_700_000_100)
+    assert check.check_ordering(prereg, [log]) == []
+
+
+@pytest.mark.parametrize("overrides", [
+    {"numerator": 0, "denominator": 5},
+    {"run_status": "COMPLETED"},
+    {"prereg_status": "PRESENT"},
+])
+def test_the_content_arm_stops_covering_the_log_the_moment_it_could_score(
+        tmp_path, monkeypatch, overrides):
+    """Self-healing, and each of the three conditions is load-bearing on its own.
+
+    A row that gains a number, a run that COMPLETED, or a registration that was PRESENT at the
+    log's head all mean the log could have been scored against thresholds written after it — so
+    the exemption must stop applying with no second edit anywhere.
+    """
+    repo = _repo(tmp_path, monkeypatch)
+    log = _write_log(repo, "capstone.log", epoch=1_700_000_000,
+                     body=_capstone_body(**overrides))
+    prereg = _write_and_commit(repo, check.PREREG_NAME, epoch=1_700_000_100)
+    failures = check.check_ordering(prereg, [log])
+    assert len(failures) == 1, failures
+    assert "not strictly after" in failures[0], failures
+    assert "does not prove it measured nothing" in failures[0], failures
+
+
+def test_the_content_arm_refuses_to_exempt_anything_it_cannot_read():
+    """Fail-closed: a missing/!JSON/rowless record is a REFUSAL, never a pass."""
+    for body in (
+        "no machine record here\n",
+        "=== CAPSTONE-VERDICT-BEGIN ===\n{not json\n=== CAPSTONE-VERDICT-END ===\n",
+        "=== CAPSTONE-VERDICT-BEGIN ===\n{}\n=== CAPSTONE-VERDICT-END ===\n",
+        _capstone_body().replace('"status": "REFUSED"', '"status": ""'),
+    ):
+        path = PREREG_DIR.parent / "_probe_body.log"
+        path.write_text(body)
+        try:
+            ok, why = check._log_declares_no_measurement(path)
+        finally:
+            path.unlink()
+        assert not ok and why, body
+
+
+def test_the_shipped_capstone_log_proves_it_measured_nothing():
+    """The real artefact, on the real file — this is what unblocks the required check."""
+    ok, why = check._log_declares_no_measurement(PREREG_DIR / "capstone.log")
+    assert ok, why

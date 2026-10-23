@@ -173,6 +173,13 @@ EXIT_KEY = re.compile(r"(?<!\w)exit\s*=\s*(\S+)", re.MULTILINE | re.IGNORECASE)
 #: Punctuation a value may be glued to at end-of-token (``result=UNPREREGISTERED,``).
 VALUE_TRAILING = ",;."
 
+#: The capstone verdict bundle's machine record, as the log carries it. Read from the LOG's own
+#: bytes — never from a pin — so a log edited into a scored one cannot keep riding an exemption.
+CAPSTONE_RECORD = re.compile(
+    r"=== CAPSTONE-VERDICT-BEGIN ===\s*(\{.*?\})\s*=== CAPSTONE-VERDICT-END ===",
+    re.DOTALL,
+)
+
 #: Every pinned corpus quantity the machine record restates and is cross-checked against. A REQUIRED
 #: set: a pins block missing one of these is a failure, never a silently-skipped comparison.
 CROSS_CHECKED_CORPUS_KEYS = (
@@ -642,6 +649,74 @@ def _pins_mapping(pins: dict, key: str) -> dict:
     return _mapping(pins, key, "pins")
 
 
+def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
+    """Does the LOG ITSELF prove it produced NO measurement? Returns (ok, reason).
+
+    The ordering rule exists so a number cannot be scored against thresholds written
+    afterwards. A log that carries no number AT ALL has nothing to launder — and its own machine
+    record says so, in three independent places this predicate requires together:
+
+      * no row carries a ``numerator`` or a ``denominator`` (a measurement is *absent*, not
+        merely unverdicted);
+      * ``run.status`` is not ``COMPLETED`` — the run did not finish, so it did not measure;
+      * ``prereg.status`` is not ``PRESENT`` — the log states that NO pre-registration existed at
+        its head, which is the only condition under which "scored before the thresholds" is not
+        even a possible history.
+
+    ⛔ WHY THIS IS NOT A PINNED EXEMPTION (#9089). `pre_existing_unscored_logs` grandfathers a
+    FILE and therefore has to prove, forever, that the file was never edited into a scored one.
+    This predicate asks its question of the log's CONTENT on EVERY run, so it is self-healing: the
+    moment a row gains a number, or the run completes, or the registration is present, the log
+    falls back into the ordered class and this gate reds again. It is fail-closed in the same
+    direction — an unreadable log, a missing machine record, a non-JSON block, no rows, or a
+    missing status is a REFUSAL to exempt, never a pass.
+    """
+    try:
+        text = log.read_text()
+    except OSError as exc:
+        return False, f"cannot be read ({exc})"
+    match = CAPSTONE_RECORD.search(text)
+    if not match:
+        return False, "carries no capstone machine record, so it cannot prove it measured nothing"
+    try:
+        record = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        return False, f"its machine record is not JSON ({exc})"
+    if not isinstance(record, dict):
+        return False, "its machine record is not an object"
+    rows = record.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return False, "its machine record carries no rows"
+    measured = [
+        str(row.get("criterion") if isinstance(row, dict) else row)
+        for row in rows
+        if not isinstance(row, dict)
+        or row.get("numerator") is not None
+        or row.get("denominator") is not None
+    ]
+    if measured:
+        return False, (
+            f"it carries a measurement for {', '.join(measured)} — a number in the log is exactly "
+            "what the ordering rule protects"
+        )
+    run = record.get("run") if isinstance(record.get("run"), dict) else {}
+    status = str(run.get("status") or "")
+    if not status:
+        return False, "its machine record declares no run.status"
+    if status == "COMPLETED":
+        return False, "it declares run.status=COMPLETED, so the run did measure"
+    prereg = record.get("prereg") if isinstance(record.get("prereg"), dict) else {}
+    prereg_status = str(prereg.get("status") or "")
+    if not prereg_status:
+        return False, "its machine record declares no prereg.status"
+    if prereg_status == "PRESENT":
+        return False, (
+            "it declares prereg.status=PRESENT — it WAS measured against a registration, so the "
+            "ordering applies to it"
+        )
+    return True, ""
+
+
 def check_ordering(prereg: Path, logs: list[Path], pins: dict | None = None) -> list[str]:
     """``[]`` when every log is either after the registration or provably unscored.
 
@@ -719,10 +794,17 @@ def check_ordering(prereg: Path, logs: list[Path], pins: dict | None = None) -> 
                 )
             continue
         if log_epoch <= prereg_epoch:
+            ok, why = _log_declares_no_measurement(log)
+            if ok:
+                # A log that provably produced NO number cannot have been scored against
+                # thresholds chosen after it was read. Re-asked of the content on every run, so
+                # the moment it gains a number this gate reds it again (#9089).
+                continue
             failures.append(
                 f"{log.name}: added at {log_epoch} which is not strictly after the "
                 f"pre-registration's add-commit {prereg_epoch} — the log may have been scored "
-                "against thresholds chosen after it was read"
+                f"against thresholds chosen after it was read, and it does not prove it measured "
+                f"nothing ({why})"
             )
     return failures
 
