@@ -1808,6 +1808,20 @@ def test_a_checkout_with_no_resolvable_head_is_refused(tmp_path, monkeypatch):
     assert not probe.HEAD_SHA_RE.match(head), head
 
 
+def test_a_deeply_nested_verdict_block_is_a_usage_error(tmp_path):
+    """#9089 review P2: `RecursionError` is not a `JSONDecodeError`, and it must not be a verdict.
+
+    A block nested past the parser's limit used to escape `extract_block`'s ValueError
+    contract entirely and surface as a traceback with exit 1 — the code this tool
+    reserves for "the table has FINDINGS" — on a document that was never read. The
+    arm that converts it is only half the fix if nothing pins it: delete it and the
+    traceback comes back silently.
+    """
+    log = tmp_path / "deep.log"
+    log.write_text(f"{cvc.BEGIN}\n" + "[" * 100000 + f"\n{cvc.END}\n")
+    assert cvc.main([str(log)]) == 2
+
+
 def test_a_resolvable_head_override_is_what_the_rows_are_stamped_with(tmp_path):
     """The legitimate use stays legitimate: a real commit IS the measured head.
 

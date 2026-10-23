@@ -715,31 +715,39 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
 
     The ordering rule exists so a number cannot be scored against thresholds written
     afterwards. A log that carries no number AT ALL has nothing to launder — and its own machine
-    record says so, in three independent places this predicate requires together:
+    record says so, in two independent conditions this predicate requires together:
 
       * no row carries a ``numerator`` or a ``denominator`` (a measurement is *absent*, not
         merely unverdicted);
-      * ``run.status`` is not ``COMPLETED`` — the run did not finish, so it did not measure;
-      * ``prereg.status`` is ``ABSENT`` — the log states that NO pre-registration existed at
-        its head, which is the only condition under which "scored before the thresholds" is not
-        even a possible history.
+      * ``run.status`` is not ``COMPLETED`` — the run did not finish, so it did not measure.
+
+    ``prereg.status`` is REQUIRED to be present, and carries NO exemption weight (see the
+    measured over-block at the end of this docstring).
 
     ⛔ THE VOCABULARY IS THE PRODUCER'S, NOT AN INVENTED ONE (#9089 review P1). This arm used to
-    test ``prereg.status == "PRESENT"`` and to read numbers out of ``rows`` only. Neither value nor
-    container is what the probe writes: ``capstone_run.py::refuse`` records ``ABSENT`` (G0 looked
-    and found none), ``OK`` (G0 read the frozen registration) or ``UNREAD`` (the run stopped
-    before G0), and the E4 receipt lives in ``run.e4_receipt``. So the old arm was INERT — it could
-    never fire on a log the probe produced — and a log declaring ``OK`` (a registration WAS read)
-    was exempted from the ordering check that exists precisely to bind such a log to thresholds
-    written BEFORE it. Both halves are now fail-closed: only ``ABSENT`` exempts (any other value,
-    known or not, refuses), and the measurement test walks the WHOLE machine record rather than
-    the one container the predicate happens to know.
+    test ``prereg.status == "PRESENT"`` and to read numbers out of ``rows`` only. ``PRESENT`` is a
+    value ``capstone_run.py::refuse`` NEVER writes (it records ``ABSENT``, ``OK`` or ``UNREAD``),
+    so that condition was INERT, and the measurement test missed the E4 receipt because it read
+    only ``rows``. The measurement test now walks the WHOLE machine record, so a number in any
+    container this artifact can produce is a refusal.
+
+    ⛔ AND THE PREREG STATUS IS NOT AN EXEMPTION CONDITION AT ALL (#9089 review cycle 4,
+    MEASURED). A revision of this arm required ``prereg.status == "ABSENT"``; the bundle's own
+    documented re-run refutes that, measured at this head: ``capstone_run.py --prereg <sha>
+    --corpus battery/config/corpus.json`` passes G0 (the artifact is committed) and refuses at G1
+    (the registration freezes no corpus sha), emitting ``prereg.status=OK``,
+    ``run.status=REFUSED``, and every numerator/denominator null — a log that PROVES it measured
+    nothing. Refusing to exempt it turns the bundle's own acceptance command into an ordering
+    violation and a repo-wide red. The question here is what the log MEASURED, which the two arms
+    above answer exactly; the prereg status records what the run READ, and cannot by itself make
+    laundering possible (a log with no number has nothing to launder, whichever registration it
+    claims to have seen).
 
     ⛔ WHY THIS IS NOT A PINNED EXEMPTION (#9089). `pre_existing_unscored_logs` grandfathers a
     FILE and therefore has to prove, forever, that the file was never edited into a scored one.
     This predicate asks its question of the log's CONTENT on EVERY run, so it is self-healing: the
-    moment a row gains a number, or the run completes, or the registration is present, the log
-    falls back into the ordered class and this gate reds again. It is fail-closed in the same
+    moment a row gains a number, or the run completes, the log falls back into the ordered class
+    and this gate reds again. It is fail-closed in the same
     direction — an unreadable log, a missing machine record, a non-JSON block, no rows, or a
     missing status is a REFUSAL to exempt, never a pass.
     """
@@ -778,9 +786,12 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
     # or `ratio` field) would be exempted rather than refused. An unrecognised schema is a shape
     # this predicate cannot read, so it is a refusal.
     # Resolved BOTH ways on purpose: this module is imported as `tools.capstone_preregistration_check`
-    # in tests and run as a SCRIPT in CI (`python3 tools/capstone_preregistration_check.py`, which
-    # puts `tools/` on sys.path[0] and knows no package). Either spelling must find the sibling —
-    # and a sibling that cannot be found is a refusal, never a pass.
+    # in tests and run as a SCRIPT in CI (invoked by path, which puts `tools/` on sys.path[0] and
+    # knows no package). Either spelling must find the sibling — and a sibling that cannot be
+    # found is a refusal, never a pass. (The CI step's form is spelled the way the entry-point
+    # guard requires: `uv run python <path>`, never a bare `python3 <path>` in prose —
+    # tests/test_entry_point_python_guard.py::test_no_doc_or_usage_advertises_the_form_the_guard_refuses
+    # reads comments, not just docs, and redded a first version of this note.)
     try:
         import capstone_verdict_check as _cvc  # script invocation
     except ImportError:
@@ -814,15 +825,19 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
     prereg_status = str(prereg.get("status") or "")
     if not prereg_status:
         return False, "its machine record declares no prereg.status"
-    if prereg_status != "ABSENT":
-        return False, (
-            f"it declares prereg.status={prereg_status!r}, which does not say that NO "
-            "pre-registration existed at its head — the probe writes ABSENT for that fact, OK "
-            "when G0 read a registration and UNREAD when the run stopped before G0. Only ABSENT "
-            "rules out the history this rule protects (a number scored against thresholds "
-            "written afterwards); every other value, including one this predicate has never "
-            "seen, is a refusal."
-        )
+    # ⛔ NO PREREG-STATUS CONDITION (#9089 review cycle 4, MEASURED). An earlier revision exempted
+    # only on `ABSENT` and refused `OK`/`UNREAD`. The bundle's OWN documented re-run contradicts
+    # that: `capstone_run.py --prereg <sha> --corpus battery/config/corpus.json | tee
+    # docs/evidence/7949-capstone/capstone.log` passes G0 and refuses at G1, so it emits
+    # `prereg.status=OK`, `run.status=REFUSED` and every numerator/denominator null — a log that
+    # proves it measured nothing — and the ABSENT-only arm refused it, which turns the acceptance
+    # command into an ordering violation (and a repo-wide red) the moment that log is committed.
+    # The question this predicate actually asks is "did this log produce a number", and the two
+    # arms above answer it exactly: no number anywhere (including inside the E4 receipt), and a
+    # run that did not complete. The prereg status says what the run READ, not what it MEASURED,
+    # so it cannot on its own make laundering possible — a log with no number has nothing to
+    # launder whatever registration it claims to have seen. The status is still REQUIRED (a
+    # record that does not state it is a shape this predicate does not understand).
     return True, ""
 
 

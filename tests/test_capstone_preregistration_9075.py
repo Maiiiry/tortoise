@@ -2272,15 +2272,7 @@ def test_a_log_that_proves_it_measured_nothing_needs_no_ordering(tmp_path, monke
 @pytest.mark.parametrize("overrides", [
     {"numerator": 0, "denominator": 5},
     {"run_status": "COMPLETED"},
-    # #9089 review P1: this arm used to test `prereg.status="PRESENT"` — a value the
-    # PRODUCER never writes. `capstone_run.py::refuse` writes ABSENT / OK / UNREAD, so the
-    # old pin exercised a shape no real log can carry and the arm it guarded was inert.
-    # The producer's own values are the ones that must red.
-    {"prereg_status": "OK"},
-    {"prereg_status": "UNREAD"},
-    # #9089 review P1: a number is not confined to `rows`. The old predicate read only that
-    # container, so a REFUSED log carrying the E4 receipt numbers was exempted while claiming a
-    # measurement its own run status says it never took.
+    # #9089 review P1: the measurement test used to read only `rows`.
     {"receipt": {"numerator": 14, "denominator": 15}},
     # #9089 review P2: the receipt's counts are not all named numerator/denominator — the
     # probe writes `s4_items`, `merged_items`, `corrected_by_s4`, `verbatim_reemissions` and
@@ -2289,11 +2281,17 @@ def test_a_log_that_proves_it_measured_nothing_needs_no_ordering(tmp_path, monke
 ])
 def test_the_content_arm_stops_covering_the_log_the_moment_it_could_score(
         tmp_path, monkeypatch, overrides):
-    """Self-healing, and each of the three conditions is load-bearing on its own.
+    """Self-healing, and each of the two measurement conditions is load-bearing on its own.
 
-    A row that gains a number, a run that COMPLETED, or a registration that was READ at the
-    log's head all mean the log could have been scored against thresholds written after it — so
-    the exemption must stop applying with no second edit anywhere.
+    A row that gains a number, or a run that COMPLETED, means the log could have been scored
+    against thresholds written after it — so the exemption must stop applying with no second edit
+    anywhere.
+
+    The PREREG STATUS is deliberately NOT in this list (#9089 review cycle 4, measured): the
+    bundle's own documented re-run passes G0 and refuses at G1, emitting `prereg.status=OK` with
+    every number null — a log that proves it measured nothing. Requiring `ABSENT` refused to
+    exempt it, which turned that documented command into an ordering violation. What the run
+    READ cannot make laundering possible; what it MEASURED can, and that is what these cases are.
     """
     repo = _repo(tmp_path, monkeypatch)
     log = _write_log(repo, "capstone.log", epoch=1_700_000_000,
@@ -2303,6 +2301,23 @@ def test_the_content_arm_stops_covering_the_log_the_moment_it_could_score(
     assert len(failures) == 1, failures
     assert "not strictly after" in failures[0], failures
     assert "does not prove it measured nothing" in failures[0], failures
+
+
+def test_a_post_g0_refusal_with_no_number_is_exempt(tmp_path, monkeypatch):
+    """#9089 review cycle 4 — the bundle's OWN documented re-run must not turn CI red.
+
+    Measured at this head: `capstone_run.py --prereg <sha> --corpus battery/config/corpus.json`
+    passes G0 (the registration is committed) and refuses at G1 (no frozen corpus sha), so it
+    emits `prereg.status=OK`, `run.status=REFUSED` and every numerator/denominator null. An
+    earlier revision of the predicate exempted only `ABSENT` and therefore refused this log —
+    which, once committed by the README's own `| tee`, reds the ordering check for every PR on
+    a log that provably measured nothing.
+    """
+    repo = _repo(tmp_path, monkeypatch)
+    log = _write_log(repo, "capstone.log", epoch=1_700_000_000,
+                     body=_capstone_body(prereg_status="OK"))
+    prereg = _write_and_commit(repo, check.PREREG_NAME, epoch=1_700_000_100)
+    assert check.check_ordering(prereg, [log]) == []
 
 
 def test_the_content_arm_refuses_to_exempt_anything_it_cannot_read(tmp_path):
