@@ -170,6 +170,42 @@ def test_docs_scanning_gates_stay_in_tier1():
         "`_ALLOWED_TRANSITIONS` merges green (#4309 class, same as #8495's "
         "sibling row)"
     )
+    assert "test_v4_declared_mechanisms.py" in tier1, (
+        "#9778 review (P1): the declared-mechanism MEMBERSHIP gate derives the "
+        "declared set from the `<!-- v4-mechanism: <id> -->` markers in "
+        "docs/architecture/**/*.md — `docs/` is in NON_PYTHON_PREFIXES, so a "
+        "docs-only diff runs tier1 only (EXTRACTOR-V4-ARCHITECTURE.md takes "
+        "the early return, STORAGE-ARCHITECTURE.md selects `onboarding`, and "
+        "`core` is added only when NOTHING matched); registered in `core` "
+        "alone, deleting or renaming a marker merged green while the gate was "
+        "red on main (#4309/#3616 class, same dual registration as the six "
+        "sibling test_extractor_v4_* doc guards)"
+    )
+
+
+def test_v4_membership_gate_runs_on_both_architecture_docs():
+    """#9778 review (P2): pin the SELECTION, not just the manifest string.
+
+    The `tier1` assertion above catches a deleted row, but the load-bearing half
+    of the reasoning had no test: `STORAGE-ARCHITECTURE.md` matches the
+    `onboarding` SOURCE_PATTERNS entry, so its plan is `surfaces=['onboarding']`
+    — a surface that does NOT contain the gate and whose `tier1` union is the
+    only thing that runs it. That is why `core` alone is insufficient, and this
+    file's idiom for such a registration is a behavioural assertion (as at
+    :func:`test_g5_destructive_half_doc_guards_run_on_a_docs_only_diff`).
+
+    Measured: 131 files for the STORAGE diff (`onboarding`), 60 for the
+    EXTRACTOR diff (empty surfaces, the early return); the gate is in the
+    selected set in both, and dropping the `tier1` row removes it from both.
+    """
+    storage = _sel(["docs/architecture/STORAGE-ARCHITECTURE.md"])
+    assert storage["surfaces"] == ["onboarding"], storage["surfaces"]
+    assert storage["full"] is False
+    assert "test_v4_declared_mechanisms.py" in storage["test_files"]
+
+    extractor = _sel(["docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md"])
+    assert extractor["surfaces"] == [], extractor["surfaces"]
+    assert "test_v4_declared_mechanisms.py" in extractor["test_files"]
 
 
 def test_g5_destructive_half_doc_guards_run_on_a_docs_only_diff():
@@ -482,6 +518,44 @@ def test_the_engine_pin_guards_are_selected_on_the_files_they_pin():
         assert guard in r["test_files"], (
             f"{changed} does not select {guard} — nothing checks the engine pin "
             f"on the one diff that can revert it (selected: {r['test_files']})"
+        )
+
+
+def test_the_9572_seed_surface_pins_are_selected_on_their_own_modules():
+    """#9572 review P2-2: a seed-surface pin must run on the module it pins.
+
+    `tests/test_9572_discriminator_not_clobbered.py` was registered `core`
+    ONLY, and `core` is the FALLBACK that a `SOURCE_PATTERNS` match REPLACES in
+    `select()`. Two of its cases pin the onboarding seed surfaces —
+    `_OrgSeedSurface` in `tortoise/hosted_api.py` (an EXACT `api` match) and
+    `_SdkSeedSurface` in `tortoise/onboarding/selfhost.py` (an `onboarding`
+    prefix match) — so on a diff touching either module the file was not
+    selected at all (measured before the entries: `surfaces=['api']` /
+    `['onboarding']` with the guard ABSENT from `test_files`).
+
+    That is the #1349/#2938 silent-drop class in its harmful direction: a PR
+    that reintroduces `def create_subject(self, name, subjectKind="other",
+    **props)` — literally the code #9572 removes — would run `api`/`onboarding`
+    and never the guard. `git grep -n "_OrgSeedSurface\|_SdkSeedSurface"` over
+    the tree finds no other test exercising either surface.
+
+    Asserted on the FILE and the SURFACE, not on non-emptiness: BOTH surfaces
+    are selected without the entry, so a `surfaces` check alone can only pass.
+    """
+    guard = "test_9572_discriminator_not_clobbered.py"
+    for changed, surface in (
+            ("tortoise/hosted_api.py", "api"),
+            ("tortoise/onboarding/selfhost.py", "onboarding")):
+        assert (REPO / changed).exists(), f"pinned file is gone: {changed}"
+        r = _sel([changed])
+        assert surface in r["surfaces"], (
+            f"{changed} selects {r['surfaces']}, not {surface} — the premise "
+            "of this pin changed; re-derive it"
+        )
+        assert guard in r["test_files"], (
+            f"{changed} does not select {guard} — the seed-surface pin sleeps "
+            "on the one diff that can re-fabricate the kind it forbids "
+            f"(selected: {r['test_files']})"
         )
 
 
@@ -2880,6 +2954,33 @@ def test_runner_autoscale_installer_change_selects_core_not_tier1():
     assert "core" in r["surfaces"], r
     assert "test_install_runner_autoscale_schedule.py" in r["test_files"], r
     assert r["full"] is False, r
+
+
+def test_install_ci_runner_x64_tool_change_selects_core_not_tier1():
+    # #9639 review P1: tools/install-ci-runner-x64.sh owns
+    # tests/test_ci_runner_x64_install.py — the label invariant (this arch's own marker only,
+    # never `self-hosted-arm64` or a `ubuntu-<version>` pin, and `--fallback auto` READS the
+    # gate's state instead of assuming it), the headroom guards, and the 1/2/3 exit contract.
+    #
+    # `tools/` is a flat NON_PYTHON_PREFIXES entry and no SOURCE_PATTERNS entry matches an
+    # installer path, so before the CORE_ALSO entry an INSTALLER-ONLY change came back with
+    # `changed == []`, took the docs-only early return and fell back to tier-1 smoke — the
+    # #1349/#3332/#3616 silent-drop class: the guard never ran on the file it guards.
+    #
+    # The guard is ALSO a `carve_out` member (subprocess-only, no graph, no URI), so it is
+    # stripped from `test_files` by design — the assertion is that the carve-out POOL carries it
+    # and that `core` is selected, not that it rides in the diff selection.
+    #
+    # Mutation check: removing the CORE_ALSO entry makes the first assert fail (surfaces == []).
+    from tools.ci_selection import carve_out_files  # noqa: I001
+
+    r = _sel(["tools/install-ci-runner-x64.sh"])
+    assert r["surfaces"] == ["core"], r
+    assert r["full"] is False, r
+    assert "test_ci_runner_x64_install.py" in carve_out_files(load_manifest()), r
+    assert r["carve_out_run"] is True, r
+    # and it is not merely tier-1 smoke: the selection carries core's own members too
+    assert set(r["test_files"]) != _tier1(), r
 
 
 def test_ci_queue_health_tool_change_selects_core_not_tier1():
