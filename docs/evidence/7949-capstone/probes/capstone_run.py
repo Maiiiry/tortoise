@@ -85,8 +85,15 @@ a guess.
 Run:
     python docs/evidence/7949-capstone/probes/capstone_run.py \\
         --prereg <frozen pre-registration commit> --corpus <corpus> \\
-        | tee docs/evidence/7949-capstone/capstone.log
-    python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone.log
+        --out docs/evidence/7949-capstone/capstone-<sha>.log
+    python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone-<sha>.log
+
+⛔ NEVER write a run over ``docs/evidence/7949-capstone/capstone.log``: that file is the
+shipped PRE-LANDING REFUSAL and its add-commit predates the pre-registration, so the
+only log it can hold is one that measured nothing (``capstone_preregistration_check``
+enforces exactly that, and its comparison uses the file's OLDEST add-commit — a scored
+run written there could never be un-redded by a later re-run). ``--out`` takes the path
+for a scored run.
 
 ``--head <sha>`` RE-STAMPS the run at another commit of the SAME TREE (a tag, or
 this tree checked out elsewhere) — it does not measure different code. It is

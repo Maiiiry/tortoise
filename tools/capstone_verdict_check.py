@@ -12,8 +12,12 @@ acceptance command:
 
     python docs/evidence/7949-capstone/probes/capstone_run.py \\
         --prereg <frozen pre-registration commit> --corpus <pre-registered corpus> \\
-        | tee docs/evidence/7949-capstone/capstone.log
-    python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone.log
+        --out docs/evidence/7949-capstone/capstone-<sha>.log
+    python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone-<sha>.log
+
+(A scored run is NEVER written over ``capstone.log``: that shipped file is the
+pre-landing REFUSAL record, and its add-commit predates the pre-registration —
+see ``docs/evidence/7949-capstone/README.md``.)
 
 The runner EMITS the verdict table (``capstone-verdict-v1``, between the two
 marker lines); this tool CHECKS it. Splitting them is the point: the run is

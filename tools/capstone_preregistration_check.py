@@ -554,6 +554,11 @@ def _log_declares_unscored(log: Path) -> tuple[bool, str]:
         text = log.read_text()
     except OSError as exc:
         return False, f"cannot be read ({exc})"
+    except UnicodeDecodeError as exc:
+        # #9089 review cycle 6: this one read without the errors="replace" the sibling predicate
+        # uses, so a non-UTF-8 log raised past every CheckError handler and surfaced as exit 1 —
+        # the code reserved for FINDINGS — on a log the tool never read.
+        return False, f"cannot be read as UTF-8 ({exc})"
     declared = ""
     for line in text.splitlines():
         if line.startswith("prereg="):
@@ -949,7 +954,11 @@ def check_machine_record(directory: Path, pins: dict) -> list[str]:
         return [f"no {MACHINE_RECORD} beside {PREREG_NAME} — the evidence probe reads the "
                 "machine record, so a document alone is not a registration it can consume"]
     try:
-        record = json.loads(path.read_text())
+        raw = path.read_text()
+    except UnicodeDecodeError as exc:
+        return [f"{MACHINE_RECORD} is not valid UTF-8: {exc}"]
+    try:
+        record = json.loads(raw)
     except (json.JSONDecodeError, RecursionError) as exc:
         return [f"{MACHINE_RECORD} is not JSON: {exc}"]
     if record.get("schema") != PREREG_SCHEMA:
@@ -1079,7 +1088,7 @@ def check_machine_record(directory: Path, pins: dict) -> list[str]:
     if missing:
         failures.append(f"{MACHINE_RECORD} omits criteria rows {missing}")
 
-    for match in FOUR_EDGE_RATE.finditer(path.read_text()):
+    for match in FOUR_EDGE_RATE.finditer(raw):
         failures.append(
             f"{MACHINE_RECORD}: four-edge denominator rate {match.group(0)!r} — the record is "
             "frozen by the run probe, so the forbidden denominator may not appear here either"
@@ -1251,7 +1260,18 @@ def run(directory: Path, use_git: bool = True, use_corpus: bool = True) -> dict:
     prereg = directory / PREREG_NAME
     if not prereg.is_file():
         raise CheckError(f"no {PREREG_NAME} in {directory}")
-    text = prereg.read_text()
+    try:
+        text = prereg.read_text()
+    except UnicodeDecodeError as exc:
+        # #9089 review cycle 6: 
+        # "a check that cannot read its subject must never report success" — and it must not
+        # report a VERDICT either. A non-UTF-8 document raised UnicodeDecodeError, which is not a
+        # CheckError, so `main` exited 1 (the code for findings) on a document it never read.
+        # Exit 2 is the documented answer for an unreadable subject.
+        raise CheckError(
+            f"{PREREG_NAME} is not valid UTF-8 ({exc}) — an unreadable document is a check "
+            "that could not be performed, never a finding about its content"
+        ) from exc
     rows = parse_criteria_rows(text)
     pins = parse_pins(text)
 

@@ -696,6 +696,20 @@ def test_cli_exits_two_when_the_document_is_absent(tmp_path, capsys):
     assert "no PRE-REGISTRATION.md" in capsys.readouterr().err
 
 
+def test_cli_exits_two_when_the_document_is_not_utf8(tmp_path, capsys):
+    """#9089 review cycle 6: an undecodable document is a CHECK ERROR, not a finding.
+
+    A non-UTF-8 `PRE-REGISTRATION.md` raised `UnicodeDecodeError`, which is not a
+    `CheckError`, so it escaped `main`'s handler and surfaced as a traceback with exit 1 —
+    the code this tool reserves for FINDINGS, on a document it never read. Exit 2 is the
+    documented answer for an unreadable subject (`docs/capstone_verdict_check`'s sibling
+    reader got the same hardening in this PR).
+    """
+    (tmp_path / check.PREREG_NAME).write_bytes(b"# pre-registration\n\xff\xfe not utf-8\n")
+    assert check.main(["--dir", str(tmp_path), "--no-git", "--no-corpus"]) == 2
+    assert "not valid UTF-8" in capsys.readouterr().err
+
+
 def test_cli_exits_one_on_a_broken_document(tmp_path, capsys):
     target = _doc(tmp_path, _rows(
         "| E1 | shape Objects written |  | `<= 0.50 × before` |",

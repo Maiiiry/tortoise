@@ -272,9 +272,13 @@ TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest \
 # bundle does NOT establish").
 python docs/evidence/7949-capstone/probes/capstone_run.py \
     --prereg <pre-registration commit> --corpus <pre-registered corpus> \
-    | tee docs/evidence/7949-capstone/capstone.log
-python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone.log --require-green
+    --out docs/evidence/7949-capstone/capstone-<sha>.log
+python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone-<sha>.log --require-green
 ```
+
+⛔ **Not over `capstone.log`**: that file is the pre-landing REFUSAL record and stays as it
+is — see the note below on why a scored run written into it reds the ordering check
+permanently.
 
 `--head <sha>` (optional) **re-stamps** the run at another commit of the SAME TREE — a
 re-run against a tag, or the same tree checked out elsewhere. It is validated, not
