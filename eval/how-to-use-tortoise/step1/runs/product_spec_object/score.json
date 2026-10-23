@@ -52,7 +52,7 @@
     {
       "severity": "P1",
       "item": "ship the memory API",
-      "finding": "two homes: Point 'The beta memory API ships on 2026-11-15 (plan v2 s' holds this item, and so does object 'Beta memory API plan v1' \u2014 one fact, two layers, so neither answers alone",
+      "finding": "two homes: Point 'The beta memory API ships on 2026-11-15 (plan v2 s' holds this item, and so does object 'Beta memory API plan v2' \u2014 one fact, two layers, so neither answers alone",
       "fix": "keep the object node and express the Point reading as a claim ABOUT it (\u00a73 edges), never as a second home"
     },
     {

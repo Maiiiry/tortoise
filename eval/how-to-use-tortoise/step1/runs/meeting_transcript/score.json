@@ -24,9 +24,9 @@
     {
       "item": "killing the self-serve tier",
       "expected": "event",
-      "written": "BOTH event:meeting and Point:decision",
+      "written": "Point:decision",
       "node": "The self-serve tier is being killed. Decision made 2026-09-14 by Dana (CEO), eff",
-      "verdict": "TWO-HOMES"
+      "verdict": "LAYER"
     },
     {
       "item": "Dana",
@@ -77,10 +77,10 @@
       "fix": "use a declared Object kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
-      "severity": "P1",
+      "severity": "P0",
       "item": "killing the self-serve tier",
-      "finding": "two homes: Point 'The self-serve tier is being killed. Decision made' holds this item, and so does event 'Pricing & self-serve decision meeting' \u2014 one fact, two layers, so neither answers alone",
-      "fix": "keep the event node and express the Point reading as a claim ABOUT it (\u00a73 edges), never as a second home"
+      "finding": "LAYER confusion: expected event, written as Point ('The self-serve tier is being killed. Decision made 2026-09-14 by Dana ') \u2014 a decision made at a moment is a TIMELINE record (\u00a75 state-centric: decision is an eventKind), not a Point",
+      "fix": "re-file as event; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
     },
     {
       "severity": "P1",
@@ -171,8 +171,8 @@
     "venture"
   ],
   "severity_counts": {
-    "P0": 1,
-    "P1": 8,
+    "P0": 2,
+    "P1": 7,
     "P2": 0
   }
 }

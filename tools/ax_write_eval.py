@@ -457,24 +457,35 @@ def _match(
 
 
 def _expected_layer_twin(item: str, nodes: list[dict], layer: str) -> dict | None:
-    """A node on the EXPECTED layer that also names this item, if any.
+    """A node on the EXPECTED layer that genuinely carries this item, if any.
 
-    A lower bar than `_match` (a third of the item's stems, at least two of
-    them): the question here is not "which node is the item" but "does the layer
-    the gold asked for carry it at all", and a differently-worded Event ("… joins
-    …" vs "… joined …") still carries it.
+    The bar is two thirds of the item's stems (and at least two of them), not a
+    third: "the expected layer also names it" is a claim that the graph
+    DISPROVES an absence, so a node that merely shares a couple of topic words
+    must not qualify. Measured: at a third, the meeting Event "Pricing &
+    self-serve decision meeting" qualified for the item "killing the self-serve
+    tier" (2 of 4 stems) and turned a real absence into a weaker finding.
+
+    Ties break toward the node that is not superseded and then toward the
+    tighter text — on the product-spec input both plan versions name the ship
+    date, and the REPLACED plan is not the one holding it.
     """
     want = _tokens(item)
     if len(want) < 2:
         return None
-    best, best_hit = None, 0
+    best_key: tuple | None = None
+    best_node: dict | None = None
     for node in nodes:
         if node["layer"].lower() != layer.lower() or node["is_operator"]:
             continue
         hit = len(want & _tokens(node["text"]))
-        if hit >= 2 and hit >= len(want) / 3 and hit > best_hit:
-            best, best_hit = node, hit
-    return best
+        ratio = hit / len(want)
+        if hit < 2 or ratio < 0.6:
+            continue
+        key = (ratio, node["status"].lower() != "superseded", -len(node["text"]))
+        if best_key is None or key > best_key:
+            best_key, best_node = key, node
+    return best_node
 
 
 def score(record_doc: dict, gold: dict, input_id: str) -> dict:

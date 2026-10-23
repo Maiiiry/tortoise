@@ -344,6 +344,48 @@ def test_two_homes_is_a_P1_and_absence_is_a_P0():
     assert verdicts["tobias lund"] == "LAYER"
 
 
+def test_the_stemmer_is_what_keeps_tense_from_reading_as_absence():
+    """Removing `_stem` used to leave every test green while three findings moved.
+
+    With the stemmer disabled, `duplicate_entity` loses its Event ("renew" vs
+    "renewal") and reads as a LAYER P0 — one of the three false P0s a review
+    found. This pins the mechanism, not just the two-homes branch.
+    """
+    assert axe._tokens("renewal") == axe._tokens("renew")
+    assert axe._tokens("joins") == axe._tokens("joined") == axe._tokens("join")
+    assert axe._tokens("3 engineer-weeks") == {"engineer", "week"}
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [{"item": "renew in january", "layer": "event", "kind": ["occurrence"]}],
+        }
+    )
+    doc = _record(
+        nodes=[_node("Event", "Northwind Logistics confirmed January renewal", kind="occurrence")]
+    )
+    result = axe.score(doc, gold, "x")
+    assert result["item_rows"][0]["verdict"] == "OK", (
+        "a singular/plural difference must not read as an absent item"
+    )
+
+
+def test_the_gold_file_does_not_carry_boilerplate_operator_rules():
+    """`expect_mitigation: false` on nine inputs was the bug, not the fix.
+
+    The code path was pinned; the ARTIFACT it was fixed in was not, so
+    re-adding the boilerplate left every test green while turning the research
+    input's sanctioned mitigation into a P0.
+    """
+    gold = json.loads(GOLD.read_text())
+    forbidden = [e["id"] for e in gold["inputs"] if e.get("expect_mitigation") is False]
+    assert forbidden == ["contradicting_claim"], (
+        "a dampener may only be forbidden where the gold argues truth is at issue; "
+        f"boilerplate found on {forbidden}"
+    )
+    missing_nand = [e["id"] for e in gold["inputs"] if "expect_nand" not in e]
+    assert not missing_nand, f"every input states whether a NAND is expected: {missing_nand}"
+
+
 def test_the_committed_gold_file_has_ten_inputs_with_pairwise_confusions():
     """Step 1's own contract: ten representative inputs, each naming the ADJACENT pair."""
     gold = json.loads(GOLD.read_text())
@@ -393,11 +435,42 @@ def test_the_reported_totals_match_the_committed_records():
         totals["P0"] += record["severity_counts"]["P0"]
         totals["P1"] += record["severity_counts"]["P1"]
         with_p0 += 1 if record["severity_counts"]["P0"] else 0
-    assert totals == {"P0": 13, "P1": 33}, f"report claims 13/33, records say {totals}"
+    assert totals == {"P0": 14, "P1": 32}, f"report claims 14/32, records say {totals}"
     assert with_p0 == 6, f"report claims 6 of 10 inputs carry a P0, records say {with_p0}"
     doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
-    assert "13 P0 and 33 P1" in doc, "the evidence doc's headline drifted from the records"
+    assert "14 P0 and 32 P1" in doc, "the evidence doc's headline drifted from the records"
     assert "6 of 10 inputs" in doc
+
+    # The CLASS counts drifted twice while the headline held, so they are pinned
+    # to the records too — an enumeration is the easiest number to get wrong.
+    classes = {"undeclared": 0, "census": 0, "layer": 0, "two_homes": 0, "wrong_kind": 0}
+    undeclared_inputs = set()
+    for path in sorted((GOLD.parent / "runs").glob("*/score.json")):
+        record = json.loads(path.read_text())
+        for finding in record["findings"]:
+            text = finding["finding"]
+            if "UNDECLARED kind" in text:
+                classes["undeclared"] += 1
+                undeclared_inputs.add(record["input"])
+            elif text.startswith("graph-wide"):
+                classes["census"] += 1
+            elif "LAYER confusion" in text:
+                classes["layer"] += 1
+            elif "two homes" in text:
+                classes["two_homes"] += 1
+            elif "frozen set" in text:
+                classes["wrong_kind"] += 1
+    assert classes == {
+        "undeclared": 16,
+        "census": 8,
+        "layer": 9,
+        "two_homes": 2,
+        "wrong_kind": 5,
+    }, f"report's class table drifted from the records: {classes}"
+    assert len(undeclared_inputs) == 6
+    assert "16 scored items across 6 inputs" in doc
+    assert "9 items across 5 inputs" in doc
+    assert "2 items across 2 inputs" in doc
 
 
 @pytest.mark.parametrize("layer", axe.LAYERS)
