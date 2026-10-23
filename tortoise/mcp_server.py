@@ -1347,13 +1347,25 @@ async def _resolve_graph_argument(ref: str | None,
     arrival = _wait_bound_arrival()
     remaining = (float(_mcp_auth._TRANSPORT_WAIT_BOUND_S) if arrival is None else max(
         0.0, _mcp_auth._TRANSPORT_WAIT_BOUND_S - (_time.monotonic() - arrival)))
+    # `asyncio.timeout`, NOT `wait_for`: `wait_for` raises `TimeoutError` for
+    # BOTH its own deadline and any builtin `TimeoutError` (`socket.timeout` IS
+    # `TimeoutError` on 3.12) escaping the lookup — a control-plane read that
+    # times out would be reported as a breach of OUR budget, discarding the
+    # real cause. `cm.expired()` is the only thing that distinguishes them (the
+    # same conflation `_await_under_mcp_wait_bound` guards for handler bodies).
+    budget = None
     try:
         # `to_thread` is this layer's existing idiom for a short blocking read
         # (`mcp_auth` runs the geo check the same way); bounded above, so a slow
         # control plane cannot hold a worker indefinitely.
-        plan = await asyncio.wait_for(
-            asyncio.to_thread(_mcp_auth.plan_graph_target, ref), timeout=remaining)
+        async with asyncio.timeout(remaining) as budget:
+            plan = await asyncio.to_thread(
+                _mcp_auth.plan_graph_target, ref)
     except TimeoutError:
+        if budget is None or not budget.expired():
+            # Raised INSIDE the lookup, not by this deadline: re-raise so the
+            # caller sees the real failure instead of a bogus "retry after Ns".
+            raise
         raise ToolError(
             f"{_mcp_auth._TRANSPORT_WAIT_BOUND_MESSAGE} (The graph lookup "
             f"exceeded the wait budget.) Retry after "
@@ -1369,6 +1381,34 @@ async def _resolve_graph_argument(ref: str | None,
         from tortoise.record_writer import use_record_tenant
 
         stack.enter_context(use_record_tenant(*tenant))
+
+
+def _dispatch_graph_name() -> str:
+    """The graph NAME a handler must address for THIS dispatch (#9340).
+
+    Some handlers name their graph themselves and hand the name to
+    `tortoise.navigation`, whose `db.select_graph(graph_name)` is what actually
+    picks the graph — `_get_org_sdk()`'s scoping alone cannot reach it. They
+    must take the name from HERE, or `graph=` is advertised on them and then
+    silently ignored: the call is scoped to the selected graph, the read lands
+    on the workspace default, and the caller gets HTTP 200 from the wrong
+    graph. That is the silent-wrong-graph class #9340 exists to close, so the
+    rule lives in one function rather than in each handler.
+
+    HTTP/self-host only — callers keep their stdio branch (it honours the
+    handler's own `graph_name` argument for operator use). The namespace can
+    only be non-None when `plan_graph_target` matched a `public.graphs` row
+    whose own `org_id` is THIS workspace (and refused a graph-bound credential
+    a re-target), so the value is the resolver's verified row, never caller
+    input — the #236 cross-tenant guard is intact.
+    """
+    # Read through `_mcp_auth` rather than a module-level import of the
+    # ContextVar: adding that global binding re-compiles
+    # `tortoise_session_capture`'s code object (its own local import of the
+    # same name compiles differently), which re-stamps an owner-reviewed
+    # `served_from` row for a handler this change does not touch.
+    return (_mcp_auth._current_graph_namespace.get()
+            or f"org_{_current_org_id.get()}")
 
 
 async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None, *,
@@ -3221,10 +3261,12 @@ def tortoise_entity_profile(entity_id: str, hops: int = 2,
     """
     from tortoise.navigation import entityProfile
     proj = _get_org_sdk()._get_proj()
-    # #236: HTTP mode ignores user-supplied graph_name — org graph authoritative
-    # (cross-tenant injection guard). Stdio mode honors it (operator use).
+    # #236: HTTP mode ignores the USER-SUPPLIED graph_name — org graph
+    # authoritative (cross-tenant injection guard). Stdio honors it (operator
+    # use). #9340: the graph the call SELECTED still wins over the workspace
+    # default, or this tool advertises an argument it then ignores.
     if _transport_mode.get() == "http":
-        graph_name = f"org_{_current_org_id.get()}"
+        graph_name = _dispatch_graph_name()
     return _safe(entityProfile, proj.db, graph_name, entity_id,
                   hops=hops, pointKind=pointKind, confidenceMin=confidenceMin)
 
@@ -3237,9 +3279,10 @@ def tortoise_traverse(entity_id: str, max_hops: int = 2,
     """
     from tortoise.navigation import tortoise_traverse as _traverse
     proj = _get_org_sdk()._get_proj()
-    # #236: HTTP mode ignores user-supplied graph_name (cross-tenant guard)
+    # #236: HTTP mode ignores the user-supplied graph_name (cross-tenant
+    # guard); #9340: the SELECTED graph is still honoured over the default.
     if _transport_mode.get() == "http":
-        graph_name = f"org_{_current_org_id.get()}"
+        graph_name = _dispatch_graph_name()
     return _safe(_traverse, proj.db, graph_name, entity_id, max_hops)
 
 
@@ -3580,7 +3623,10 @@ def tortoise_analyze(question: str,
             # #236: HTTP mode must use the org graph, NOT the hardcoded
             # "tortoise" graph — that hardcode bypasses org isolation via
             # db.select_graph() (cross-tenant read). Stdio keeps "tortoise".
-            gname = f"org_{_current_org_id.get()}" if _transport_mode.get() == "http" else "tortoise"
+            # #9340: the SELECTED graph wins over the workspace default, or
+            # the anchors come from a different graph than the analysis runs on.
+            gname = (_dispatch_graph_name()
+                     if _transport_mode.get() == "http" else "tortoise")
             profile = entityProfile(proj.db, gname, entityId, hops=2)
             ids = {entityId}
             for category in profile.get("connected", {}).values():

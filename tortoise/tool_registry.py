@@ -1519,8 +1519,10 @@ def get_tool_by_name() -> dict[str, ToolDefinition]:
 #: Tools that must NOT advertise (nor honour) the `graph` argument: they
 #: already name a graph explicitly (`graph_id`), address the WORKSPACE rather
 #: than a graph, or are the discovery surface itself. ONE constant, read by
-#: both the schema extension below and `mcp_server._apply_graph_argument`, so
-#: the advertised set and the honoured set cannot drift apart.
+#: both the schema extension below and the dispatch seam
+#: (`mcp_server._take_graph_argument` for the strip + exclusion refusal,
+#: `mcp_server._resolve_graph_argument` for the resolve/scope half), so the
+#: advertised set and the honoured set cannot drift apart.
 #:
 #: ⛔ The WORKSPACE-level entries are not a judgement call: each one calls
 #: `mcp_server._reject_graph_bound_mcp_org_surface`, which refuses whenever a
@@ -1551,7 +1553,8 @@ GRAPH_ARGUMENT_EXCLUDED: frozenset[str] = frozenset({
 GRAPH_ARGUMENT_DESCRIPTION = (
     "Optional graph to act on. Omitted = the workspace's default graph. "
     "Accepts, in order of preference: the graph's id, the namespace string "
-    "tortoise_list_graphs returns for it (e.g. `org_<workspace>_<graph_id>`), "
+    "`tortoise_list_graphs` returns for it (e.g. `org_<workspace>_<graph_id>` "
+    "— that tool lists namespaces, not ids), "
     "or its name when that name is unique in this workspace. An unknown, "
     "ambiguous, deleted or other-workspace graph is refused. A HOSTED "
     "workspace connection only: a stdio or self-host server has no workspace "
@@ -1567,8 +1570,9 @@ def _with_graph_argument(tool: Any, name: str) -> Any:
     `config/surface-manifest.yml` are derived from the HANDLER, and a per-tool
     signature edit would re-stamp every row of an owner-reviewed baseline for
     one uniform argument. The parameter is honoured centrally, at the single
-    dispatch point (`mcp_server._apply_graph_argument`), so this declaration
-    and the behaviour cannot disagree.
+    dispatch point (`mcp_server._take_graph_argument` strips it and refuses it
+    on an excluded tool; `mcp_server._resolve_graph_argument` resolves and
+    scopes the request), so this declaration and the behaviour cannot disagree.
 
     `GRAPH_ARGUMENT_EXCLUDED` tools keep their schema untouched; a caller that
     sends the argument to one of them is refused centrally, so an excluded tool

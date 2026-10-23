@@ -22,6 +22,16 @@ What these tests pin, in the decision's own terms:
 * the surface — the argument is advertised on graph-touching tools and NOT on
   the tools that name their graph explicitly, and the HANDLER signatures are
   untouched (the owner-reviewed `served_attributes` baseline does not move).
+* the argument is HONOURED where it is advertised — a handler that names its
+  own graph (`tortoise_entity_profile`, `tortoise_traverse`, `tortoise_analyze`)
+  reads the SELECTED namespace, not the workspace default, and the derivation
+  that asserts it is proven non-vacuous in both directions (no handler names
+  the default itself; every graph-naming handler routes through the one
+  sanctioned helper). Advertising an argument a handler then ignores is the
+  same silent wrong-graph class as not having it.
+* a lookup that fails with its OWN `TimeoutError` (a control-plane/socket
+  timeout — `socket.timeout` IS `TimeoutError` on 3.12) surfaces that failure
+  instead of being misreported as a breach of the transport wait budget.
 
 Before this change there was no argument at all: `tortoise_query(graph=...)`
 was not a call a connector could make, so every one of these cases was
@@ -496,6 +506,42 @@ def test_the_dispatch_resolution_is_bounded_and_refuses_legibly(monkeypatch):
         mcp_auth._current_org_id.reset(org)
 
 
+def test_a_lookup_timeout_is_not_misreported_as_our_budget(monkeypatch):
+    """A control-plane `TimeoutError` is not a breach of the TRANSPORT budget.
+
+    `asyncio.wait_for` converts BOTH its own deadline and any builtin
+    `TimeoutError` raised inside the awaited coroutine into `TimeoutError`, so a
+    control-plane or socket timeout (`socket.timeout` IS `TimeoutError` on 3.12)
+    would be reported to the caller as "the graph lookup exceeded the wait
+    budget … Retry after Ns" — a wrong, retry-shaped story about a failure that
+    has nothing to do with the caller's arrival budget, with the real cause
+    discarded. `cm.expired()` is the only thing that distinguishes them.
+    """
+    def _boom(ref):
+        raise TimeoutError("postgrest: connection timed out")
+
+    monkeypatch.setattr(mcp_auth, "plan_graph_target", _boom)
+    org = mcp_auth._current_org_id.set(ORG_A)
+
+    async def _dispatch():
+        stack = contextlib.ExitStack()
+        try:
+            await mcp_server._resolve_graph_argument("g_fund_a", stack)
+        finally:
+            stack.close()
+
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            asyncio.run(_dispatch())
+        assert "wait budget" not in str(excinfo.value), (
+            "our transport budget blamed for the lookup's own timeout: "
+            f"{excinfo.value}")
+        assert "postgrest" in str(excinfo.value), (
+            "the real cause was discarded, so the caller cannot act on it")
+    finally:
+        mcp_auth._current_org_id.reset(org)
+
+
 def test_the_wiring_scopes_the_dispatch_and_never_forwards_the_key(monkeypatch):
     """`_wrapped_call_tool` is the ONLY thing that makes the feature work.
 
@@ -774,3 +820,177 @@ def test_the_handler_signatures_are_unchanged():
         fn = getattr(mcp_server, name)
         assert "graph" not in inspect.signature(fn).parameters, (
             f"{name}'s signature grew a `graph` parameter")
+
+
+# ── the argument must be HONOURED where it is advertised ───────────────────
+
+
+class _FakeProj:
+    db = "DB"
+
+
+class _FakeScopedSDK:
+    """Stands in for `_get_org_sdk()` — the scoping half must not be re-proven."""
+
+    def _get_proj(self):
+        return _FakeProj()
+
+
+@pytest.fixture
+def _http_workspace(monkeypatch):
+    """An HTTP dispatch in ORG_A, with the graph layer stubbed out."""
+    mode = mcp_auth._transport_mode.set("http")
+    org = mcp_auth._current_org_id.set(ORG_A)
+    monkeypatch.setattr(mcp_server, "_get_org_sdk", lambda: _FakeScopedSDK())
+    yield
+    mcp_auth._transport_mode.reset(mode)
+    mcp_auth._current_org_id.reset(org)
+
+
+@pytest.mark.parametrize("handler,fn_name", [
+    ("tortoise_entity_profile", "entityProfile"),
+    ("tortoise_traverse", "tortoise_traverse"),
+])
+def test_the_selected_graph_reaches_the_navigation_call(
+        monkeypatch, _http_workspace, handler, fn_name):
+    """`db.select_graph(graph_name)` is what picks the graph, not the SDK scope.
+
+    `tortoise_entity_profile` and `tortoise_traverse` compute a Falkor
+    namespace themselves and hand it to `tortoise.navigation`; `_get_org_sdk()`
+    is scoped correctly by the argument, so the ONLY thing that decides which
+    graph is read is this name. Naming `org_<org_id>` here meant
+    `graph="Fund A"` returned the workspace DEFAULT graph with HTTP 200 and no
+    signal — the advertised-then-ignored defect #9340 exists to close.
+    """
+    import tortoise.navigation as navigation
+
+    seen = {}
+
+    def _capture(db, graph_name, *args, **kwargs):
+        seen["graph_name"] = graph_name
+        return {"entity": {}, "connected": {}}
+
+    monkeypatch.setattr(navigation, fn_name, _capture)
+    ns = mcp_auth._current_graph_namespace.set(FUND_A["namespace"])
+    try:
+        getattr(mcp_server, handler)("e1")
+    finally:
+        mcp_auth._current_graph_namespace.reset(ns)
+
+    assert seen.get("graph_name") == FUND_A["namespace"], (
+        f"{handler} read {seen.get('graph_name')!r} — the workspace default — "
+        f"while the call selected {FUND_A['namespace']!r}")
+
+
+def test_a_selected_default_graph_still_reads_the_workspace_namespace(
+        monkeypatch, _http_workspace):
+    """No selection ⇒ the #236 default is unchanged, byte for byte."""
+    import tortoise.navigation as navigation
+
+    seen = {}
+
+    def _capture(db, graph_name, *args, **kwargs):
+        seen["graph_name"] = graph_name
+        return {"entity": {}, "connected": {}}
+
+    monkeypatch.setattr(navigation, "entityProfile", _capture)
+    mcp_server.tortoise_entity_profile("e1")
+    assert seen["graph_name"] == f"org_{ORG_A}"
+
+
+def test_the_caller_cannot_name_the_namespace_itself(monkeypatch, _http_workspace):
+    """#236 stays intact: on HTTP the argument is the ONLY way to move the graph.
+
+    The selected namespace comes from the resolver's verified `public.graphs`
+    row. The handler's own `graph_name` parameter is caller input and must stay
+    ignored on HTTP, or the cross-tenant injection guard is reopened.
+    """
+    import tortoise.navigation as navigation
+
+    seen = {}
+
+    def _capture(db, graph_name, *args, **kwargs):
+        seen["graph_name"] = graph_name
+        return {"entity": {}, "connected": {}}
+
+    monkeypatch.setattr(navigation, "entityProfile", _capture)
+    mcp_server.tortoise_entity_profile("e1", graph_name="org_org_b")
+    assert seen["graph_name"] == f"org_{ORG_A}", (
+        "a caller-supplied graph_name selected the graph on the HTTP lane")
+
+
+def test_analyze_derives_its_anchors_from_the_selected_graph(
+        monkeypatch, _http_workspace):
+    """The anchor set and the analysis must read the SAME graph.
+
+    `tortoise_analyze` derives `entity_subgraph_ids` from a profile and then
+    runs `analyze()` on the selected projection. Deriving the anchors from the
+    workspace default while analysing the selected graph means an entity that
+    exists only in the selected graph yields an empty anchor set, and the
+    surrounding `except Exception: pass` silently widens the call to a
+    full-graph analysis — a different question answered than the one asked.
+    """
+    import tortoise.analyze as analyze_mod
+    import tortoise.navigation as navigation
+
+    seen = {}
+
+    def _capture(db, graph_name, entity_id, hops=2):
+        seen["graph_name"] = graph_name
+        return {"entity": {"id": entity_id}, "connected": {"points": [{"id": "p1"}]}}
+
+    monkeypatch.setattr(navigation, "entityProfile", _capture)
+    monkeypatch.setattr(analyze_mod, "analyze",
+                        lambda *a, **kw: {"answer": "ok", "raw": []})
+    monkeypatch.setattr(mcp_server, "_analyze_llm_budget_available", lambda: False)
+
+    ns = mcp_auth._current_graph_namespace.set(FUND_A["namespace"])
+    try:
+        mcp_server.tortoise_analyze("where is the disagreement?", entityId="e1")
+    finally:
+        mcp_auth._current_graph_namespace.reset(ns)
+
+    assert seen.get("graph_name") == FUND_A["namespace"], (
+        f"the anchors came from {seen.get('graph_name')!r} while the analysis "
+        f"ran on {FUND_A['namespace']!r}")
+
+
+def test_no_advertised_handler_names_the_workspace_default_itself():
+    """The complement of the workspace-level derivation: HONOURED, not ignored.
+
+    Derived from handler SOURCE, because the earlier derivation only looked for
+    `_reject_graph_bound_mcp_org_surface` callers and so could not see this
+    class — a handler that computes `org_<org_id>` itself and hands it to
+    `db.select_graph()`, reading the default graph while the call is scoped to
+    another. The one sanctioned site is `_dispatch_graph_name()`; anything else
+    must be excluded from the argument.
+    """
+    import re
+
+    advertised = {t.name for t in asyncio.run(mcp_server.mcp.list_tools())}
+    helper_source = inspect.getsource(mcp_server._dispatch_graph_name)
+    assert re.search(r'f"org_\{', helper_source), (
+        "the detector no longer matches the sanctioned site — it cannot fail, "
+        "so it proves nothing")
+
+    offenders = []
+    routed = set()
+    for name in sorted(advertised):
+        fn = getattr(mcp_server, name, None)
+        if fn is None or not inspect.isfunction(fn):
+            continue
+        source = inspect.getsource(fn)
+        if "_dispatch_graph_name(" in source:
+            routed.add(name)
+        if name in mcp_auth.GRAPH_ARGUMENT_EXCLUDED:
+            continue
+        if re.search(r'f"org_\{', source) and "_dispatch_graph_name(" not in source:
+            offenders.append(name)
+
+    assert not offenders, (
+        "these tools advertise `graph` and then name the workspace default "
+        f"graph themselves, so the selection is silently ignored: {offenders}")
+    assert routed >= {"tortoise_entity_profile", "tortoise_traverse",
+                      "tortoise_analyze"}, (
+        "a graph-naming handler stopped reading the dispatch's selection: "
+        f"{sorted(routed)}")
