@@ -2895,6 +2895,18 @@ surfaces:
   # Registered beside its sibling capture tests; `tortoise/sdk.py` is a
   # SHARED_MODULE, so an sdk.py-only change already runs the full matrix.
   - test_capture_validfrom_3945.py
+  # #5064: the declared-mechanism gate. `core` is its classification home and
+  # the lane for a code diff; `tier1` is REQUIRED because half the gate's subject
+  # is now DOCUMENT — `membership_errors()` reads the
+  # `<!-- v4-mechanism: <id> -->` markers in `docs/architecture/**/*.md` — and this
+  # file is in NEITHER named surface a docs-only diff can select. `docs/` is in
+  # NON_PYTHON_PREFIXES, so the mechanism differs by document: an
+  # EXTRACTOR-V4-ARCHITECTURE.md-only diff takes `select()`'s early return
+  # (`surfaces=[]`, 60 files) while a STORAGE-ARCHITECTURE.md-only diff is
+  # claimed by the `onboarding` SOURCE_PATTERNS entry (`surfaces=['onboarding']`,
+  # 131 files) — neither selects `core`. Measured for both: the gate is selected
+  # only once this `tier1` row exists, which is the same placement every sibling
+  # v4 doc-subject guard uses (#5092).
   - test_v4_declared_mechanisms.py
   # #4495: `pricing.allowance_reachability` — cap vs allowance quantised at the
   # node boundary — lives in tortoise/pricing.py, which matches no SOURCE_PATTERNS
@@ -3475,7 +3487,11 @@ surfaces:
   # `docs/architecture/STORAGE-ARCHITECTURE.md`-only diff does NOT take
   # `select()`'s early return — that path is claimed by the `onboarding`
   # `SOURCE_PATTERNS` entry, so `select()` returns `surfaces=['onboarding'],
-  # full=False, 121 files` — re-derive it after any `tier1` addition (this change added one); a `docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md`-only
+  # full=False, 131 files`. ⚠️ Re-derive that figure after any `tier1` addition,
+  # and do not attribute its whole history to one row: #5064's row accounts for
+  # exactly ONE of those files (measured: 130 at the commit before it, 131
+  # after), so the `121` this comment used to carry was already 9 short before
+  # the row existed. A `docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md`-only
   # diff DOES take the early return (`surfaces=[]`). The guard is selected in
   # both cases (measured: `guard_selected=True` for either doc), which is the
   # property that matters — `tier1` is unconditional in the tier-2 selection and
@@ -5896,6 +5912,19 @@ tier1:
 # `ast`-only shape, and the same docs-only PR is exactly the change that can
 # falsify a claim it pins (or tidy the marker away).
 - test_extractor_v4_s4_stage_claims.py
+# #5064: the declared-mechanism gate (`core` above) — its membership half scans
+# `docs/architecture/**/*.md` for the `v4-mechanism:` markers, so a docs-only PR is
+# exactly the change that can delete, rename or forge one with the gate absent
+# from the tier-1 arm. Same no-DB, doc/`ast` shape as the guards above.
+# ⚠️ #9778 review (P1): the docs-only diff really does reach this entry, and the
+# mechanism differs by DOCUMENT — measured with `tools/ci_selection.py`:
+# EXTRACTOR-V4-ARCHITECTURE.md takes `select()`'s early return (`surfaces=[]`,
+# 60 files) while STORAGE-ARCHITECTURE.md matches the `onboarding` entry
+# (`surfaces=['onboarding']`, 131 files), and `core` is added only when NOTHING
+# matched. Registered in `core` alone the gate was asleep on the exact diff class
+# that can red it (#1349/#3332/#3616 silent-drop class); pinned by
+# `tests/test_ci_selection.py::test_docs_scanning_gates_stay_in_tier1`.
+- test_v4_declared_mechanisms.py
 # #8495: the same document's per-step FAILURE-POLICY guard (`core` above) — same
 # no-DB shape, and the same docs-only PR is exactly the change that can drop or
 # contradict the declared policy.
