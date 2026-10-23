@@ -84,7 +84,7 @@ for e in sdk.get_events("observation", limit=200):
     if e.get("name") != EVENT_NAME:
         continue
     linked = sdk._get_proj().g.query(
-        "MATCH (e)-[r]->() WHERE e.id = '%s' RETURN count(r)" % e["id"]
+        f"MATCH (e)-[r]->() WHERE e.id = '{e['id']}' RETURN count(r)"
     ).result_set[0][0]
     if linked:
         ev_id = e["id"]           # already wired by a prior run: reuse

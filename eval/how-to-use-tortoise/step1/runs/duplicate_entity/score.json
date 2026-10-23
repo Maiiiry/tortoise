@@ -59,7 +59,7 @@
       "severity": "P1",
       "item": "(kinds)",
       "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['contract']",
-      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -77,11 +77,13 @@
   "sources": [
     "urn:document:northwind-logistics-sow"
   ],
+  "mitigations": [],
   "kind_census": {
     "Source": [
       "contract"
     ]
   },
+  "cross_axis_kinds": [],
   "packs": [
     "agent-ops",
     "dev",

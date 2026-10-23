@@ -48,20 +48,14 @@
     {
       "severity": "P0",
       "item": "(truth-vs-relevance)",
-      "finding": "a contradicting claim was filed with NO NAND against the attacked Point (operators present: ['IMPL']; mitigations: 1) \u2014 truth was not attacked",
+      "finding": "a contradicting claim was filed with NO NAND against the attacked Point (operators present: ['IMPL']; mitigations: 1 \u2014 relevance was dampened where truth was at issue) \u2014 truth was not attacked",
       "fix": "a contradiction attacks the TRUTH of the Point (NAND); mitigation dampens an operator's RELEVANCE (w_eff = w x (1-strength))"
-    },
-    {
-      "severity": "P0",
-      "item": "(truth-vs-relevance)",
-      "finding": "1 INVALIDATES/mitigation edge(s) written on an input that needs none \u2014 relevance dampening applied where truth is at issue",
-      "fix": "do not dampen an operator when the claim itself is wrong; NAND the Point"
     },
     {
       "severity": "P1",
       "item": "(kinds)",
       "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Event: ['observation']",
-      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -75,11 +69,15 @@
     "IMPL"
   ],
   "sources": [],
+  "mitigations": [
+    "mitigated_by: ? -> [MITIGATION] The 2026-08-28 audit was sc"
+  ],
   "kind_census": {
     "Event": [
       "observation"
     ]
   },
+  "cross_axis_kinds": [],
   "packs": [
     "agent-ops",
     "dev",
@@ -89,7 +87,7 @@
     "venture"
   ],
   "severity_counts": {
-    "P0": 3,
+    "P0": 2,
     "P1": 2,
     "P2": 0
   }

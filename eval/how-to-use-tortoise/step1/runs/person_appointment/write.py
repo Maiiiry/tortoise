@@ -122,7 +122,7 @@ edges = [
 
 for relation, from_id, to_id in edges:
     res = sdk.create_edge(relation, from_id, to_id)
-    print(f"EDGE {relation:16s} {str(res.get('created')):5s} {from_id} -> {to_id}")
+    print(f"EDGE {relation:16s} {res.get('created')!s:5s} {from_id} -> {to_id}")
 
 print("IDS", {"source": src, "subject_marta": marta, "subject_tobias": tobias,
               "object_northwind": northwind, "object_halcyon": halcyon,

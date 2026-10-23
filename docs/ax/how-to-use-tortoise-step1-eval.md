@@ -83,7 +83,7 @@ severity rules the review skills use:
 | Severity | Rule |
 |---|---|
 | **P0** | layer confusion (an item filed on a different label than its gold layer) · item absent/absorbed · no Source at all · a contradicting claim filed with no operator · relevance dampening where truth is at issue · change written without supersession |
-| **P1** | a kind **no vocabulary declares** (core §5 or a loaded pack) · the graph-wide census of undeclared kinds beyond the gold · **two homes** for one item (the expected layer holds it *and* a second layer does) · a declared-but-wrong kind · duplicate nodes for one entity · Source nodes with zero claim→source edges · a NAND where nothing contradicts · a node with no kind property |
+| **P1** | a kind **no vocabulary declares** (core §5 or a loaded pack) · a kind written on **another layer's property** (`subjectKind` on an Object — nothing on the Object layer reads it) · the graph-wide census of undeclared kinds beyond the gold · **two homes** for one item (the expected layer holds it *and* a second layer does) · a declared-but-wrong kind · duplicate nodes for one entity · Source nodes with zero claim→source edges · a NAND where nothing contradicts · a node with no kind property |
 
 The matcher is deliberately dumb (token overlap). A fuzzy matcher would *hide*
 the exact failure being measured: a `Northwind Logistics Ltd` that became a
@@ -104,11 +104,11 @@ uv run python eval/how-to-use-tortoise/step1/setup.py \
 ```
 
 The instrument's scoring rules are pinned by
-`tests/test_ax_write_eval.py` (21 tests, no database needed):
+`tests/test_ax_write_eval.py` (31 tests, no database needed):
 
 ```bash
 TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_ax_write_eval.py -q
-# 21 passed
+# 31 passed
 ```
 
 ## Results — measured 2026-10-22, ten runs
@@ -116,9 +116,21 @@ TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_ax_write_eval.py -q
 Every number below is recomputed from the graph each agent wrote. Each run
 directory holds **both** halves — `graph.json` (every node's label, kind and id,
 every edge) and `score.json` (the verdicts read from it) — beside the agent's own
-`write.py`. Running `score()` again over a committed `graph.json` reproduces its
-`score.json` exactly; that is what makes these numbers auditable rather than
-asserted.
+`write.py`. Re-scoring a committed `graph.json` reproduces its `score.json`
+exactly — one command, no database:
+
+```bash
+uv run python tools/ax_write_eval.py score \
+    --graph eval/how-to-use-tortoise/step1/runs/contradicting_claim/graph.json \
+    --id contradicting_claim --out /tmp/rescore
+```
+
+That is what makes these numbers auditable rather than asserted, and
+`test_rescoring_a_committed_graph_reproduces_its_score` pins it for all ten
+runs. A `graph.json` written before the kind-axis fix carries one `kind` per
+node and no `kind_prop`/`foreign_kinds`; the scorer falls back to the layer's
+own property, so old records stay scorable and the ten committed verdicts are
+unchanged by that fix.
 
 | # | Input cell | P0 | P1 | Layers written | The failure |
 |---|---|---|---|---|---|
@@ -130,10 +142,10 @@ asserted.
 | 6 | duplicate entity | 0 | 3 | 3 Point · 1 Subject · 1 Object · 1 Event · 1 Source | the **alias was correctly folded onto the existing node** (no duplicate — the measurable this input exists for); the renewal lands on an Event, but with `eventKind: customerCommitment` (undeclared) and a `subjectKind: person` |
 | 7 | regulatory filing | 0 | 2 | 5 Point · 2 Subject · 1 Object · 1 Event · 1 Source | no layer failure and no undeclared kind: Source + subject kinds correct (`core:organization` is the **declared** spelling); the two figures use the legacy `observation` kind rather than `statement` |
 | 8 | person appointment | 2 | 4 | 4 Point · 2 Subject · 5 Object · 1 Event · 1 Source | the **organisation and the role** written as Objects; `subjectKind: person` ×2; the appointment Event carries an undeclared `eventKind: employmentStart` |
-| 9 | contradicting claim | 3 | 2 | 7 Point · 1 Event | **no NAND** — the contradiction was answered by *mitigating the IMPL operator*: relevance dampened where truth was at issue. No Source written at all |
+| 9 | contradicting claim | 2 | 2 | 7 Point · 1 Event | **no NAND** — the contradiction was answered by *mitigating the IMPL operator*: relevance dampened where truth was at issue. No Source written at all |
 | 10 | product spec | 2 | 2 | 4 Point · 1 Subject · 2 Object · 1 Event · 1 Source | **two homes** for the ship date (plan Object + target Point); the success bar is only a Point; v1's dates are Points, not on the v1 Object |
 
-**Aggregate: 13 P0 and 33 P1 across the ten inputs; 6 of 10 inputs carry at
+**Aggregate: 12 P0 and 33 P1 across the ten inputs; 6 of 10 inputs carry at
 least one P0, and no input is clean graph-wide.** Two inputs are *near* misses —
 the correction (0 P0, two undeclared kinds elsewhere) and the duplicate (0 P0,
 the alias fold correct) — and saying so is the point: the failures are not
@@ -143,13 +155,13 @@ distributed evenly, they cluster where a *judgement* has to be made.
 
 | Class | Count | What it looked like |
 |---|---|---|
-| **Undeclared kind** (neither a core §5 kind nor one any loaded pack declares) | 16 scored items across 7 inputs | `subjectKind` ∈ {`person` ×6, `company` ×2, `investor`, `authorGroup`} · `objectKind: offering` · `pointKind: issue` ×2 · `sourceKind: research` · `eventKind: customerCommitment`, `employmentStart`. Every one accepted by the write path (warn-not-block, #1934). **Not** counted: `core:organization` (the declared key), `disbursement`/`tranche`/`estimate` (the venture/pm packs declare them) |
+| **Undeclared kind** (neither a core §5 kind nor one any loaded pack declares) | 16 scored items across 6 inputs | `subjectKind` ∈ {`person` ×6, `company` ×2, `investor`, `authorGroup`} · `objectKind: offering` · `pointKind: issue` ×2 · `sourceKind: research` · `eventKind: customerCommitment`, `employmentStart`. Every one accepted by the write path (warn-not-block, #1934). **Not** counted: `core:organization` (the declared key), `disbursement`/`tranche`/`estimate` (the venture/pm packs declare them) |
 | **Uncatalogued kinds beyond the gold** (the graph-wide census, 8 inputs) | 8 findings | the gold names some items; the census asks the whole graph. It is what keeps a near-miss from reading 0/0 — `pointKind: incident`, `eventKind: correction` / `planRevision` / `meetingTranscript`, `objectKind: openQuestion`/`governanceSeat`/`deliverable`, `sourceKind: spec`/`note`/`contract` |
 | **Layer confusion — only the wrong layer holds the item** | 8 items across 4 inputs | portfolio: ARR + headcount as Points · decision request: goal, deadline, estimate · person appointment: organisation, role · product spec: the success bar |
 | **Two homes — the right layer holds it AND a second one does** | 3 items across 3 inputs | decision request: the request (Event + Point) · meeting: the decision (meeting Event + decision Point) · product spec: the ship date (plan Object + target Point). Weaker than an absence, and a different instruction: express the second reading as a claim *about* the node |
 | **Wrong-but-declared kind** (legacy-valid, not invented) | 5 | `pointKind: observation` where the state-centric ruling says `statement`; `eventKind: disbursement` where the occurrence is an occurrence/milestone. A different lesson from an invented kind, which is why the instrument separates them |
 | **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it — the matcher's stems miss "slips"/"slip") and product spec: v1's dates. Both are human-verified below |
-| **Truth vs relevance** | 1 input, 2 facets | contradicting claim: no NAND **and** a mitigation applied. One root failure, counted as two findings and stated as one failure |
+| **Truth vs relevance** | 1 input, 1 finding | contradicting claim: no NAND, with the dampener named inside that finding (the record's `mitigations` shows the `mitigated_by` edge). One act, one finding — it used to be charged twice |
 | **NAND where nothing contradicts** | 1 | meeting: one NAND operator with two edges (onto the comms plan, onto the slip forecast). A judgment call, and the instrument treats it as a finding because a contradiction operator on a claim nobody attacked computes a wrong confidence |
 | **Provenance** | 1 | contradicting claim wrote no Source at all. Nine of ten runs wrote one; the route that worked is `create_point(extractedFrom=[url])` — a **property**, not an edge verb |
 | **Duplicate identity** | 0 | the one input built to produce a duplicate produced none: the alias was folded onto the existing Object. This is the measurable the document must keep |
@@ -201,6 +213,27 @@ Round 2:
     total of 14). Every number in this section is now recomputed from the
     records and pinned by `test_the_reported_totals_match_the_committed_records`.
 
+Round 3:
+11. **One write was charged twice.** `contradicting_claim` carried a P0 for the
+    missing NAND *and* a second P0 for the mitigation that replaced it — one act,
+    two findings, so the aggregate counted it twice. The dampener is now named
+    **inside** the missing-NAND finding (and in the record's `mitigations`), the
+    standalone dampener rule fires only when no NAND-less contradiction already
+    accounts for the write, and the totals moved 13/33 → **12/33**.
+12. **The test that was supposed to catch the instrument's own worst false
+    positive could not fail.** Its two nodes tied at 0.80, so list order decided
+    the verdict and the whole same-layer preference could be deleted with the
+    suite still green. The fixture now makes the wrong-layer node an exact match
+    (1.0) against a 0.867 correct-layer one, and the test asserts the raw ranking
+    puts the wrong-layer node first — deleting the preference now reds it.
+13. **`KIND_PROP` was declared and referenced nowhere.** The record read the
+    kind through one `coalesce` across all five kind properties, so it could not
+    say WHICH property carried it — and a kind on the wrong axis (`eventKind` on
+    an Object) read back as a legal-looking kind. Each layer is now read from its
+    own property, a foreign-axis kind is kept as `foreign_kinds` and reported as
+    its own **P1 cross-axis** finding (gold-named nodes) or inside the
+    graph-wide census.
+
 Still true, and stated as a limit rather than a rule: the matcher is token
 overlap with a crude stemmer. **Two "item absent" verdicts remain
 human-verified as present** (meeting: the 80% forecast was written as a Point,
@@ -239,7 +272,7 @@ Derived from the classes above, in the order an agent has to decide.
    for anything that can act or be acted upon, `Object` only for the thing whose
    state changes.
 4. **Kinds come from the declared vocabulary — and the two axes are not one.**
-   The most common single failure (16 scored items, 7 of 10 inputs) is an
+   The most common single failure (16 scored items, 6 of 10 inputs) is an
    invented kind: `subjectKind: person`, `company`, `investor`, `authorGroup`.
    And the paper got `sourceKind: research`, which is the *genre* axis
    (`documentKind`). Rule: pick the kind the layer's vocabulary declares (§5
