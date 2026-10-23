@@ -1,0 +1,75 @@
+{
+  "input": "contradicting_claim",
+  "cell": "contradicting claim",
+  "confuses": [
+    "truth-vs-relevance",
+    "NAND-vs-mitigation"
+  ],
+  "counts": {
+    "Point": 7,
+    "Subject": 0,
+    "Object": 0,
+    "Event": 1,
+    "Source": 0
+  },
+  "item_rows": [
+    {
+      "item": "scoped to the hardware only",
+      "expected": "point:statement",
+      "written": "Point:statement",
+      "node": "The safety audit Solstice Robotics passed on 2026-08-28 was scoped to hardware o",
+      "fuzzy": true,
+      "verdict": "OK"
+    },
+    {
+      "item": "two open findings",
+      "expected": "point:statement",
+      "written": "Point:issue",
+      "node": "Auditors have flagged two open findings in the Solstice Robotics firmware-scope ",
+      "fuzzy": true,
+      "verdict": "KIND-UNDECLARED"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "P1",
+      "item": "two open findings",
+      "finding": "UNDECLARED kind 'issue' on a Point ('Auditors have flagged two open findings in the Sol') \u2014 no vocabulary declares it (declared Point kinds: 9); nothing routes to, finds or classifies it",
+      "fix": "use a declared Point kind (\u00a75 / pack kindDefs)"
+    },
+    {
+      "severity": "P0",
+      "item": "(provenance)",
+      "finding": "no Source node written; every claim is uncheckable",
+      "fix": "write the source (\u00a74.6) and tie claims to it with extractedFrom"
+    },
+    {
+      "severity": "P0",
+      "item": "(truth-vs-relevance)",
+      "finding": "a contradicting claim was filed with NO NAND against the attacked Point (operators present: ['IMPL']; mitigations: 1) \u2014 truth was not attacked",
+      "fix": "a contradiction attacks the TRUTH of the Point (NAND); mitigation dampens an operator's RELEVANCE (w_eff = w x (1-strength))"
+    },
+    {
+      "severity": "P0",
+      "item": "(truth-vs-relevance)",
+      "finding": "1 INVALIDATES/mitigation edge(s) written on an input that needs none \u2014 relevance dampening applied where truth is at issue",
+      "fix": "do not dampen an operator when the claim itself is wrong; NAND the Point"
+    }
+  ],
+  "relations": [
+    "IMPL",
+    "INPUT",
+    "aboutPoint",
+    "mitigated_by",
+    "related"
+  ],
+  "operators": [
+    "IMPL"
+  ],
+  "sources": [],
+  "severity_counts": {
+    "P0": 3,
+    "P1": 1,
+    "P2": 0
+  }
+}

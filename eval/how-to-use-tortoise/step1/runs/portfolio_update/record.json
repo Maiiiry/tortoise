@@ -1,0 +1,126 @@
+{
+  "input": "portfolio_update",
+  "cell": "portfolio update",
+  "confuses": [
+    "Object-vs-Event",
+    "Event-vs-Object"
+  ],
+  "counts": {
+    "Point": 5,
+    "Subject": 3,
+    "Object": 2,
+    "Event": 3,
+    "Source": 1
+  },
+  "item_rows": [
+    {
+      "item": "Northwind Logistics",
+      "expected": "subject:organization",
+      "written": "Subject:company",
+      "node": "Northwind Logistics",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "Acme Capital",
+      "expected": "subject:organization",
+      "written": "Subject:investor",
+      "node": "Acme Capital",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "Solstice Robotics",
+      "expected": "subject:organization",
+      "written": "Subject:company",
+      "node": "Solstice Robotics",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "Series B",
+      "expected": "event:occurrence|milestone",
+      "written": "Event:milestone",
+      "node": "Northwind Logistics closed a Series B round",
+      "fuzzy": true,
+      "verdict": "OK"
+    },
+    {
+      "item": "tranche 2",
+      "expected": "event:occurrence|milestone",
+      "written": "Event:disbursement",
+      "node": "Acme Capital released tranche 2 to Solstice Robotics",
+      "fuzzy": true,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "$8.4M",
+      "expected": "object",
+      "written": "Point:observation",
+      "node": "Northwind Logistics ARR is $8.4M as of 2026-08, up from $5.1M at our entry.",
+      "verdict": "LAYER"
+    },
+    {
+      "item": "74 people",
+      "expected": "object",
+      "written": "Point:observation",
+      "node": "Solstice Robotics headcount is 74 people as of 2026-09-30, up from 61 in Q1 2026",
+      "verdict": "LAYER"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "P1",
+      "item": "Northwind Logistics",
+      "finding": "UNDECLARED kind 'company' on a Subject ('Northwind Logistics') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+    },
+    {
+      "severity": "P1",
+      "item": "Acme Capital",
+      "finding": "UNDECLARED kind 'investor' on a Subject ('Acme Capital') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+    },
+    {
+      "severity": "P1",
+      "item": "Solstice Robotics",
+      "finding": "UNDECLARED kind 'company' on a Subject ('Solstice Robotics') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+    },
+    {
+      "severity": "P1",
+      "item": "tranche 2",
+      "finding": "UNDECLARED kind 'disbursement' on a Event ('Acme Capital released tranche 2 to Solstice Roboti') \u2014 no vocabulary declares it (declared Event kinds: 16); nothing routes to, finds or classifies it",
+      "fix": "use a declared Event kind (\u00a75 / pack kindDefs)"
+    },
+    {
+      "severity": "P0",
+      "item": "$8.4M",
+      "finding": "LAYER confusion: expected object, written as Point ('Northwind Logistics ARR is $8.4M as of 2026-08, up from $5.1M at our e') \u2014 current state of the company \u2014 \u00a74.3 holds *now*; a released tranche / passed audit is what makes it true (Event\u2192fold)",
+      "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+    },
+    {
+      "severity": "P0",
+      "item": "74 people",
+      "finding": "LAYER confusion: expected object, written as Point ('Solstice Robotics headcount is 74 people as of 2026-09-30, up from 61 ') \u2014 now-state, not a claim",
+      "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+    }
+  ],
+  "relations": [
+    "IMPL",
+    "aboutObject",
+    "aboutSource",
+    "aboutSubject",
+    "extractedFrom",
+    "related"
+  ],
+  "operators": [],
+  "sources": [
+    "memo://our-fund/portfolio/2026-08-quarterly-update"
+  ],
+  "severity_counts": {
+    "P0": 2,
+    "P1": 4,
+    "P2": 0
+  }
+}

@@ -68,6 +68,32 @@ KIND_PROP = {
     "Source": "sourceKind",
 }
 
+# The DECLARED vocabularies the write path validates against — imported, never
+# re-spelled here, so this instrument cannot drift from the product's own kind
+# sets. A kind outside every one of these is "a kind nothing declares", which
+# §5 of #9675 names as a write failure in its own right (nothing routes to it).
+def _vocab() -> dict[str, frozenset[str]]:
+    from tortoise.pack_registry import (
+        CANONICAL_DOCUMENT_KINDS,
+        CANONICAL_EVENT_KINDS,
+        CANONICAL_OBJECT_KINDS,
+        CANONICAL_POINT_KINDS,
+        registered_source_types,
+    )
+    from tortoise.source_credibility import SOURCE_KIND_DEFAULTS
+
+    subject_kinds = frozenset(
+        {"organization", "team", "role", "legalPerson", "naturalPerson", "other"}
+    )  # ONTOLOGY §4.2/§5, the closed Subject vocabulary
+    return {
+        "Point": CANONICAL_POINT_KINDS,
+        "Object": CANONICAL_OBJECT_KINDS,
+        "Event": CANONICAL_EVENT_KINDS,
+        "Source": registered_source_types() | frozenset(SOURCE_KIND_DEFAULTS),
+        "Subject": subject_kinds,
+    }
+
+
 _STOP = {
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "we", "our",
     "is", "are", "was", "were", "be", "been", "with", "by", "at", "as", "it",
@@ -107,11 +133,11 @@ def _rows(proj, cypher: str) -> list[list]:
 def record(uri_or_path: str) -> dict:
     """Read the graph and return the structural record (no scoring)."""
     sdk, proj = _open(uri_or_path)
-    try:
     # One query, all the props we need; FalkorDB returns positional rows.
     rows = _rows(
         proj,
-        "MATCH (n) RETURN labels(n), coalesce(n.name, n.content, ''), "
+        "MATCH (n) RETURN labels(n), "
+        "coalesce(n.name, n.content, n.title, n.url, ''), "
         "coalesce(n.pointKind, n.subjectKind, n.objectKind, n.eventKind, "
         "n.sourceKind, ''), n.is_operator, coalesce(n.op_type, ''), "
         "coalesce(n.status, ''), coalesce(n.url, '')",
@@ -164,7 +190,14 @@ def record(uri_or_path: str) -> dict:
         "operators": [n for n in nodes if n["is_operator"]],
         "sources": [n for n in nodes if n["layer"] == "Source"],
         "relations": sorted({e["relation"] for e in edges}),
-        "mitigations": [e for e in edges if "INVALID" in e["relation"].upper()],
+        # A mitigation is the relevance dampener on an OPERATOR: `mitigate_operator`
+        # writes `mitigated_by`, and an INVALIDATES edge is the same lane under its
+        # epistemic name. Both are "relevance attacked", never "truth attacked".
+        "mitigations": [
+            e
+            for e in edges
+            if "MITIGAT" in e["relation"].upper() or "INVALID" in e["relation"].upper()
+        ],
     }
 
 
@@ -172,33 +205,85 @@ def record(uri_or_path: str) -> dict:
 
 
 def _tokens(text: str) -> set[str]:
+    """Significant tokens of a node's text.
+
+    Trailing sentence punctuation is stripped — ``frozen.`` and ``frozen`` are
+    the same token, and leaving the dot on silently makes every expectation
+    whose word ends a sentence score as a miss.
+    """
     words = re.findall(r"[a-z0-9][a-z0-9$%.\-]*", text.lower())
-    out = {w for w in words if len(w) >= 2 and w not in _STOP}
-    return out
+    out = {w.rstrip(".-") for w in words}
+    return {w for w in out if len(w) >= 2 and w not in _STOP}
 
 
-def _match(expect_item: str, nodes: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Find the nodes that could be the expected item.
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
-    Returns (matches, near_misses). A node matches when every significant
-    token of the expectation appears in its text; a near-miss is a node that
-    carries at least half of them — reported so a human can see WHAT the agent
-    wrote instead, without the matcher silently unifying the two.
+
+def _match(
+    expect_item: str, nodes: list[dict], want_layer: str
+) -> tuple[dict | None, float, list[dict]]:
+    """Find the ONE node that best answers the expected item.
+
+    Returns ``(best, score, duplicates)``. The best node is the single closest
+    candidate, ranked by: exact name equality, then a node whose text CONTAINS
+    every significant token of the expectation (the tighter node wins — a
+    300-character Point that happens to mention "Dana" is not the node that
+    represents Dana), then partial overlap at half weight.
+
+    Deliberately ONE best, not "every node that mentions it": judging a layer
+    off the union of every node that mentions a name is how a matcher
+    manufactures layer-confusion noise out of correct writes. A fuzzy matcher
+    would also hide the very failure being measured — a ``Northwind Logistics
+    Ltd`` that became a SECOND node must read as a duplicate.
     """
     want = _tokens(expect_item)
     if not want:
-        return [], []
-    matches, near = [], []
+        return None, 0.0, []
+    scored: list[tuple[float, dict]] = []
     for node in nodes:
         have = _tokens(node["text"])
-        hit = want & have
-        if not hit:
+        if not have:
             continue
         if want <= have:
-            matches.append(node)
-        elif len(hit) * 2 >= len(want):
-            near.append(node)
-    return matches, near
+            exact = _norm(node["text"]) == _norm(expect_item)
+            # Containment scores ABOVE any partial overlap but below an exact
+            # name match: a 20-word Point that reports the figure is a real
+            # candidate for the figure, it just has to lose to a node whose
+            # whole job is that item.
+            scored.append((1.0 if exact else 0.6 + 0.4 * len(want) / len(have), node))
+        else:
+            hit = want & have
+            if hit:
+                scored.append((0.5 * len(hit) / len(want), node))
+    scored.sort(key=lambda pair: -pair[0])
+    if not scored or scored[0][0] < 0.5:
+        return None, scored[0][0] if scored else 0.0, []
+    # SAME-LAYER PREFERENCE. Layer confusion means the item is represented on a
+    # DIFFERENT layer and NOT on the expected one. If a node on the expected
+    # layer also mentions it (e.g. the claim AND its Object both name the
+    # figure), the item was filed correctly and the duplicate representation is
+    # the finding — not a layer error. Without this rule the matcher reports the
+    # shorter mention as a confusion and buries the real one.
+    same = [pair for pair in scored if pair[1]["layer"].lower() == want_layer.lower()]
+    if same:
+        scored = same
+    best, best_score = scored[0][1], scored[0][0]
+    # Duplicates: another node carrying the SAME identity (one name is the
+    # other, or one is a prefix of the other — "Ltd"/"Inc"/"Plc" spellings).
+    bnorm = _norm(best["text"])
+    dups = [
+        node
+        for _, node in scored[1:]
+        if node is not best
+        and node["layer"] == best["layer"]
+        and (
+            _norm(node["text"]) == bnorm
+            or _norm(node["text"]).startswith(bnorm)
+            or bnorm.startswith(_norm(node["text"]))
+        )
+    ]
+    return best, best_score, dups
 
 
 def score(record_doc: dict, gold: dict, input_id: str) -> dict:
@@ -218,11 +303,10 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
         item = exp["item"]
         layer = exp["layer"]
         allowed = [k.lower() for k in exp.get("kind", [])]
-        matches, near = _match(item, nodes)
+        best, best_score, dups = _match(item, nodes, layer)
+        fuzzy = best is not None and best_score < 0.75
 
         if layer == "edge":
-            # An expected EDGE — score by relation name appearing on any edge
-            # whose endpoints match the item's neighbours.
             rels = [r.lower() for r in exp.get("kind", [])]
             got = [e for e in record_doc["edges"] if e["relation"].lower() in rels]
             if not got:
@@ -234,7 +318,9 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                     "write the relationship as a graph edge (§3), not as a node "
                     "or a string property",
                 )
-                item_rows.append({"item": item, "expected": "edge", "written": None, "verdict": "MISSING"})
+                item_rows.append(
+                    {"item": item, "expected": "edge", "written": None, "verdict": "MISSING"}
+                )
             else:
                 item_rows.append(
                     {
@@ -246,25 +332,25 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                 )
             continue
 
-        if not matches:
-            wrote = ", ".join(f"{n['layer']}:{n['text'][:50]}" for n in near) or "(nothing)"
+        if best is None:
             add(
                 "P0",
                 item,
-                f"expected {layer} — no node matches; near misses: {wrote}",
-                "the item was absorbed or written under a name nothing can find",
+                f"expected {layer} — no node represents it (best overlap {best_score:.2f})",
+                "the item was absorbed into prose or written under a name nothing "
+                "can find",
             )
-            item_rows.append({"item": item, "expected": layer, "written": wrote, "verdict": "MISSING"})
+            item_rows.append(
+                {"item": item, "expected": layer, "written": "(nothing)", "verdict": "MISSING"}
+            )
             continue
 
-        # Layer agreement — the highest-leverage axis (#9675 step 1).
-        layers = {m["layer"] for m in matches}
-        if layer not in layers:
+        if best["layer"].lower() != layer.lower():
             add(
                 "P0",
                 item,
-                f"LAYER confusion: expected {layer}, written as "
-                f"{'/'.join(sorted(layers))} — {exp.get('why','')}",
+                f"LAYER confusion: expected {layer}, written as {best['layer']} "
+                f"({best['text'][:70]!r}) — {exp.get('why','')}",
                 f"re-file as {layer}; a wrong layer cannot be rescued downstream "
                 f"(kind_classifier partitions by type before choosing a kind)",
             )
@@ -272,40 +358,56 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                 {
                     "item": item,
                     "expected": layer,
-                    "written": "/".join(sorted(layers)),
+                    "written": f"{best['layer']}:{best['kind'] or '(none)'}",
+                    "node": best["text"][:80],
                     "verdict": "LAYER",
                 }
             )
             continue
 
-        on_layer = [m for m in matches if m["layer"] == layer]
-        kinds = {(m["kind"] or "(none)").lower() for m in on_layer}
-        if allowed and not (kinds & set(allowed)):
+        allowed = [k.lower() for k in exp.get("kind", [])]
+        got_kind = (best["kind"] or "(none)").lower()
+        declared = _vocab()[best["layer"]]
+        declared_lower = {k.lower() for k in declared}
+        if got_kind and got_kind not in declared_lower:
+            add(
+                "P1",
+                item,
+                f"UNDECLARED kind {got_kind!r} on a {best['layer']} "
+                f"({best['text'][:50]!r}) — no vocabulary declares it "
+                f"(declared {best['layer']} kinds: {len(declared)}); nothing "
+                f"routes to, finds or classifies it",
+                f"use a declared {best['layer']} kind (§5 / pack kindDefs)",
+            )
+            verdict = "KIND-UNDECLARED"
+        elif allowed and got_kind not in allowed:
             add(
                 "P1",
                 item,
                 f"kind outside the frozen set: expected one of {exp['kind']}, "
-                f"written {sorted(kinds)}",
+                f"written {got_kind!r} ({best['text'][:60]!r}) — declared, but "
+                f"not the kind this item is",
                 "pick a kind the active vocabulary declares for this layer (§5)",
             )
             verdict = "KIND"
         else:
             verdict = "OK"
-        duplicates = [m for m in matches if m["layer"] == layer]
-        if len(duplicates) > 1:
+        if dups:
             add(
                 "P1",
                 item,
-                f"duplicate nodes for one item: {len(duplicates)} "
-                f"({[m['text'][:40] for m in duplicates]})",
-                "re-mention must UPDATE the existing node, not mint a second one",
+                f"duplicate nodes for one identity: {len(dups) + 1} "
+                f"({[n['text'][:40] for n in [best, *dups]]})",
+                "a re-mention must UPDATE the existing node, never mint a second one",
             )
             verdict = verdict if verdict != "OK" else "DUP"
         item_rows.append(
             {
                 "item": item,
                 "expected": f"{layer}:{'|'.join(exp.get('kind', []))}",
-                "written": f"{layer}:{'|'.join(sorted(kinds))}",
+                "written": f"{best['layer']}:{best['kind'] or '(none)'}",
+                "node": best["text"][:80],
+                "fuzzy": fuzzy,
                 "verdict": verdict,
             }
         )
@@ -337,12 +439,16 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                 )
 
     # Truth vs relevance — §3.1 / step 5 of the write pipeline.
-    if entry.get("expect_nand") and not record_doc["operators"]:
+    if entry.get("expect_nand") and not any(
+        (op.get("op_type") or "").upper() == "NAND" for op in record_doc["operators"]
+    ):
         add(
             "P0",
             "(truth-vs-relevance)",
-            "a contradicting claim was filed with NO operator at all — neither a "
-            "NAND against the attacked Point nor a mitigation of the operator",
+            "a contradicting claim was filed with NO NAND against the attacked "
+            "Point (operators present: "
+            f"{[o['op_type'] for o in record_doc['operators']] or 'none'}; mitigations: "
+            f"{len(record_doc['mitigations'])}) — truth was not attacked",
             "a contradiction attacks the TRUTH of the Point (NAND); mitigation "
             "dampens an operator's RELEVANCE (w_eff = w x (1-strength))",
         )

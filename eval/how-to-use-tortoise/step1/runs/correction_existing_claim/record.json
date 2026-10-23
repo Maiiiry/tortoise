@@ -1,0 +1,55 @@
+{
+  "input": "correction_existing_claim",
+  "cell": "correction to an existing claim",
+  "confuses": [
+    "Point-vs-Event",
+    "truth-vs-relevance"
+  ],
+  "counts": {
+    "Point": 6,
+    "Subject": 0,
+    "Object": 0,
+    "Event": 1,
+    "Source": 1
+  },
+  "item_rows": [
+    {
+      "item": "3.2%",
+      "expected": "point:statement",
+      "written": "Point:statement",
+      "node": "Our Q3 churn was 3.2%.",
+      "fuzzy": true,
+      "verdict": "OK"
+    },
+    {
+      "item": "4.1%",
+      "expected": "point:statement",
+      "written": "Point:statement",
+      "node": "Our Q3 churn was 4.1%.",
+      "fuzzy": true,
+      "verdict": "OK"
+    }
+  ],
+  "findings": [],
+  "relations": [
+    "CORRECTS",
+    "IMPL",
+    "INPUT",
+    "aboutDocument",
+    "aboutPoint",
+    "references",
+    "wasDerivedFrom"
+  ],
+  "operators": [
+    "IMPL",
+    "IMPL"
+  ],
+  "sources": [
+    "https://dash.internal.example/churn/q3"
+  ],
+  "severity_counts": {
+    "P0": 0,
+    "P1": 0,
+    "P2": 0
+  }
+}

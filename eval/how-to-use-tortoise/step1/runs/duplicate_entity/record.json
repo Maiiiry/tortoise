@@ -1,0 +1,75 @@
+{
+  "input": "duplicate_entity",
+  "cell": "duplicate entity",
+  "confuses": [
+    "Object-vs-Point",
+    "identity-vs-belief"
+  ],
+  "counts": {
+    "Point": 3,
+    "Subject": 1,
+    "Object": 1,
+    "Event": 1,
+    "Source": 1
+  },
+  "item_rows": [
+    {
+      "item": "Northwind Logistics",
+      "expected": "object:other|organization",
+      "written": "Object:other",
+      "node": "Northwind Logistics",
+      "fuzzy": false,
+      "verdict": "OK"
+    },
+    {
+      "item": "Marta Reyes",
+      "expected": "subject:naturalPerson",
+      "written": "Subject:person",
+      "node": "Marta Reyes",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "renew in January",
+      "expected": "event:occurrence|milestone",
+      "written": "Event:customerCommitment",
+      "node": "Northwind Logistics confirmed January renewal (2026-10-04)",
+      "fuzzy": true,
+      "verdict": "KIND-UNDECLARED"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "P1",
+      "item": "Marta Reyes",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Marta Reyes') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+    },
+    {
+      "severity": "P1",
+      "item": "renew in January",
+      "finding": "UNDECLARED kind 'customercommitment' on a Event ('Northwind Logistics confirmed January renewal (202') \u2014 no vocabulary declares it (declared Event kinds: 16); nothing routes to, finds or classifies it",
+      "fix": "use a declared Event kind (\u00a75 / pack kindDefs)"
+    }
+  ],
+  "relations": [
+    "aboutDocument",
+    "aboutEvent",
+    "aboutObject",
+    "aboutSource",
+    "aboutSubject",
+    "extractedFrom",
+    "hasMember",
+    "managedBy",
+    "wasDerivedFrom"
+  ],
+  "operators": [],
+  "sources": [
+    "urn:document:northwind-logistics-sow"
+  ],
+  "severity_counts": {
+    "P0": 0,
+    "P1": 2,
+    "P2": 0
+  }
+}
