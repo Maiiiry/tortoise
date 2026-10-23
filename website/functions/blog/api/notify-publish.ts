@@ -36,7 +36,7 @@ function json(body: unknown, status: number): Response {
   });
 }
 
-type Row = { id: string; slug: string; status: string };
+type Row = { id: string; slug: string; status: string; hold_for_review: boolean | null };
 
 export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY || !env.SUPABASE_SERVICE_ROLE_KEY) {
@@ -67,7 +67,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   let row: Row | undefined;
   try {
     const res = await fetch(
-      `${env.SUPABASE_URL}/rest/v1/blog_posts?select=id,slug,status&slug=eq.${encodeURIComponent(slug)}&limit=1`,
+      `${env.SUPABASE_URL}/rest/v1/blog_posts?select=id,slug,status,hold_for_review&slug=eq.${encodeURIComponent(slug)}&limit=1`,
       {
         headers: {
           apikey: env.SUPABASE_SERVICE_ROLE_KEY,
@@ -90,13 +90,26 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   }
 
   if (!row) return json({ error: "not_found" }, 404);
-  if (row.status !== "published") {
+
+  // "LIVE" IS TWO COLUMNS, and checking only the first is the bug this endpoint
+  // was one edit away from shipping. A post with `status = 'published'` and
+  // `hold_for_review = true` is filtered out of every public surface
+  // (`_lib.ts` fetchPostBySlug filters `hold_for_review=eq.false`; the anon RLS
+  // policy does the same), so its URL answers 404 — and submitting it would hand
+  // six search engines a dead URL, the exact thing the module header forbids.
+  // The renderer's own definition of "the public can read this" IS this
+  // predicate; anything narrower here diverges from what the site serves.
+  const live = row.status === "published" && row.hold_for_review !== true;
+  if (!live) {
     // Deliberate, and not softened: no retraction exists in this protocol.
-    return json({ error: "not_published", status: row.status }, 409);
+    return json({ error: "not_live", status: row.status, hold_for_review: row.hold_for_review === true }, 409);
   }
 
   const url = `${SITE_URL}/blog/${slug}`;
   const result = await notifyPublished({ env, id: row.id, url, nowMs: Date.now() });
+  // `submit-failed` reaches the editor as a 200 with that result: the article is
+  // live either way, and a vendor rejection is not a failed publish. It exists so
+  // the response cannot claim a delivery that did not happen.
   return json({ slug, url, result }, 200);
 };
 

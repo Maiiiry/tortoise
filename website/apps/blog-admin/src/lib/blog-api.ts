@@ -181,7 +181,13 @@ export async function archivePost(post: BlogPostRow): Promise<BlogPostRow> {
 
 /** Clear hold_for_review (E2E-2 after-clear step — post goes public everywhere). */
 export async function clearHoldPost(post: BlogPostRow): Promise<BlogPostRow> {
-  return updatePost(post.id, { hold_for_review: false });
+  const updated = await updatePost(post.id, { hold_for_review: false });
+  // #9803, the MIRROR of the publish guard: clearing the hold on an already-
+  // published post is the transition that makes its URL live, so it is the
+  // event worth submitting. The endpoint re-checks "live" itself (a held post
+  // answers 409), so firing here on a draft is a no-op by construction.
+  if (updated.status === 'published' && updated.slug) void notifyPublished(updated.slug);
+  return updated;
 }
 
 // ── Input sanitization (mirrors the agent API zod surface) ────────────────

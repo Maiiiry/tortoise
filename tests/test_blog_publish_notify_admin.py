@@ -18,8 +18,15 @@ WHAT IS PINNED, AND WHY EACH CASE CAN FAIL
   * V2 an unpublished slug is refused 409 and NOTHING is submitted. Dropping the
     `status !== 'published'` guard reds it. This is the case that must never be
     softened: IndexNow has no retraction, and the slug comes from the browser.
+    V2c is the SECOND half of that predicate: `status='published'` with
+    `hold_for_review=true` is filtered out of every public surface, so its URL
+    answers 404 — the endpoint must answer 409 and submit nothing. A guard that
+    reads only `status` passes V2 and reds V2c.
   * V3 a published slug submits exactly one URL. Deleting the `notifyPublished`
     call reds it.
+  * V3b the vendor's REFUSAL is reported as `submit-failed`, not `submitted`.
+    Discarding `submitUrl`'s `SubmitResult` (the pre-fix shape) reds it: the
+    attempt was made and did not land, and the caller must be able to tell.
   * V4 a published slug inside the 24h window submits NOTHING and reports
     `skipped-window`. Bypassing the shared rule (calling `submitUrl` directly)
     reds it.
@@ -27,7 +34,10 @@ WHAT IS PINNED, AND WHY EACH CASE CAN FAIL
     `skipped-unreadable` — a store blip is not a publish failure and must not
     look like one to the editor.
   * V6 `save.ts` fires the notification on `mode === 'publish'` for BOTH the
-    create path and the update path, and NOT on a draft save.
+    create path and the update path, and NOT on a draft save; and
+    `clearHoldPost` fires it when clearing a hold makes a published post live —
+    the mirror transition, without which the hold fix would leave a real
+    publish un-notified.
 
 The real exported `onRequestPost` runs under Node's type-stripping loader (the
 convention of `tests/test_blog_indexnow.py`), with `globalThis.fetch` stubbed as
@@ -54,6 +64,7 @@ WEBSITE = REPO_ROOT / "website"
 NOTIFY_FUNCTION = WEBSITE / "functions" / "blog" / "api" / "notify-publish.ts"
 INDEXNOW_MODULE = WEBSITE / "functions" / "blog" / "_shared" / "indexnow.ts"
 SAVE_UNIT = WEBSITE / "apps" / "blog-admin" / "src" / "lib" / "save.ts"
+BLOG_API = WEBSITE / "apps" / "blog-admin" / "src" / "lib" / "blog-api.ts"
 
 SITE = "https://tortoise.premiselabs.co"
 
@@ -62,7 +73,7 @@ const handler = await import(process.argv[2]);
 const indexnow = await import(process.argv[3]);
 const c = JSON.parse(process.argv[4]);
 
-const rows = c.row ? [{ id: 'row-1', slug: c.row.slug, status: c.row.status }] : [];
+const rows = c.row ? [{ id: 'row-1', slug: c.row.slug, status: c.row.status, hold_for_review: !!c.row.hold_for_review }] : [];
 const submissions = [];
 const logs = [];
 const realLog = console.log, realWarn = console.warn;
@@ -74,7 +85,7 @@ globalThis.fetch = async (url, init) => {
   const method = String((init && init.method) || 'GET').toUpperCase();
   if (u.startsWith('https://api.indexnow.org')) {
     submissions.push({ url: u, body: JSON.parse(String(init.body)) });
-    return new Response('', { status: 200 });
+    return new Response('', { status: c.indexnowStatus || 200 });
   }
   if (u.includes('/auth/v1/user')) return Response.json({ id: 'user-1' });
   if (u.includes('/rest/v1/blog_admins')) {
@@ -158,7 +169,22 @@ def test_v1b_no_token_is_refused():
 def test_v2_unpublished_slug_is_refused_and_never_submitted():
     out = _run({"row": {"slug": "agent-memory", "status": "draft"}, "body": {"slug": "agent-memory"}})
     assert out["status"] == 409
-    assert out["body"]["error"] == "not_published"
+    assert out["body"]["error"] == "not_live"
+    assert out["submissions"] == []
+
+
+def test_v2c_published_but_held_is_refused_and_never_submitted():
+    """A held post has status='published' but is filtered out of every public
+    surface, so its URL answers 404. Submitting it would hand six engines a dead
+    URL — the failure the module header forbids. This case reds if the guard
+    checks only `status`."""
+    out = _run({
+        "row": {"slug": "agent-memory", "status": "published", "hold_for_review": True},
+        "body": {"slug": "agent-memory"},
+    })
+    assert out["status"] == 409
+    assert out["body"]["error"] == "not_live"
+    assert out["body"]["hold_for_review"] is True
     assert out["submissions"] == []
 
 
@@ -181,6 +207,23 @@ def test_v3_published_slug_submits_exactly_one_canonical_url():
     # by every engine.
     assert payload["key"] == out["indexnowKey"]
     assert payload["keyLocation"] == f"{SITE}/{out['indexnowKey']}.txt"
+    # The key must be SERVED at that path, not merely named: an unserved key is
+    # rejected by every engine, so the assertion that matters is that the repo
+    # ships the file `keyLocation` points at.
+    key_file = WEBSITE / f"{out['indexnowKey']}.txt"
+    assert key_file.is_file(), f"missing key file {key_file}"
+    assert key_file.read_text().strip() == out["indexnowKey"]
+
+
+def test_v3b_vendor_rejection_is_reported_as_submit_failed():
+    out = _run({
+        "row": {"slug": "agent-memory", "status": "published"},
+        "body": {"slug": "agent-memory"},
+        "indexnowStatus": 403,
+    })
+    assert out["status"] == 200
+    assert out["body"]["result"] == "submit-failed"
+    assert len(out["submissions"]) == 1
 
 
 def test_v4_inside_the_window_nothing_is_submitted():
@@ -229,3 +272,9 @@ def test_v6_editor_fires_on_publish_only_for_both_paths():
     )
     # and nothing outside those two guarded sites (the import carries no paren)
     assert src.count("notifyPublished(") == 2, "expected exactly two call sites"
+    # the MIRROR transition: clearing a hold on a published post makes its URL
+    # live, so that save is the event worth submitting
+    api = BLOG_API.read_text()
+    assert re.search(r"export async function clearHoldPost[\s\S]{0,900}?void notifyPublished\(updated\.slug\)", api), (
+        "clearHoldPost must notify when it makes a published post live"
+    )
