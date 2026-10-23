@@ -162,7 +162,7 @@ def run_worker(
         if api_url:
             env["TORTOISE_API_URL"] = api_url
     try:
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        proc = subprocess.run(  # fixed argv, no shell
             argv, capture_output=True, text=True, timeout=timeout, check=False, env=env
         )
     except subprocess.TimeoutExpired:
@@ -220,17 +220,16 @@ def run_sweep(
         only_session_id = _session_id_from_filename(files[0])
     if spool:
         try:
-            from tortoise.capture_spool import flush_spool, spool_dir
-
             # #3615: this command POSTs spooled turns, so it carries the SAME
             # consent gate as `session capture` / `session drain` /
             # `sessions import`. Without it a host that never consented to
             # capture had its locally-spooled (deliberately ungated) turns
             # uploaded by a command nobody classified as an upload path.
-            from tortoise.capture_consent import (  # noqa: PLC0415
+            from tortoise.capture_consent import (
                 capture_consent_enabled,
                 capture_declined_reason,
             )
+            from tortoise.capture_spool import flush_spool, spool_dir
 
             if not capture_consent_enabled():
                 receipt["spool"] = {
@@ -247,7 +246,7 @@ def run_sweep(
                     # A substrate that was NOT drained is not a success.
                     receipt["ok"] = False
                 else:
-                    from tortoise.__main__ import _session_post  # noqa: PLC0415
+                    from tortoise.__main__ import _session_post
 
                     summary_obj = flush_spool(
                         spool_dir(),

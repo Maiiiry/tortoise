@@ -11679,16 +11679,16 @@ def _cmd_store_sync(args) -> int:
     no config at all to READ files and re-anchor cursors: it reports "no
     credential" honestly instead of dying before it runs.
     """
+    import contextlib
+
     from tortoise.store_sync import main as _store_sync_main
 
     api_key = None
     api_url = None
-    try:
-        _cfg_path, _config, api_key, api_url = _resolve_transmit_config()
-    except Exception:
+    with contextlib.suppress(Exception):
         # A corrupt OR UNREADABLE config must not make the sweep a no-op: the
         # spool leg then reports `no_credential` and the log leg still runs.
-        pass
+        _cfg_path, _config, api_key, api_url = _resolve_transmit_config()
     args.api_key = api_key
     args.api_url = api_url
     return _store_sync_main(args)

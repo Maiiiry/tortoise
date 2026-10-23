@@ -56,7 +56,7 @@ class CaptureServer:
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:  # the BaseHTTPRequestHandler protocol name
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length)
                 try:
@@ -348,7 +348,7 @@ def test_part_ii_a_real_pi_session_file_is_captured_and_attributed(server, tmp_p
     target = tmp_path / "sessions" / "copied.jsonl"
     target.write_bytes(source.read_bytes())
 
-    proc, receipt = _run_sync(tmp_path, "--file", str(target), server=server)
+    _proc, receipt = _run_sync(tmp_path, "--file", str(target), server=server)
     log = receipt["log"]
     assert log["errors"] == [], log["errors"]
     if not server.sessions:
@@ -728,7 +728,7 @@ def test_dry_run_moves_no_cursor_at_process_level(server, tmp_path):
         json.dumps({"type": "label", "id": "l1", "parentId": None,
                     "timestamp": "2026-10-23T10:00:01.000Z", "label": "cp"}),
     ])
-    proc, receipt = _run_sync(tmp_path, "--dry-run", server=server)
+    _proc, receipt = _run_sync(tmp_path, "--dry-run", server=server)
     assert server.calls == 0, "a dry run POSTed"
     assert receipt["log"]["noTurns"] == 1, receipt["log"]
     assert not (tmp_path / "cursor" / "cursor.json").exists(), (
