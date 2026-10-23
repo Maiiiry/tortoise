@@ -221,7 +221,18 @@ def extract_block(text: str) -> dict:
     end = text.index(END)
     if end < start:
         raise ValueError("verdict block markers are out of order")
-    return json.loads(text[start:end].strip())
+    try:
+        return json.loads(text[start:end].strip())
+    except RecursionError as exc:
+        # #9089 review P2: deeply nested JSON raises RecursionError, which is NOT a JSONDecodeError
+        # and is caught by NEITHER this module's ValueError arm nor `main` — it surfaced as a
+        # traceback with exit 1, the code reserved for "the table has findings". The log's block is
+        # unreadable, so the honest answer is the usage error (exit 2) every other unreadable
+        # block gets.
+        raise ValueError(
+            "the verdict block nests too deeply to parse — a block this gate "
+            "cannot read is a usage error, not a finding about the table"
+        ) from exc
 
 
 class Findings:

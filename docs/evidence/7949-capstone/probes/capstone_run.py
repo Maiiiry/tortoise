@@ -526,6 +526,23 @@ def resolve_head(override: str | None) -> tuple[str, str]:
             f"--head {override!r} does not resolve to a commit in this repo — "
             "an unresolvable sha cannot be the commit this run was measured "
             "at (pass the full sha, or drop --head to use the worktree HEAD)")
+    # ⛔ THE OVERRIDE MUST NAME THE TREE THIS PROCESS ACTUALLY EXECUTED (#9089 review P2).
+    # The checks above prove the string is a sha that resolves — not that the CODE THAT RAN is
+    # that revision. `--head HEAD~5` from an unmodified checkout produced a table whose every
+    # row was stamped `HEAD~5` while the run was executed on `HEAD`, so the evidence bundle would
+    # record "measured at X" for code that never ran at X, and V5 then resolves the
+    # pre-registration's ancestry against that false stamp. The honest test is the TREE: a re-run
+    # against a tag, or the same tree checked out elsewhere, has the same `^{tree}` as the
+    # worktree's HEAD and stays legitimate; a different tree is a different program, so it is
+    # refused. (Uncommitted worktree edits are not seen by this test — stated, not implied.)
+    head_tree = _git("rev-parse", "HEAD^{tree}").stdout.strip()
+    override_tree = _git("rev-parse", f"{override}^{{tree}}").stdout.strip()
+    if not head_tree or override_tree != head_tree:
+        return _git("rev-parse", "HEAD").stdout.strip() or "unknown", (
+            f"--head {override!r} is a DIFFERENT tree from this checkout's HEAD — the run "
+            "executes the code that is here, so stamping its rows with a revision it never "
+            "ran on would make the provenance chain claim a measurement nobody took (a tag or "
+            "a checkout of the SAME tree is accepted; check the revision out instead)")
     return override, ""
 
 

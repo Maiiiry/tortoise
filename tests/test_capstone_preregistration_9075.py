@@ -2282,6 +2282,10 @@ def test_a_log_that_proves_it_measured_nothing_needs_no_ordering(tmp_path, monke
     # container, so a REFUSED log carrying the E4 receipt numbers was exempted while claiming a
     # measurement its own run status says it never took.
     {"receipt": {"numerator": 14, "denominator": 15}},
+    # #9089 review P2: the receipt's counts are not all named numerator/denominator — the
+    # probe writes `s4_items`, `merged_items`, `corrected_by_s4`, `verbatim_reemissions` and
+    # `added_by_s4` too, so a two-key match exempted a record carrying five other numbers.
+    {"receipt": {"s4_items": 200, "merged_items": 7}},
 ])
 def test_the_content_arm_stops_covering_the_log_the_moment_it_could_score(
         tmp_path, monkeypatch, overrides):
@@ -2316,6 +2320,9 @@ def test_the_content_arm_refuses_to_exempt_anything_it_cannot_read(tmp_path):
         _capstone_body().replace('"status": "REFUSED"', '"status": ""'),
         _capstone_body(blocks=2),
         _capstone_body(schema="capstone-verdict-v2"),
+        # #9089 review P2: a document nested past the parser's limit raises RecursionError,
+        # which is NOT a JSONDecodeError — it escaped this predicate entirely.
+        "=== CAPSTONE-VERDICT-BEGIN ===\n" + "[" * 100000 + "\n=== CAPSTONE-VERDICT-END ===\n",
     ):
         path = tmp_path / "_probe_body.log"
         path.write_text(body)

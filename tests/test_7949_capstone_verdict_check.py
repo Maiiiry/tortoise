@@ -212,6 +212,38 @@ def test_the_probes_owners_map_names_no_landed_criterion_lane():
     assert "#7947 LANDED" not in rows["E1"]["note"]
 
 
+# ── V1/V3: the record's SHAPE and its vocabulary ──────────────────────────
+
+def test_an_unrecognised_root_schema_is_a_finding():
+    """V1: a schema this gate does not know is refused, never guessed at.
+
+    #9089 review P2: this arm was pinned by NOTHING — deleting the schema test
+    from `check()` left the whole suite green, so a refactor could drop it and
+    the gate would go on blessing a `capstone-verdict-v2` table it cannot read
+    (the same shape `capstone_preregistration_check` already refuses in the
+    exemption, which is why the two must not disagree here).
+    """
+    codes = _codes(_record(schema="capstone-verdict-v2"))
+    assert "V1" in codes, codes
+
+
+def test_an_unrecognised_verdict_word_or_evidence_kind_is_a_finding():
+    """V3: the vocabulary is closed. An unknown word is not a verdict.
+
+    #9089 review P2: `VERDICTS` and `EVIDENCE_KINDS` were likewise unpinned —
+    neutering both kept 95/95 green. The concrete failure they prevent: a row
+    carrying `"verdict": "PASS"` produced no V3 finding, fell through to the
+    blocker rule (a REFUSED row with `blocked_by` set is honest) and the table
+    exited 0 "structurally sound" with a verdict word the gate does not
+    understand — a green light spelled a new way.
+    """
+    rec = _record()
+    rec["rows"][0]["verdict"] = "PASS"
+    rec["rows"][0]["evidence_kind"] = "estimate"
+    codes = _codes(rec)
+    assert "V3" in codes, codes
+
+
 # ── V2: the five-row contract ────────────────────────────────────────────
 
 def test_missing_row_is_a_finding():
@@ -1708,6 +1740,50 @@ def test_a_head_that_does_not_resolve_is_refused(tmp_path):
     assert "does not resolve" in record["run"]["reason"]
     assert record["head"] == HEAD, record["head"]
     assert "V3" not in _codes(record), _codes(record)
+
+
+def test_a_head_override_naming_a_different_tree_is_refused(tmp_path, monkeypatch):
+    """#9089 review P2: the override must name the TREE this process executed.
+
+    `--head` checked that the string was a sha and that it RESOLVED — not that the
+    code that ran is that revision. Measured on the pre-fix probe: `--head HEAD~5`
+    from an unmodified checkout stamped every row `HEAD~5` while executing `HEAD`,
+    so the evidence bundle recorded "measured at X" for code that never ran at X
+    (and V5 then resolves the pre-registration's ancestry against that false
+    stamp). The honest test is the tree: a tag, or the same tree checked out
+    elsewhere, has the same `^{tree}` and stays legitimate; a different tree is a
+    different program.
+
+    Non-vacuity: the pre-fix `resolve_head` returns the override unchanged for BOTH
+    commits below, so the first assertion reds (no error is produced).
+    """
+    repo = tmp_path / "tree_repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "r@example.com")
+    git("config", "user.name", "R")
+    (repo / "code.txt").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "one")
+    old = git("rev-parse", "HEAD")
+    (repo / "code.txt").write_text("v2\n")
+    git("commit", "-q", "-am", "two")
+    same_tree = git("rev-parse", "HEAD")
+    git("commit", "-q", "--allow-empty", "-m", "three")
+    monkeypatch.setattr(probe, "ROOT", repo)
+
+    head, err = probe.resolve_head(old)
+    assert err and "DIFFERENT tree" in err, (head, err)
+    assert head == git("rev-parse", "HEAD"), head
+
+    # the same TREE at a different commit is the documented legitimate case
+    head, err = probe.resolve_head(same_tree)
+    assert err == "" and head == same_tree, (head, err)
 
 
 def test_a_resolvable_head_override_is_what_the_rows_are_stamped_with(tmp_path):

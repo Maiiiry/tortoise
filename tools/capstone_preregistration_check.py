@@ -664,6 +664,16 @@ def _measured_locations(record: dict) -> list[str]:
     it never took, and reading only ``rows`` exempted exactly that document. A hand-editable
     artifact can put a number in any container, so the predicate asks the document instead of the
     one field it happens to know about.
+
+    ⛔ TWO CONTAINER NAMES, NOT "ANY NUMBER ANYWHERE" (#9089 review P2). The receipt's counts are
+    not all called ``numerator``/``denominator`` — ``e4_receipt`` carries ``s4_items``,
+    ``merged_items``, ``corrected_by_s4``, ``verbatim_reemissions`` and ``added_by_s4`` too — so a
+    two-key match exempted a record carrying five other numbers. It cannot be widened to "any
+    number in the document": the shipped log legitimately carries ``run.gate_failed: 2``, and a
+    blanket rule would over-block the very artifact this exemption exists for. So the two named
+    measurement keys are honoured wherever they sit, and the ``e4_receipt`` container's numeric
+    leaves count as measurements. A boolean is never a count (``True`` is an ``int`` in Python and
+    the gate refuses booleans as denominators — the same rule here).
     """
     found: list[str] = []
     stack: list[tuple[str, object]] = [("record", record)]
@@ -674,12 +684,30 @@ def _measured_locations(record: dict) -> list[str]:
             for key, item in node.items():
                 if key in ("numerator", "denominator") and item is not None:
                     found.append(label)
+                elif key == "e4_receipt" and _carries_number(item):
+                    found.append(f"{where}.{key}")
                 else:
                     stack.append((f"{where}.{key}", item))
         elif isinstance(node, list):
             for index, item in enumerate(node):
                 stack.append((f"{where}[{index}]", item))
     return found
+
+
+def _carries_number(node: object) -> bool:
+    """Does this container hold a numeric leaf? Iterative, so a hostile document cannot recurse."""
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, (int, float)):
+            return True
+        if isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
 
 
 def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
@@ -733,6 +761,16 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
         record = json.loads(match.group(1))
     except json.JSONDecodeError as exc:
         return False, f"its machine record is not JSON ({exc})"
+    except RecursionError:
+        # #9089 review P2: a document nested past the parser's limit raised RecursionError, which
+        # is NOT a JSONDecodeError — it escaped this predicate and surfaced as exit 1, the code
+        # this tool reserves for FINDINGS, on a document it never read. An unreadable shape is a
+        # refusal (exit 2 via the caller's CheckError path is a reader problem, but the exemption
+        # question has a safe answer here: do not exempt).
+        return False, (
+            "its machine record nests too deeply to parse — a shape this predicate cannot read "
+            "is a refusal, not an exemption"
+        )
     if not isinstance(record, dict):
         return False, "its machine record is not an object"
     # ⛔ The schema is PINNED, not inferred. Without it the whole "self-healing" argument is bounded
@@ -897,7 +935,7 @@ def check_machine_record(directory: Path, pins: dict) -> list[str]:
                 "machine record, so a document alone is not a registration it can consume"]
     try:
         record = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         return [f"{MACHINE_RECORD} is not JSON: {exc}"]
     if record.get("schema") != PREREG_SCHEMA:
         failures.append(
