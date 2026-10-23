@@ -391,6 +391,41 @@ def test_e4_measured_with_a_boolean_denominator_is_a_finding():
     assert any("no positive" in m for m in msgs), msgs
 
 
+def test_a_measurement_row_without_a_corpus_is_a_finding_without_being_green_or_red():
+    """V7 applies to what a row MEASURED, not to the verdict word (#9089 cycle 8).
+
+    The arm fired only on GREEN/RED, so a row declaring `evidence_kind:
+    "measurement"` under a non-GREEN verdict — exactly the shape
+    `capstone_run.py::completed_rows` writes for four of five rows — carried no
+    corpus obligation: a null `corpus_sha256` against a log that identified a
+    corpus produced NO finding and the tally printed "structurally sound".
+    Non-vacuity: the same row as RED yields V7, which is what made the gap
+    invisible.
+    """
+    rec = _record()
+    rec["rows"][0].update({"verdict": "BLOCKED",
+                           "evidence_kind": "measurement",
+                           "corpus_sha256": None})
+    codes = _codes(rec)
+    assert "V7" in codes, codes
+
+
+def test_a_receipt_with_no_denominator_key_does_not_back_the_rows_number():
+    """V10: absence is the same non-agreement as a wrong value (#9089 cycle 8).
+
+    `15/15` on E4's row with a receipt that is present but carries no
+    `denominator` key was SKIPPED by the `in receipt` guard, so the row's number
+    stood unbacked while the gate reported one number deciding E4. The arm's own
+    rule is that the row must carry the SAME denominator the receipt computed.
+    """
+    receipt = probe.e4_receipt({"s4_merge": {"s2_items": 15,
+                                           "kept_from_s2": 14}})
+    rec = _completed_record(receipt)
+    del rec["run"]["e4_receipt"]["denominator"]
+    msgs = _messages(rec)
+    assert any("carries no denominator" in m for m in msgs), msgs
+
+
 def test_a_boolean_receipt_denominator_against_a_numeric_row_is_a_finding():
     """A copy that is not a number cannot AGREE with the row's (#9089 cycle 2).
 

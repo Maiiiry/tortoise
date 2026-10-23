@@ -571,7 +571,16 @@ def check(record: dict, *, repo: Path,
 
         # ── V7 one corpus ─────────────────────────────────────────────────
         row_corpus = row.get("corpus_sha256")
-        if verdict in ("GREEN", "RED"):
+        # ⛔ MEASURED, NOT MERELY VERDICTED (#9089 review cycle 8). The arm used
+        # to fire only on GREEN/RED, so a row that DECLARES a measurement
+        # (`evidence_kind: "measurement"`) under a non-GREEN verdict — exactly
+        # the shape `capstone_run.py::completed_rows` writes for four of five
+        # rows — carried no corpus obligation at all: a null `corpus_sha256`
+        # against a log that identified a corpus produced NO finding, while the
+        # same row as RED produced V7. The docstring states this rule of "a
+        # measurement row", so the row's EVIDENCE KIND is the predicate, not
+        # its verdict word.
+        if verdict in ("GREEN", "RED") or kind == "measurement":
             if not row_corpus:
                 f.add("V7", where, "a measured row must carry corpus_sha256 — "
                                    "the before/after denominators have to be "
@@ -639,21 +648,33 @@ def check(record: dict, *, repo: Path,
         # pre-helper arm refused it because ``True != 15``. Guarding with
         # ``_count(...)`` alone silently skipped that comparison and dropped a
         # true-positive V10, so the non-count receipt is reported explicitly.
-        if isinstance(receipt, dict) and "denominator" in receipt \
-                and _count(e4_den):
-            receipt_den = receipt.get("denominator")
-            if not _count(receipt_den):
+        #
+        # ⛔ AND SO IS AN ABSENT ONE (#9089 review cycle 8): a receipt that is
+        # present but carries no `denominator` key was skipped by the
+        # `in receipt` guard, so the row's 15/15 stood with nothing behind it
+        # while the gate still reported one number deciding E4. By this arm's
+        # own rule E4's row must carry the SAME denominator the receipt
+        # computed, and absence is the same non-agreement as a wrong value.
+        if measured and isinstance(receipt, dict) and _count(e4_den):
+            if "denominator" not in receipt:
                 f.add("V10", "rows[E4]",
-                      f"the run's e4_receipt denominator is not an integer "
-                      f"count ({receipt_den!r}) while the row's is {e4_den} "
-                      "— one number decides E4, and a copy that is not a "
-                      "number cannot agree with the row's")
-            elif receipt_den != e4_den:
-                f.add("V10", "rows[E4]",
-                      f"the row's denominator ({e4_den}) and the run's "
-                      f"e4_receipt ({receipt_den}) disagree — one number "
-                      "decides E4, and two copies that differ let a hand-edit "
-                      "pick which")
+                      f"the run's e4_receipt carries no denominator while the "
+                      f"row's is {e4_den} — the row's number is unbacked, and "
+                      "one number decides E4 only when both copies carry it")
+            else:
+                receipt_den = receipt.get("denominator")
+                if not _count(receipt_den):
+                    f.add("V10", "rows[E4]",
+                          f"the run's e4_receipt denominator is not an integer "
+                          f"count ({receipt_den!r}) while the row's is {e4_den} "
+                          "— one number decides E4, and a copy that is not a "
+                          "number cannot agree with the row's")
+                elif receipt_den != e4_den:
+                    f.add("V10", "rows[E4]",
+                          f"the row's denominator ({e4_den}) and the run's "
+                          f"e4_receipt ({receipt_den}) disagree — one number "
+                          "decides E4, and two copies that differ let a hand-edit "
+                          "pick which")
 
     # ── V8 denominators carried, not restated ────────────────────────────
     for cid, row in by_id.items():
