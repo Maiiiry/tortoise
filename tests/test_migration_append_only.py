@@ -896,6 +896,35 @@ def test_the_double_booking_rule_refuses_an_uncited_party_the_tree_does_not_ship
     )
 
 
+def test_the_rule_reads_EVERY_example_in_the_header_not_just_the_first():
+    """Non-vacuity for the `finditer`: a second, WRONG example must red.
+
+    Measured before this arm, by reverting the matcher to `_DOUBLE_BOOKED.search`:
+    every arm in this file stayed green, because each fixture (and the shipped
+    header) states exactly ONE example — so the first-match defect had no reader
+    and could be reintroduced silently. The sibling census guard was repaired the
+    same way and shipped a fixture stating its figure TWICE, precisely so that a
+    first-match reader reds; this is that shape: the first example is correct and
+    the SECOND is the fail-open one a lane greps just as readily.
+    """
+    header = (
+        "which is how 20261023000001 was double-booked "
+        "(record_session_narrative vs blog_author_backfill_atomic #9707). "
+        "A second paragraph, wrongly: which is how 20261023000001 was "
+        "double-booked (blog_indexnow vs record_session_narrative)."
+    )
+    shipped = {
+        "record_session_narrative": "20261023000001",
+        "blog_author_backfill_atomic": "20261025000001",  # #9707 after its renumber
+        "blog_indexnow": "20261024000001",
+    }
+    problems = _example_problems(header, shipped.get)
+    assert any("example 2 of 2" in p and "blog_indexnow" in p for p in problems), (
+        "the rule read only the first double-booking example, so a second, wrong "
+        f"example passed unread: {problems}"
+    )
+
+
 #: The files whose prefix guidance a lane reads before choosing a version. A
 #: `<version>_<leaf>` mention in their PROSE that the tree no longer carries at that
 #: version is a stale pointer with the same harm as a stale example: the reader greps
