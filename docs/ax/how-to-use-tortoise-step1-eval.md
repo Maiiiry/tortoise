@@ -46,6 +46,12 @@ ruling on the point/object/event overlap). This document deliberately does **not
 restate those definitions; two ontologies that drift is the failure class the
 issue names.
 
+Only the scoring **directives** have ever been added after a run: the
+three-valued operator rules (`expect_nand` / `expect_mitigation`, corrections
+6 and 12) and the endpoint shape an edge item is graded on (correction 29).
+Each one can only ADD a finding, never excuse one, and no expectation, layer or
+kind has moved since the freeze.
+
 Each input names the **adjacent layer pair it is designed to confuse** — the
 issue's own requirement: *"pairwise discriminator tests … because the failures
 are confusions between adjacent layers — a per-layer positive test does not catch
