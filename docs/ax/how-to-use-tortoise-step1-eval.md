@@ -39,12 +39,27 @@ names, and writing against the 81 would document names about to be retired.
 ## What is frozen, and when
 
 `eval/how-to-use-tortoise/step1/inputs.json` holds ten representative inputs and
-their **gold structure**, frozen **before** any run. The gold is derived from
+their **gold structure**, frozen **before** the first run (`3fb9a1ae7`) and
+**unchanged since**: no expectation, layer, kind or `confuses` entry has moved in
+any later commit, so no verdict in this document was re-fitted to what an agent
+wrote. The gold is derived from
 `docs/ONTOLOGY.md` — the definitions owner (§4.1 Point, §4.2 Subject, §4.3
 Object, §4.5 Event, §4.6 Source, §5 state-centric vocabulary + the #7813 owner
 ruling on the point/object/event overlap). This document deliberately does **not**
 restate those definitions; two ontologies that drift is the failure class the
 issue names.
+
+**What was NOT frozen, stated plainly.** The *scoring directives* beside the gold
+were corrected after the first run, and the correction is disclosed rather than
+absorbed: `40cc04335` removed the boilerplate `expect_mitigation: false` from nine
+inputs, added `expect_nand: false` to nine, and added `setup` to
+`product_spec_object`; later rounds added the `scoring` block that documents the
+three-valued operator rules. Those directives are not gold — they declare what the
+scorer looks for, and the boilerplate was itself the defect: under it a
+**sanctioned** mitigation read as a failure, which is what charged `research_paper`
+a P0 the correction removed (item 6 below). So one verdict moved because a
+scoring directive was fixed, not because the gold was fitted: the ten gold
+structures were frozen pre-run and have never been edited.
 
 Each input names the **adjacent layer pair it is designed to confuse** — the
 issue's own requirement: *"pairwise discriminator tests … because the failures
@@ -105,11 +120,11 @@ uv run python eval/how-to-use-tortoise/step1/setup.py \
 ```
 
 The instrument's scoring rules are pinned by
-`tests/test_ax_write_eval.py` (37 tests, no database needed):
+`tests/test_ax_write_eval.py` (38 tests, no database needed):
 
 ```bash
 TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_ax_write_eval.py -q
-# 37 passed
+# 38 passed
 ```
 
 ## Results — measured 2026-10-22, ten runs
@@ -170,11 +185,12 @@ steps are decisions rather than rules.
 
 ### Instrument limitations and corrections, stated rather than hidden
 
-This section exists because **five rounds of fresh-context review found the
-instrument lying about its own subject** — each round also found the sentences
-below still quoting the pre-fix causes — and the numbers above are what remains
-after every fix. The corrections are recorded, not quietly absorbed: a
-measurement artifact that hides its own revisions teaches the wrong thing.
+This section exists because **six rounds of fresh-context review found the
+instrument lying about its own subject** — five of them moved the headline, and
+each round also found the sentences below still quoting the pre-fix causes — and
+the numbers above are what remains after every fix. The corrections are recorded,
+not quietly absorbed: a measurement artifact that hides its own revisions teaches
+the wrong thing.
 
 Round 1:
 
@@ -263,6 +279,27 @@ Round 5:
 18. **Five sentences still quoted pre-fix causes** (the provenance count in the
     outline, the 80% forecast's kind class, a "measurable" the gold never stated,
     the tie-break justification, the round count). Corrected against the records.
+
+Round 6:
+19. **One act, one finding — again, on the cross-axis rule.** A node whose kind
+    sits only on another layer's property had its own property empty, so after
+    the cross-axis P1 the item-level checks fired a *second* P1 whose text
+    ("declared, but not the kind this item is", `written ''`) was false in its own
+    terms. The existing test could not catch it because its gold declared no
+    `kind`; `test_one_cross_axis_write_is_charged_once_even_when_the_gold_declares_a_kind`
+    is non-vacuous (pre-fix: 2 P1 / verdict `KIND`; post-fix: 1 P1 /
+    `KIND-CROSS-AXIS`) and a control pins that a node which ALSO wrote a
+    wrong-but-declared kind on its own property is still charged. The totals did
+    not move — 13/32 both ways — which is why the headline trajectory above has
+    five entries for six rounds.
+20. **Two CI-leg defects the same round caught**: `tools/ax_write_eval.py` is a
+    new `tools/` entry point and lacked the #5128 interpreter guard
+    (`entrypoint-guards` is skipped on this PR, so it would have reddened the next
+    diff that selects `tests/test_entry_point_python_guard.py`), and the new doc
+    carried four markdownlint findings (an unescaped `|` in a table row — which
+    also dropped that row's last sentence from the render — a missing blank line
+    after `Round 1:`, and two `-` bullets in an asterisk list). Both fixed; the
+    drift-guard leg was re-merged to clear a byte-identity red.
 
 Still true, and stated as a limit rather than a rule: the matcher is token
 overlap with a crude stemmer, and **the class table above is the MACHINE
