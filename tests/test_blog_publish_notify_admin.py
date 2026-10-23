@@ -82,7 +82,19 @@ const indexnow = await import(process.argv[3]);
 const c = JSON.parse(process.argv[4]);
 
 const held = c.row && c.row.hold_for_review;
-const rows = c.row ? [{ id: 'row-1', slug: c.row.slug, status: c.row.status, hold_for_review: held === 'null' ? null : !!held }] : [];
+const fullRow = () => ({ id: 'row-1', slug: c.row.slug, status: c.row.status, hold_for_review: held === 'null' ? null : !!held });
+// HONOUR `select=`. PostgREST returns ONLY the columns named, so a stub that
+// always returns every column hides the fact that the guard and the SELECT are
+// ONE change: drop `hold_for_review` from the select and the endpoint reads
+// `undefined`, which the `=== false` predicate refuses — every live post answers
+// 409 while a permissive stub keeps the suite green (measured: the reviewer
+// removed the column and all 14 cases stayed green).
+const projectRow = (select) => {
+  if (!select) return fullRow();
+  const fields = new Set(select.split(',').map((f) => f.trim()).filter(Boolean));
+  return Object.fromEntries(Object.entries(fullRow()).filter(([k]) => fields.has(k)));
+};
+const rows = c.row ? [fullRow()] : [];
 const submissions = [];
 const logs = [];
 const realLog = console.log, realWarn = console.warn;
@@ -108,7 +120,10 @@ globalThis.fetch = async (url, init) => {
     if (method === 'GET' && c.readFails) {
       return new Response('{"message":"boom"}', { status: 500 });
     }
-    if (method === 'GET') return Response.json(rows);
+    if (method === 'GET') {
+      const m = u.match(/[?&]select=([^&]*)/);
+      return Response.json(c.row ? [projectRow(m ? decodeURIComponent(m[1]) : '')] : []);
+    }
     if (method === 'PATCH') return Response.json([{ ...rows[0] }]);
   }
   return Response.json({});
@@ -208,6 +223,22 @@ def test_v2d_null_hold_is_refused_like_held():
     assert out["status"] == 409
     assert out["body"]["error"] == "not_live"
     assert out["submissions"] == []
+
+
+def test_v2e_the_row_select_actually_asks_for_the_hold_column():
+    """The guard and the SELECT are ONE change. PostgREST returns only the named
+    columns, so a select without `hold_for_review` reads `undefined`, which the
+    `=== false` predicate refuses — every live post answers 409, a total outage.
+
+    The behaviour cases catch it because the driver honours `select=`, but this
+    pins the pair directly, so a future edit that relaxes the predicate back to
+    `!== true` cannot re-open the hole by also dropping the column."""
+    src = NOTIFY_FUNCTION.read_text()
+    m = re.search(r"select=id,slug,status[^&`]*", src)
+    assert m, "the endpoint must name its columns explicitly in the PostgREST query"
+    assert "hold_for_review" in m.group(0), (
+        "the row read must select hold_for_review — the live predicate is two columns"
+    )
 
 
 def test_v2b_unknown_slug_is_404_and_never_submitted():
