@@ -52,11 +52,28 @@
  *    entry, cut at a `compaction` entry's `firstKeptEntryId`.
  *  - **A permanent 4xx is dead-lettered, not retried forever** (piece 11) —
  *    otherwise one bad record head-of-line-blocks every later turn with no
- *    surfaced error.
- *  - **Bounded per run** (piece 10): files, requests, and attempts.
+ *    surfaced error. `PERMANENT` means the BYTES are refused; a CREDENTIAL
+ *    refusal (401/403/407) is retained like 402, because crossing the cursor
+ *    past it would destroy exactly the sessions this backstop exists for.
+ *  - **A window may never SHRINK below what this file already delivered.**
+ *    `activeBranch` cuts at a `compaction` entry, so a post-`/compact` window
+ *    is strictly shorter; the turn store's shorter-re-capture rule then
+ *    hard-DELETES the turns beyond the new window. So a shrinking window is
+ *    REFUSED (cursor retained, counted) rather than shipped.
+ *  - **Bounded per run** (piece 10): files, requests, and attempts. An
+ *    up-to-date file is skipped from its `stat` + header line, so a sweep does
+ *    not read the whole session tree.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -95,10 +112,22 @@ export const MAX_REQUESTS_PER_RUN = 200;
 
 /** HTTP codes that will never succeed for the same bytes. Retrying them
  *  forever is the head-of-line block piece 11 exists to end. */
-export const PERMANENT_STATUS = new Set([400, 401, 403, 404, 405, 406, 409, 413, 415, 422]);
+export const PERMANENT_STATUS = new Set([400, 404, 405, 406, 413, 415, 422]);
 /** 402 is the quota ceiling: it is a REFUSAL OF THE MOMENT, not of the bytes,
- *  so it is retryable (retained) rather than dead-lettered. */
-export const RETAIN_STATUS = new Set([402, 408, 425, 429]);
+ *  so it is retryable (retained) rather than dead-lettered. 408/425/429 are
+ *  timing, and 409 is "already in flight" — a concurrent producer writing the
+ *  SAME turns, so dead-lettering it would drop what the other lane is filing. */
+export const RETAIN_STATUS = new Set([402, 408, 409, 425, 429]);
+/** 401/403/407 are the CREDENTIAL/entitlement refusals. They pass the file's
+ *  own test for retention — the refusal is of the MOMENT and of the CALLER,
+ *  never of the bytes — so they are retained, NOT dead-lettered. The permanent
+ *  branch CROSSES the cursor, which for a session that has ended (the only
+ *  kind this backstop recovers: an active file keeps growing) is final: the
+ *  turns can never be re-shipped and nothing reports a failure. A rotated or
+ *  expired key would then destroy exactly the sessions the backstop exists
+ *  for. Retained means the fixed key re-ships them.
+ */
+export const AUTH_STATUS = new Set([401, 403, 407]);
 
 export type FetchLike = (
   input: string,
@@ -283,6 +312,62 @@ export function windowCapturedAt(window: WindowEntry[]): number | undefined {
 
 export type PlanAction = "ship" | "skip" | "reanchor";
 
+/** Enough bytes for a Pi session header line, and small enough that reading it
+ *  costs nothing next to a full session file. */
+const HEADER_READ_BYTES = 8192;
+
+export interface HeaderScan {
+  /** The header `id`, from the FIRST line only (Pi writes it first). */
+  headerId?: string;
+  /** sha256 of that line — the same value `scanSessionFile` records. */
+  headerSha?: string;
+  /** True when the first line is not terminated inside the read window. */
+  partial: boolean;
+}
+
+/**
+ * Read ONLY the header line — everything `planFile` needs to decide skip vs
+ * ship/re-anchor.
+ *
+ * `scanSessionFile` reads the WHOLE file and JSON.parses every line, and a
+ * `session_start` sweep runs over the user's entire session history: the
+ * measured tree on a working box is gigabytes, re-read on every start and
+ * multiplied by concurrent sessions. A file whose cursor is already at its
+ * size needs neither read. The header is line 1 in Pi's own output, so one
+ * small positional read answers the identity question; the full scan is paid
+ * for only when the plan says ship or re-anchor.
+ */
+export function scanHeaderLine(path: string): HeaderScan {
+  const fd = openSync(path, "r");
+  let read = 0;
+  const buf = Buffer.alloc(HEADER_READ_BYTES);
+  try {
+    read = readSync(fd, buf, 0, buf.length, 0);
+  } finally {
+    closeSync(fd);
+  }
+  const slice = buf.subarray(0, Math.max(0, read));
+  const nl = slice.indexOf(0x0a);
+  if (nl === -1) return { partial: true };
+  const text = slice.subarray(0, nl).toString("utf8").trim();
+  if (!text) return { partial: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { partial: false };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { partial: false };
+  const rec = parsed as Record<string, unknown>;
+  if (rec.type !== "session") return { partial: false };
+  return {
+    headerId: typeof rec.id === "string" && rec.id ? rec.id : undefined,
+    // HAShed exactly as `scanSessionFile` does (`t` is the trimmed line).
+    headerSha: createHash("sha256").update(text).digest("hex"),
+    partial: false,
+  };
+}
+
 export interface FilePlan {
   action: PlanAction;
   offset: number;
@@ -365,6 +450,14 @@ export interface RunReceipt {
   files: FileOutcome[];
   shipped: number;
   skipped: number;
+  /** Files whose window holds no shippable turn yet (nothing is lost: the
+   *  window is re-derived from the whole file on every run). Counted
+   *  separately from `skipped`, which means "already up to date" — otherwise a
+   *  sweep that examined real work reads as "0 shipped, 0 up to date". */
+  noTurns: number;
+  /** Files REFUSED because their window is shorter than what was already
+   *  delivered (a `/compact` cut). Counted, never silent. */
+  shrunk: number;
   dropped: number;
   deadLettered: number;
   requests: number;
@@ -405,15 +498,15 @@ function defaultListFiles(root: string): string[] {
 export function classifyStatus(status: number | undefined): "advance" | "permanent" | "retain" {
   if (status === undefined) return "retain"; // transport failure — retryable
   if (status >= 200 && status < 300) return "advance";
-  if (RETAIN_STATUS.has(status)) {
-    // 409 is ambiguous on this API: "already in flight" is benign and the
-    // payload may land later; a shape 409 never will. The seam treats 409 as
-    // retryable (a 409 from a concurrent producer must NOT be dead-lettered —
-    // the same turns are being written by the other lane), so it stays
-    // retained and the next run re-files.
-    return "retain";
-  }
-  if (status === 409) return "retain";
+  // 409 is ambiguous on this API: "already in flight" is benign and the
+  // payload may land later; a shape 409 never will. The seam treats 409 as
+  // retryable (a 409 from a concurrent producer must NOT be dead-lettered —
+  // the same turns are being written by the other lane), so it is a member of
+  // RETAIN_STATUS and the next run re-files.
+  if (RETAIN_STATUS.has(status)) return "retain";
+  // A credential/entitlement refusal is not a refusal of the BYTES: retaining
+  // keeps the cursor where it is, so a fixed key re-ships (never a cross).
+  if (AUTH_STATUS.has(status)) return "retain";
   if (PERMANENT_STATUS.has(status)) return "permanent";
   if (status >= 400 && status < 500) return "permanent";
   return "retain"; // 5xx / anything else: the moment, not the bytes
@@ -428,6 +521,8 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     files: [],
     shipped: 0,
     skipped: 0,
+    noTurns: 0,
+    shrunk: 0,
     dropped: 0,
     deadLettered: 0,
     requests: 0,
@@ -489,6 +584,37 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     };
     const identity = fileIdentity(path);
     if (!identity) continue;
+    const prior = state.files[path];
+    // Read the HEADER LINE ONLY first: a sweep runs over the user's whole
+    // session history, and an up-to-date file must not be read (or JSON.parsed
+    // line by line) to discover that. The full scan below is paid for only
+    // when the plan says ship or re-anchor.
+    let head: HeaderScan;
+    try {
+      head = scanHeaderLine(path);
+    } catch (err) {
+      receipt.errors.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    const headPlan = planFile(prior, identity, {
+      headerId: head.headerId,
+      headerSha: head.headerSha,
+    });
+    if (headPlan.action === "skip" && head.headerSha !== undefined) {
+      // The cheap path: `stat` identity + the header sha already agree and the
+      // cursor is exactly at the file's size. Nothing to read, nothing to POST.
+      receipt.skipped += 1;
+      receipt.files.push({
+        path,
+        sessionId: head.headerId ?? prior?.sessionId,
+        action: "skip",
+        offset: headPlan.offset,
+        delivered: prior?.delivered ?? 0,
+        attempts: 0,
+        reason: "up_to_date",
+      });
+      continue;
+    }
     let scan: ScanResult;
     try {
       scan = scanSessionFile(path);
@@ -496,7 +622,8 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
       receipt.errors.push(`${path}: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
-    const prior = state.files[path];
+    // The FULL scan is authoritative for the plan: it can find a session header
+    // that is not the first line, which the header-only read cannot.
     const plan = planFile(prior, identity, {
       headerId: scan.headerId,
       headerSha: scan.headerSha,
@@ -542,17 +669,35 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     }
     const window = activeBranch(scan.entries);
     const turns = windowTurns(window);
+    const priorDelivered = prior?.delivered ?? 0;
     if (!turns.length) {
       // Nothing shippable yet (only a user message so far, or an empty
-      // branch). The cursor still advances past the complete lines we did
+      // branch). A real run advances the cursor past the complete lines it did
       // read: there is no turn to lose, and re-reading them buys nothing.
+      receipt.noTurns += 1;
+      if (dryRun) {
+        // A dry run is REPORT-ONLY — `tortoise store-sync --dry-run` is
+        // documented as "POST nothing, move no cursor", so it must not create
+        // the cursor store or move an offset either.
+        receipt.files.push({
+          path,
+          sessionId,
+          action: scan.partial ? "partial" : "skip",
+          offset: plan.offset,
+          delivered: priorDelivered,
+          attempts: 0,
+          reason: "no_turns",
+        });
+        continue;
+      }
       const advance: FileCursor = {
         offset: scan.nextOffset,
         sessionId,
         dev: identity.dev,
         ino: identity.ino,
         headerSha: scan.headerSha,
-        delivered: prior?.delivered ?? 0,
+        delivered: priorDelivered,
+        lastWindow: prior?.lastWindow,
         updatedAt: now(),
       };
       state.files[path] = advance;
@@ -562,10 +707,52 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         sessionId,
         action: scan.partial ? "partial" : "skip",
         offset: scan.nextOffset,
-        delivered: prior?.delivered ?? 0,
+        delivered: priorDelivered,
         attempts: 0,
         reason: "no_turns",
       });
+      continue;
+    }
+
+    // THE SHRINK GUARD. A `compaction` entry cuts the window at
+    // `firstKeptEntryId`, so a post-`/compact` window is STRICTLY SHORTER than
+    // what this file already delivered. The turn store's shorter-re-capture
+    // rule then hard-deletes every turn beyond the new window (#1920,
+    // journaled as a delete) — so shipping it would DESTROY turns the hook
+    // already filed. Refuse: retain the cursor, count it, and say why. The
+    // hook lane never shrinks its window (Pi's entry array keeps the
+    // pre-compaction entries), so this refusal costs nothing it would ship.
+    const compacted = window.some((w) => w.type === "compaction");
+    const priorWindow = prior?.lastWindow ?? 0;
+    if (compacted && priorWindow > 0 && turns.length < priorWindow) {
+      state.files[path] = {
+        offset: plan.offset,
+        sessionId,
+        dev: identity.dev,
+        ino: identity.ino,
+        headerSha: scan.headerSha,
+        delivered: priorDelivered,
+        lastWindow: priorWindow,
+        updatedAt: prior?.updatedAt ?? 0,
+        attemptedAt: now(),
+        failures: (prior?.failures ?? 0) + 1,
+      };
+      receipt.shrunk += 1;
+      receipt.files.push({
+        path,
+        sessionId,
+        action: "failed",
+        offset: plan.offset,
+        delivered: turns.length,
+        attempts: 0,
+        reason: "window_shrunk",
+      });
+      log(
+        `store-sync: REFUSED a shrunk window for ${sessionId} ` +
+          `(${turns.length} turns vs ${priorWindow} already delivered — a ` +
+          "/compact cut; shipping it would delete the turns past the new window)",
+      );
+      checkpoint();
       continue;
     }
 
@@ -650,6 +837,9 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         ino: identity.ino,
         headerSha: scan.headerSha,
         delivered: (prior?.delivered ?? 0) + turns.length,
+        // What THIS window delivered: the shrink guard compares the next window
+        // against it, so a `/compact` cut is detectable without a re-read.
+        lastWindow: turns.length,
         updatedAt: now(),
         attemptedAt: now(),
         failures: 0,
@@ -688,6 +878,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         ino: identity.ino,
         headerSha: scan.headerSha,
         delivered: prior?.delivered ?? 0,
+        lastWindow: prior?.lastWindow,
         updatedAt: now(),
         attemptedAt: now(),
         failures: (prior?.failures ?? 0) + 1,
@@ -720,6 +911,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
       ino: identity.ino,
       headerSha: scan.headerSha,
       delivered: prior?.delivered ?? 0,
+      lastWindow: prior?.lastWindow,
       updatedAt: prior?.updatedAt ?? 0,
       attemptedAt: now(),
       failures: (prior?.failures ?? 0) + 1,
@@ -738,8 +930,14 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     checkpoint();
   }
 
-  const saved = saveCursor(options.cursorDir, state);
-  if (!saved.ok) receipt.cursorWriteError = saved.error;
+  // A dry run is REPORT-ONLY: it must not create the cursor store or rewrite
+  // any offset (the CLI advertises "POST nothing, move no cursor").
+  if (!dryRun) {
+    // `prune` drops rows for session files that no longer exist, so the cursor
+    // store cannot grow without bound and every checkpoint stays O(live files).
+    const saved = saveCursor(options.cursorDir, state, { prune: true });
+    if (!saved.ok) receipt.cursorWriteError = saved.error;
+  }
   receipt.deadLetters = readDeadLetters(options.cursorDir);
   return receipt;
 }
@@ -767,6 +965,10 @@ export function parseArgs(argv: string[]): Record<string, unknown> {
     else if (arg === "--max-requests") out.maxRequests = Number(take());
     else if (arg === "--exclude-session-id") out.excludeSessionId = take();
     else if (arg === "--api-url") out.apiUrl = take();
+    // The credential is normally passed through the ENVIRONMENT by the Python
+    // CLI (`TORTOISE_API_KEY`), so it never appears in `ps`. The flag exists
+    // for a caller that has no environment to hand.
+    else if (arg === "--api-key") out.apiKey = take();
     else if (arg === "--dry-run") out.dryRun = true;
     else if (arg === "--json") out.json = true;
   }
@@ -789,6 +991,7 @@ export async function main(argv: string[]): Promise<number> {
       ? (args.maxRequests as number)
       : undefined,
     apiUrl: args.apiUrl as string | undefined,
+    apiKey: args.apiKey as string | undefined,
     excludeSessionId: args.excludeSessionId as string | undefined,
     dryRun: args.dryRun === true,
     log: (line) => process.stderr.write(`${line}\n`),

@@ -58,6 +58,11 @@ export interface FileCursor {
   headerSha?: string;
   /** How many turns this file has shipped — an honest, monotone counter. */
   delivered?: number;
+  /** How many turns the LAST shipped window carried. The store-sync worker
+   *  refuses to ship a window SHORTER than this after a `/compact` cut: the
+   *  turn store's shorter-re-capture rule would hard-delete the turns past the
+   *  new window, so the shrink is detectable for free and must not be shipped. */
+  lastWindow?: number;
   /** Unix ms of the last successful advance. */
   updatedAt?: number;
   /** Unix ms of the last attempt (2xx or not) — drives the backoff floor. */
@@ -103,7 +108,9 @@ function validCursor(raw: unknown): FileCursor | undefined {
   }
   const out: FileCursor = { offset: Math.floor(offset) };
   if (typeof rec.sessionId === "string" && rec.sessionId) out.sessionId = rec.sessionId;
-  for (const key of ["dev", "ino", "updatedAt", "attemptedAt", "failures", "delivered"] as const) {
+  for (const key of [
+    "dev", "ino", "updatedAt", "attemptedAt", "failures", "delivered", "lastWindow",
+  ] as const) {
     const v = rec[key];
     if (typeof v === "number" && Number.isFinite(v)) out[key] = v;
   }
@@ -169,12 +176,25 @@ export function loadCursor(dir: string): LoadResult {
  * cursor that cannot be written means the next run re-ships: safe, and must
  * be visible rather than assumed).
  */
-export function saveCursor(dir: string, state: CursorState): { ok: boolean; error?: string } {
+export interface SaveOptions {
+  /** Drop rows for session files that no longer exist, so the store cannot grow
+   *  without bound (a deleted session file has nothing left to ship, and a row
+   *  for it is dead weight rewritten at every checkpoint). Off by default: a
+   *  caller that only touches part of the tree must not prune the rest. */
+  prune?: boolean;
+}
+
+export function saveCursor(
+  dir: string,
+  state: CursorState,
+  opts: SaveOptions = {},
+): { ok: boolean; error?: string } {
   const target = cursorPath(dir);
   const tmp = `${target}.tmp.${process.pid}`;
   try {
     mkdirSync(dir, { recursive: true });
-    const body = `${JSON.stringify(serialise(state), null, 1)}\n`;
+    const toWrite = opts.prune === true ? pruneMissing(state) : state;
+    const body = `${JSON.stringify(serialise(toWrite), null, 1)}\n`;
     const fd = openSync(tmp, "w", 0o600);
     try {
       writeFileSync(fd, body);
@@ -186,13 +206,31 @@ export function saveCursor(dir: string, state: CursorState): { ok: boolean; erro
       // Highest-precedence copy BEFORE the rename: if the rename leaves a
       // torn target (it cannot, but the backup costs one copy), the last good
       // offset is still here.
-      writeFileSync(backupPath(dir), readFileSync(target), { mode: 0o600 });
+      //
+      // ONLY from a target that PARSES. After a corrupt-main recovery this
+      // save runs with the freshly recovered state, and copying the CURRENT
+      // (still corrupt) main over the backup would destroy the last good
+      // offset the recovery was made from — the documented fallback would then
+      // hold only until the next save (P3: a FALSE guarantee).
+      const current = readFileSync(target);
+      if (parseState(current.toString("utf8")) !== undefined) {
+        writeFileSync(backupPath(dir), current, { mode: 0o600 });
+      }
     }
     renameSync(tmp, target);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+/** Drop rows whose session file no longer exists. */
+function pruneMissing(state: CursorState): CursorState {
+  const files: Record<string, FileCursor> = {};
+  for (const [path, cursor] of Object.entries(state.files)) {
+    if (existsSync(path)) files[path] = cursor;
+  }
+  return { version: state.version, files };
 }
 
 function serialise(state: CursorState): CursorState {

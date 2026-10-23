@@ -1,4 +1,4 @@
-// tortoise-hook-version: 7
+// tortoise-hook-version: 8
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
@@ -40,6 +40,13 @@
 // shipped bytes move. `session verify`'s "it captures with older logic"
 // wording is imprecise for this one generation; the classification and the
 // repair it prompts are right.
+//
+// Generation 8 (#3515 review): the `capture:` health line now also reports the
+// store-sync backstop's DEAD-LETTER count. A permanent refusal dead-letters a
+// session's window and CROSSES its cursor, so those turns can never re-ship;
+// the count lived only in the worker's receipt, and the one production caller
+// spawns it with `stdio: "ignore"` — i.e. the loss was counted into a document
+// nothing reads. The count belongs on the only line a user sees per session.
 //
 // Generation 7 (#3515): `session_start` now also starts the STORE-SYNC
 // BACKSTOP — a detached one-shot `tortoise store-sync` that drains Pi's own
@@ -856,6 +863,10 @@ export function postCapture(
 // ONE session and issues ONE POST.
 
 export const SPOOL_DIR = join(homedir(), ".tortoise", "capture-spool");
+/** The store-sync backstop's cursor store (whose dead-letter substrate is the
+ *  count the health line reports). `tortoise/store_sync.py::default_cursor_dir`
+ *  is the same path — one directory, two readers. */
+export const STORE_SYNC_DIR = join(homedir(), ".tortoise", "store-sync");
 /**
  * Spool ceilings. Count AND bytes (the issue's contract). These are NOT a TTL —
  * see the #3870 note above.
@@ -2338,10 +2349,54 @@ export function writeCaptureStatus(dir: string, status: CaptureStatus): void {
  * behind it. A spool that cannot be LISTED is `unreadable` and is never
  * reported as empty, nor healed.
  */
+export interface CaptureHealth {
+  state: CaptureState;
+  queued: number;
+  status?: number;
+  line: string;
+}
+
+/** Rows in the store-sync backstop's dead-letter substrate. A missing file is
+ *  0 (no drops), never an error: the health line must not fail because a
+ *  bookkeeping file is absent. */
+export function countStoreSyncDeadLetters(dir: string): number {
+  try {
+    const path = join(dir, "dead-letter.jsonl");
+    if (!existsSync(path)) return 0;
+    return readFileSync(path, "utf8").split("\n").filter((l) => l.trim()).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * The per-box capture health line.
+ *
+ * `storeSyncDir` names the store-sync cursor store, whose DEAD LETTERS are
+ * included in the line: a permanent refusal there crosses a per-file cursor, so
+ * those turns can never re-ship — and the count otherwise exists only in the
+ * worker's receipt, which the extension throws away (`stdio: "ignore"`). A
+ * count nothing reads is a silent drop; this is the one line a user sees.
+ */
 export function captureHealthLine(
   dir: string,
-  opts: { apiKey?: string } = {},
-): { state: CaptureState; queued: number; status?: number; line: string } {
+  opts: { apiKey?: string; storeSyncDir?: string } = {},
+): CaptureHealth {
+  const base = spoolHealthLine(dir, opts);
+  // The store is DERIVED from the spool root (both live under `~/.tortoise/`)
+  // rather than from `homedir()`: a caller that hands in a temp spool — every
+  // test does — must not read the machine's real cursor store (#3721).
+  const deadLettered = countStoreSyncDeadLetters(
+    opts.storeSyncDir ?? join(dirname(dir), "store-sync"),
+  );
+  if (deadLettered <= 0) return base;
+  return {
+    ...base,
+    line: `${base.line}, ${deadLettered} store-sync dead-lettered`,
+  };
+}
+
+function spoolHealthLine(dir: string, opts: { apiKey?: string } = {}): CaptureHealth {
   const pending = countPendingEntries(dir);
   if (pending === undefined) {
     // A spool we cannot list is UNKNOWN, not empty. Reporting `OK` here would be

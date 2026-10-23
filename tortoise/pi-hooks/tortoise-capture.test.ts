@@ -48,6 +48,7 @@ import {
   backoffDelay,
   buildCapturePayload,
   captureHealthLine,
+  countStoreSyncDeadLetters,
   captureKey,
   carriedWindow,
   clampAttempts,
@@ -2912,6 +2913,41 @@ test("#2100: the per-box health line is present in every state", async () => {
   writeSpoolEntry(dir, snapshot("sess-h2"));
   assert.equal(captureHealthLine(dir, { apiKey: "tt_x" }).state, "draining");
   assert.equal(captureHealthLine(dir, { apiKey: "" }).state, "inactive");
+
+  // #3515 review: a store-sync DEAD LETTER is a permanent refusal whose cursor
+  // is CROSSED — those turns can never re-ship — and its only other surface is
+  // the worker's receipt, which this extension discards (`stdio: "ignore"`).
+  // The count therefore belongs on the one line a user sees per session.
+  //
+  // MUTATION THAT REDS THIS: drop the `countStoreSyncDeadLetters` suffix → the
+  // line reads `capture: OK (0 queued)` while two sessions are unrecoverable.
+  // A dedicated PARENT (never tmpdir() itself: the sibling path is derived from
+  // the spool's own directory, so polluting the shared temp root would leak the
+  // count into every other fixture).
+  const parent = mkdtempSync(join(tmpdir(), "tortoise-capture-health-"));
+  const withDrops = join(parent, "capture-spool");
+  mkdirSync(withDrops, { recursive: true });
+  mkdirSync(join(parent, "store-sync"), { recursive: true });
+  writeFileSync(
+    join(parent, "store-sync", "dead-letter.jsonl"),
+    `${JSON.stringify({ path: "/s/a.jsonl", reason: "HTTP 400", at: 1 })}\n`
+      + `${JSON.stringify({ path: "/s/b.jsonl", reason: "HTTP 415", at: 2 })}\n`,
+  );
+  assert.equal(countStoreSyncDeadLetters(join(parent, "store-sync")), 2);
+  const dropped = captureHealthLine(withDrops, { apiKey: "tt_x" });
+  assert.equal(
+    dropped.line,
+    "capture: OK (0 queued), 2 store-sync dead-lettered",
+    "a dead-lettered drop is named on the human line, not only in a receipt",
+  );
+  assert.equal(dropped.state, "ok", "the drop count must not change the SPOOL's state");
+  // Derived from the SPOOL ROOT, never from `homedir()`: the default must not
+  // read the developer's real store (#3721 — the machine is not the code).
+  assert.equal(
+    captureHealthLine(tmpSpool(), { apiKey: "tt_x" }).line,
+    "capture: OK (0 queued)",
+    "a sibling store that does not exist adds nothing",
+  );
 
   // A HEALTH CHECK MUST NOT MUTATE WHAT IT DESCRIBES. `listSpoolEntries` (the
   // drain's scanner) REPAIRS as it reads: it records `corrupt_entry` discards

@@ -3415,7 +3415,7 @@ def test_every_capture_artifact_ships_in_the_wheel():
 # also flags the missing script/entry on its own, so the bump is what carries
 # the change to an install whose bytes are frozen at generation 3.
 _EXPECTED_INSTALL_CONTRACT = {"claude": 11, "codex": 3, "cursor": 4,
-                             "pi": 7}
+                             "pi": 8}
 
 
 @pytest.mark.parametrize("harness", sorted(_EXPECTED_INSTALL_CONTRACT))
@@ -3511,12 +3511,12 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
     siblings, so a stale installed copy is comparable rather than
     unmeasurable (#4680).
 
-    Mutation: delete ``// tortoise-hook-version: 7`` from
+    Mutation: delete ``// tortoise-hook-version: 8`` from
     ``tortoise/pi-hooks/tortoise-capture.ts`` — ``read_hook_version`` returns
     ``None``, ``contract_version_for('pi')`` returns ``None``, and both this
     test and the generation pin RED.
     """
-    assert hook_install.read_hook_version(_PI_SRC) == 7
+    assert hook_install.read_hook_version(_PI_SRC) == 8
     assert hook_install.count_canonical_markers(_PI_SRC) == 1, (
         "the Pi seam must carry exactly ONE column-0 marker (a second one is a "
         "site marker that would be mistaken for the contract)")
@@ -3532,7 +3532,7 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
 #: SHIPPED bytes and so compares equal by construction.  Edit the artifact, move
 #: the generation, update this pair — all three in one commit.
 _PINNED_PI_SEAM_INSTALL_CONTRACT = (
-    7, "db6fa30beb67fec50f43e05536c00c9501be066279536b52d69766df62f1ca59")
+    8, "90813c2efae5b0be48821b9d1c22eb9dd0754f82057758d1acad46a7c2f12c4d")
 
 #: One digest per generation from generation 3 forward, so "bytes changed,
 #: generation left alone" cannot be certified by editing the pair above by itself:
@@ -3562,6 +3562,12 @@ _GENERATION_DIGESTS = {
     # (or `git show HEAD:tortoise/pi-hooks/tortoise-capture.ts | sha256sum`).
     6: "6f8c94b5f333fe571b9e913e9cec17c00d537395bce804290d9f2fe7ca445ae9",
     7: "db6fa30beb67fec50f43e05536c00c9501be066279536b52d69766df62f1ca59",
+    # #3515 review: the `capture:` health line also reports the store-sync
+    # backstop's dead-letter count (a permanent refusal crosses that file's
+    # cursor, so the turns can never re-ship — and the one production caller
+    # discards the worker's receipt). Behaviour moved, so the generation moved
+    # with it: generation 8.
+    8: "90813c2efae5b0be48821b9d1c22eb9dd0754f82057758d1acad46a7c2f12c4d",
 }
 
 

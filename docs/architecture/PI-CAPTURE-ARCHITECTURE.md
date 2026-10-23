@@ -102,15 +102,26 @@ path: the backstop imports the hook's `buildCapturePayload` / `extractTurns` /
 `postCapture`, so the two lanes cannot drift into two payload shapes. A test pins
 that import (`test_the_worker_does_not_carry_a_second_payload_builder`).
 
-**One recorded consequence of that sharing (found in review, not yet resolved).**
+**One recorded consequence of that sharing — GUARDED, not resolved.**
 The two lanes agree on the payload *shape* but can disagree on *content* after a
 `/compact`: the backstop's window is strictly shorter (cut at
 `compaction.firstKeptEntryId`), while the hook's payload grows. The turn store's
 shorter-re-capture rule **DELETES the turns beyond the new window** (`sdk.py`, the
 #1920 behaviour, journaled as a delete) — so a post-compaction backstop ship can
-remove turns the hook filed. Recovery is the journal, not the Session. Pinned as a
-defect to fix (post the union of shipped + kept, or refuse a shrinking window); it
-is deliberately NOT papered over here.
+remove turns the hook filed.
+
+The worker therefore **REFUSES to ship a shrinking window**: when the active branch
+carries a `compaction` entry and the window is shorter than `lastWindow` (the size of
+what this file already delivered), the cursor is RETAINED, nothing is posted, and the
+refusal is counted (`receipt.shrunk`) and logged. That makes the deletion path
+unreachable without deciding the open design question — posting the *union* of
+shipped + kept, or a server-side monotone window — which stays on #3515 and is named
+in §9. Recovery for anything already filed is still the journal, not the Session.
+
+**One deliberate cost, stated so it cannot read as an oversight.** The refusal is per
+FILE and STICKY: a compacted session whose window cannot grow back past what was
+delivered stays refused on every later run. That is the intended trade — a refused
+session is visible (`shrunk`) while a deleting ship is not.
 
 **The one field that distinguishes them** is the persisted `capture_lane`
 (`hook` | `store_sync`). Without it the two lanes POST byte-identical payloads and a
@@ -130,13 +141,13 @@ and are not renumbered). Status against the tree at this commit:
 | 2 | **A cursor per session file, advance-on-2xx only** | **built here** — `cursor-store.ts` + `store-sync.ts`. |
 | 3 | A retrying sync worker with **bounded** backoff | **built here** — `BACKOFF_MS` (5 attempts, ≤20 s), `MAX_ATTEMPTS` derived from it. |
 | 4 | At-least-once delivery keyed by an **idempotency key** | **landed before this lane** — the server MERGEs turn Points on `{session_id}_t{i}`; the worker re-ships the window and relies on that MERGE. |
-| 5 | **Recovery sweep on next start** — spool **and** unsynced files | **built here** — `tortoise store-sync` (one command, both substrates) + a detached one-shot spawn from the extension's `session_start`, excluding the live session. |
+| 5 | **Recovery sweep on next start** — spool **and** unsynced files | **built here** — `tortoise store-sync` (one command, both substrates) + a detached one-shot spawn from the extension's `session_start`, excluding the live session. `--exclude-session-id` and `--file` reach BOTH halves (the spool half too: filing the LIVE session there makes the server skip extraction for every later turn of it). The spool leg carries the #3615 **consent** gate — this command is a fourth upload path — while the log leg keeps the Pi seam's per-install consent; the credential is resolved ONCE and handed to both halves (in the worker's environment, never its argv), so a key from one store is never paired with a URL from another (#2369 D1.1). |
 | 6 | `session_id` from the **on-disk header id only** | **built here** for the backstop; the hook already passes the session's own id. A file with no header id is **refused**, never given a generated one. |
 | 7 | Sweep-vs-hook concurrency guard, server-side extraction claim + lease TTL | **NOT built by this lane** — it is a server change (a claim keyed by `_session_capture_event_id` with a lease ≥ the ~819 s extraction deadline) and it is **the next task**, not a silent drop. Until it lands, a sweep+live-hook race can run extraction twice; the captures themselves converge (idempotent MERGE). Recorded in §9. |
 | 8 | Persisted **lane/provenance** marker, end to end | **landed before this lane** — `SessionRequest.capture_lane`, the set-only-when-present MERGE, `capture_spool.CAPTURE_LANES`, the TS mirror, and `test_capture_lane_3516.py`. The backstop **stamps `store_sync`**. |
 | 9 | **Cursor-past-EOF / file-replaced** handling | **built here** — `planFile`: `cursor_past_eof` → re-read from offset 0; `file_replaced` (dev/ino) and `header_changed` (header sha) likewise. Never a silent skip. |
-| 10 | Bounded sweep rate + spool cap | **built here for the sweep** — `MAX_FILES_PER_RUN = 50` **files shipped** per run (the remainder drains next run), `MAX_REQUESTS_PER_RUN = 200`. The spool cap is the existing count/byte bound in `capture_spool.DEFAULT_BOUNDS` (no TTL — the owner ruled the spool is kept until the user deletes it). |
-| 11 | Backoff exhaustion retains; restarts do not multiply; permanent 4xx → stall + dead-letter, non-blocking | **built here** — retention keeps the cursor at the last good offset and persists `failures`; a permanent 4xx writes a dead-letter row (folded to one row per file, capped at 500), advances past it, and **counts the drop** so a later file still ships. |
+| 10 | Bounded sweep rate + spool cap | **built here for the sweep** — `MAX_FILES_PER_RUN = 50` **files shipped** per run (the remainder drains next run), `MAX_REQUESTS_PER_RUN = 200`. The cap deliberately bounds SHIPPED files, not EXAMINED ones (capping the examined prefix would starve the tail), so an up-to-date file is skipped from its `stat` identity plus its HEADER LINE: a sweep never reads a whole session file it is going to skip. The spool cap is the existing count/byte bound in `capture_spool.DEFAULT_BOUNDS` (no TTL — the owner ruled the spool is kept until the user deletes it). |
+| 11 | Backoff exhaustion retains; restarts do not multiply; permanent 4xx → stall + dead-letter, non-blocking | **built here** — retention keeps the cursor at the last good offset and persists `failures`; a permanent 4xx writes a dead-letter row (folded to one row per file, capped at 500), advances past it, and **counts the drop** so a later file still ships. `PERMANENT` is the set that will never succeed **for the same BYTES** (400/404/405/406/413/415/422). A credential refusal (401/403/407) is **RETAINED**, never crossed: it refuses the CALLER, not the bytes, so a rotated/expired key would otherwise permanently drop every pending session — the exact loss the backstop exists to prevent. The dead-letter count is also printed on the extension's `capture:` health line, since the one production caller spawns the worker with `stdio: "ignore"`. |
 | 12 | Clock source per lane | **landed before this lane** (`cli_observed` / `file_mtime` / `unknown`); **extended here** with `entry_timestamp` — the store-sync lane stamps the **log entry's own** `timestamp`, in unix seconds, under its own source name so the floor can tell the three clocks apart. Server vocabulary, the `capture_spool` mirror and the TS mirror move together; a test pins the TS mirror against the server's set. |
 | 13 | **ONE shared turn-window / branch contract** | **built here** as `activeBranch` + `cutAtCompaction` (leaf → root via `parentId`, cut at `compaction.firstKeptEntryId`, no positional ids ever). The Python backfill reader (`session_import.parsers.parse_pi`) is **NOT yet branch-aware** — it walks lines — so the contract has one consumer and one known non-conformant reader, recorded in §9 rather than claimed. |
 
@@ -146,11 +157,15 @@ and are not renumbered). Status against the tree at this commit:
 |---|---|---|
 | **Half-written trailing line** | The cursor never crosses a line's terminating newline, so the partial line is neither parsed (garbage) nor skipped (loss). It ships whole on the next pass. | `a partial trailing line is NOT consumed and NOT lost`; `a half-written tail neither ships garbage nor blocks the next run` (process level). Mutation control: making the cursor jump to `buf.length` reds 3 rows. |
 | **Restart** | The cursor is written `tmp`+`fsync`+`rename`, with the previous good copy kept as `.bak`. A restart resumes at the same byte and **POSTs nothing** for an up-to-date file. | `the cursor SURVIVES a restart and neither re-emits nor skips`; `test_cursor_survives_a_restart_and_does_not_re_emit` (two processes, zero POSTs on the second). |
-| **Corrupt cursor** | Fails **closed to the last good offset** (`.bak`), with the recovery recorded — never 0 (duplicate storm) and never EOF (silent loss). | `a CORRUPT cursor fails closed to the last good offset (recorded, not silent)`. |
+| **Corrupt cursor** | Fails **closed to the last good offset** (`.bak`), with the recovery recorded — never 0 (duplicate storm) and never EOF (silent loss) **while the backup is usable**. When BOTH copies are unusable it re-ships from offset **0** and says so: at-least-once is the contract and the duplicate is absorbed by the server's turn MERGE. A save made straight after a recovery does not copy the still-corrupt main over the backup, so the fallback survives the next checkpoint. | `a CORRUPT cursor fails closed to the last good offset (recorded, not silent)`; `a cursor from a future version is not silently interpreted` (pins the empty state that IS the double-corrupt contract); `a RECOVERY save does not overwrite the last good backup with the corrupt bytes`. |
+| **`/compact` shrink** | A window shorter than what this file already delivered is **REFUSED**: cursor retained, nothing posted, the refusal counted (`shrunk`). Shipping it would make the turn store hard-delete the turns past the new window (#1920). | `a /compact SHRINK is refused, never shipped (it would delete filed turns)`. Mutation control: delete the guard → the row POSTs. |
 | **Truncation / rotation / replacement** | `cursor > file_size` (L6), an inode change, or a changed header sha ⇒ **re-read from the header and re-ship**, reason recorded. | `planFile re-anchors to the header on cursor > file_size`; `…when the file is REPLACED under the same path`; `test_a_truncated_file_is_re_anchored_not_silently_skipped`. Mutation control: deleting the past-EOF branch reds the planFile row. |
 
 Two workers over one file cannot corrupt the cursor (single `rename`), and both may
 POST the same window: the server's turn MERGE is the idempotency boundary.
+`--dry-run` is genuinely read-only: it POSTs nothing, moves no offset, and does not
+create the cursor store — including on the branch where the window holds no shippable
+turn yet.
 
 ---
 
@@ -299,6 +314,10 @@ the server's admission pool.
 
 ### Recorded remainders (not silent drops)
 
+These all stay on **#3515**, which this PR references (`Refs`, not `Closes`) for
+exactly this reason: they are the issue's own Indicators, and closing it while they
+are unbuilt would read as done.
+
 - **Piece 7** — the server-side extraction claim + lease: the next task. Its test
   set is already named in the issue.
 - **Piece 13's second consumer** — `session_import.parsers.parse_pi` (the backfill
@@ -307,4 +326,11 @@ the server's admission pool.
   a follow-up.
 - **Startup resolution assert** on the user's machine — §7.
 - **Part (ii)'s falsifiers (a)/(b)/(c)** — §6.
-- **A monotone window across a `/compact`** — §4's recorded consequence.
+- **A monotone window across a `/compact`** — §4's recorded consequence. The
+  deletion path is now unreachable (the worker refuses a shrinking window), so what
+  remains is the design choice between posting the union and a server-side monotone
+  window, plus the sticky-refusal cost recorded in §4.
+- **Two operators over one cursor directory** — the sweep is spawned per
+  `session_start` with no singleton or lock. Two workers cannot corrupt the cursor
+  (one `rename`) and both may POST the same window (the server MERGE absorbs it), but
+  a fleet box pays the sweep N times concurrently. Bounded, not fixed.

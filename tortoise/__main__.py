@@ -11666,11 +11666,18 @@ def _flush_pending_capture_notice() -> None:
 def _cmd_store_sync(args) -> int:
     """``tortoise store-sync`` — the #3515 recovery sweep (spool + Pi log).
 
-    Credential resolution is BEST-EFFORT and happens here only so the spool
-    half can reuse the shared POST path; the log half's worker resolves its own
-    config (it is also runnable on a machine with no Python tortoise install).
-    A host with no credential still runs the sweep and says so — the sweep is
-    the one place that must never be silent about a substrate it skipped.
+    Credential resolution is BEST-EFFORT and happens here only so both halves
+    use ONE credential chain: the resolved key/url are handed to the spool leg
+    and to the worker (in the worker's own environment, never its argv).
+
+    The resolver is wrapped in a BLANKET ``except Exception``, not
+    ``_ConfigError``: ``_resolve_config_path`` calls ``Path.is_file()``, which
+    raises ``PermissionError`` when ``~/.tortoise`` is unreadable — and the
+    sweep is spawned DETACHED with ``stdio: "ignore"``, so a traceback here
+    both aborts the recovery sweep and hides why. That is the #3963 lesson
+    ``_cmd_session_drain_best_effort`` already records, and the log half needs
+    no config at all to READ files and re-anchor cursors: it reports "no
+    credential" honestly instead of dying before it runs.
     """
     from tortoise.store_sync import main as _store_sync_main
 
@@ -11678,10 +11685,9 @@ def _cmd_store_sync(args) -> int:
     api_url = None
     try:
         _cfg_path, _config, api_key, api_url = _resolve_transmit_config()
-    except _ConfigError:
-        # A corrupt config must not make the sweep a no-op (the #3963 lesson:
-        # a broken config once turned the capture mechanism of record silent).
-        # The log half needs no config at all to READ and to re-anchor cursors.
+    except Exception:
+        # A corrupt OR UNREADABLE config must not make the sweep a no-op: the
+        # spool leg then reports `no_credential` and the log leg still runs.
         pass
     args.api_key = api_key
     args.api_url = api_url
@@ -11862,7 +11868,9 @@ def main(argv: list[str] | None = None) -> int:
     ss.add_argument("--cursor-dir", default=None,
                     help="Cursor store directory (default: ~/.tortoise/store-sync)")
     ss.add_argument("--file", action="append", default=None,
-                    help="Sync only this session file (repeatable)")
+                    help="Sync only this session file (repeatable). A single "
+                         "--file also narrows the SPOOL half to that session "
+                         "(the filename carries the session id)")
     ss.add_argument("--max-files", type=int, default=None,
                     help="Bound this run to N session files (the rest drains next run)")
     ss.add_argument("--max-requests", type=int, default=None,
@@ -11871,7 +11879,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="Skip this session id (the one LIVE right now — filing it "
                          "would make the server skip extraction for later turns)")
     ss.add_argument("--no-spool", action="store_true",
-                    help="Skip the spool half (log half only)")
+                    help="Skip the spool half (log half only). The spool half "
+                         "POSTs turns, so it needs capture consent "
+                         "(TORTOISE_CAPTURE=1); the log half does not")
     ss.add_argument("--dry-run", action="store_true",
                     help="Plan only — POST nothing, move no cursor")
     ss.add_argument("--json", action="store_true", help="Machine-readable receipt")

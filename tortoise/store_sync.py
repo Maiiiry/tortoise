@@ -23,10 +23,29 @@ and it gives self-hosted users a manual sync command.
 An unavailable ``node`` is not a capture failure to hide: the spool half still
 runs and the receipt says the log half was skipped and why. A Pi user always
 has node (Pi is a node program); a non-Pi user has no Pi session log to ship.
+
+TWO DELIBERATE ASYMMETRIES between the halves, both stated so neither reads as
+an oversight:
+
+* **Consent.** The spool leg is a TRANSMISSION primitive and carries the #3615
+  consent gate (``capture_consent_enabled``), exactly like ``session capture``,
+  ``sessions import`` and ``session drain`` — this is the FOURTH upload path,
+  and a host whose capture is off must not have its spool POSTed by a command
+  it did not think of as an upload. The LOG leg keeps the Pi seam's own
+  posture (per-install consent, ``pi-hooks/README.md``): the extension is
+  installed only when the user consented to that install.
+* **Credential.** The credential is resolved ONCE, at the CLI, and handed to
+  BOTH halves (``_cmd_store_sync`` → ``api_key`` → :func:`run_worker`, which
+  passes it to the worker in its ENVIRONMENT, never on argv). The worker still
+  falls back to its own chain when no key is handed to it, so it stays runnable
+  on a machine with no Python tortoise install — but a caller that already
+  holds a credential never leaves the worker reading a DIFFERENT store, which
+  would pair a key from one chain with a URL from another (#2369 D1.1).
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -80,6 +99,7 @@ def run_worker(
     max_requests: int | None = None,
     dry_run: bool = False,
     api_url: str | None = None,
+    api_key: str | None = None,
     exclude_session_id: str | None = None,
     node: str | None = None,
     timeout: int = WORKER_TIMEOUT_S,
@@ -89,6 +109,13 @@ def run_worker(
     Process-level on purpose: the cursor's crash-consistency claim is about a
     process that exits and a later process that resumes, which an in-process
     call cannot produce.
+
+    ``api_key``/``api_url`` are the credential the CALLER resolved (env →
+    ``~/.tortoise/credentials.json``). They are handed to the worker in its
+    ENVIRONMENT — never argv, which every process on the box can read — so the
+    worker cannot pair a key from one store with a URL from another. When both
+    are absent the worker resolves its own chain, which is what keeps this
+    module runnable on a machine that has no Python install.
     """
     artifact = worker_path()
     if not artifact.exists():  # pragma: no cover - the artifact guard covers this
@@ -127,13 +154,27 @@ def run_worker(
     if dry_run:
         argv += ["--dry-run"]
     argv += ["--json"]
+    env = None
+    if api_key:
+        # The worker's OWN resolution reads these, so the key and the URL come
+        # from the SAME chain by construction (co-source, #2369 D1.1).
+        env = {**os.environ, "TORTOISE_API_KEY": api_key}
+        if api_url:
+            env["TORTOISE_API_URL"] = api_url
     try:
         proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            argv, capture_output=True, text=True, timeout=timeout, check=False
+            argv, capture_output=True, text=True, timeout=timeout, check=False, env=env
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "worker_status": "timeout",
                 "detail": f"worker exceeded {timeout}s", "files": []}
+    except OSError as exc:
+        # An unusable `node` (a path that exists in PATH but not on disk, a
+        # permission refusal) must be a NAMED not-run reason, not a traceback:
+        # the sweep is spawned detached with stdio ignored, so an exception
+        # here would silently end the recovery sweep (#3963's shape).
+        return {"ok": False, "worker_status": "node_unavailable",
+                "detail": f"cannot execute {exe}: {exc}", "files": []}
     receipt = _parse_receipt(proc.stdout or "")
     if receipt is None:
         return {
@@ -169,12 +210,35 @@ def run_sweep(
     (a spool drain with a stubbed transport must not reach the network).
     """
     receipt: dict[str, Any] = {"spool": None, "log": None, "ok": True}
+    # `--file` names ONE session file for the LOG half; for the spool half the
+    # equivalent is that session's spool entry. Both filters are forwarded so
+    # neither flag is silently half-applied (#3515 review: `--exclude-session-id`
+    # applied only to the log half still filed the LIVE session from the spool,
+    # which makes the server skip extraction for every later turn of it).
+    only_session_id: str | None = None
+    if files and len(files) == 1:
+        only_session_id = _session_id_from_filename(files[0])
     if spool:
-        summary: dict[str, Any] = {"attempted": 0}
         try:
             from tortoise.capture_spool import flush_spool, spool_dir
 
-            if post is None:
+            # #3615: this command POSTs spooled turns, so it carries the SAME
+            # consent gate as `session capture` / `session drain` /
+            # `sessions import`. Without it a host that never consented to
+            # capture had its locally-spooled (deliberately ungated) turns
+            # uploaded by a command nobody classified as an upload path.
+            from tortoise.capture_consent import (  # noqa: PLC0415
+                capture_consent_enabled,
+                capture_declined_reason,
+            )
+
+            if not capture_consent_enabled():
+                receipt["spool"] = {
+                    "status": "declined",
+                    "detail": capture_declined_reason()
+                    or "capture is off — the spool half was not drained",
+                }
+            elif post is None:
                 if not api_key:
                     receipt["spool"] = {
                         "status": "no_credential",
@@ -185,10 +249,20 @@ def run_sweep(
                 else:
                     from tortoise.__main__ import _session_post  # noqa: PLC0415
 
-                    summary_obj = flush_spool(spool_dir(), _session_post(api_key, api_url or ""))
+                    summary_obj = flush_spool(
+                        spool_dir(),
+                        _session_post(api_key, api_url or ""),
+                        only_session_id=only_session_id,
+                        exclude_session_id=exclude_session_id,
+                    )
                     receipt["spool"] = _summary_dict(summary_obj)
             else:
-                summary_obj = flush_spool(spool_dir(), post)
+                summary_obj = flush_spool(
+                    spool_dir(),
+                    post,
+                    only_session_id=only_session_id,
+                    exclude_session_id=exclude_session_id,
+                )
                 receipt["spool"] = _summary_dict(summary_obj)
         except Exception as exc:  # a broken spool must not kill the log half
             receipt["spool"] = {"error": f"{type(exc).__name__}: {exc}"}
@@ -201,6 +275,7 @@ def run_sweep(
         max_requests=max_requests,
         dry_run=dry_run,
         api_url=api_url,
+        api_key=api_key,
         exclude_session_id=exclude_session_id,
         node=node,
     )
@@ -208,6 +283,22 @@ def run_sweep(
     if receipt["log"] is not None and receipt["log"].get("ok") is False:
         receipt["ok"] = False
     return receipt
+
+
+def _session_id_from_filename(path: str) -> str | None:
+    """The session id a Pi/Claude session filename carries, or ``None``.
+
+    Pi names the file after the session UUID (``2026-05-01T10-00-00Z_<uuid>.jsonl``)
+    and the header ``id`` equals that UUID, so the filename is the spool key
+    without reading the file. A name that carries no plausible id returns
+    ``None`` rather than a guess: a wrong filter would drain the wrong entry.
+    """
+    stem = Path(str(path)).name
+    for suffix in (".jsonl", ".json"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+    tail = stem.rsplit("_", 1)[-1]
+    return tail if len(tail) >= 8 and all(c.isalnum() or c in "-" for c in tail) else None
 
 
 def _summary_dict(summary) -> dict[str, Any]:
@@ -244,6 +335,8 @@ def main(args) -> int:
             "store-sync: "
             f"{log.get('shipped', 0)} shipped, "
             f"{log.get('skipped', 0)} up to date, "
+            f"{log.get('noTurns', 0)} awaiting a turn, "
+            f"{log.get('shrunk', 0)} refused (shrunk window), "
             f"{log.get('deadLettered', 0)} dead-lettered, "
             f"{log.get('dropped', 0)} dropped"
         )
