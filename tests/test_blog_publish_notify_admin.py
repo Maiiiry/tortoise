@@ -65,6 +65,8 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from tests._verdict import NODE_FLOOR_STRIP_TYPES, require_node_floor
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -167,20 +169,42 @@ console.log(JSON.stringify({
 """
 
 
-def _run(case: dict) -> dict:
+_DRIVER_DIR: Path | None = None
+
+
+def _driver_path() -> Path:
+    """Write the driver ONCE, not once per case, and tolerate its removal.
+
+    A temp dir per call cost the same node start PLUS mkdir/rmtree, and the file is
+    constant. It is re-created if it disappeared (a cleaner, or a sibling test
+    module tidying a shared tmp root), so a missing file can never present as a
+    node loader error.
+    """
+    global _DRIVER_DIR
+    if _DRIVER_DIR is None or not (_DRIVER_DIR / "driver.mjs").is_file():
+        if _DRIVER_DIR is not None:
+            shutil.rmtree(_DRIVER_DIR, ignore_errors=True)
+        _DRIVER_DIR = Path(tempfile.mkdtemp(prefix="notify-publish-"))
+        (_DRIVER_DIR / "driver.mjs").write_text(_DRIVER)
+    return _DRIVER_DIR / "driver.mjs"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _node_floor():
+    """The floor probe spawns node too; once per module is enough, and it must run
+    BEFORE the first case rather than 17 times alongside them."""
     require_node_floor(NODE_FLOOR_STRIP_TYPES, what="the admin-editor publish notification guard", absent="fail")
-    driver = Path(tempfile.mkdtemp(prefix="notify-publish-")) / "driver.mjs"
-    driver.write_text(_DRIVER)
-    try:
-        proc = subprocess.run(
-            ["node", "--experimental-strip-types", str(driver), str(NOTIFY_FUNCTION), str(INDEXNOW_MODULE), json.dumps(case)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=str(REPO_ROOT),
-        )
-    finally:
-        shutil.rmtree(driver.parent, ignore_errors=True)
+    yield
+
+
+def _run(case: dict) -> dict:
+    proc = subprocess.run(
+        ["node", "--experimental-strip-types", str(_driver_path()), str(NOTIFY_FUNCTION), str(INDEXNOW_MODULE), json.dumps(case)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(REPO_ROOT),
+    )
     assert proc.returncode == 0, proc.stderr[-3000:]
     return json.loads(proc.stdout.strip().splitlines()[-1])
 
@@ -245,6 +269,19 @@ def test_v2e_the_row_select_actually_asks_for_the_hold_column():
     assert "hold_for_review" in m.group(0), (
         "the row read must select hold_for_review — the live predicate is two columns"
     )
+
+
+def test_v2g_archived_is_not_live():
+    """Archived is terminal and never public. Without a case here, relaxing the
+    guard to `status !== "draft"` leaves the suite green while a terminal row's
+    URL is submitted."""
+    out = _run({
+        "row": {"slug": "agent-memory", "status": "archived"},
+        "body": {"slug": "agent-memory"},
+    })
+    assert out["status"] == 409
+    assert out["body"]["error"] == "not_live"
+    assert out["submissions"] == []
 
 
 def test_v2b_unknown_slug_is_404_and_never_submitted():
