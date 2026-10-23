@@ -102,7 +102,11 @@
   "sources": [
     "https://arxiv.org/abs/2005.11401"
   ],
+  "mitigations": [
+    "mitigated_by: ? -> [MITIGATION] The instability-to-necessit"
+  ],
   "kind_census": {},
+  "cross_axis_kinds": [],
   "packs": [
     "agent-ops",
     "dev",

@@ -71,7 +71,7 @@
       "severity": "P1",
       "item": "(kinds)",
       "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Point: ['criterion', 'option']",
-      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -94,6 +94,7 @@
     "tortoise://inbox/platform-team/2026-09-20-celery-to-temporal",
     "session:ax-eval/run-decision_request"
   ],
+  "mitigations": [],
   "kind_census": {
     "Point": [
       "option",
@@ -101,6 +102,7 @@
       "criterion"
     ]
   },
+  "cross_axis_kinds": [],
   "packs": [
     "agent-ops",
     "dev",

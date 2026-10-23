@@ -34,6 +34,11 @@ Two subcommands:
     ``graph.json`` (the structural record it was read from — nodes, labels,
     kinds, edges). The committed run directories hold both.
 
+    ``--graph <path>`` re-scores a COMMITTED ``graph.json`` with no database at
+    all. That is the audit path, and it is exact: scoring a committed record
+    reproduces its committed ``score.json`` (`tests/test_ax_write_eval.py` pins
+    it for all ten runs).
+
 The matching is deliberately dumb (token overlap over the node's name/content)
 because a clever matcher would hide the very failure being measured: a
 "Northwind Logistics Ltd" that became a SECOND node must show as a duplicate,
@@ -72,6 +77,10 @@ KIND_PROP = {
     "Event": "eventKind",
     "Source": "sourceKind",
 }
+
+# The read order of the kind columns in `record()`'s single query. Derived from
+# KIND_PROP so a new layer cannot be added to one and forgotten in the other.
+KIND_PROPS = tuple(KIND_PROP[label] for label in LAYERS)
 
 # ── the declared vocabularies ─────────────────────────────────────────────
 #
@@ -231,7 +240,7 @@ _STOP = {
     "is", "are", "was", "were", "be", "been", "with", "by", "at", "as", "it",
     "its", "that", "this", "from", "into", "over", "after", "before", "has",
     "have", "had", "will", "would", "should", "must", "not", "no", "their",
-    "they", "them", "she", "he", "his", "her", "was", "were", "only", "still",
+    "they", "them", "she", "he", "his", "her", "only", "still",
 }
 
 
@@ -262,37 +271,65 @@ def _rows(proj, cypher: str) -> list[list]:
     return list(proj.query(cypher).result_set)
 
 
+def _node_from_row(
+    labels, text, kind_values, is_operator, op_type, status, url, node_id=""
+):
+    """Shape one graph row into a record node. Pure, so the kind-axis rule is
+    pinnable without a database (#9695 review P2).
+
+    ``kind`` is the layer's OWN property (``KIND_PROP``); every other layer's
+    kind property present on the same node is kept as ``foreign_kinds`` instead
+    of being coalesced into ``kind``. A `subjectKind` written on an Object then
+    reads as a finding in its own right, instead of as a legal-looking Object
+    kind — one `coalesce` across all five cannot say WHICH property carried it,
+    so `eventKind: meeting` on an Object passed silently.
+
+    Returns ``None`` for infrastructure labels (Meta/Session/registry) — those
+    are not written knowledge nodes.
+    """
+    labels = labels if isinstance(labels, list) else [labels]
+    layer = next((label for label in LAYERS if label in labels), None)
+    if layer is None:
+        return None
+    own = KIND_PROP[layer]
+    kinds = {prop: (value or "").strip() for prop, value in kind_values.items()}
+    return {
+        "layer": layer,
+        "labels": labels,
+        "text": (text or "").strip(),
+        "kind": kinds.get(own, ""),
+        "kind_prop": own,
+        "foreign_kinds": {p: v for p, v in kinds.items() if p != own and v},
+        "is_operator": bool(is_operator),
+        "op_type": (op_type or "").strip(),
+        "status": (status or "").strip(),
+        "url": (url or "").strip(),
+        "id": str(node_id or "").strip(),
+    }
+
+
 def record(uri_or_path: str) -> dict:
     """Read the graph and return the structural record (no scoring)."""
     sdk, proj = _open(uri_or_path)
-    # One query, all the props we need; FalkorDB returns positional rows.
+    # One query, all the props we need; FalkorDB returns positional rows. The
+    # five kind properties come back as SEPARATE columns so the record can say
+    # which property carried the kind (see KIND_PROP).
+    kind_cols = ", ".join(f"coalesce(n.{prop}, '')" for prop in KIND_PROPS)
     rows = _rows(
         proj,
         "MATCH (n) RETURN labels(n), "
         "coalesce(n.name, n.content, n.title, n.url, ''), "
-        "coalesce(n.pointKind, n.subjectKind, n.objectKind, n.eventKind, "
-        "n.sourceKind, ''), n.is_operator, coalesce(n.op_type, ''), "
+        f"{kind_cols}, n.is_operator, coalesce(n.op_type, ''), "
         "coalesce(n.status, ''), coalesce(n.url, ''), coalesce(n.id, n.eventId, '')",
     )
     nodes = []
-    for labels, text, kind, is_op, op_type, status, url, node_id in rows:
-        labels = labels if isinstance(labels, list) else [labels]
-        layer = next((label for label in LAYERS if label in labels), None)
-        if layer is None:
-            continue  # Meta / Session / registry infra — not a written knowledge node
-        nodes.append(
-            {
-                "layer": layer,
-                "labels": labels,
-                "text": (text or "").strip(),
-                "kind": (kind or "").strip(),
-                "is_operator": bool(is_op),
-                "op_type": (op_type or "").strip(),
-                "status": (status or "").strip(),
-                "url": (url or "").strip(),
-                "id": str(node_id or "").strip(),
-            }
-        )
+    for row in rows:
+        labels, text = row[0], row[1]
+        kind_values = dict(zip(KIND_PROPS, row[2 : 2 + len(KIND_PROPS)], strict=True))
+        tail = row[2 + len(KIND_PROPS) :]
+        node = _node_from_row(labels, text, kind_values, *tail)
+        if node is not None:
+            nodes.append(node)
 
     edges = []
     for rel, src, dst, sl, dl, a_id, b_id in _rows(
@@ -598,6 +635,25 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
 
         allowed = [k.lower() for k in exp.get("kind", [])]
         got_kind = (best["kind"] or "").lower()
+        own_prop = best.get("kind_prop") or KIND_PROP.get(best["layer"], "kind")
+        foreign = best.get("foreign_kinds") or {}
+        # A kind written to a DIFFERENT layer's property is its own finding. The
+        # word may be perfectly legal on the other axis (`meeting` is an
+        # eventKind; an Object carrying `eventKind: meeting` is still invisible
+        # to every Object reader), so calling it "undeclared" would be false —
+        # and one `coalesce` across all five properties hid it completely
+        # (#9695 review P2).
+        if foreign:
+            carried = ", ".join(f"{p}={v!r}" for p, v in sorted(foreign.items()))
+            add(
+                "P1",
+                item,
+                f"CROSS-AXIS kind: {best['layer']} {best['text'][:50]!r} carries "
+                f"{carried} — that property belongs to another layer"
+                + (f" and its own {own_prop} is empty" if not got_kind else "")
+                + f", so nothing routes to, finds or classifies it as a {best['layer']}",
+                f"write the kind to {own_prop} (§4 {best['layer']} / §5)",
+            )
         status = kind_status(best["layer"], best["kind"])
         if status == "UNDECLARED":
             findings.append(
@@ -695,24 +751,33 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             "NAND is for a claim that is WRONG; anything else is either plain "
             "support (IMPL) or a relevance question (mitigation on the operator)",
         )
-    if entry.get("expect_nand") and not any(
-        (op.get("op_type") or "").upper() == "NAND" for op in record_doc["operators"]
-    ):
+    if entry.get("expect_nand") and not nand_present:
+        # ONE ACT, ONE FINDING. A contradiction answered with a dampener instead
+        # of a NAND is a single mistake: charging it a P0 for the missing NAND
+        # AND a second P0 for the mitigation counted one write twice in the
+        # aggregate a Step-3 delta is read against (#9695 review P1). The
+        # dampener is named inside this finding, and the `elif` below covers the
+        # genuinely separate case (a NAND written where none belongs, or a
+        # dampener on an input that has no contradiction at all).
+        mitigated = record_doc["mitigations"]
+        dampened = " — relevance was dampened where truth was at issue" if mitigated else ""
+        operators = [o["op_type"] for o in record_doc["operators"]] or "none"
         add(
             "P0",
             "(truth-vs-relevance)",
             "a contradicting claim was filed with NO NAND against the attacked "
-            "Point (operators present: "
-            f"{[o['op_type'] for o in record_doc['operators']] or 'none'}; mitigations: "
-            f"{len(record_doc['mitigations'])}) — truth was not attacked",
+            f"Point (operators present: {operators}; mitigations: "
+            f"{len(mitigated)}{dampened}) — truth was not attacked",
             "a contradiction attacks the TRUTH of the Point (NAND); mitigation "
             "dampens an operator's RELEVANCE (w_eff = w x (1-strength))",
         )
     # Three-state, deliberately: ABSENT means "not scored" (most inputs neither
     # need nor forbid a dampener — the research input legitimately mitigates an
     # under-evidenced inference, and a boilerplate `false` on every input turned
-    # that sanctioned write into a P0). Only an explicit `false` forbids one.
-    if entry.get("expect_mitigation") is False and record_doc["mitigations"]:
+    # that sanctioned write into a P0). Only an explicit `false` forbids one, and
+    # only when no NAND-less contradiction already accounts for the write above:
+    # truth being at issue is what makes a dampener a substitute for a NAND.
+    elif entry.get("expect_mitigation") is False and record_doc["mitigations"]:
         add(
             "P0",
             "(truth-vs-relevance)",
@@ -779,6 +844,7 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
     # whose two gold items both landed and whose other nodes carried undeclared
     # kinds). The census keeps "clean" honest.
     census: dict[str, list[str]] = {}
+    cross_axis: list[str] = []
     # The census exists to catch what the GOLD did not name, so it skips the
     # nodes a gold item already resolved to (`item_rows[*]["node"]`). Keying it
     # on kind-bearing findings instead let a gold-named node — already reported
@@ -790,22 +856,47 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
     for node in nodes:
         if node["is_operator"]:
             continue
-        if kind_status(node["layer"], node["kind"]) != "UNDECLARED":
-            continue
         if node["text"][:80] in named_texts:
             continue
+        foreign = node.get("foreign_kinds") or {}
+        if foreign:
+            # A kind on another layer's property is invisible to every reader of
+            # this layer, so it belongs in the census that keeps "no undeclared
+            # kind" honest — a single coalesce used to hide it (#9695 review P2).
+            carried = ", ".join(f"{p}={v!r}" for p, v in sorted(foreign.items()))
+            cross_axis.append(f"{node['layer']} {node['text'][:30]!r} carries {carried}")
+            continue
+        if kind_status(node["layer"], node["kind"]) != "UNDECLARED":
+            continue
         census.setdefault(node["layer"], []).append(node["kind"] or "(none)")
-    if census:
+    if census or cross_axis:
+        parts = []
+        if census:
+            parts.append(
+                "; ".join(
+                    f"{layer}: {sorted(set(kinds))}" for layer, kinds in census.items()
+                )
+            )
+        if cross_axis:
+            parts.append("cross-axis: " + "; ".join(cross_axis))
         add(
             "P1",
             "(kinds)",
             "graph-wide: kinds no vocabulary declares, beyond the gold items — "
-            + "; ".join(f"{layer}: {sorted(set(kinds))}" for layer, kinds in census.items()),
-            "every node needs a kind from the core §5 vocabulary or a loaded pack",
+            + " | ".join(parts),
+            "every node needs a kind on ITS OWN layer's property, from the core "
+            "§5 vocabulary or a loaded pack",
         )
 
-    # Kind completeness — a node with no kind property routes nowhere.
-    unkinded = [n for n in nodes if not n["kind"] and not n["is_operator"]]
+    # Kind completeness — a node with no kind on its own layer routes nowhere.
+    # A node carrying a kind on the WRONG property is reported by the census
+    # above (it does carry one); counting it here too would charge one write
+    # twice.
+    unkinded = [
+        n
+        for n in nodes
+        if not n["kind"] and not n["is_operator"] and not (n.get("foreign_kinds"))
+    ]
     if unkinded:
         add(
             "P1",
@@ -825,7 +916,15 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
         "relations": record_doc["relations"],
         "operators": [n["op_type"] or "(none)" for n in record_doc["operators"]],
         "sources": [s["url"] or s["text"] for s in record_doc["sources"]],
+        # Reported, never silently dropped: a dampener on an operator whose
+        # support is thin is a SANCTIONED write (write-pipeline item 5), so it is
+        # evidence for the delta even when it is not scored as a finding.
+        "mitigations": [
+            f"{m['relation']}: {(m.get('from') or '?')[:40]} -> {(m.get('to') or '?')[:40]}"
+            for m in record_doc["mitigations"]
+        ],
         "kind_census": census,
+        "cross_axis_kinds": cross_axis,
         "packs": _pack_vocab()["packs"],
         "severity_counts": {
             sev: sum(1 for f in findings if f["severity"] == sev)
@@ -843,7 +942,15 @@ def main(argv: list[str] | None = None) -> int:
     rec.add_argument("--out", default=None)
 
     sc = sub.add_parser("score", help="score a graph against the frozen gold")
-    sc.add_argument("--db", required=True)
+    sc.add_argument("--db", default=None, help="embedded db path or docker:// URI")
+    sc.add_argument(
+        "--graph",
+        default=None,
+        help=(
+            "re-score a COMMITTED graph.json instead of reading a database — the "
+            "audit path: it must reproduce that run's score.json exactly"
+        ),
+    )
     sc.add_argument("--gold", default=str(DEFAULT_GOLD))
     sc.add_argument("--id", required=True, help="gold input id")
     sc.add_argument(
@@ -864,8 +971,10 @@ def main(argv: list[str] | None = None) -> int:
             print(text)
         return 0
 
+    if bool(args.db) == bool(args.graph):
+        ap.error("score needs exactly one of --db (read a graph) or --graph (re-score a record)")
     gold = json.loads(Path(args.gold).read_text())
-    doc = record(args.db)
+    doc = record(args.db) if args.db else json.loads(Path(args.graph).read_text())
     result = score(doc, gold, args.id)
     text = json.dumps(result, indent=2)
     if args.out:

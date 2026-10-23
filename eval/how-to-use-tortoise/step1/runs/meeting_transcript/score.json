@@ -130,7 +130,7 @@
       "severity": "P1",
       "item": "(kinds)",
       "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['meetingTranscript']; Object: ['deliverable', 'openQuestion', 'productSurface']",
-      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -152,6 +152,7 @@
   "sources": [
     "transcript://meetings/2026-09-14-pricing"
   ],
+  "mitigations": [],
   "kind_census": {
     "Source": [
       "meetingTranscript"
@@ -162,6 +163,7 @@
       "openQuestion"
     ]
   },
+  "cross_axis_kinds": [],
   "packs": [
     "agent-ops",
     "dev",

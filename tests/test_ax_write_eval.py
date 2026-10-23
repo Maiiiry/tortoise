@@ -48,12 +48,15 @@ def _record(nodes=(), edges=(), operators=(), sources=(), mitigations=()):
     }
 
 
-def _node(layer, text, kind="", status="", is_operator=False, op_type=""):
+def _node(layer, text, kind="", status="", is_operator=False, op_type="",
+          kind_prop=None, foreign_kinds=None):
     return {
         "layer": layer,
         "labels": [layer],
         "text": text,
         "kind": kind,
+        "kind_prop": kind_prop if kind_prop is not None else axe.KIND_PROP.get(layer, ""),
+        "foreign_kinds": dict(foreign_kinds or {}),
         "is_operator": is_operator,
         "op_type": op_type,
         "status": status,
@@ -73,25 +76,36 @@ def test_same_layer_preference_does_not_report_confusion_when_the_item_is_also_r
     the item on the expected layer. Reporting "layer confusion" because the
     shorter mention sorted first would bury the real finding and make the
     document teach a rule nobody broke.
+
+    The fixture is DISCRIMINATING on purpose (#9695 review P1): the wrong-layer
+    Point is an EXACT match (1.0) and the correct-layer Subject only a
+    containment match (0.867), so the Point ranks first on score alone and the
+    same-layer preference is the only thing that can produce `OK`. The previous
+    fixture put both nodes at 0.8 — a tie broken by list order — so the whole
+    preference could be DELETED and this test still passed.
     """
+    nodes = [
+        _node("Point", "Marta Reyes", kind="statement"),
+        _node("Subject", "Marta Reyes, CFO", kind="naturalPerson"),
+    ]
     gold = _gold(
         {
             "id": "x",
-            "expect": [{"item": "northwind arr 8.4m", "layer": "object", "kind": ["other"]}],
+            "expect": [{"item": "Marta Reyes", "layer": "subject", "kind": ["naturalPerson"]}],
         }
     )
-    doc = _record(
-        nodes=[
-            # containment match on the expected layer
-            _node("Object", "Northwind ARR 8.4m (2026-08)", kind="other"),
-            # a WORSE same-layer mention: one token of three
-            _node("Object", "ARR reporting policy", kind="other"),
-            # the different-layer node that mentions every token
-            _node("Point", "Northwind ARR is 8.4m as of 2026-08", kind="statement"),
-        ]
-    )
-    result = axe.score(doc, gold, "x")
-    assert not [f for f in result["findings"] if "LAYER confusion" in f["finding"]]
+
+    # Non-vacuity: asked for a layer NEITHER node is on, `_match` returns the
+    # node the raw ranking put first — the wrong-layer Point, at 1.0. Only the
+    # preference can turn that into the Subject.
+    ranked_first, score, _ = axe._match("Marta Reyes", nodes, "Event")
+    assert (ranked_first["layer"], score) == ("Point", 1.0)
+    assert axe._match("Marta Reyes", nodes, "Subject")[0]["layer"] == "Subject"
+
+    result = axe.score(_record(nodes=nodes), gold, "x")
+    assert not [
+        f for f in result["findings"] if "LAYER confusion" in f["finding"]
+    ], result["findings"]
     assert result["item_rows"][0]["verdict"] == "OK"
 
 
@@ -264,11 +278,169 @@ def test_a_contradiction_handled_by_mitigation_is_a_P0_even_with_an_operator_pre
     doc = _record(
         nodes=[_node("Point", "", is_operator=True, op_type="IMPL")],
         operators=[{"op_type": "IMPL"}],
-        mitigations=[{"relation": "mitigated_by"}],
+        mitigations=[{"relation": "mitigated_by", "from": "op", "to": "claim"}],
     )
     result = axe.score(doc, gold, "x")
     p0 = [f for f in result["findings"] if f["severity"] == "P0"]
     assert any("NO NAND" in f["finding"] for f in p0)
+
+
+def test_one_write_is_charged_once_when_a_contradiction_is_mitigated_instead_of_nand():
+    """One act, one P0.
+
+    A NAND-less contradiction answered with a dampener is a SINGLE mistake. It
+    used to be billed twice — a P0 for the missing NAND *and* a P0 for the
+    mitigation — so one write counted twice in the aggregate a Step-3 delta is
+    read against (#9695 review P1). The dampener must still be named inside the
+    finding, and still reported as written.
+    """
+    gold = _gold({"id": "x", "expect_nand": True, "expect_mitigation": False, "expect": []})
+    doc = _record(
+        nodes=[_node("Point", "", is_operator=True, op_type="IMPL")],
+        operators=[{"op_type": "IMPL"}],
+        mitigations=[{"relation": "mitigated_by", "from": "op", "to": "claim"}],
+    )
+    result = axe.score(doc, gold, "x")
+    truth = [f for f in result["findings"] if f["item"] == "(truth-vs-relevance)"]
+    assert len(truth) == 1, [f["finding"] for f in truth]
+    assert "mitigations: 1" in truth[0]["finding"]
+    assert "relevance was dampened where truth was at issue" in truth[0]["finding"]
+    assert result["severity_counts"]["P0"] == 1
+    assert result["mitigations"] == ["mitigated_by: op -> claim"]
+
+
+def test_a_dampener_on_an_input_with_no_contradiction_is_its_own_P0():
+    """The genuinely separate case: `expect_mitigation: false` with truth NOT at issue.
+
+    The `elif` in `score()` must still fire when nothing was NAND-less —
+    otherwise fixing the double charge would have deleted the rule rather than
+    made it disjoint from the missing-NAND rule.
+    """
+    gold = _gold(
+        {"id": "x", "expect_mitigation": False, "expect_nand": False, "expect": []}
+    )
+    doc = _record(
+        nodes=[_node("Point", "", is_operator=True, op_type="IMPL")],
+        operators=[{"op_type": "IMPL"}],
+        mitigations=[{"relation": "mitigated_by"}],
+    )
+    result = axe.score(doc, gold, "x")
+    truth = [f for f in result["findings"] if f["item"] == "(truth-vs-relevance)"]
+    assert len(truth) == 1
+    assert "INVALIDATES/mitigation" in truth[0]["finding"]
+
+
+def test_a_kind_written_on_another_layer_property_is_its_own_finding():
+    """`subjectKind` on an Object is invisible to every reader of an Object.
+
+    One cross-property `coalesce` read a foreign kind back as the layer's own
+    kind, so the worst version of this write (a legal word on the wrong axis —
+    `eventKind: meeting` on an Object) passed, and `KIND_PROP` was declared and
+    referenced nowhere (#9695 review P2).
+    """
+    node = axe._node_from_row(
+        ["Object"], "Northwind Logistics", {"subjectKind": "organization"},
+        False, "", "", "", "n1",
+    )
+    assert node["kind"] == "", "a foreign-axis kind must not become the layer's kind"
+    assert node["kind_prop"] == "objectKind"
+    assert node["foreign_kinds"] == {"subjectKind": "organization"}
+    assert node["id"] == "n1"
+
+    gold = _gold(
+        {"id": "x", "expect": [{"item": "Northwind Logistics", "layer": "object"}]}
+    )
+    result = axe.score(_record(nodes=[node]), gold, "x")
+    rows = [f for f in result["findings"] if f["item"] == "Northwind Logistics"]
+    assert rows, result["findings"]
+    assert "CROSS-AXIS" in rows[0]["finding"]
+    assert "subjectKind='organization'" in rows[0]["finding"]
+    assert result["mitigations"] == []
+
+
+def test_the_graph_wide_census_catches_a_kind_on_the_wrong_axis():
+    """An unnamed node's foreign-axis kind is invisible unless the census says so.
+
+    `kind` is empty on the layer's own property, so the undeclared-kind census
+    skips it and the unkinded check would describe it as "no kind property" — a
+    different (and less true) finding than "you wrote it on the wrong property".
+    """
+    gold = _gold({"id": "x", "expect": []})
+    doc = _record(
+        nodes=[
+            _node("Object", "Renewal window", foreign_kinds={"eventKind": "meeting"}),
+        ]
+    )
+    result = axe.score(doc, gold, "x")
+    census = [f for f in result["findings"] if "cross-axis" in f["finding"]]
+    assert census, result["findings"]
+    assert "eventKind='meeting'" in census[0]["finding"]
+    assert "carry no kind property" not in census[0]["finding"]
+    assert result["cross_axis_kinds"] == ["Object 'Renewal window' carries eventKind='meeting'"]
+
+
+def test_every_layer_reads_its_own_kind_property():
+    """The record must say WHICH property carried the kind, per layer."""
+    assert set(axe.KIND_PROPS) == set(axe.KIND_PROP.values())
+    derived = tuple(axe.KIND_PROP[layer] for layer in axe.LAYERS)
+    assert derived == axe.KIND_PROPS, "KIND_PROPS must be derived from KIND_PROP"
+    for layer, prop in axe.KIND_PROP.items():
+        node = axe._node_from_row([layer], "t", {prop: "x"}, False, "", "", "")
+        read = node["kind_prop"], node["kind"], node["foreign_kinds"]
+        assert read == (prop, "x", {}), f"{layer} did not read {prop}"
+    # infrastructure labels are not knowledge nodes
+    assert axe._node_from_row(["Meta"], "t", {}, False, "", "", "") is None
+
+
+def test_record_reads_the_kind_columns_in_KIND_PROPS_order(monkeypatch):
+    """Pin `record()`'s positional column order — a silent mis-zip swaps kinds.
+
+    The five kind properties come back as separate columns now, so one off-by-one
+    in the slice would report another layer's kind as this node's. No database:
+    the seam is `_rows`.
+    """
+
+    class _SDK:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    sdk = _SDK()
+    monkeypatch.setattr(axe, "_open", lambda uri: (sdk, object()))
+    node_row = (
+        ["Object", "Node"], "Northwind ARR", "", "", "other", "", "",
+        False, "", "live", "https://example.invalid/nw", "n7",
+    )
+    edge_row = ("aboutObject", "p", "Northwind ARR", ["Point"], ["Object"], "p1", "n7")
+    seen: list[str] = []
+
+    def fake_rows(proj, cypher):
+        seen.append(cypher)
+        return [edge_row] if "-[e]->" in cypher else [node_row]
+
+    monkeypatch.setattr(axe, "_rows", fake_rows)
+    doc = axe.record("memory://x")
+
+    assert sdk.closed, "record() must close the SDK it opened"
+    node = doc["nodes"][0]
+    assert (node["layer"], node["kind"], node["kind_prop"]) == ("Object", "other", "objectKind")
+    assert node["foreign_kinds"] == {}
+    assert (node["status"], node["url"], node["id"]) == (
+        "live", "https://example.invalid/nw", "n7",
+    )
+    assert doc["counts"]["Object"] == 1
+    assert doc["edges"][0] == {
+        "relation": "aboutObject",
+        "from": "p",
+        "to": "Northwind ARR",
+        "from_layer": "Point",
+        "to_layer": "Object",
+        "from_id": "p1",
+        "to_id": "n7",
+    }
+    for prop in axe.KIND_PROPS:
+        assert f"coalesce(n.{prop}" in seen[0], f"{prop} is not a column of the node query"
 
 
 def test_supersession_must_leave_a_superseded_node_behind():
@@ -515,7 +687,10 @@ def test_the_reported_totals_match_the_committed_records():
     """The report's headline must be a function of the records, not of memory.
 
     A reviewer found the first draft's totals wrong; this pin is what makes the
-    next stale number a red test instead of a claim.
+    next stale number a red test instead of a claim. The P0 count moved 14 -> 13
+    when one write stopped being charged twice (#9695 review P1: a NAND-less
+    contradiction answered with a dampener was a P0 for the missing NAND *and* a
+    P0 for the mitigation).
     """
     totals = {"P0": 0, "P1": 0}
     with_p0 = 0
@@ -524,12 +699,16 @@ def test_the_reported_totals_match_the_committed_records():
         totals["P0"] += record["severity_counts"]["P0"]
         totals["P1"] += record["severity_counts"]["P1"]
         with_p0 += 1 if record["severity_counts"]["P0"] else 0
-    assert totals == {"P0": 14, "P1": 32}, f"report claims 14/32, records say {totals}"
+    assert totals == {"P0": 13, "P1": 32}, f"report claims 13/32, records say {totals}"
     assert with_p0 == 6, f"report claims 6 of 10 inputs carry a P0, records say {with_p0}"
+    doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
+    assert "13 P0 and 32 P1" in doc, "the evidence doc's headline drifted from the records"
+
     # PER-INPUT pin. The totals and the class aggregates cannot see a COMPENSATED
     # pair of record edits (one input gaining a finding as another loses one), so
     # the report's per-input table could contradict the records with the suite
-    # green. This is the table, value by value.
+    # green. This is the table, value by value — and each row is grepped out of the
+    # doc so a stale cell is a red test rather than a reading exercise.
     per_input = {
         record["input"]: (
             record["severity_counts"]["P0"],
@@ -549,11 +728,9 @@ def test_the_reported_totals_match_the_committed_records():
         "duplicate_entity": (0, 3),
         "regulatory_filing": (0, 2),
         "person_appointment": (2, 4),
-        "contradicting_claim": (3, 2),
+        "contradicting_claim": (2, 2),
         "product_spec_object": (2, 2),
     }, f"the report's per-input table drifted from the records: {per_input}"
-
-    doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
     cells = {
         "portfolio_update": (1, "portfolio update"),
         "meeting_transcript": (2, "meeting transcript"),
@@ -573,39 +750,95 @@ def test_the_reported_totals_match_the_committed_records():
             f"the doc's table row for {input_id} is not {expected_row!r} — the "
             f"report and the records disagree"
         )
-    assert "14 P0 and 32 P1" in doc, "the evidence doc's headline drifted from the records"
     assert "6 of 10 inputs" in doc
+    index = (REPO_ROOT / "docs" / "00_index.md").read_text()
+    assert "13 P0 / 32 P1" in index, "the docs index headline drifted from the records"
 
-    # The CLASS counts drifted twice while the headline held, so they are pinned
-    # to the records too — an enumeration is the easiest number to get wrong.
-    classes = {"undeclared": 0, "census": 0, "layer": 0, "two_homes": 0, "wrong_kind": 0}
-    undeclared_inputs = set()
-    for path in sorted((GOLD.parent / "runs").glob("*/score.json")):
-        record = json.loads(path.read_text())
-        for finding in record["findings"]:
-            text = finding["finding"]
-            if "UNDECLARED kind" in text:
-                classes["undeclared"] += 1
-                undeclared_inputs.add(record["input"])
-            elif text.startswith("graph-wide"):
-                classes["census"] += 1
-            elif "LAYER confusion" in text:
-                classes["layer"] += 1
-            elif "two homes" in text:
-                classes["two_homes"] += 1
-            elif "frozen set" in text:
-                classes["wrong_kind"] += 1
-    assert classes == {
-        "undeclared": 16,
-        "census": 8,
-        "layer": 9,
-        "two_homes": 2,
-        "wrong_kind": 5,
-    }, f"report's class table drifted from the records: {classes}"
-    assert len(undeclared_inputs) == 6
-    assert "16 scored items across 6 inputs" in doc
-    assert "9 items across 5 inputs" in doc
-    assert "2 items across 2 inputs" in doc
+
+def test_the_documented_failure_classes_reconcile_with_the_committed_records():
+    """The class table must be derivable from the `score.json` files alone.
+
+    Two reviews caught the class counts contradicting their own records ("1
+    input, 2 findings" for a class the records carried three of, a research-paper
+    row silent about the P0 it had, an enumeration summing to 12 for a total of
+    14). Counting every class here — from the committed verdicts, by the wording
+    the verdicts themselves use — is what makes the next stale number a red test.
+    """
+    runs = [
+        json.loads(path.read_text())
+        for path in sorted((GOLD.parent / "runs").glob("*/score.json"))
+    ]
+
+    def count(needle: str) -> tuple[int, int]:
+        hits = [
+            (record["input"], f)
+            for record in runs
+            for f in record["findings"]
+            if needle in f["finding"] or needle == f["item"]
+        ]
+        return len(hits), len({name for name, _ in hits})
+
+    classes = {
+        "UNDECLARED kind": (16, 6),  # a kind no vocabulary declares, on a gold item
+        "graph-wide": (8, 8),  # the census beyond the gold
+        "LAYER confusion": (9, 5),
+        "two homes:": (2, 2),
+        "kind outside the frozen set": (5, 3),
+        "no node represents it": (2, 2),
+        "a NAND was written where nothing contradicts": (1, 1),
+        "(provenance)": (1, 1),
+        "nodes carry one identity": (0, 0),
+        "INVALIDATES/mitigation": (0, 0),  # truth-vs-relevance is charged once
+    }
+    measured = {needle: count(needle) for needle in classes}
+    assert measured == classes, measured
+
+    # One P0 for the one contradiction: the dampener is named INSIDE it, so the
+    # record carries exactly one truth-vs-relevance P0 for `contradicting_claim`.
+    contradicting = next(r for r in runs if r["input"] == "contradicting_claim")
+    truth_p0 = [
+        f
+        for f in contradicting["findings"]
+        if f["item"] == "(truth-vs-relevance)" and f["severity"] == "P0"
+    ]
+    assert len(truth_p0) == 1, [f["finding"] for f in truth_p0]
+    assert "mitigations: 1" in truth_p0[0]["finding"]
+
+    doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
+    for claim in (
+        "16 scored items across 6 inputs",
+        "9 items across 5 inputs",
+        "2 items across 2 inputs",
+        "1 input, 1 finding",
+    ):
+        assert claim in doc, f"the class table no longer states {claim!r}"
+
+
+def test_the_cli_re_scores_a_committed_graph_without_a_database(tmp_path):
+    """`score --graph` is the audit path the doc tells a reader to use.
+
+    The seam is the CLI entry point itself, not `score()`: the doc prints this
+    command, and an audit command that asks for a database it does not have is
+    not an audit path.
+    """
+    run_dir = GOLD.parent / "runs" / "contradicting_claim"
+    out = tmp_path / "rescore"
+    assert axe.main(
+        ["score", "--graph", str(run_dir / "graph.json"), "--id", "contradicting_claim",
+         "--out", str(out)]
+    ) == 1  # that run carries P0s, so the exit status is non-zero by contract
+    assert json.loads((out / "score.json").read_text()) == json.loads(
+        (run_dir / "score.json").read_text()
+    )
+    assert json.loads((out / "graph.json").read_text()) == json.loads(
+        (run_dir / "graph.json").read_text()
+    )
+
+
+def test_score_refuses_an_ambiguous_or_missing_source():
+    """Exactly one of --db / --graph, or the run says so instead of guessing."""
+    with pytest.raises(SystemExit):
+        axe.main(["score", "--id", "contradicting_claim"])
 
 
 @pytest.mark.parametrize("layer", axe.LAYERS)

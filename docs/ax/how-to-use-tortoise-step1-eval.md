@@ -83,8 +83,8 @@ severity rules the review skills use:
 
 | Severity | Rule |
 |---|---|
-| **P0** | layer confusion (an item filed on a different label than its gold layer, and the expected layer does **not** hold it) · item absent/absorbed · no Source at all · a contradicting claim filed with **no NAND** (an IMPL or a mitigation does not attack the truth of a Point) · relevance dampening where truth is at issue · change written without supersession |
-| **P1** | a kind **no vocabulary declares** (core §5 or a loaded pack) · the graph-wide census of undeclared kinds beyond the gold · **two homes** for one item (the expected layer holds it *and* a second layer does) · a declared-but-wrong kind · duplicate nodes for one entity · Source nodes with zero claim→source edges · a NAND where nothing contradicts · a node with no kind property |
+| **P0** | layer confusion (an item filed on a different label than its gold layer, and the expected layer does **not** hold it) · item absent/absorbed · no Source at all · a contradicting claim filed with **no NAND** (an IMPL or a mitigation does not attack the truth of a Point; one act, one finding) · change written without supersession |
+| **P1** | a kind **no vocabulary declares** (core §5 or a loaded pack) · a kind written on **another layer's property** (`subjectKind` on an Object — nothing on the Object layer reads it) · the graph-wide census of undeclared kinds beyond the gold · **two homes** for one item (the expected layer holds it *and* a second layer does) · a declared-but-wrong kind · duplicate nodes for one entity · Source nodes with zero claim→source edges · a NAND where nothing contradicts · a node with no kind property |
 
 The matcher is deliberately dumb (token overlap). A fuzzy matcher would *hide*
 the exact failure being measured: a `Northwind Logistics Ltd` that became a
@@ -105,11 +105,11 @@ uv run python eval/how-to-use-tortoise/step1/setup.py \
 ```
 
 The instrument's scoring rules are pinned by
-`tests/test_ax_write_eval.py` (28 tests, no database needed):
+`tests/test_ax_write_eval.py` (37 tests, no database needed):
 
 ```bash
 TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_ax_write_eval.py -q
-# 28 passed
+# 37 passed
 ```
 
 ## Results — measured 2026-10-22, ten runs
@@ -117,9 +117,21 @@ TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_ax_write_eval.py -q
 Every number below is recomputed from the graph each agent wrote. Each run
 directory holds **both** halves — `graph.json` (every node's label, kind and id,
 every edge) and `score.json` (the verdicts read from it) — beside the agent's own
-`write.py`. Running `score()` again over a committed `graph.json` reproduces its
-`score.json` exactly; that is what makes these numbers auditable rather than
-asserted.
+`write.py`. Re-scoring a committed `graph.json` reproduces its `score.json`
+exactly — one command, no database:
+
+```bash
+uv run python tools/ax_write_eval.py score \
+    --graph eval/how-to-use-tortoise/step1/runs/contradicting_claim/graph.json \
+    --id contradicting_claim --out /tmp/rescore
+```
+
+That is what makes these numbers auditable rather than asserted, and
+`test_rescoring_a_committed_graph_reproduces_its_score` pins it for all ten
+runs. A `graph.json` written before the kind-axis fix carries one `kind` per
+node and no `kind_prop`/`foreign_kinds`; the scorer falls back to the layer's
+own property, so old records stay scorable and the ten committed verdicts are
+unchanged by that fix.
 
 | # | Input cell | P0 | P1 | Layers written | The failure |
 |---|---|---|---|---|---|
@@ -131,10 +143,10 @@ asserted.
 | 6 | duplicate entity | 0 | 3 | 3 Point · 1 Subject · 1 Object · 1 Event · 1 Source | the **alias was correctly folded onto the existing node** (no duplicate — the measurable this input exists for); the renewal lands on an Event, but with `eventKind: customerCommitment` (undeclared) and a `subjectKind: person` |
 | 7 | regulatory filing | 0 | 2 | 5 Point · 2 Subject · 1 Object · 1 Event · 1 Source | no layer failure and no undeclared kind: Source + subject kinds correct (`core:organization` is the **declared** spelling); the two figures use the legacy `observation` kind rather than `statement` |
 | 8 | person appointment | 2 | 4 | 4 Point · 2 Subject · 5 Object · 1 Event · 1 Source | the **organisation and the role** written as Objects; `subjectKind: person` ×2; the appointment Event carries an undeclared `eventKind: employmentStart` |
-| 9 | contradicting claim | 3 | 2 | 7 Point · 1 Event | **no NAND** — the contradiction was answered by *mitigating the IMPL operator*: relevance dampened where truth was at issue. No Source written at all |
+| 9 | contradicting claim | 2 | 2 | 7 Point · 1 Event | **no NAND** — the contradiction was answered by *mitigating the IMPL operator*: relevance dampened where truth was at issue. No Source written at all |
 | 10 | product spec | 2 | 2 | 4 Point · 1 Subject · 2 Object · 1 Event · 1 Source | **two homes** for the ship date (plan Object + target Point); the success bar is only a Point; v1's dates are Points, not on the v1 Object |
 
-**Aggregate: 14 P0 and 32 P1 across the ten inputs; 6 of 10 inputs carry at
+**Aggregate: 13 P0 and 32 P1 across the ten inputs; 6 of 10 inputs carry at
 least one P0, and no input is clean graph-wide.** Four inputs carry no P0 at
 all, and two of those are near-clean — the correction (0 P0, two undeclared
 kinds elsewhere) and the duplicate (0 P0, the alias fold correct). The failures
@@ -151,16 +163,16 @@ steps are decisions rather than rules.
 | **Two homes — the right layer holds it AND a second one does** | 2 items across 2 inputs | decision request: the request (the Event names it, a Point also holds it) · product spec: the ship date (plan Object + target Point). Weaker than an absence, and a different instruction: express the second reading as a claim *about* the node |
 | **Wrong-but-declared kind** (legacy-valid, not invented) | 5 | `pointKind: observation` where the state-centric ruling says `statement`; `eventKind: disbursement` where the occurrence is an occurrence/milestone. A different lesson from an invented kind, which is why the instrument separates them |
 | **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it, but the node says "probability" where the item says "chance" — a synonym, leaving 3 of 4 stems and a 0.375 partial score under the 0.5 floor) and product spec: v1's dates. Both are itemised below |
-| **Truth vs relevance** | 1 input, 2 facets | contradicting claim: no NAND **and** a mitigation applied. One root failure, counted as two findings and stated as one failure |
+| **Truth vs relevance** | 1 input, 1 finding | contradicting claim: no NAND, with the dampener named **inside** that finding (the record's `mitigations` shows the `mitigated_by` edge). One act, one finding — it used to be charged twice |
 | **NAND where nothing contradicts** | 1 | meeting: one NAND operator with two edges (onto the comms plan, onto the slip forecast). A judgment call, and the instrument treats it as a finding because a contradiction operator on a claim nobody attacked computes a wrong confidence |
-| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Of the other nine, eight wrote their own Source (the correction's was seeded by the fixture) and **seven stamped the edge with `create_point(extractedFrom=[url])`** — the create argument, not a separate `create_edge` call, which the structural verb refuses for this predicate. Two runs (correction, person appointment) reached provenance through `create_edge("wasDerivedFrom"|"references", …)` instead, and the instrument credits any provenance edge with a Source endpoint. So the question this class was meant to answer — *does the agent find the create argument* — is **not** what it measures, and the two `create_edge` runs score as clean provenance |
+| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Of the other nine, eight wrote their own Source (the correction's was seeded by the fixture) and **seven stamped the edge with `create_point(extractedFrom=[url])`** — the create argument, not a separate `create_edge` call, which the structural verb refuses for this predicate. Two runs (correction, person appointment) reached provenance through `create_edge("wasDerivedFrom"|"references", …)` instead, and the instrument credits any provenance edge with a Source endpoint — so the fixture's stated measurable ("does the agent find the create argument") is **not** what the class measures |
 | **Duplicate identity** | 0 | the one input built to produce a duplicate produced none: the alias was folded onto the existing Object. This is the measurable the document must keep |
 
 ### Instrument limitations and corrections, stated rather than hidden
 
 This section exists because **three rounds of fresh-context review found the
-instrument lying about its own subject** (and a fourth found two unpinned gates
-plus five sentences still quoting the pre-fix causes), and the numbers above are what remains
+instrument lying about its own subject** (and a fourth found the sentences below
+still quoting the pre-fix causes), and the numbers above are what remains
 after every fix. The corrections are recorded, not quietly absorbed: a
 measurement artifact that hides its own revisions teaches the wrong thing.
 
@@ -221,15 +233,33 @@ Round 3:
     headline.
 
 Round 4:
-14. **The re-score gate did not cover the case its docstring named.** Two
+14. **One write was charged twice.** `contradicting_claim` carried a P0 for the
+    missing NAND *and* a second P0 for the mitigation that replaced it — one act,
+    two findings, so the aggregate counted it twice. The dampener is now named
+    **inside** the missing-NAND finding (and in the record's `mitigations`), the
+    standalone dampener rule fires only when no NAND-less contradiction already
+    accounts for the write, and the totals moved 14/32 → **13/32**.
+15. **The test that was supposed to catch the instrument's own worst false
+    positive could not fail.** Its two nodes tied at 0.80, so list order decided
+    the verdict and the whole same-layer preference could be deleted with the
+    suite still green. The fixture now makes the wrong-layer node an exact match
+    (1.0) against a 0.867 correct-layer one, and the test asserts the raw ranking
+    puts the wrong-layer node first — deleting the preference now reds it.
+16. **`KIND_PROP` was declared and referenced nowhere.** The record read the kind
+    through one `coalesce` across all five kind properties, so it could not say
+    WHICH property carried it — and a kind on the wrong axis (`eventKind` on an
+    Object) read back as a legal-looking kind. Each layer is now read from its
+    own property, a foreign-axis kind is kept as `foreign_kinds`, and it is
+    reported as its own **P1 cross-axis** finding (gold-named nodes) or inside
+    the graph-wide census. Old `graph.json` files still score identically.
+
+Round 5:
+17. **The re-score gate did not cover the case its docstring named.** Two
     *compensated* edits — one record gaining a wrong-but-declared kind while
     another loses one — leave the totals and every class aggregate intact, so the
-    report's per-input table could contradict the records with the whole suite
-    green. The per-input counts are pinned now, table row and record together.
-15. **The bar was `ratio < 0.6` while the doc said two thirds** — equal up to four
-    stems, divergent from five. Compared as `hit * 3 < 2 * len(want)` now, with a
-    two-sided test at the boundary.
-16. **Five sentences still quoted pre-fix causes** (the provenance count in the
+    report's per-input table could contradict the records with the suite green.
+    The per-input counts are pinned now, table row and record together.
+18. **Five sentences still quoted pre-fix causes** (the provenance count in the
     outline, the 80% forecast's kind class, a "measurable" the gold never stated,
     the tie-break justification, the round count). Corrected against the records.
 
@@ -243,8 +273,8 @@ itemised here rather than subtracted from the headline:
   cause is a synonym: `chance` vs `probability` leaves 3 of 4 stems, and a
   partial overlap scores `0.5 × 3/4 = 0.375`, under the 0.5 acceptance floor.
   Human reading: correct layer, and a **pack-declared** kind (`estimate`, which
-  the pm pack declares) where the item is a `statement` — the wrong-but-declared
-  class, not the invented-kind class.
+  the pm pack declares) where the item is a `statement` — the
+  wrong-but-declared class, not the invented-kind class.
 * product spec, "v1 said 2026-10-15" — reported **absent**. v1's dates live on
   Points, and the v1 Object was superseded; human reading: the state is on the
   wrong layer, which is the same lesson as the two Points that *were* caught.
@@ -302,10 +332,13 @@ Derived from the classes above, in the order an agent has to decide.
    not spend lines re-teaching the mechanics.
 7. **Provenance is stamped by the create** (`create_point(extractedFrom=[url])`),
    not by a separate `create_edge` call (the structural edge verb refuses
-   `extractedFrom`). Nine of ten runs found it; the one that wrote no Source at all is
-   the input where the claim was being attacked. Rule: every claim written from
-   something we read gets its source at write time, and a Source with no
-   claim→source edge is a scrapbook entry.
+   `extractedFrom`; `wasDerivedFrom`/`references` are accepted, and one run used
+   them alone). The counts: eight runs wrote their own Source, **seven** stamped
+   the edge with the create argument, one reached it only through `create_edge`,
+   one had its Source pre-seeded by the fixture — and the tenth, the input where
+   the claim was being attacked, wrote **no Source at all**. Rule: every claim
+   written from something we read gets its source at write time, and a Source
+   with no claim→source edge is a scrapbook entry.
 8. **The silent-failure warning.** Every failure above succeeded — the call
    returned, the node was created, and nothing disclosed the error. That is the
    sentence the document opens with, and it is the reason the checklist exists.
