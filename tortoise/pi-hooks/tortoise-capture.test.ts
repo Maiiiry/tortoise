@@ -158,12 +158,29 @@ function tmpSpool(): string {
   return mkdtempSync(join(tmpdir(), `tortoise-capture-spool-${process.pid}-${spoolSeq++}-`));
 }
 
+/**
+ * #3963/#3721, one layer deeper: `session_start` now also invokes the
+ * store-sync backstop, whose production branch is a DETACHED
+ * `spawn("tortoise", ["store-sync", …], { stdio: "ignore" })`. That child
+ * inherits `process.env` (so `TEST_ENV`/`NO_CONFIG_PATH` never reach it) and
+ * `child.unref()` lets it outlive the test run, so an un-injected seam makes a
+ * bare `node --test` read the developer's whole `~/.pi/agent/sessions`, write
+ * the REAL `~/.tortoise/store-sync/cursor.json`, and — where a credential is
+ * configured — POST real transcripts to the hosted API. Measured: 18 real
+ * spawns per run of this file before the sweep was sealed here.
+ *
+ * Every row that asserts on the sweep passes its own `sweepImpl`; this default
+ * is the seal that makes a row which does NOT care about the sweep unable to
+ * reach the spawn path at all.
+ */
 function hermeticDeps(fetchImpl: unknown, spoolDir: string = tmpSpool()) {
   return {
     fetchImpl: fetchImpl as never,
     env: TEST_ENV,
     configPath: NO_CONFIG_PATH,
     spoolDir,
+    // Sealed, not merely quiet: no test may reach a real CLI process.
+    sweepImpl: () => {},
   };
 }
 
@@ -889,6 +906,48 @@ test("#3515: a sweep that THROWS cannot break session_start", async () => {
     process.off("uncaughtException", onUncaught);
   }
   assert.deepEqual(uncaught, [], "a throwing sweep must be caught, not escape into Pi");
+});
+
+// #3721/#3963, the third layer: the test suite itself must not sweep. The
+// production branch is a DETACHED `spawn("tortoise", ["store-sync", …])` that
+// inherits `process.env` and outlives the run, so a row that forgets to inject
+// `sweepImpl` reads the developer's real `~/.pi/agent/sessions`, rewrites their
+// real cursor store and can POST their real transcripts — invisible to every
+// assertion in this file (measured: 18 real spawns per run before the seal).
+// The shim `tortoise` below is the observer: if any code path reaches the
+// spawn, it writes a marker, and this row reds.
+test("#3515: hermetic test deps SEAL the sweep — a test can never spawn the real CLI", async () => {
+  if (process.platform === "win32") return; // the shim is a /bin/sh script
+  const dir = mkdtempSync(join(tmpdir(), "tortoise-capture-sweep-shim-"));
+  const marker = join(dir, "spawned");
+  writeFileSync(
+    join(dir, "tortoise"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(marker)}\n`,
+    { mode: 0o755 },
+  );
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${dir}:${originalPath ?? ""}`;
+  try {
+    const pi = mockPi();
+    const { fetchImpl } = mockFetch([{ ok: true }]);
+    // The plain hermetic deps — NO row-local `sweepImpl`. This is what every
+    // `session_start` row in this file used to do.
+    tortoiseCapture(pi as never, hermeticDeps(fetchImpl));
+    await pi.handlers.session_start(undefined, mockCtx({ entries: [], sessionId: "sid-live" }) as never);
+    await settle();
+    // A detached child would start on its own clock; give it room to land.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(
+      existsSync(marker),
+      false,
+      "hermeticDeps must inject `sweepImpl` — without it session_start spawns the REAL "
+        + "`tortoise store-sync`, which reads the developer's sessions, rewrites their real "
+        + "cursor store and can upload their transcripts",
+    );
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("session_start resolves WITHOUT awaiting the probe (Pi awaits the handler at startup)", async () => {
@@ -2679,6 +2738,10 @@ async function sessionStartLines(
     env,
     configPath: NO_CONFIG_PATH,
     spoolDir: spool,
+    // This helper's deps are written out by hand rather than built from
+    // `hermeticDeps`, so the sweep seal has to be stated here too — otherwise
+    // every `sessionStartLines` caller fires the real detached spawn.
+    sweepImpl: () => {},
   });
   const lines: string[] = [];
   const original = console.log;
