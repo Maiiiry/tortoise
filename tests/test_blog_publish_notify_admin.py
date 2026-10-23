@@ -33,11 +33,20 @@ WHAT IS PINNED, AND WHY EACH CASE CAN FAIL
   * V5 the row read that fails (500 / unreachable) answers 503 and reports
     `skipped-unreadable` — a store blip is not a publish failure and must not
     look like one to the editor.
+  * V5b the OTHER unreadable arm: the submission STAMP read failing is a 200 with
+    `skipped-unreadable` and nothing submitted. Returning `skipped-window` there
+    (a plausible "just skip it" edit) reds it — the two arms mean different
+    things and the editor reads them.
+  * V2d a NULL `hold_for_review` is refused, because the renderer serves only
+    `= false`. The pre-fix `!== true` predicate passes V2c and reds this: a NULL
+    row 404s on the site, so submitting it is the same failure as a held row.
   * V6 `save.ts` fires the notification on `mode === 'publish'` for BOTH the
     create path and the update path, and NOT on a draft save; and
     `clearHoldPost` fires it when clearing a hold makes a published post live —
     the mirror transition, without which the hold fix would leave a real
-    publish un-notified.
+    publish un-notified; and `publishPost` fires it on the drafts-queue one-click
+    Publish, which is the console's other publish entry point and never passes
+    through the editor form's save.
 
 The real exported `onRequestPost` runs under Node's type-stripping loader (the
 convention of `tests/test_blog_indexnow.py`), with `globalThis.fetch` stubbed as
@@ -73,7 +82,8 @@ const handler = await import(process.argv[2]);
 const indexnow = await import(process.argv[3]);
 const c = JSON.parse(process.argv[4]);
 
-const rows = c.row ? [{ id: 'row-1', slug: c.row.slug, status: c.row.status, hold_for_review: !!c.row.hold_for_review }] : [];
+const held = c.row && c.row.hold_for_review;
+const rows = c.row ? [{ id: 'row-1', slug: c.row.slug, status: c.row.status, hold_for_review: held === 'null' ? null : !!held }] : [];
 const submissions = [];
 const logs = [];
 const realLog = console.log, realWarn = console.warn;
@@ -93,6 +103,7 @@ globalThis.fetch = async (url, init) => {
   }
   if (u.includes('/rest/v1/blog_posts')) {
     if (method === 'GET' && u.includes('select=indexnow_submitted_at')) {
+      if (c.stampReadFails) return new Response('{"message":"boom"}', { status: 400 });
       return Response.json([{ indexnow_submitted_at: c.lastSubmittedAt ?? null }]);
     }
     if (method === 'GET' && c.readFails) {
@@ -188,6 +199,18 @@ def test_v2c_published_but_held_is_refused_and_never_submitted():
     assert out["submissions"] == []
 
 
+def test_v2d_null_hold_is_refused_like_held():
+    """The renderer serves only `hold_for_review = false`, so a NULL row is not
+    public. `!== true` would call it live and submit a URL that 404s."""
+    out = _run({
+        "row": {"slug": "agent-memory", "status": "published", "hold_for_review": "null"},
+        "body": {"slug": "agent-memory"},
+    })
+    assert out["status"] == 409
+    assert out["body"]["error"] == "not_live"
+    assert out["submissions"] == []
+
+
 def test_v2b_unknown_slug_is_404_and_never_submitted():
     out = _run({"row": None, "body": {"slug": "nope"}})
     assert out["status"] == 404
@@ -260,6 +283,21 @@ def test_v5c_invalid_slug_is_400():
     assert out["submissions"] == []
 
 
+def test_v5b_stamp_read_failure_is_a_200_skipped_unreadable():
+    """The row is live and readable, but the submission STAMP cannot be read: the
+    endpoint answers 200 with `skipped-unreadable` and submits nothing. Reporting
+    `skipped-window` instead would tell the editor "already submitted" about a
+    post that was never submitted."""
+    out = _run({
+        "row": {"slug": "agent-memory", "status": "published"},
+        "body": {"slug": "agent-memory"},
+        "stampReadFails": True,
+    })
+    assert out["status"] == 200
+    assert out["body"]["result"] == "skipped-unreadable"
+    assert out["submissions"] == []
+
+
 def test_v6_editor_fires_on_publish_only_for_both_paths():
     src = SAVE_UNIT.read_text()
     # create path
@@ -277,4 +315,10 @@ def test_v6_editor_fires_on_publish_only_for_both_paths():
     api = BLOG_API.read_text()
     assert re.search(r"export async function clearHoldPost[\s\S]{0,900}?void notifyPublished\(updated\.slug\)", api), (
         "clearHoldPost must notify when it makes a published post live"
+    )
+    assert re.search(r"export async function publishPost[\s\S]{0,900}?void notifyPublished\(updated\.slug\)", api), (
+        "publishPost (the drafts-queue one-click Publish) must notify"
+    )
+    assert api.count("void notifyPublished(") == 2, (
+        "expected exactly two console call sites: publishPost and clearHoldPost"
     )

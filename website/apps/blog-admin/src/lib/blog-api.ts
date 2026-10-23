@@ -120,13 +120,19 @@ export interface AuditIdentity {
  * "clear hold" is its own action).
  */
 export async function publishPost(post: BlogPostRow, identity: AuditIdentity): Promise<BlogPostRow> {
-  return updatePost(post.id, {
+  const updated = await updatePost(post.id, {
     status: 'published',
     published_at: new Date().toISOString(),
     published_by: identity.userId,
     reviewed_by: null,
     reviewed_at: null,
   });
+  // #9803: the drafts-queue one-click Publish is the OTHER publish entry point in
+  // this console, and it never passes through the editor form's save. Without
+  // this line the whole agent-draft queue publishes unsubmitted. The endpoint
+  // re-checks "live" itself, so a held row answers 409 and nothing is submitted.
+  if (updated.slug) void notifyPublished(updated.slug);
+  return updated;
 }
 
 /** Unpublish: status → draft, clears review state, drops stale review notes. */

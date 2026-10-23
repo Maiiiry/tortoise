@@ -97,9 +97,12 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   // (`_lib.ts` fetchPostBySlug filters `hold_for_review=eq.false`; the anon RLS
   // policy does the same), so its URL answers 404 — and submitting it would hand
   // six search engines a dead URL, the exact thing the module header forbids.
-  // The renderer's own definition of "the public can read this" IS this
-  // predicate; anything narrower here diverges from what the site serves.
-  const live = row.status === "published" && row.hold_for_review !== true;
+  // The predicate is written to MATCH the renderer character for character:
+  // `_lib.ts` filters `hold_for_review=eq.false`, so a NULL is NOT served — and
+  // `!== true` would call a NULL live and submit a URL that 404s. The column is
+  // `boolean NOT NULL DEFAULT false` today, which makes this unreachable; it is
+  // written this way so relaxing that constraint cannot silently re-open the hole.
+  const live = row.status === "published" && row.hold_for_review === false;
   if (!live) {
     // Deliberate, and not softened: no retraction exists in this protocol.
     return json({ error: "not_live", status: row.status, hold_for_review: row.hold_for_review === true }, 409);
