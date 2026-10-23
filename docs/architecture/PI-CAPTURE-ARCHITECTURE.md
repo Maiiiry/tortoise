@@ -106,8 +106,8 @@ that import (`test_the_worker_does_not_carry_a_second_payload_builder`).
 The two lanes agree on the payload *shape* but can disagree on *content* after a
 `/compact`: the backstop's window is strictly shorter (cut at
 `compaction.firstKeptEntryId`), while the hook's payload grows. The turn store's
-shorter-re-capture rule **DELETES the turns beyond the new window** (`sdk.py`, the
-#1920 behaviour, journaled as a delete) — so a post-compaction backstop ship can
+shorter-re-capture rule **DELETES the turns beyond the new window** (`sdk.py`; the
+`#1920` behaviour, journaled as a delete) — so a post-compaction backstop ship can
 remove turns the hook filed.
 
 The worker therefore **REFUSES to ship a shrinking window**: when the active branch

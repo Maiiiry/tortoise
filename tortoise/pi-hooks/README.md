@@ -242,8 +242,8 @@ version-contract route to stale-install detection is **`#4680`**.
 The extension reads `TORTOISE_API_KEY` / `TORTOISE_API_URL` from the
 environment (both are already required by the Pi MCP setup), falling back to
 `~/.pi/agent/tortoise-config.json` (`apiKey` / `apiUrl`). The key and the URL
-are **co-sourced** (mirroring `tortoise/__main__.py::_resolve_config_path`,
-#2369 D1.1): an env key may use the env URL, but a **file**-sourced key
+are **co-sourced** (mirroring `tortoise/__main__.py::_resolve_config_path`, issue
+`#2369` D1.1): an env key may use the env URL, but a **file**-sourced key
 always resolves its URL from the same file or the built-in default — a
 poisoned `TORTOISE_API_URL` can never redirect a stored credential (and the
 captured conversations) to another host. No local `tortoise` CLI or Python
@@ -304,7 +304,7 @@ boxes ran normally.
 
 Three properties close that, and they are all pinned in the suite:
 
-* **Nothing the handlers do AFTER the durable snapshot runs on the tick Pi
+- **Nothing the handlers do AFTER the durable snapshot runs on the tick Pi
   awaits.** `session_start` and `agent_end` write their snapshot inline (that is
   the #3963 durability guarantee — a kill must not lose the turn) and then only
   *schedule* (`setImmediate`) the health line and the replay. Fire-and-forget
@@ -315,14 +315,14 @@ Three properties close that, and they are all pinned in the suite:
   there the bounds are what protect the exit, and the *live* session is filed
   first (one `onlySessionId` pass) rather than ranked behind older entries it
   can only be filed by shutdown.
-* **One pass is bounded.** At most `FLUSH_MAX_ATTEMPTS` (8) POSTs and
+- **One pass is bounded.** At most `FLUSH_MAX_ATTEMPTS` (8) POSTs and
   `FLUSH_BUDGET_MS` (5 s) of wall clock, checked between entries (never
   mid-POST, so a completed attempt's outcome is always recorded). Entries the
   pass never reached stay queued — counted as `remaining` and continued in the
   background on an `unref()`d timer, so a pending continuation can never keep a
   finished Pi process alive either. Removal on the bound is the spool's own
   count/byte ceiling, unchanged.
-* **A quota refusal is a NAMED state, not a growing backlog.** The first 402
+- **A quota refusal is a NAMED state, not a growing backlog.** The first 402
   carrying one of the server's categories (`quota_exceeded` for the plan
   allowance, `cohort_cost_cap` for the org spend cap — the two are named
   separately, because a spend cap reported as "quota" sends the owner to buy a
@@ -335,7 +335,7 @@ Three properties close that, and they are all pinned in the suite:
 Every `session_start` prints exactly one health line, which is the per-box
 surface an operator (or a lane log that produced 259 B) reads:
 
-```
+```text
 capture: OK (0 queued)
 capture: DRAINING (12 queued)
 capture: BLOCKED (320 queued, 402 quota)
@@ -345,8 +345,8 @@ capture: UNREADABLE (cannot list …/capture-spool/entries)
 
 `queued` is **pending** work — recomputed from the spool on every call as
 entries that are neither FILED (the server already accepted exactly that
-content; the entry is kept, not unlinked) nor TERMINAL (kept, never retried —
-#7708). Counting raw meta files would count spool *occupancy*, which only grows
+content; the entry is kept, not unlinked) nor TERMINAL (kept, never retried — see
+`#7708`). Counting raw meta files would count spool *occupancy*, which only grows
 on a healthy box: `OK (0 queued)` would never print and `BLOCKED` could never
 clear. The recorded marker is only trusted while something is still pending, so
 a quota that has since lifted, or a spool another leg has drained, cannot keep
