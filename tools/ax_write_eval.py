@@ -460,7 +460,8 @@ def _expected_layer_twin(item: str, nodes: list[dict], layer: str) -> dict | Non
     """A node on the EXPECTED layer that genuinely carries this item, if any.
 
     The bar is two thirds of the item's stems (and at least two of them), not a
-    third: "the expected layer also names it" is a claim that the graph
+    third — compared as ``hit * 3 >= 2 * len(want)``, never as a rounded float,
+    so "0.6" cannot stand in for "two thirds" on a five-stem item: "the expected layer also names it" is a claim that the graph
     DISPROVES an absence, so a node that merely shares a couple of topic words
     must not qualify. Measured: at a third, the meeting Event "Pricing &
     self-serve decision meeting" qualified for the item "killing the self-serve
@@ -480,7 +481,7 @@ def _expected_layer_twin(item: str, nodes: list[dict], layer: str) -> dict | Non
             continue
         hit = len(want & _tokens(node["text"]))
         ratio = hit / len(want)
-        if hit < 2 or ratio < 0.6:
+        if hit < 2 or hit * 3 < 2 * len(want):
             continue
         key = (ratio, node["status"].lower() != "superseded", -len(node["text"]))
         if best_key is None or key > best_key:

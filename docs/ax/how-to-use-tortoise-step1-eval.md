@@ -26,10 +26,11 @@ points, the graph doesn't work. If mitigations are not understood as relevance
 mitigations, and hence not used, then there's no proper logic used and the
 outputs of the graph's calculation are wrong."*
 
-The method the issue prescribes is the opposite of how the document was built.
-Anthropic's authoring guidance is explicit that documentation-first means
-*"documenting imagined ones"*: run the agent without the skill, record the real
-failures, then write. We never did that for this document.
+The method the issue prescribes is the opposite of how the document was built:
+run the agent **without** the skill, record the real failures, and only then
+write — because a document authored first records **imagined** failures. We never
+did that for this document, and this eval is the first time the outline is a
+function of measurement rather than of imagination.
 
 **Step 1 is the only scope #9675 releases today.** Steps 2–3 (the rewrite) are
 gated behind #4282 Phase 3, because the rewrite must cite the 27-tool surface's
@@ -82,7 +83,7 @@ severity rules the review skills use:
 
 | Severity | Rule |
 |---|---|
-| **P0** | layer confusion (an item filed on a different label than its gold layer) · item absent/absorbed · no Source at all · a contradicting claim filed with no operator · relevance dampening where truth is at issue · change written without supersession |
+| **P0** | layer confusion (an item filed on a different label than its gold layer, and the expected layer does **not** hold it) · item absent/absorbed · no Source at all · a contradicting claim filed with **no NAND** (an IMPL or a mitigation does not attack the truth of a Point) · relevance dampening where truth is at issue · change written without supersession |
 | **P1** | a kind **no vocabulary declares** (core §5 or a loaded pack) · the graph-wide census of undeclared kinds beyond the gold · **two homes** for one item (the expected layer holds it *and* a second layer does) · a declared-but-wrong kind · duplicate nodes for one entity · Source nodes with zero claim→source edges · a NAND where nothing contradicts · a node with no kind property |
 
 The matcher is deliberately dumb (token overlap). A fuzzy matcher would *hide*
@@ -104,11 +105,11 @@ uv run python eval/how-to-use-tortoise/step1/setup.py \
 ```
 
 The instrument's scoring rules are pinned by
-`tests/test_ax_write_eval.py` (25 tests, no database needed):
+`tests/test_ax_write_eval.py` (28 tests, no database needed):
 
 ```bash
 TORTOISE_TEST_CARVE_OUT=1 uv run pytest tests/test_ax_write_eval.py -q
-# 25 passed
+# 28 passed
 ```
 
 ## Results — measured 2026-10-22, ten runs
@@ -149,16 +150,17 @@ steps are decisions rather than rules.
 | **Layer confusion — only the wrong layer holds the item** | 9 items across 5 inputs | portfolio: ARR + headcount as Points · decision request: goal, deadline, estimate · meeting: the decision · person appointment: organisation, role · product spec: the success bar |
 | **Two homes — the right layer holds it AND a second one does** | 2 items across 2 inputs | decision request: the request (the Event names it, a Point also holds it) · product spec: the ship date (plan Object + target Point). Weaker than an absence, and a different instruction: express the second reading as a claim *about* the node |
 | **Wrong-but-declared kind** (legacy-valid, not invented) | 5 | `pointKind: observation` where the state-centric ruling says `statement`; `eventKind: disbursement` where the occurrence is an occurrence/milestone. A different lesson from an invented kind, which is why the instrument separates them |
-| **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it — the matcher's stems miss "slips"/"slip") and product spec: v1's dates. Both are human-verified below |
+| **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it, but the node says "probability" where the item says "chance" — a synonym, leaving 3 of 4 stems and a 0.375 partial score under the 0.5 floor) and product spec: v1's dates. Both are itemised below |
 | **Truth vs relevance** | 1 input, 2 facets | contradicting claim: no NAND **and** a mitigation applied. One root failure, counted as two findings and stated as one failure |
 | **NAND where nothing contradicts** | 1 | meeting: one NAND operator with two edges (onto the comms plan, onto the slip forecast). A judgment call, and the instrument treats it as a finding because a contradiction operator on a claim nobody attacked computes a wrong confidence |
-| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Nine of ten runs wrote one; the route that worked is `create_point(extractedFrom=[url])` — an argument on the create that stamps the `extractedFrom` edge, never a separate `create_edge` call |
+| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Of the other nine, eight wrote their own Source (the correction's was seeded by the fixture) and **seven stamped the edge with `create_point(extractedFrom=[url])`** — the create argument, not a separate `create_edge` call, which the structural verb refuses for this predicate. Two runs (correction, person appointment) reached provenance through `create_edge("wasDerivedFrom"|"references", …)` instead, and the instrument credits any provenance edge with a Source endpoint — so the fixture's stated measurable ("does the agent find the create argument") is **not** what the class measures |
 | **Duplicate identity** | 0 | the one input built to produce a duplicate produced none: the alias was folded onto the existing Object. This is the measurable the document must keep |
 
 ### Instrument limitations and corrections, stated rather than hidden
 
-This section exists because **two rounds of fresh-context review found the
-instrument lying about its own subject**, and the numbers above are what remains
+This section exists because **three rounds of fresh-context review found the
+instrument lying about its own subject** (and a fourth found the sentences below
+still quoting the pre-fix causes), and the numbers above are what remains
 after every fix. The corrections are recorded, not quietly absorbed: a
 measurement artifact that hides its own revisions teaches the wrong thing.
 
@@ -207,8 +209,9 @@ Round 3:
     meeting *session* Event (`Pricing & self-serve decision meeting`, 2 of 4
     stems) stand in for the kill decision — turning a real absence into a weaker
     finding. The bar is now two thirds, with ties broken toward a node that is
-    not superseded (the product-spec input has both plan versions naming the ship
-    date, and the *replaced* plan is not the one holding it).
+    not superseded (on the product-spec input both plan Objects clear the bar on
+    the same two topic stems, only one of them is still live, and the live one is
+    the plan the run acted on).
 12. **Two rules were still unpinned**: removing the stemmer, or re-adding
     `expect_mitigation: false` boilerplate to the gold, each left every test
     green. Both are pinned now, including one assertion on the GOLD FILE itself.
@@ -255,11 +258,13 @@ Derived from the classes above, in the order an agent has to decide.
    discriminator the document must teach: *does this hold now (Object), did it
    happen at a time (Event), is it a belief we hold (Point), is it an actor
    (Subject), is it something we read it from (Source)?*
-2. **An occurrence is not a belief.** The decision in the transcript, the
-   appointment in the note and the "request" in the decision request were all
-   written as **Points** beside (or instead of) an Event. Rule: if it happened on
-   a date, it is an Event with an `eventKind` — the belief layer records what we
-   *conclude*, not what *occurred*.
+2. **An occurrence is not a belief.** The decision in the transcript became a
+   Point with **no Event of its own**, and the "request" in the decision request
+   exists as both. Rule: if it happened on a date, it is an Event with an
+   `eventKind` — the belief layer records what we *conclude*, not what
+   *occurred*; a Point *about* the occurrence is fine only when it is wired to it
+   (the appointment input did exactly that: `Point -aboutEvent-> Event`, and no
+   finding flags it).
 3. **A person, an organisation and a role are Subjects — a role is not an
    Object.** One run wrote the employer and the role as Objects. Rule: `Subject`
    for anything that can act or be acted upon, `Object` only for the thing whose

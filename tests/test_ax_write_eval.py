@@ -386,6 +386,95 @@ def test_the_gold_file_does_not_carry_boilerplate_operator_rules():
     assert not missing_nand, f"every input states whether a NAND is expected: {missing_nand}"
 
 
+def test_every_committed_run_reproduces_from_its_own_graph():
+    """The single gate that keeps the report honest.
+
+    Re-scores each committed `graph.json` and demands the committed `score.json`
+    back, EXACTLY — which pins the matcher's thresholds (including the two-thirds
+    two-homes bar), the tie-breaks, the class rules, and the link between a
+    record's verdicts and its own findings list. Without it, a compensated pair of
+    edits to two records leaves the totals intact while the report's per-input
+    table contradicts them, and loosening the two-homes bar from two thirds to a
+    third left all 25 tests green.
+    """
+    gold = json.loads(GOLD.read_text())
+    runs = sorted((GOLD.parent / "runs").glob("*/score.json"))
+    assert len(runs) == 10
+    for path in runs:
+        committed = json.loads(path.read_text())
+        graph = json.loads((path.parent / "graph.json").read_text())
+        recomputed = axe.score(graph, gold, path.parent.name)
+        assert recomputed == committed, (
+            f"{path.parent.name}: re-scoring its graph.json does not reproduce the "
+            f"committed verdicts — the report and the record have diverged"
+        )
+        # A record's own severity counts must follow from its own findings.
+        counted = {
+            sev: sum(1 for f in committed["findings"] if f["severity"] == sev)
+            for sev in ("P0", "P1", "P2")
+        }
+        assert committed["severity_counts"] == counted, (
+            f"{path.parent.name}: severity_counts disagree with its findings list"
+        )
+
+
+def test_the_two_homes_bar_is_two_thirds_not_a_third():
+    """The cycle-3 regression as a test.
+
+    At a third, the meeting SESSION event ("Pricing & self-serve decision
+    meeting", 2 of 4 stems) stood in for the kill decision and a real absence
+    became the weaker two-homes finding.
+    """
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {"item": "killing the self-serve tier", "layer": "event", "kind": ["decision"]}
+            ],
+        }
+    )
+    half = _record(
+        nodes=[
+            _node("Event", "Pricing & self-serve decision meeting", kind="meeting"),
+            _node("Point", "The self-serve tier is being killed", kind="decision"),
+        ]
+    )
+    result = axe.score(half, gold, "x")
+    assert result["item_rows"][0]["verdict"] == "LAYER", (
+        "an Event sharing two of four topic stems must not count as the item's home"
+    )
+    two_thirds = _record(
+        nodes=[
+            _node(
+                "Event",
+                "Decision recorded by the chief executive at the weekly pricing "
+                "review: kill the self-serve tier, effective Q4, with the "
+                "migration comms owned by product",
+                kind="decision",
+            ),
+            _node("Point", "The self-serve tier is being killed", kind="decision"),
+        ]
+    )
+    result2 = axe.score(two_thirds, gold, "x")
+    assert result2["item_rows"][0]["verdict"] == "TWO-HOMES"
+
+
+def test_the_incremental_inputs_all_state_their_before_graph():
+    """A Step-3 re-run driven from the gold alone must know what to seed.
+
+    `product_spec_object` depends on a pre-existing plan Object and was the one
+    incremental input whose gold carried no `setup` note.
+    """
+    gold = json.loads(GOLD.read_text())
+    seeded = [e["id"] for e in gold["inputs"] if e.get("setup")]
+    assert seeded == [
+        "correction_existing_claim",
+        "duplicate_entity",
+        "contradicting_claim",
+        "product_spec_object",
+    ], f"incremental inputs must state their before-graph: {seeded}"
+
+
 def test_the_committed_gold_file_has_ten_inputs_with_pairwise_confusions():
     """Step 1's own contract: ten representative inputs, each naming the ADJACENT pair."""
     gold = json.loads(GOLD.read_text())
