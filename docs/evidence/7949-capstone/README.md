@@ -288,3 +288,22 @@ unusable value cannot reach a shipped log.
 A checkout with no resolvable `HEAD` commit (unborn HEAD, or not a git repo) is
 refused the same way: a table whose rows carry the literal string `HEAD` is red by
 this repo's own `V3` rule.
+
+⛔ **A SCORED re-run must NOT overwrite this file** (#9089 review cycle 5, measured).
+The `| tee …/capstone.log` form above is for a REFUSAL re-run — the artifact shipped
+here records that the instrument refuses at G0. The ordering rule requires a log to be
+committed AFTER the pre-registration, and `capstone.log`'s own add-commit predates it
+(`1792521015` vs `1792619351`), so the file can only be exempt by proving it measured
+nothing — which a scored run cannot claim. Once #9075/#9076 land, write a scored run
+to its own path:
+
+```bash
+python docs/evidence/7949-capstone/probes/capstone_run.py \
+    --prereg <frozen pre-registration commit> --corpus <frozen corpus> \
+    --out docs/evidence/7949-capstone/capstone-<sha>.log
+python tools/capstone_verdict_check.py docs/evidence/7949-capstone/capstone-<sha>.log --require-green
+```
+
+Leaving `capstone.log` alone is not bookkeeping: overwriting it would red a required
+check with a message blaming the measurement, and re-running could not clear it (the
+ordering rule compares the file's OLDEST add-commit, which never moves).
