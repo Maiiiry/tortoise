@@ -59,10 +59,11 @@ def seed(input_id: str, db: str) -> dict:
             )
             minted["source"] = src["url"]
             # NOTE: deliberately NO provenance edge here. `extractedFrom` is in
-            # §3.3 but NOT in §3.9's `create_edge` vocabulary, so a hand write
-            # has no validated route to attach a claim to its source (it is
-            # produced by the ingest paths only). That gap is itself a Step-1
-            # measurement, so the fixture must not paper over it.
+            # §3.3 but NOT in §3.9's `create_edge` vocabulary, so the structural
+            # edge verb refuses it; the working route is an argument on the
+            # create — `create_point(..., extractedFrom=[url])` — which stamps
+            # the edge. The fixture leaves it off so the eval measures whether an
+            # agent finds that route, rather than papering over it.
 
         elif input_id == "duplicate_entity":
             o1 = sdk.create_object("Northwind Logistics", objectKind="other")

@@ -539,7 +539,8 @@
       "expect_source": true,
       "expect_supersede": "v2 over v1",
       "notes": "Measures three things at once: commitment-states on the Object layer, v1 superseded rather than overwritten, and ownership written as an edge rather than a string property.",
-      "expect_nand": false
+      "expect_nand": false,
+      "setup": "The graph already contains Object 'Beta memory API plan v1' (objectKind plan, status live, goalState active) \u2014 built by eval/how-to-use-tortoise/step1/setup.py."
     }
   ],
   "scoring": {

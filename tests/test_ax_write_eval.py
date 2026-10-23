@@ -516,6 +516,137 @@ def test_two_homes_is_a_P1_and_absence_is_a_P0():
     assert verdicts["tobias lund"] == "LAYER"
 
 
+def test_the_stemmer_is_what_keeps_tense_from_reading_as_absence():
+    """Removing `_stem` used to leave every test green while three findings moved.
+
+    With the stemmer disabled, `duplicate_entity` loses its Event ("renew" vs
+    "renewal") and reads as a LAYER P0 — one of the three false P0s a review
+    found. This pins the mechanism, not just the two-homes branch.
+    """
+    assert axe._tokens("renewal") == axe._tokens("renew")
+    assert axe._tokens("joins") == axe._tokens("joined") == axe._tokens("join")
+    assert axe._tokens("3 engineer-weeks") == {"engineer", "week"}
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [{"item": "renew in january", "layer": "event", "kind": ["occurrence"]}],
+        }
+    )
+    doc = _record(
+        nodes=[_node("Event", "Northwind Logistics confirmed January renewal", kind="occurrence")]
+    )
+    result = axe.score(doc, gold, "x")
+    assert result["item_rows"][0]["verdict"] == "OK", (
+        "a singular/plural difference must not read as an absent item"
+    )
+
+
+def test_the_gold_file_does_not_carry_boilerplate_operator_rules():
+    """`expect_mitigation: false` on nine inputs was the bug, not the fix.
+
+    The code path was pinned; the ARTIFACT it was fixed in was not, so
+    re-adding the boilerplate left every test green while turning the research
+    input's sanctioned mitigation into a P0.
+    """
+    gold = json.loads(GOLD.read_text())
+    forbidden = [e["id"] for e in gold["inputs"] if e.get("expect_mitigation") is False]
+    assert forbidden == ["contradicting_claim"], (
+        "a dampener may only be forbidden where the gold argues truth is at issue; "
+        f"boilerplate found on {forbidden}"
+    )
+    missing_nand = [e["id"] for e in gold["inputs"] if "expect_nand" not in e]
+    assert not missing_nand, f"every input states whether a NAND is expected: {missing_nand}"
+
+
+def test_every_committed_run_reproduces_from_its_own_graph():
+    """The single gate that keeps the report honest.
+
+    Re-scores each committed `graph.json` and demands the committed `score.json`
+    back, EXACTLY — which pins the matcher's thresholds (including the two-thirds
+    two-homes bar), the tie-breaks, the class rules, and the link between a
+    record's verdicts and its own findings list. Without it, a compensated pair of
+    edits to two records leaves the totals intact while the report's per-input
+    table contradicts them, and loosening the two-homes bar from two thirds to a
+    third left all 25 tests green.
+    """
+    gold = json.loads(GOLD.read_text())
+    runs = sorted((GOLD.parent / "runs").glob("*/score.json"))
+    assert len(runs) == 10
+    for path in runs:
+        committed = json.loads(path.read_text())
+        graph = json.loads((path.parent / "graph.json").read_text())
+        recomputed = axe.score(graph, gold, path.parent.name)
+        assert recomputed == committed, (
+            f"{path.parent.name}: re-scoring its graph.json does not reproduce the "
+            f"committed verdicts — the report and the record have diverged"
+        )
+        # A record's own severity counts must follow from its own findings.
+        counted = {
+            sev: sum(1 for f in committed["findings"] if f["severity"] == sev)
+            for sev in ("P0", "P1", "P2")
+        }
+        assert committed["severity_counts"] == counted, (
+            f"{path.parent.name}: severity_counts disagree with its findings list"
+        )
+
+
+def test_the_two_homes_bar_is_two_thirds_not_a_third():
+    """The cycle-3 regression as a test.
+
+    At a third, the meeting SESSION event ("Pricing & self-serve decision
+    meeting", 2 of 4 stems) stood in for the kill decision and a real absence
+    became the weaker two-homes finding.
+    """
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {"item": "killing the self-serve tier", "layer": "event", "kind": ["decision"]}
+            ],
+        }
+    )
+    half = _record(
+        nodes=[
+            _node("Event", "Pricing & self-serve decision meeting", kind="meeting"),
+            _node("Point", "The self-serve tier is being killed", kind="decision"),
+        ]
+    )
+    result = axe.score(half, gold, "x")
+    assert result["item_rows"][0]["verdict"] == "LAYER", (
+        "an Event sharing two of four topic stems must not count as the item's home"
+    )
+    two_thirds = _record(
+        nodes=[
+            _node(
+                "Event",
+                "Decision recorded by the chief executive at the weekly pricing "
+                "review: kill the self-serve tier, effective Q4, with the "
+                "migration comms owned by product",
+                kind="decision",
+            ),
+            _node("Point", "The self-serve tier is being killed", kind="decision"),
+        ]
+    )
+    result2 = axe.score(two_thirds, gold, "x")
+    assert result2["item_rows"][0]["verdict"] == "TWO-HOMES"
+
+
+def test_the_incremental_inputs_all_state_their_before_graph():
+    """A Step-3 re-run driven from the gold alone must know what to seed.
+
+    `product_spec_object` depends on a pre-existing plan Object and was the one
+    incremental input whose gold carried no `setup` note.
+    """
+    gold = json.loads(GOLD.read_text())
+    seeded = [e["id"] for e in gold["inputs"] if e.get("setup")]
+    assert seeded == [
+        "correction_existing_claim",
+        "duplicate_entity",
+        "contradicting_claim",
+        "product_spec_object",
+    ], f"incremental inputs must state their before-graph: {seeded}"
+
+
 def test_the_committed_gold_file_has_ten_inputs_with_pairwise_confusions():
     """Step 1's own contract: ten representative inputs, each naming the ADJACENT pair."""
     gold = json.loads(GOLD.read_text())
@@ -556,7 +687,7 @@ def test_the_reported_totals_match_the_committed_records():
     """The report's headline must be a function of the records, not of memory.
 
     A reviewer found the first draft's totals wrong; this pin is what makes the
-    next stale number a red test instead of a claim. The count moved 13 -> 12
+    next stale number a red test instead of a claim. The P0 count moved 14 -> 13
     when one write stopped being charged twice (#9695 review P1: a NAND-less
     contradiction answered with a dampener was a P0 for the missing NAND *and* a
     P0 for the mitigation).
@@ -568,23 +699,23 @@ def test_the_reported_totals_match_the_committed_records():
         totals["P0"] += record["severity_counts"]["P0"]
         totals["P1"] += record["severity_counts"]["P1"]
         with_p0 += 1 if record["severity_counts"]["P0"] else 0
-    assert totals == {"P0": 12, "P1": 33}, f"report claims 12/33, records say {totals}"
+    assert totals == {"P0": 13, "P1": 32}, f"report claims 13/32, records say {totals}"
     assert with_p0 == 6, f"report claims 6 of 10 inputs carry a P0, records say {with_p0}"
     doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
-    assert "12 P0 and 33 P1" in doc, "the evidence doc's headline drifted from the records"
+    assert "13 P0 and 32 P1" in doc, "the evidence doc's headline drifted from the records"
     assert "6 of 10 inputs" in doc
     index = (REPO_ROOT / "docs" / "00_index.md").read_text()
-    assert "12 P0 / 33 P1" in index, "the docs index headline drifted from the records"
+    assert "13 P0 / 32 P1" in index, "the docs index headline drifted from the records"
 
 
 def test_the_documented_failure_classes_reconcile_with_the_committed_records():
     """The class table must be derivable from the `score.json` files alone.
 
-    A reviewer caught the first draft's class counts contradicting its own
-    records ("1 input, 2 findings" for a class the records carried three of, a
-    research-paper row silent about the P0 it had). Counting the classes here —
-    from the committed verdicts, by the wording the verdicts use — is what makes
-    the next stale number a red test.
+    Two reviews caught the class counts contradicting their own records ("1
+    input, 2 findings" for a class the records carried three of, a research-paper
+    row silent about the P0 it had, an enumeration summing to 12 for a total of
+    14). Counting every class here — from the committed verdicts, by the wording
+    the verdicts themselves use — is what makes the next stale number a red test.
     """
     runs = [
         json.loads(path.read_text())
@@ -601,10 +732,10 @@ def test_the_documented_failure_classes_reconcile_with_the_committed_records():
         return len(hits), len({name for name, _ in hits})
 
     classes = {
-        "neither a core": (16, 6),  # a kind no vocabulary declares, on a gold item
+        "UNDECLARED kind": (16, 6),  # a kind no vocabulary declares, on a gold item
         "graph-wide": (8, 8),  # the census beyond the gold
-        "LAYER confusion": (8, 4),
-        "two homes:": (3, 3),
+        "LAYER confusion": (9, 5),
+        "two homes:": (2, 2),
         "kind outside the frozen set": (5, 3),
         "no node represents it": (2, 2),
         "a NAND was written where nothing contradicts": (1, 1),
@@ -629,33 +760,38 @@ def test_the_documented_failure_classes_reconcile_with_the_committed_records():
     doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
     for claim in (
         "16 scored items across 6 inputs",
-        "8 items across 4 inputs",
-        "3 items across 3 inputs",
+        "9 items across 5 inputs",
+        "2 items across 2 inputs",
         "1 input, 1 finding",
     ):
         assert claim in doc, f"the class table no longer states {claim!r}"
 
 
-def test_rescoring_a_committed_graph_reproduces_its_score():
-    """The audit path: a verdict must be a pure function of the evidence beside it.
+def test_the_cli_re_scores_a_committed_graph_without_a_database(tmp_path):
+    """`score --graph` is the audit path the doc tells a reader to use.
 
-    `score --graph <committed graph.json>` is how a reader checks a number
-    without a database — and it is what makes "every number is read from the
-    records" falsifiable. Re-scoring must reproduce the committed `score.json`
-    BYTE for byte, for all ten runs.
+    The seam is the CLI entry point itself, not `score()`: the doc prints this
+    command, and an audit command that asks for a database it does not have is
+    not an audit path.
     """
-    gold = json.loads(GOLD.read_text())
-    runs = sorted((GOLD.parent / "runs").glob("*/graph.json"))
-    assert len(runs) == 10, f"expected 10 committed graphs, found {len(runs)}"
-    for graph_path in runs:
-        run_dir = graph_path.parent
-        graph = json.loads(graph_path.read_text())
-        committed = json.loads((run_dir / "score.json").read_text())
-        rescored = axe.score(graph, gold, run_dir.name)
-        assert json.dumps(rescored, indent=2) + "\n" == json.dumps(committed, indent=2) + "\n", (
-            f"{run_dir.name}: re-scoring the committed graph does not reproduce "
-            f"its committed score — the verdict and its evidence disagree"
-        )
+    run_dir = GOLD.parent / "runs" / "contradicting_claim"
+    out = tmp_path / "rescore"
+    assert axe.main(
+        ["score", "--graph", str(run_dir / "graph.json"), "--id", "contradicting_claim",
+         "--out", str(out)]
+    ) == 1  # that run carries P0s, so the exit status is non-zero by contract
+    assert json.loads((out / "score.json").read_text()) == json.loads(
+        (run_dir / "score.json").read_text()
+    )
+    assert json.loads((out / "graph.json").read_text()) == json.loads(
+        (run_dir / "graph.json").read_text()
+    )
+
+
+def test_score_refuses_an_ambiguous_or_missing_source():
+    """Exactly one of --db / --graph, or the run says so instead of guessing."""
+    with pytest.raises(SystemExit):
+        axe.main(["score", "--id", "contradicting_claim"])
 
 
 @pytest.mark.parametrize("layer", axe.LAYERS)
