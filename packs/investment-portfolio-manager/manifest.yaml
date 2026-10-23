@@ -67,6 +67,25 @@ ontology:
     #   (3) is a step in a declared `chains` path;
     #   (4) is an endpoint of a declared `relations` entry carrying a
     #       `mechanism`.
+    #
+    # ⛔ The justification lives HERE, in comments — never in `description`.
+    # `description` is PROMPT TEXT: `value_extractor` carries it into the value
+    # brief, `_render_master_verbose`/the compact render emit
+    # `- {kind} — {description}` into the S2/S4 classification prompt, and
+    # `compile_kind_index_spec` embeds it too. So design-review bookkeeping in a
+    # description ships into every extraction on the catalog-union path
+    # (#2714/#5163 — every graph with no `:PackInstall` records). Pinned by
+    # `test_kind_descriptions_are_extractor_prose_not_review_bookkeeping`.
+    #
+    #   mandate         — (4) endpoint of the `constrainedBy` relation, mechanism
+    #                     IMPL. It ALSO declares a closed `statuses` vocabulary,
+    #                     so it OWNS its state, but publishes no `folds` — no
+    #                     event kind in this pack is the driving occurrence of a
+    #                     mandate's status, and inventing one to satisfy the
+    #                     wording of (1) would be a kind that declares nothing.
+    #   allocationTarget — (2) declares `targetPct` as a `percent` value. Also
+    #                     (4): endpoint of `boundedBy`, mechanism IMPL.
+    #   valuationMark   — (4) endpoint of the `marks` relation, mechanism IMPL.
     mandate:
       description: >-
         A bounded permission the fund or the board grants the portfolio manager
@@ -75,11 +94,6 @@ ontology:
         rules). Lifecycle: draft → adopted → breached → retired. A mandate is
         the constraint, not the holding: "is this within mandate?" is answered
         by looking at the mandate a position or target is bound to.
-        [value test: (4) endpoint of the `constrainedBy` relation, mechanism
-        IMPL. It also declares a closed statuses vocabulary so it OWNS its
-        state, but publishes no `folds` — no event kind in this pack is the
-        driving occurrence of a mandate's status, and inventing one to satisfy
-        the wording of (1) would be a kind that declares nothing.]
       statuses: [draft, adopted, breached, retired]
       synonyms:
       - investment mandate
@@ -111,8 +125,6 @@ ontology:
         against); a bare benchmark LABEL with no weight is not this kind, and is
         kept as prose rather than minted into a kind with a `targetPct` the
         utterance never stated.
-        [value test: (2) declares `targetPct` as a `percent` value. Also (4):
-        endpoint of `boundedBy`, mechanism IMPL.]
       statuses: [proposed, adopted, retired]
       values:
       - name: targetPct
@@ -144,7 +156,6 @@ ontology:
         value of a position stays on `venture:investment` (whose lifecycle and
         state this pack deliberately does not re-declare — a pack cannot extend
         another pack's lifecycle), so this event publishes no `folds`.
-        [value test: (4) endpoint of the `marks` relation, mechanism IMPL.]
       synonyms:
       - mark
       - valuation mark

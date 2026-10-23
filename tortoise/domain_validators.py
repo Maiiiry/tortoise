@@ -355,12 +355,90 @@ _PORTFOLIO_DOMAIN = "portfolio"
 #: (not inlined) because the exemption is a decision, not a test.
 _OBJECT_UNSET_STATUSES = frozenset({"live"})
 
-#: The kind and relation a valuation mark must reach, read off the pack's own
-#: declarations (`packs/investment-portfolio-manager/manifest.yaml`: `marks` →
-#: `venture:investment`) rather than invented here — a second copy of the
-#: manifest's contract is the drift this pack exists to avoid.
+#: The mark's kind, and the FALLBACK contract used only when the pack registry
+#: cannot be read (the same degradation `_portfolio_declared_statuses` accepts).
+#: The live contract is read off the pack's own declarations at call time
+#: (`_portfolio_mark_contract`) — a hardcoded copy is the drift this pack exists
+#: to avoid, so these two values are pinned against the manifest by
+#: ``test_the_mark_contract_fallback_matches_the_manifest``.
+MARK_KIND = "portfolio:valuationMark"
 POSITION_KIND = "venture:investment"
 MARK_RELATION = "marks"
+
+
+def _pack_relations() -> list[dict]:
+    """The loaded portfolio pack's declared relations (``[]`` when unreadable)."""
+    try:
+        from .domain_loader import _get_registry
+        reg = _get_registry()
+        pack = reg.get_pack(_PORTFOLIO_DOMAIN) if reg is not None else None
+    except Exception:  # noqa: BLE001, RUF100 — advisory surface, see docstring
+        return []
+    if pack is None:
+        return []
+    return [r for r in (pack.relations or []) if isinstance(r, dict)]
+
+
+def _portfolio_mark_contract() -> tuple[str, str, str]:
+    """``(mark_kind, position_kind, relation)`` for the valuation-mark rule.
+
+    Read from the loaded pack at call time — the ``marks`` relation whose
+    ``fromKind`` is this pack's ``valuationMark`` — so a manifest edit to
+    ``toKind`` or a predicate rename moves the rule with it instead of silently
+    desynchronising it (the orphan rule then flags every correctly-wired mark,
+    or goes blind, with nothing red in CI). Falls back to the module constants
+    when the registry is unavailable, which is the same fail-open-but-visible
+    degradation ``_portfolio_declared_statuses`` takes: a validator that raised
+    here would be swallowed by ``run_domain_graph_validators`` and read CLEAN.
+    """
+    forms = {MARK_KIND.lower(), MARK_KIND.partition(":")[2].lower()}
+    for rel in _pack_relations():
+        from_kind = str(rel.get("fromKind") or "").lower()
+        to_kind = rel.get("toKind")
+        predicate = rel.get("predicate")
+        if from_kind in forms and to_kind and predicate:
+            return MARK_KIND, str(to_kind), str(predicate)
+    return MARK_KIND, POSITION_KIND, MARK_RELATION
+
+
+def _admitted_kind_forms(namespaced_kind: str) -> list[str]:
+    """Every case-folded spelling the write gate admits for a pack kind.
+
+    ``portfolio:valuationMark`` → ``["portfolio:valuationmark",
+    "valuationmark"]``. Both spellings matter here for two INDEPENDENT reasons,
+    and missing either is a false CLEAN (or a false violation) on the shape the
+    rule exists to report:
+
+      * the write gate admits ``ns:local`` AND bare ``local``
+        (``extractor_v2._object_kind_forms``/``_event_kind_forms`` lowercase
+        both) and the projection stores the spelling VERBATIM;
+      * the extraction pipeline's own event commit STRIPS the namespace
+        (``sdk.py`` ``_extract_session_v2`` writes ``ekind.rsplit(":", 1)[-1]``),
+        so every mark minted by extraction is stored bare — the #2729 review
+        P1 that widened ``StatusFoldIndex``'s keys, and the reason the rule
+        must read the same map rather than re-derive it.
+
+    The spellings come from that canonical seam
+    (``StatusFoldIndex.kind_forms_for``); the inline pair is the registry-less
+    fallback, identical to what the index returns.
+    """
+    try:
+        from .domain_loader import _get_registry
+        reg = _get_registry()
+        fold_index = reg.status_fold_index if reg is not None else None
+    except Exception:  # noqa: BLE001, RUF100 — advisory surface, see docstring
+        fold_index = None
+    if fold_index is not None:
+        try:
+            return [str(f).lower() for f in
+                    fold_index.kind_forms_for(namespaced_kind)]
+        except Exception:  # advisory surface — fall through to the pair below
+            pass
+    forms = [namespaced_kind.lower()]
+    local = namespaced_kind.partition(":")[2]
+    if local and local.lower() not in forms:
+        forms.append(local.lower())
+    return forms
 
 
 def _portfolio_declared_statuses() -> dict[str, frozenset[str]]:
@@ -489,7 +567,7 @@ def validate_portfolio_shape(graph) -> list[dict]:
                 ),
             })
 
-    mark_kind = f"{_PORTFOLIO_DOMAIN}:valuationMark"
+    mark_kind, position_kind, mark_relation = _portfolio_mark_contract()
     # A mark is attached when it reaches a POSITION either way round:
     #   * the DECLARED relation. The manifest declares `marks` with
     #     ``mechanism: IMPL``, and a mechanism resolves to the OPERATOR write
@@ -504,19 +582,31 @@ def validate_portfolio_shape(graph) -> list[dict]:
     #     Object".
     #   * the STRUCTURAL ``aboutObject`` form some callers use, which is just as
     #     attached (it is not a declared relation, and is accepted as such).
-    # Both legs require the target to be a ``venture:investment`` — the
-    # manifest's declared ``toKind`` — because a mark that values something else
-    # is not a mark on a position.
+    # Both legs require the target to be the declared ``toKind`` (read from the
+    # pack, ``_portfolio_mark_contract``) — a mark that values something else is
+    # not a mark on a position.
+    #
+    # Every kind filter is ``toLower(...) IN $forms`` over EVERY spelling the
+    # write gate admits, on BOTH sides: an exact namespaced literal misses the
+    # marks the extraction pipeline writes (``eventKind`` stored bare, see
+    # ``_admitted_kind_forms``) — a false CLEAN on the rule's own purpose — and
+    # misses a position stored under the bare ``investment``, which would flag a
+    # correctly-wired mark as an orphan. Same seam, same widening as rule 1.
     rows = graph.g.query(
-        "MATCH (e:Event) WHERE e.eventKind = $kind "
-        "OPTIONAL MATCH (e)-[:aboutObject]->(o1:Object {objectKind: $position}) "
+        "MATCH (e:Event) WHERE toLower(e.eventKind) IN $mark_forms "
+        "OPTIONAL MATCH (e)-[:aboutObject]->(o1:Object) "
+        "WHERE toLower(o1.objectKind) IN $position_forms "
         "OPTIONAL MATCH (e)-[:INPUT]->(op:Point {label: $rel})"
-        "-[:IMPL]->(o2:Object {objectKind: $position}) "
+        "-[:IMPL]->(o2:Object) "
+        "WHERE toLower(o2.objectKind) IN $position_forms "
         "WITH e, count(DISTINCT o1) + count(DISTINCT o2) AS targets "
         "WHERE targets = 0 "
         "RETURN e.id, e.name",
-        params={"kind": mark_kind, "position": POSITION_KIND,
-                "rel": MARK_RELATION},
+        params={
+            "mark_forms": _admitted_kind_forms(mark_kind),
+            "position_forms": _admitted_kind_forms(position_kind),
+            "rel": mark_relation,
+        },
     ).result_set
     for node_id, name in rows:
         violations.append({
@@ -529,9 +619,10 @@ def validate_portfolio_shape(graph) -> list[dict]:
                 f"marks, so the mark cannot be joined back to what it valued"
             ),
             "fix": (
-                f"record the declared `{MARK_RELATION}` relation: "
-                "create_operator('IMPL', <mark>, [<the venture:investment it "
-                f"values>], label='{MARK_RELATION}', semantics='related')"
+                f"record the declared `{mark_relation}` relation: "
+                "create_operator('IMPL', <mark>, [<the "
+                f"{position_kind} it values>], label='{mark_relation}', "
+                "semantics='related')"
             ),
         })
     return violations

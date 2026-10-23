@@ -305,6 +305,39 @@ class TestValueTest:
         shipping a declaration that does nothing."""
         assert not pack.chains
 
+    def test_kind_descriptions_are_extractor_prose_not_review_bookkeeping(
+            self, pack):
+        """`description` is PROMPT TEXT, not a comment (issue #9663).
+
+        Three consumers read it verbatim: `value_extractor` carries it into the
+        value brief, `_build_master_from_brief` puts it in `pack_kinds`, and
+        `_render_master_verbose`/the compact render emit
+        ``- {kind} — {description}`` into the S2/S4 classification prompt
+        (`compile_kind_index_spec` embeds it too). So review bookkeeping in a
+        description ships into EVERY extraction on the catalog-union path
+        (#2714/#5163 — every graph with no `:PackInstall` records), and it is
+        the one place this pack's design rationale must NOT live: the rationale
+        belongs in YAML comments, which do not ship.
+
+        Both halves are pinned — the junk marker is absent, and the prose that
+        the extractor actually needs is still there (a fix that deleted the
+        kind's description outright would pass the first assertion alone).
+        """
+        for kind, spec in pack.kind_defs.items():
+            description = spec.get("description") or ""
+            assert "[" not in description and "value test" not in description, (
+                f"{NS}:{kind}'s description carries review bookkeeping; it is "
+                f"rendered into every extraction prompt — move it to the "
+                f"manifest's comment header: {description!r}")
+            assert description.strip(), (
+                f"{NS}:{kind} ships no description — the extractor prompt "
+                f"renders it as the kind's only disambiguation prose")
+        # The extractor-facing disambiguation this pack NEEDS is extractor prose
+        # and must survive the move (`test_benchmark_is_absorbed_only_with_a_
+        # weight` pins the same sentence from the declaration side).
+        assert "bare benchmark LABEL" in (
+            pack.kind_defs["allocationTarget"]["description"])
+
     # ── rejected candidates ───────────────────────────────────────────────
 
     def test_thesis_is_a_core_point_not_a_kind(self, pack):
@@ -800,6 +833,136 @@ class TestKindsAreMintable:
             "MATCH (o:Object {name:'Allocation Target AT-2'}) "
             "SET o.status = 'proposed'")
         assert sdk.validate_domain(NS)["ok"] is True
+
+    @requires_db
+    def test_a_pipeline_spelled_mark_is_seen_by_the_orphan_rule(self, sdk):
+        """Rule 2 must read the spellings the ENGINE writes, not only the ones a
+        caller types — the rule-2 analogue of
+        ``test_a_bare_spelled_kind_is_not_blind_to_the_rule``.
+
+        Two independent widenings, and both directions are pinned:
+
+          * the extraction pipeline's own event commit STRIPS the namespace
+            (``sdk._extract_session_v2`` writes ``ekind.rsplit(":", 1)[-1]``),
+            so every mark minted by extraction is stored ``valuationMark``. An
+            exact ``e.eventKind = 'portfolio:valuationMark'`` matched nothing the
+            pipeline wrote — the unattached mark was never reported, a false
+            CLEAN on the rule's own purpose;
+          * the write gate admits the BARE object-kind spelling too
+            (``objectKind='investment'``), and the projection stores it
+            verbatim — so an exact ``(o:Object {objectKind: 'venture:investment'})``
+            flagged a CORRECTLY wired mark as an orphan (a false violation).
+        """
+        # (a) an UNATTACHED mark under the pipeline's bare event-kind spelling
+        #     → REPORTED (the false-CLEAN half).
+        sdk.create_entity("event", "VM pipeline-spelled orphan",
+                          eventKind="valuationMark")
+        # (b) a mark wired to a BARE-spelled position → CLEAN (the false-
+        #     violation half).
+        bare_position = sdk.create_object("Beta Holdings (bare position kind)",
+                                          objectKind="investment")
+        sdk.create_entity("event", "VM-4 (bare position)",
+                          eventKind="valuationMark",
+                          aboutObject=bare_position["id"])
+
+        # The graph really holds the spellings this test claims (a test that
+        # silently got canonicalised kinds would prove nothing).
+        marks = dict(sdk._get_proj().g.query(
+            "MATCH (e:Event) RETURN e.name, e.eventKind").result_set)
+        assert marks["VM pipeline-spelled orphan"] == "valuationMark", marks
+        positions = dict(sdk._get_proj().g.query(
+            "MATCH (o:Object) RETURN o.name, o.objectKind").result_set)
+        assert positions["Beta Holdings (bare position kind)"] == "investment", (
+            positions)
+
+        orphan_id = sdk._get_proj().g.query(
+            "MATCH (e:Event {name:'VM pipeline-spelled orphan'}) RETURN e.id"
+        ).result_set[0][0]
+        verdict = sdk.validate_domain(NS)
+        flagged = {v["ref"] for v in verdict["violations"]
+                   if v["rule"] == "orphaned_valuation_mark"}
+        assert flagged == {orphan_id}, verdict
+
+        # (c) attaching the pipeline-spelled mark to the bare-spelled position
+        #     clears it: the rule is about the attachment, never the spelling.
+        sdk._get_proj().g.query(
+            "MATCH (e:Event {name:'VM pipeline-spelled orphan'}) "
+            "MATCH (o:Object {name:'Beta Holdings (bare position kind)'}) "
+            "CREATE (e)-[:aboutObject]->(o)")
+        assert sdk.validate_domain(NS)["ok"] is True
+
+    def test_the_mark_contract_is_pinned_to_the_manifest(self):
+        """``POSITION_KIND``/``MARK_RELATION`` used to be an UNPINNED second copy
+        of the manifest's ``marks`` entry while the comment claimed they were
+        read off it. Both halves are now pinned: the contract the rule uses is
+        read from the loaded pack, and the registry-less FALLBACK constants are
+        asserted against the manifest so they cannot drift either.
+        """
+        from tortoise import domain_validators as dv
+
+        marks = next(r for r in RAW["ontology"]["relations"]
+                     if r["predicate"] == "marks")
+        expected = (f"{NS}:valuationMark", marks["toKind"], marks["predicate"])
+        assert dv._portfolio_mark_contract() == expected, (
+            "the rule must read the pack's own `marks` declaration")
+        assert expected == (dv.MARK_KIND, dv.POSITION_KIND, dv.MARK_RELATION), (
+            "the registry-less fallback must not drift from the manifest it "
+            "stands in for")
+
+    def test_the_mark_contract_follows_a_manifest_edit(self, monkeypatch):
+        """Why derivation rather than a constant: a manifest edit to ``toKind``
+        or a predicate rename must move the rule WITH it, or the orphan rule
+        silently flags every correctly-wired mark (or goes blind) with nothing
+        red in CI.
+        """
+        from tortoise import domain_loader
+        from tortoise import domain_validators as dv
+
+        class _Pack:
+            relations: ClassVar[list[dict]] = [{
+                "predicate": "marksPosition",
+                "fromKind": f"{NS}:valuationMark",
+                "toKind": "venture:deal",
+                "mechanism": "IMPL",
+            }]
+
+        class _Reg:
+            status_fold_index = None
+
+            def get_pack(self, namespace):
+                return _Pack() if namespace == NS else None
+
+        monkeypatch.setattr(domain_loader, "_get_registry", lambda: _Reg())
+        assert dv._portfolio_mark_contract() == (
+            f"{NS}:valuationMark", "venture:deal", "marksPosition")
+
+    def test_the_admitted_kind_forms_are_widened_and_case_folded(self,
+                                                                monkeypatch):
+        """The vocabulary the rule queries is every spelling the write gate
+        admits, lowercased — ``portfolio:allocationTarget`` keeps its capital in
+        storage, so folding only ONE side would trade the bare-spelling
+        blindness for a namespaced one. Read from ``StatusFoldIndex``'s own
+        seam, never re-derived a third time.
+        """
+        from tortoise import domain_loader
+        from tortoise import domain_validators as dv
+        from tortoise.status_folds import StatusFoldIndex
+
+        index = StatusFoldIndex()
+
+        class _Reg:
+            status_fold_index = index
+
+            def get_pack(self, namespace):  # pragma: no cover — unused here
+                return None
+
+        monkeypatch.setattr(domain_loader, "_get_registry", lambda: _Reg())
+        assert dv._admitted_kind_forms(f"{NS}:valuationMark") == [
+            f"{NS}:valuationmark", "valuationmark"]
+        # The same set the index itself returns — the seam, not a copy of it.
+        assert dv._admitted_kind_forms(f"{NS}:allocationTarget") == [
+            str(f).lower()
+            for f in index.kind_forms_for(f"{NS}:allocationTarget")]
 
     @requires_db
     def test_each_object_kind_mints_with_its_own_status(self, sdk):
