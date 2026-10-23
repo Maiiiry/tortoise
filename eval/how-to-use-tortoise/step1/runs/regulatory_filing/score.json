@@ -75,7 +75,27 @@
   ],
   "mitigations": [],
   "kind_census": {},
+  "wrong_axis_kinds": [],
   "cross_axis_kinds": [],
+  "kind_sources": {
+    "Point": {
+      "observation": "CORE",
+      "statement": "CORE"
+    },
+    "Subject": {
+      "core:organization": "CORE",
+      "core:role": "CORE"
+    },
+    "Object": {
+      "other": "CORE"
+    },
+    "Event": {
+      "occurrence": "CORE"
+    },
+    "Source": {
+      "document": "CORE"
+    }
+  },
   "packs": [
     "agent-ops",
     "dev",

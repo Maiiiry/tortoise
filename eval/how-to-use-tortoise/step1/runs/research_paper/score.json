@@ -106,7 +106,27 @@
     "mitigated_by: ? -> [MITIGATION] The instability-to-necessit"
   ],
   "kind_census": {},
+  "wrong_axis_kinds": [],
   "cross_axis_kinds": [],
+  "kind_sources": {
+    "Point": {
+      "observation": "CORE",
+      "statement": "CORE"
+    },
+    "Subject": {
+      "authorGroup": "UNDECLARED"
+    },
+    "Object": {
+      "architecture": "PACK",
+      "asset": "PACK"
+    },
+    "Event": {
+      "extraction": "CORE"
+    },
+    "Source": {
+      "research": "UNDECLARED"
+    }
+  },
   "packs": [
     "agent-ops",
     "dev",

@@ -84,7 +84,7 @@ severity rules the review skills use:
 | Severity | Rule |
 |---|---|
 | **P0** | layer confusion (an item filed on a different label than its gold layer, and the expected layer does **not** hold it) · item absent/absorbed · no Source at all · a contradicting claim filed with **no NAND** (an IMPL or a mitigation does not attack the truth of a Point; one act, one finding) · change written without supersession |
-| **P1** | a kind the product's vocabulary **does not declare** (not a core §5 kind, not one the SDK registers, not one a loaded pack declares) · a kind written on **another layer's property** (`subjectKind` on an Object — nothing on the Object layer reads it) · the graph-wide census of undeclared kinds beyond the gold · **two homes** for one item (the expected layer holds it *and* a second layer does) · a declared-but-wrong kind · duplicate nodes for one entity · Source nodes with zero claim→source edges · a NAND where nothing contradicts · a node with no kind property |
+| **P1** | a kind **no vocabulary reads on the layer it was written to** — the four sources the instrument consults are the §5 canonical sets, a loaded pack, the kinds `tortoise.sdk` registers with `register_kind`, and the legacy flat registry behind `domain_loader.kind_is_known(kind, bucket)`; a kind that only the FLAT registry accepts *and* that belongs to another axis (`meeting` on a Point, `issue`/`incident` on a Point, `workflow`) is reported as exactly that, never blessed as declared · a kind written on **another layer's property** (`subjectKind` on an Object — nothing on the Object layer reads it) · the graph-wide census of all of the above beyond the gold · **two homes** for one item (the expected layer holds it *and* a second layer does) · a declared-but-wrong kind · duplicate nodes for one entity · Source nodes with zero claim→source edges · a NAND where nothing contradicts · a node with no kind property |
 
 The matcher is deliberately dumb (token overlap). A fuzzy matcher would *hide*
 the exact failure being measured: a `Northwind Logistics Ltd` that became a
@@ -161,8 +161,8 @@ steps are decisions rather than rules.
 
 | Class | Count | What it looked like |
 |---|---|---|
-| **Undeclared kind** (a kind the product's own vocabulary does not know on that layer) | 14 scored items across 5 inputs | `subjectKind` ∈ {`person` ×6, `company` ×2, `investor`, `authorGroup`} · `objectKind: offering` · `sourceKind: research` · `eventKind: customerCommitment`, `employmentStart`. Every one accepted by the write path (warn-not-block, #1934). **Not** counted: `core:organization` (the declared key), `disbursement`/`tranche`/`estimate` (the venture/pm packs declare them), and `option`/`criterion`/`incident`/`issue` — the SDK's `register_kind` and the legacy flat registry declare them, so `domain_loader.kind_is_known(kind, bucket)` accepts them (corrected in round 6; `pointKind: issue` ×2 moved to the wrong-but-declared class, `option`/`criterion` stopped being findings at all) |
-| **Uncatalogued kinds beyond the gold** (the graph-wide census, 7 inputs) | 7 findings | the gold names some items; the census asks the whole graph, which is what keeps a near-miss from reading 0/0. Among them (×N = how many times the kind was **written** across those inputs, a node the gold resolved included): `objectKind: openQuestion`/`governanceSeat`/`role` ×3/`deliverable`/`productSurface`/`organization`, `eventKind: correction`/`planRevision`/`observation`, `sourceKind: spec`/`note`/`contract`/`portfolioUpdateMemo`/`meetingTranscript` |
+| **Undeclared kind** (a kind the product's own vocabulary does not know on that layer) | 14 scored items across 5 inputs | `subjectKind` ∈ {`person` ×6, `company` ×2, `investor`, `authorGroup`} · `objectKind: offering` · `sourceKind: research` · `eventKind: customerCommitment`, `employmentStart`. Every one accepted by the write path (warn-not-block, #1934). **Not** counted: `core:organization` (the declared key), `disbursement`/`tranche`/`estimate` (the venture/pm packs declare them), `option`/`criterion`/`evidence` (the SDK's `register_kind` declares them, and no other axis does), and `pointKind: issue` ×2 — **the flat registry** accepts `issue` on the point bucket, so it is not "invented"; it is declared-for-the-Object-axis, which is the wrong-but-declared class below (corrected in round 6) |
+| **Uncatalogued kinds beyond the gold** (the graph-wide census, 7 inputs) | 7 findings | the gold names some items; the census asks the whole graph, which is what keeps a near-miss from reading 0/0. Among them (×N = how many times the kind was **written** across those inputs, a node the gold resolved included): `objectKind: openQuestion`/`governanceSeat`/`role` ×3/`deliverable`/`productSurface`/`organization` ×2, `eventKind: correction`/`planRevision`/`observation`, `sourceKind: spec`/`note`/`contract`/`portfolioUpdateMemo`/`meetingTranscript` — plus **one kind declared for another axis**: `pointKind: incident` on a Point (`incident` is an Object kind; the flat registry accepts it on the point bucket, so it is reported as a wrong axis, not as an invention) |
 | **Layer confusion — only the wrong layer holds the item** | 9 items across 5 inputs | portfolio: ARR + headcount as Points · decision request: goal, deadline, estimate · meeting: the decision · person appointment: organisation, role · product spec: the success bar |
 | **Two homes — the right layer holds it AND a second one does** | 2 items across 2 inputs | decision request: the request (the Event names it, a Point also holds it) · product spec: the ship date (plan Object + target Point). Weaker than an absence, and a different instruction: express the second reading as a claim *about* the node |
 | **Wrong-but-declared kind** (legacy-valid, not invented) | 7 | `pointKind: observation` where the state-centric ruling says `statement`; `eventKind: disbursement` where the occurrence is an occurrence/milestone; `pointKind: issue` where the item is a statement ×2. A different lesson from an invented kind, which is why the instrument separates them |
@@ -310,6 +310,27 @@ Round 6:
 26. **The test count in this document was the one number nothing pinned** — it
     said 37 where the file collected 38, and it will drift with every test added.
     The count is gone rather than restated; the command remains.
+27. **The registry answer needed its own residue class.** The legacy flat bucket
+    is FLAT, so `known_kinds("pointKind")` also accepts kinds that belong to
+    another axis (`meeting`, `issue`, `incident`, `workflow`) — trusting it
+    wholesale would have blessed "an occurrence filed as a belief", the exact
+    failure #9675 quotes, and no committed record would have shown it. A kind
+    that only the flat registry accepts AND that another axis declares is now
+    `OTHER-AXIS` and is reported by the census with the axis named
+    (`correction_existing_claim`'s `pointKind: incident`), so the class survived
+    the correction instead of being absorbed by it.
+28. **The reproduction gate was still coupled to the LIVE vocabulary** — the
+    `packs` exclusion removed pack-list deltas only, so a pack that declared a
+    kind a committed graph carries (or a registry change) would still red a
+    `core` test on main, with a message accusing the EVIDENCE of drift. The
+    remaining coupling is disclosed rather than hidden: every `score.json` now
+    records `kind_sources` (the vocabulary it was scored under, per kind it
+    used), and the gate checks that map FIRST — a red now says "the product's
+    kind vocabulary moved under this record, re-score it", which is the
+    actionable fact, instead of the false one. A full freeze of the vocabulary
+    per run (so an unrelated vocabulary change cannot red the gate at all) would
+    need a committed snapshot artifact with its own pin; that is not this
+    issue's scope and is recorded here as the known residual.
 
 Still true, and stated as a limit rather than a rule: the matcher is token
 overlap with a crude stemmer, and **the class table above is the MACHINE
@@ -367,10 +388,14 @@ Derived from the classes above, in the order an agent has to decide.
    kind the product does not know on that layer: `subjectKind: person`,
    `company`, `investor`, `authorGroup`. And the paper got `sourceKind: research`,
    which is the *genre* axis
-   (`documentKind`). Rule: pick the kind the layer's vocabulary declares (§5
-   core, a kind `tortoise.sdk` registers, or a pack kind spelled the way the pack
-   declares it), and never confuse
-   `sourceKind` (what kind of source) with `documentKind` (what genre it is).
+   (`documentKind`). Rule: pick the kind the layer's vocabulary declares — the §5
+   core, a kind `tortoise.sdk` registers (`option`, `criterion`, `evidence`), or a
+   pack kind spelled the way the pack declares it — and remember that the legacy
+   flat registry accepting a name on a bucket does **not** make it the right axis:
+   `meeting` is an Event kind, `issue` and `incident` are Object kinds, and
+   `pointKind: incident` is reported as a wrong axis rather than as a declaration.
+   Never confuse `sourceKind` (what kind of source) with `documentKind` (what
+   genre it is).
 5. **Truth attacks the Point; relevance dampens the operator.** The one
    contradicting input was answered by mitigating an `IMPL` and nothing attacked
    the Point. Rule: a claim that is *wrong* gets a `NAND`; a claim that is *less

@@ -98,7 +98,7 @@
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds the product's vocabulary does not declare, beyond the gold items \u2014 Source: ['note']; Object: ['organization', 'role']",
+      "finding": "graph-wide: kinds no vocabulary reads on the layer they were written to, beyond the gold items \u2014 Source: ['note']; Object: ['organization', 'role']",
       "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary, the SDK's registered kinds, or a loaded pack"
     }
   ],
@@ -129,7 +129,26 @@
       "role"
     ]
   },
+  "wrong_axis_kinds": [],
   "cross_axis_kinds": [],
+  "kind_sources": {
+    "Point": {
+      "statement": "CORE"
+    },
+    "Subject": {
+      "person": "UNDECLARED"
+    },
+    "Object": {
+      "organization": "UNDECLARED",
+      "role": "UNDECLARED"
+    },
+    "Event": {
+      "employmentStart": "UNDECLARED"
+    },
+    "Source": {
+      "note": "UNDECLARED"
+    }
+  },
   "packs": [
     "agent-ops",
     "dev",

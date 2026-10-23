@@ -239,10 +239,46 @@ def _kind_matches(got: str, allowed: list[str]) -> bool:
     return bool(candidates & {a.split(":", 1)[-1].lower() for a in allowed})
 
 
-def kind_status(layer: str, kind: str) -> str:
-    """``CORE`` / ``PACK`` / ``LEGACY`` / ``UNDECLARED`` for one written kind.
+def _own_vocabulary(layer: str, raw: str) -> str:
+    """``CORE`` / ``PACK`` if THIS layer's own sets declare ``raw``, else ``""``.
 
-    The four-way answer is the point: "wrong kind" (declared, but not the kind
+    Split out of `kind_status` so the cross-axis probe below can ask the same
+    question of the OTHER layers without recursing back into `kind_status`.
+    """
+    core = {k.lower() for k in _vocab().get(layer, frozenset())}
+    if raw.lower() in core:
+        return "CORE"
+    pack_kinds = _pack_vocab()["by_layer"].get(layer, set())
+    if raw in pack_kinds or raw.lower() in {p.lower() for p in pack_kinds}:
+        return "PACK"
+    return ""
+
+
+def other_axes_declaring(layer: str, kind: str) -> list[str]:
+    """The OTHER layers whose vocabulary declares ``kind`` (sorted, may be empty).
+
+    Used for the honest wording of the cross-axis case: `meeting` is an Event
+    kind, and the legacy flat registry accepts it on the point bucket only by
+    accident (`domain_loader` says so itself: the `meeting` overlap "was never
+    ruled on by #2767"). Accepting the registry's answer is right — the write
+    validator does — but calling the result "declared" would hide exactly the
+    confusion this eval exists to measure.
+    """
+    raw = kind.strip()
+    if not raw:
+        return []
+    return sorted(
+        other
+        for other in LAYERS
+        if other != layer
+        and (_own_vocabulary(other, raw) or _registry_declares(other, raw))
+    )
+
+
+def kind_status(layer: str, kind: str) -> str:
+    """``CORE`` / ``PACK`` / ``LEGACY`` / ``OTHER-AXIS`` / ``UNDECLARED``.
+
+    The five-way answer is the point: "wrong kind" (declared, but not the kind
     this item is) and "kind nothing declares" are different lessons for the
     document, and collapsing them teaches neither.
 
@@ -254,23 +290,28 @@ def kind_status(layer: str, kind: str) -> str:
     §5 canonical set made the decide flow's OWN kinds read as inventions and put
     them in the document's outline as failures (#9695 review P1, measured on
     `decision_request`: `option`, `criterion` ×2).
+
+    ``OTHER-AXIS`` is the residue that answer must not swallow. The legacy
+    bucket is FLAT, so it also accepts kinds that belong to another axis
+    (`meeting`, `issue`, `incident`, `workflow`) — a canonical Event kind on a
+    Point is the exact failure #9675 quotes ("events are classified as
+    objects"), and blessing it as "declared" would blind the graph-wide census
+    to it. So: declared, but declared for another layer, which is a finding with
+    its own text (#9695 review round 2, P2).
     """
     if not kind:
         return "NONE"
     raw = kind.strip()
-    core = {k.lower() for k in _vocab().get(layer, frozenset())}
-    if raw.lower() in core:
-        return "CORE"
-    pack_kinds = _pack_vocab()["by_layer"].get(layer, set())
-    if raw in pack_kinds or raw.lower() in {p.lower() for p in pack_kinds}:
-        return "PACK"
+    own = _own_vocabulary(layer, raw)
+    if own:
+        return own
     if layer == "Subject":
         from tortoise.subject_binding import is_subject_kind
 
         if is_subject_kind(raw):
             return "CORE"
     if _registry_declares(layer, raw):
-        return "LEGACY"
+        return "OTHER-AXIS" if other_axes_declaring(layer, raw) else "LEGACY"
     return "UNDECLARED"
 
 
@@ -984,6 +1025,7 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
     # whose two gold items both landed and whose other nodes carried undeclared
     # kinds). The census keeps "clean" honest.
     census: dict[str, list[str]] = {}
+    wrong_axis: list[str] = []
     cross_axis: list[str] = []
     # The census exists to catch what the GOLD did not name, so it skips the
     # nodes a gold item already resolved to (`item_rows[*]["node"]`). Keying it
@@ -1010,10 +1052,22 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             # item-level rule charges both (the own kind on its own property is a
             # second, separate write). The `continue` that used to sit here made
             # the census the one place that rule was inverted (#9695 review P2).
-        if kind_status(node["layer"], node["kind"]) != "UNDECLARED":
+        status = kind_status(node["layer"], node["kind"])
+        if status == "OTHER-AXIS":
+            # The flat legacy registry accepts a kind that belongs to ANOTHER
+            # axis (`meeting` on a Point). The write validator does accept it, so
+            # it is not "invented" — but nothing on THIS layer reads it, and
+            # "events classified as points" is the failure #9675 quotes, so it
+            # must not vanish into the LEGACY bucket (#9695 review round 2, P2).
+            axes = ", ".join(other_axes_declaring(node["layer"], node["kind"]))
+            wrong_axis.append(
+                f"{node['layer']} {node['kind']!r} is declared for {axes}"
+            )
+            continue
+        if status != "UNDECLARED":
             continue
         census.setdefault(node["layer"], []).append(node["kind"] or "(none)")
-    if census or cross_axis:
+    if census or cross_axis or wrong_axis:
         parts = []
         if census:
             parts.append(
@@ -1021,13 +1075,15 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                     f"{layer}: {sorted(set(kinds))}" for layer, kinds in census.items()
                 )
             )
+        if wrong_axis:
+            parts.append("declared for another axis: " + "; ".join(wrong_axis))
         if cross_axis:
             parts.append("cross-axis: " + "; ".join(cross_axis))
         add(
             "P1",
             "(kinds)",
-            "graph-wide: kinds the product's vocabulary does not declare, beyond "
-            "the gold items — " + " | ".join(parts),
+            "graph-wide: kinds no vocabulary reads on the layer they were written "
+            "to, beyond the gold items — " + " | ".join(parts),
             "every node needs a kind on ITS OWN layer's property, from the core "
             "§5 vocabulary, the SDK's registered kinds, or a loaded pack",
         )
@@ -1083,7 +1139,28 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             for m in record_doc["mitigations"]
         ],
         "kind_census": census,
+        "wrong_axis_kinds": wrong_axis,
         "cross_axis_kinds": cross_axis,
+        # The vocabulary the run was scored UNDER, per kind it actually used —
+        # provenance, and the diagnostic that tells a future lane WHICH change
+        # moved a committed verdict (a product-side vocabulary change vs. an
+        # edit to the instrument). The reproduction gate still re-scores against
+        # the live tree; this map is what makes a red there name its cause
+        # instead of accusing the evidence of drift (#9695 review P2).
+        "kind_sources": {
+            layer: {
+                kind: status
+                for kind, status in sorted(
+                    {
+                        node["kind"]: kind_status(layer, node["kind"])
+                        for node in nodes
+                        if node["layer"] == layer and node["kind"]
+                    }.items()
+                )
+            }
+            for layer in LAYERS
+            if any(node["layer"] == layer and node["kind"] for node in nodes)
+        },
         "packs": _pack_vocab()["packs"],
         "severity_counts": {
             sev: sum(1 for f in findings if f["severity"] == sev)

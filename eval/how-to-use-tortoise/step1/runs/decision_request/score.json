@@ -90,7 +90,33 @@
   ],
   "mitigations": [],
   "kind_census": {},
+  "wrong_axis_kinds": [],
   "cross_axis_kinds": [],
+  "kind_sources": {
+    "Point": {
+      "criterion": "LEGACY",
+      "decision": "CORE",
+      "evidence": "LEGACY",
+      "option": "LEGACY",
+      "target": "CORE"
+    },
+    "Subject": {
+      "team": "CORE"
+    },
+    "Object": {
+      "other": "CORE",
+      "tool": "CORE",
+      "workflow": "CORE"
+    },
+    "Event": {
+      "milestone": "CORE",
+      "occurrence": "CORE"
+    },
+    "Source": {
+      "agentSession": "CORE",
+      "conversation": "CORE"
+    }
+  },
   "packs": [
     "agent-ops",
     "dev",

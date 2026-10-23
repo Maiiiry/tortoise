@@ -114,7 +114,7 @@
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds the product's vocabulary does not declare, beyond the gold items \u2014 Source: ['portfolioUpdateMemo']; Object: ['governanceSeat']",
+      "finding": "graph-wide: kinds no vocabulary reads on the layer they were written to, beyond the gold items \u2014 Source: ['portfolioUpdateMemo']; Object: ['governanceSeat']",
       "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary, the SDK's registered kinds, or a loaded pack"
     }
   ],
@@ -139,7 +139,30 @@
       "governanceSeat"
     ]
   },
+  "wrong_axis_kinds": [],
   "cross_axis_kinds": [],
+  "kind_sources": {
+    "Point": {
+      "decision": "CORE",
+      "observation": "CORE"
+    },
+    "Subject": {
+      "company": "UNDECLARED",
+      "investor": "UNDECLARED"
+    },
+    "Object": {
+      "governanceSeat": "UNDECLARED",
+      "tranche": "PACK"
+    },
+    "Event": {
+      "conditionMet": "PACK",
+      "disbursement": "PACK",
+      "milestone": "CORE"
+    },
+    "Source": {
+      "portfolioUpdateMemo": "UNDECLARED"
+    }
+  },
   "packs": [
     "agent-ops",
     "dev",

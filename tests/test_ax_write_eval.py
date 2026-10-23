@@ -204,6 +204,27 @@ def test_the_products_own_registry_is_a_vocabulary_source():
     assert result["kind_census"] == {}
     assert result["severity_counts"] == {"P0": 0, "P1": 0, "P2": 0}, result["findings"]
 
+    # CONTROL — the residue the registry answer must NOT swallow. The legacy
+    # bucket is FLAT, so it also accepts kinds that belong to another axis: an
+    # occurrence filed as a belief is the failure #9675 quotes, and blessing it
+    # as "declared" would blind the census to it.
+    assert axe.kind_status("Point", "meeting") == "OTHER-AXIS"
+    assert axe.other_axes_declaring("Point", "meeting") == ["Event"]
+    assert axe.kind_status("Point", "issue") == "OTHER-AXIS"
+    wrong_axis = axe.score(
+        _record(nodes=[_node("Point", "pricing review held on tuesday", kind="meeting")]),
+        gold,
+        "x",
+    )
+    assert wrong_axis["wrong_axis_kinds"] == [
+        "Point 'meeting' is declared for Event"
+    ], wrong_axis["wrong_axis_kinds"]
+    census_finding = next(
+        f for f in wrong_axis["findings"] if f["finding"].startswith("graph-wide")
+    )
+    assert "declared for another axis" in census_finding["finding"]
+    assert "Point 'meeting' is declared for Event" in census_finding["finding"]
+
 
 def test_the_declared_subject_spelling_is_not_a_failure():
     """`core:organization` is the DECLARED §5 key; the bare form is its alias.
@@ -813,12 +834,35 @@ def test_every_committed_run_reproduces_from_its_own_graph():
         # committed evidence files. That already happened once inside this PR
         # (`origin/main` added the `portfolio` pack, #9694, and every verdict was
         # byte-identical). The provenance is asserted separately, below.
-        assert {k: v for k, v in recomputed.items() if k != "packs"} == {
-            k: v for k, v in committed.items() if k != "packs"
-        }, (
-            f"{path.parent.name}: re-scoring its graph.json does not reproduce the "
-            f"committed verdicts — the report and the record have diverged"
-        )
+        live = {k: v for k, v in recomputed.items() if k != "packs"}
+        stored = {k: v for k, v in committed.items() if k != "packs"}
+        if live != stored:
+            # A red here has TWO possible causes and they are not the same news:
+            # the instrument's rules changed (the evidence must be re-derived) or
+            # the PRODUCT's kind vocabulary moved under a committed record (a pack
+            # or registry change, unrelated to this eval — re-score with
+            # `score --graph`, nothing was wrong before). `kind_sources` is the
+            # record's own frozen answer, so the second case is detectable and
+            # must not be reported as "your evidence drifted" (#9695 review P2).
+            moved = {
+                layer: {
+                    kind: (was, axe.kind_status(layer, kind))
+                    for kind, was in kinds.items()
+                    if axe.kind_status(layer, kind) != was
+                }
+                for layer, kinds in (committed.get("kind_sources") or {}).items()
+            }
+            moved = {layer: kinds for layer, kinds in moved.items() if kinds}
+            assert not moved, (
+                f"{path.parent.name}: the product's KIND VOCABULARY moved under this "
+                f"committed record — {moved} (was, now). This is not evidence drift: "
+                f"re-score the ten records with `score --graph` and update the doc's "
+                f"counts, or pin the vocabulary if the move is a bug"
+            )
+            assert live == stored, (
+                f"{path.parent.name}: re-scoring its graph.json does not reproduce the "
+                f"committed verdicts — the report and the record have diverged"
+            )
         assert committed["packs"], f"{path.parent.name}: the score record lost its vocabulary"
         assert committed["packs"] == sorted(committed["packs"]), (
             f"{path.parent.name}: the recorded pack set is not in its canonical order"
