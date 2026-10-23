@@ -4073,6 +4073,30 @@ def _raw_query_lane_permit() -> str | None:
     return reason
 
 
+def replay_window_open() -> bool:
+    """True while a REPLAY window is open — i.e. this write came FROM the journal.
+
+    The ONE reader a producer-side door consults when it must not append a record
+    to the journal it is replaying (#9553 class 4). Read it from the SCOPE STACK,
+    not from the innermost lane: every replay engine opens
+    `_replay_write_scope()`, and an inner lane (`_prewipe_restore_write_scope`,
+    `_prewipe_synthetic_write_scope`, `_graph_metadata_write_scope`, or the edge
+    lane's own `_structural_edge_write_scope`) SHADOWS the reason while the
+    replay is still running. `_RAW_QUERY_CLOSED_DEPTH` is the depth #9391 built
+    for exactly that property — it is set by `_handle_only_write_scope`, which is
+    what `_replay_write_scope()` returns (and the only other caller is
+    `event_store`'s replay leg) — so `> 0` means "inside a handle-only replay
+    window", inherited by every nested scope.
+
+    ⛔ WHY A WRITE DOOR ASKS THIS AT ALL. The journal is the TRUTH store: a
+    rebuild that appended to it would make the log a function of itself — one
+    new `DirectEdgeCreated` per journaled link per rebuild, unbounded — and it
+    would write back the endpoints it resolved AT REPLAY TIME, so any live↔replay
+    drift becomes new durable truth. Recovery must read the log, never extend it.
+    """
+    return _RAW_QUERY_CLOSED_DEPTH.get() > 0
+
+
 @contextlib.contextmanager
 def _handle_only_write_scope(reason: str):
     """A permit for the write HANDLE only — held for the WHOLE nested window.
@@ -10219,6 +10243,34 @@ class FalkorProjection(
     # journal (it cannot be: nothing turned ``True``), and no stub can flip the
     # refusal off on a projection whose journal really was bound.
     _journal_backed: bool = False
+
+    #: #9553 class 4: the RECORDER the journal-owning door binds so this
+    #: projection's structural-edge mints can JOURNAL what they wrote. A class
+    #: attribute (not set in ``__init__``) for the same reason
+    #: ``_journal_backed`` is: the ``object.__new__`` guard stubs that skip
+    #: ``__init__`` must read a default instead of raising ``AttributeError``.
+    #:
+    #: ⛔ WHY A CALLBACK AND NOT A DIRECT APPEND. The journal handle lives on the
+    #: SDK (``_emit_event`` owns the ordinal, the dirty set and the record's live
+    #: door, ``record_writer.write_live_record``); a projection built on its own —
+    #: a test fold, `rebuild_all`, `FalkorProjection.from_uri` — has no journal at
+    #: all. A bound callback keeps ONE producer for the whole write surface (every
+    #: SDK door, `hosted_api`, `mining`, and `create_edge`'s three typed wrappers
+    #: all funnel through the two mints) and leaves an unbound projection writing
+    #: exactly what it wrote before this change: nothing.
+    _structural_edge_recorder: Any = None
+
+    def _bind_structural_edge_recorder(self, recorder: Any) -> None:
+        """Bind (or, with ``None``, clear) the structural-edge record producer.
+
+        Called by :meth:`TortoiseSDK._get_proj` next to ``_bind_journal`` — the
+        same "this projection is somebody's live cache" moment. The value is a
+        callable taking ONE flat descriptor
+        (``{edge_type, src, src_label, tgt, tgt_label}``); it must never raise on
+        the write path (the journal append is best-effort by contract), and this
+        module does not interpret its result.
+        """
+        self._structural_edge_recorder = recorder
 
     def _bind_journal(self, journal_path: str | None) -> None:
         """Mark this projection as the derived cache of a journal (`#7951`).

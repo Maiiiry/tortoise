@@ -1818,11 +1818,28 @@ def _nested_node_carrier(record: Mapping[str, Any],
 #: edges are carried by their OWN declarations, not this one:
 #: `_POINT_PROPERTY_RELATIONS` (class 1, `extractedFrom`) and
 #: `_OPERATOR_RELATION_RECORDS` (class 3 — the operator's `IMPL`/`NAND`/`hasPart`,
-#: its reverse `INPUT`, and the canonical `mitigated_by` mirror). What stays
-#: missing is the rest of the point-property set (`about*`, `TAGGED`) and the
-#: structural predicates `ownedBy`/`hasPart`/`dependsOn`/`references` and
-#: friends, which have a working `DirectEdgeCreated` fold and NO producer
-#: (class 4 — a producer-side change in `sdk.py`, not a projection one).
+#: its reverse `INPUT`, and the canonical `mitigated_by` mirror).
+#:
+#: The STRUCTURAL predicates (`ownedBy`/`hasPart`/`dependsOn`/`wasDerivedFrom`,
+#: `references`, the bare `about*` mints) are class 4, and they are carried by the
+#: `DirectEdgeCreated` descriptor this module already handles below — the missing
+#: half was the PRODUCER, not this fold. Since `#9553` the structural-edge lane's
+#: two mints journal that record (`projection/edges.py::_record_structural_edges`
+#: ← `TortoiseSDK._record_structural_edge`), so those edges land a `relation` row
+#: with `source_label`/`target_label` naming the endpoints' tables. What stays
+#: missing is NAMED, not implied:
+#:   * `tags` → `TAGGED`: the target is a `:Tag` node and `NODE_TABLES` has no
+#:     `tag` table, so the record holds no `(Tag, key)` identity for
+#:     `relation.tgt_key`'s composite FK to point at — a schema decision, not a
+#:     projection one;
+#:   * a `:Source`-anchored `references` (`link_source_to_entity`): the replay
+#:     fold addresses endpoints by sweeping `EPISTEMIC_LABELS` on `p.id`, and a
+#:     `:Source` is url-keyed and outside it. The lane therefore DECLINES to
+#:     journal such a write and WARNs once, with the reason, rather than filing a
+#:     record the journal route cannot replay (`projection/edges.py`,
+#:     `RECORD_ADDRESSABLE_EDGE_LABELS`).
+#:   * `about*` when no `EntityLinked` record exists is now carried by the bare
+#:     `create_about_edge` mint, on the same `DirectEdgeCreated` route.
 _ENVELOPE_RELATIONS: tuple[tuple[str, str, str, str, str], ...] = (
     ("PointAdded", "contains_session", "CONTAINS", "Session", "Point"),
     ("OperatorAdded", "contains_session", "CONTAINS", "Session", "Point"),

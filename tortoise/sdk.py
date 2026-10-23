@@ -7430,6 +7430,24 @@ class TortoiseSDK:
             # `_projection_for(target)` assignments in `__main__.py` hand the
             # SDK a projection that was never bound either.
             self._proj._bind_journal(self._event_log_path)
+            # #9553 class 4 (R5): the structural-edge mints (`create_edge` and its
+            # three typed wrappers, `create_about_edge`) wrote bare edges that
+            # NOTHING journaled, so `rebuild_all` reported `edges: 0` for
+            # `ownedBy`/`hasPart`/`dependsOn`/`wasDerivedFrom`/`references` and the
+            # record's `relation` table never saw them. The engine already carries
+            # them (`DirectEdgeCreated` + pass-2b) — what was missing was the
+            # EMISSION, and this is it: the projection hands each edge it writes
+            # back to this SDK, which journals the record. Bound HERE, beside
+            # `_bind_journal`, because that is the same fact — this projection is a
+            # live cache with a journal behind it.
+            #
+            # ⛔ CONDITIONAL ON THE JOURNAL, exactly as the record's own door is
+            # (`record_writer.write_live_record`: a record appended to a SCRATCH
+            # buffer must not become a row, because nothing could ever replay it).
+            # With no journal the recorder is None, so the mint writes exactly what
+            # it wrote before #9553 — no record, no half-carried edge.
+            self._proj._bind_structural_edge_recorder(
+                self._record_structural_edge if self._event_log_path else None)
             # (B) #2952: explicit embedder warm-up at ENGINE INIT —
             # best-effort, non-fatal, and non-blocking (daemon thread) so a
             # load failure surfaces ONCE here instead of masquerading as a
@@ -7793,6 +7811,74 @@ class TortoiseSDK:
             purge_overflow(proj, max_events=cap)
         except Exception:  # noqa: BLE001, RUF100
             _logger.warning("event retention purge failed — continuing", exc_info=True)
+
+    def _record_structural_edge(self, descriptor: dict) -> None:
+        """Journal ONE structural edge as §4.4's flat `DirectEdgeCreated` (#9553).
+
+        Bound on the projection by :meth:`_get_proj`; called by the structural
+        edge lane's two mints AFTER their MERGE (`projection/edges.py`,
+        `_record_structural_edges`), once per resolved endpoint pair.
+
+        THE SHAPE IS `create_direct_edge`'s, deliberately: `{src, tgt,
+        edge_type}` flat, plus `source_label`/`target_label`. The labels are what
+        `record_projection` needs — `relation.src_label`/`tgt_label` are bound as
+        VALUES and `relation` carries composite FKs into `node_identity`, so the
+        record must know WHICH table to resolve the endpoint in (a `Point` keys
+        `node_key = id`, a `Subject` keys `name`) — while the journal fold
+        IGNORES them and resolves labels itself by an id-anchored sweep
+        (`rebuild_all` pass-2b). Adding them therefore changes nothing for the
+        journal route and is what makes the record route agree with it.
+
+        ⚠️ NO `direction`/`confidence`/`weight`/`label`/`batch_id`: these edges
+        carry no relationship properties (§9.6 — the verbs take no value
+        parameter). Emitting `direction` here would be an invention the fold
+        would then SET on the rebuilt edge.
+
+        Emission is on EVERY successful write, not created-only, exactly as
+        `create_direct_edge` does: the replay MERGE is idempotent, and a
+        created-only gate would lose the edge from the log forever if the process
+        died between the graph write and this call.
+
+        Never raises: `_emit_event` is best-effort by contract (a journal append
+        failure is counted and logged there) and the record write's own door
+        (`record_writer.write_live_record`) heals by replay.
+        """
+        rel = descriptor.get("edge_type")
+        src, tgt = descriptor.get("src"), descriptor.get("tgt")
+        # A malformed descriptor is journaled as NOTHING (a record that cannot be
+        # addressed is worse than an absent one). A SELF-EDGE is skipped for the
+        # reason the replay fold skips it — `E2E-11.6`'s no-self contract — so
+        # journaling one would give the RECORD an edge the journal-sourced rebuild
+        # never re-creates: the two routes would disagree about topology, which is
+        # the defect this producer exists to end. ⛔ AND THE SKIP IS DISCLOSED once
+        # per relation, like the endpoint decline: the mint DID write a live
+        # self-loop, so silence here would be a live ≠ rebuild divergence with no
+        # diagnostic anywhere (measured: `create_edge("related", p, p)` leaves one
+        # live edge, no record, no log line).
+        if not isinstance(rel, str) or not isinstance(src, str) \
+                or not isinstance(tgt, str):
+            return
+        if src == tgt:
+            from .projection.edges import _RECORD_GAP_WARNED
+
+            if rel not in _RECORD_GAP_WARNED:
+                _RECORD_GAP_WARNED.add(rel)
+                _logger.warning(
+                    "structural edge %r: a SELF-EDGE (%s -> %s) is written to the "
+                    "graph and NOT journaled — the replay fold skips `src == tgt` "
+                    "(E2E-11.6), so a rebuild cannot re-create it. Declared at "
+                    "`04-projection.md` §3 rather than dropped in silence (#9553).",
+                    rel, src, tgt)
+            return
+        self._emit_event(
+            "DirectEdgeCreated",
+            id=f"{src}->{tgt}:{rel}",
+            src=src,
+            tgt=tgt,
+            edge_type=rel,
+            source_label=descriptor.get("src_label"),
+            target_label=descriptor.get("tgt_label"),
+        )
 
     def _emit_event(self, type_: str, payload: dict | None = None, *,
                     point: dict | None = None,

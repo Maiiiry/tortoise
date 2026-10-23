@@ -289,6 +289,50 @@ closed at both layers:
   where the producer lives: the rest of the point-property set (`about*`,
   `TAGGED`) and the structural predicates whose `DirectEdgeCreated` fold works
   but has **no producer**.
+  > **Updated #9553 (R5 class 4).** The structural predicates now HAVE their
+  > producer: the edge lane's two mints (`projection/edges.py::create_edge` and
+  > `create_about_edge`, plus `create_edge`'s three typed wrappers) journal §4.4's
+  > flat `DirectEdgeCreated` — `{src, tgt, edge_type, source_label,
+  > target_label}` — through `TortoiseSDK._record_structural_edge`, which the
+  > projection reaches via `_bind_structural_edge_recorder` (`_get_proj`, beside
+  > `_bind_journal`, and only when a journal exists). Nothing new is invented: the
+  > record type, the pass-2b fold and the `RelationUpsert` all predate it; the
+  > labels are additive for the RECORD (`relation.src_label`/`tgt_label` are bound
+  > values and each label resolves through its own key column) and ignored by the
+  > fold. TWO gates sit in front of the emission, both load-bearing: a REPLAY never
+  > journals (`projection.replay_window_open()` — `apply()`/`rebuild_all` re-wire
+  > about links through this very mint on the SDK's BOUND projection, so without it
+  > a recovery write would append to the append-only journal and write back the
+  > endpoints it resolved at replay time), and an endpoint the fold cannot address
+  > (`Source`; a non-`id`-valued node) is declined rather than half-journaled.
+  >
+  > **Measured.** PGlite (`supabase/tests/pglite/validate.mjs`) is the record
+  > route's CI gate: `PointAdded` + `SubjectAdded` + the descriptor ⇒ exactly one
+  > `relation` row `Point/p1 -> Subject/team-x` (the Subject filed by NAME), and
+  > idempotent on re-replay. On a local throwaway Postgres + FalkorDB the whole
+  > family set was measured 1:1:1 across live / journal-rebuild / record-rebuild
+  > (`ownedBy`, `dependsOn`, `hasPart`, `wasDerivedFrom`, `references`, bare
+  > `aboutObject`); `relation` goes from 0 rows for each to one. A
+  > `capture_session` leaves `aboutObject`/`extractedFrom` short by the captured
+  > turns — R4's pinned `point.search_keys` refusal, not an edge defect (the Point
+  > never reaches the record, so its edges have no endpoint).
+  >
+  > **UNCARRIED, named** (`RECORD_CARRIED_STRUCTURAL_RELS` /
+  > `SOURCE_TARGETED_ABOUT_RELS` partition the lane's write set, and
+  > `structural_edge_record_carrier` answers per relation):
+  > `TAGGED` (no record `tag` table to key `relation.tgt_key` on — a schema
+  > decision); a `:Source`-anchored `references` (`link_source_to_entity`; the fold
+  > sweeps `EPISTEMIC_LABELS` on `p.id` and a `:Source` is url-keyed and outside it
+  > — per-WRITE); and `aboutDocument`/`aboutSource`, whose CONTRACT target is a
+  > `:Source` and is therefore NEVER addressable (per-RELATION — carrying them
+  > needs a url-keyed `:Source` branch in the fold, a different behaviour — **#9834**). A
+  > self-edge is skipped (the fold's `E2E-11.6`) and, like every other decline,
+  > WARNed once rather than dropped in silence.
+  >
+  > ⚠️ One uncarried writer is OUTSIDE this lane and stays open:
+  > `sdk.backfill_about_entities` mints about edges through `_create_about_edges` →
+  > `wire_about_link` (a bare MERGE) with no record and no `aboutEntities` snapshot
+  > prop, so neither carrier restores them — **#9833**.
 * **It does not approve `#7879`'s scope.** Scope and Plan carry human gates.
 * **It adds no migration-safety surface** (owner scope ruling, 2026-10-10).
 * **It changes no public surface.** No MCP tool and no public SDK method is added,

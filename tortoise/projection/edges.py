@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 from tortoise.entity_identity import display_holder_ids, record_non_folded
 from tortoise.live import epistemic_disjunction
@@ -724,19 +725,23 @@ def source_change_notices(g, source_refs, current_versions: dict[str, str] | Non
 # WHY DECLARED AND NOT JOURNALLED, PRECISELY. Two shapes would have made this
 # write honest without a declaration, and the evidence rejects BOTH:
 #   * `_live_write_scope` — its contract is "journal appended first, then the
-#     fold", and NOTHING is appended on this path: `sdk.create_edge` →
-#     `proj.create_edge` emits no record, so the scope would state a false
-#     ordering.
-#   * journalling — the replay half ALREADY EXISTS and this is NOT a request for
-#     a new resolver: `DirectEdgeCreated` is a flat `{src, tgt, edge_type,
-#     direction}` record whose pass-2b fold re-creates exactly this edge shape,
-#     and MEASURED on this head, emitting that record and running `rebuild_all`
-#     brings `ownedBy`, `dependsOn`, `references` and `memberOf` edges back.
-#     What is missing is the EMISSION: this is a PROJECTION method with no
-#     journal handle, so the gap is on the producer side (an SDK-level edge door
-#     that emits the record) — a bigger change than a declaration child, and it
-#     belongs to the record-store epic (`#7879`) with the write-class row carried
-#     on `#9079`'s census.
+#     fold". ✅ That is now TRUE of this lane (`#9553` class 4): the mints journal
+#     a flat `DirectEdgeCreated` next to the edge, so the lane COULD declare it.
+#     It keeps the narrower `_structural_edge_write_scope` because the write is
+#     still not gated on the append (the append is best-effort, and a refused
+#     append must not refuse a product write) — the declaration names the write,
+#     not the ordering.
+#   * journalling — ✅ LANDED (`#9553` class 4, `_record_structural_edges`).
+#     `DirectEdgeCreated` is a flat `{src, tgt, edge_type, source_label,
+#     target_label}` record whose pass-2b fold re-creates exactly this edge shape,
+#     and `record_projection`'s `RelationUpsert` materialises the same descriptor
+#     as a `relation` row — so ONE carrier serves both rebuild routes. The
+#     emission lives at the mint and reaches the journal through the recorder the
+#     journal-owning door binds; a REPLAY never emits (`replay_window_open`),
+#     because a recovery write that appended to the truth store would make the
+#     log a function of itself. The record-store epic that owns this half is
+#     `#7879` (R5), and the write-class row this lane's LIVE side already carried
+#     is on `#9079`'s census.
 # And the ORDERING is settled the other way round regardless: the declaration
 # lands BEFORE the guard, because a guard that refuses the product's own edge
 # mints is not a guard, it is a regression (measured on `#9079`'s lane: arming it
@@ -757,24 +762,27 @@ def source_change_notices(g, source_refs, current_versions: dict[str, str] | Non
 #     which is how the sanctioned writers write it (`create_point(aboutSubject=
 #     …)`, `extractedFrom=…`) — and NOT when it is a bare assertion on a node
 #     whose record never held it.
-#   * **no carrier emitted by this lane** — every other predicate in
-#     `STRUCTURAL_EDGE_LANE_PREDICATES` (`related`, `dependsOn`, `ownedBy`, `managedBy`,
-#     `authoredBy`, `memberOf`, `hasMember`, `holdsRole`, `reportsTo`,
-#     `participatesIn`, `hasPart`, `performs`, `produces`, `uses`,
-#     `wasDerivedFrom`, `references`, `aboutSource`, `aboutAction`). MEASURED at
-#     this head: mint them live and `rebuild_all` reports `edges: 0` — they are
-#     GONE, whether minted bare or carried by an `ownedBy`/`managedBy`/
-#     `authoredBy` node property, because nothing emitted a record for them.
-#     **This lane does NOT claim durability for them.** It discloses the gap so
-#     the next reader meets it here instead of discovering it, and so that
-#     `#9124`'s census has the class enumerated rather than assumed: the
-#     missing half is the EMISSION from the edge doors (the record type, the
-#     fold and the resolver exist — `DirectEdgeCreated`), tracked on `#9079`'s
-#     census (the folded write-surface map of `#2296`, whose per-write-class
-#     obligation (`#7951`) this row discharges only for the LIVE side).
-#     Declaring this lane does not create that gap and does not bless it — the
-#     gap exists on `origin/main` today, with no declaration anywhere (measured
-#     the same way).
+#   * **record-carried** — every other predicate in
+#     `STRUCTURAL_EDGE_LANE_PREDICATES`, via `structural_edge_record_carrier`:
+#     the mint journals a flat `DirectEdgeCreated` (`related`, `dependsOn`,
+#     `ownedBy`, `managedBy`, `authoredBy`, `memberOf`, `hasMember`, `holdsRole`,
+#     `reportsTo`, `participatesIn`, `hasPart`, `performs`, `produces`, `uses`,
+#     `wasDerivedFrom`, `references`). MEASURED after this landed: mint them live
+#     and `rebuild_all` restores each one (they used to report `edges: 0`), and
+#     the record's `relation` table gains one row each — the same family, one
+#     carrier, both routes.
+#   * **NOT carried, and named** — `SOURCE_TARGETED_ABOUT_RELS`
+#     (`aboutDocument`, `aboutSource`): their contract target is a `:Source`,
+#     which the pass-2b sweep (`EPISTEMIC_LABELS` on `p.id`) cannot address, so
+#     those writes are declined at the mint and warned once. Carrying them needs
+#     a FOLD change (a url-keyed Source branch), not a producer — a separate
+#     behaviour, declared in `04-projection.md` §3 and doc 08 §R5.
+#
+#     ⚠️ Per-WRITE caveats, not per-relation ones: a `references` whose SOURCE is
+#     a `:Source` (the `link_source_to_entity` shape) is declined the same way,
+#     and a SELF-EDGE is skipped (the fold's `E2E-11.6` no-self contract) — both
+#     warn once. Before `#9553`, EVERY one of these was uncarried and silent;
+#     the point of the ledger is that the remaining gaps are named.
 #
 # ⛔ WHAT THIS LANE DOES NOT COVER — stated, so a reader does not infer it from
 # a green suite. `_EdgeHandlers` holds OTHER edge-minting verbs; they are not
@@ -829,19 +837,18 @@ STRUCTURAL_EDGE_WRITE_LANE = "structural-edge.derived"
 
 
 def structural_edge_carrier(rel: str) -> str | None:
-    """The replay carrier THIS LANE provides for an edge of relation ``rel``.
+    """The SNAPSHOT carrier an edge of relation ``rel`` has, if any.
 
     ``"endpoint-snapshot"`` — the endpoint Point's own record is the carrier
     (`DERIVABLE_STRUCTURAL_RELS`, resurrected by
     `entities._upsert_point_edges`), so an edge the lane mints survives a
     rebuild when that record already carries the same link.
 
-    ``None`` — **this verb emits no record and the endpoint snapshot carries no
-    such link, so a rebuild drops the edge.** That is NOT a claim that no replay
-    carrier can exist: the ENGINE has one (`DirectEdgeCreated` + its pass-2b
-    fold), and emitting that record restores these edges (measured). The gap is
-    the EMISSION — this projection verb has no journal handle — so ``None``
-    reads "nothing carried from here", never "nothing could carry it".
+    ``None`` — the endpoint snapshot carries no such link. ⛔ THIS IS NOT "no
+    carrier at all" any more (#9553 class 4): :func:`structural_edge_record_carrier`
+    answers the RECORD half, and since the lane journals its own edges every
+    predicate it can write is carried there. Read the two together; a `None`
+    here reads "no snapshot carrier", never "nothing carried it".
 
     DERIVED from ``DERIVABLE_STRUCTURAL_RELS`` — the one set the replay engines
     read — rather than a second hand-maintained table, so adding a rel to that
@@ -849,6 +856,113 @@ def structural_edge_carrier(rel: str) -> str | None:
     drift from replay's actual behaviour.
     """
     return "endpoint-snapshot" if rel in DERIVABLE_STRUCTURAL_RELS else None
+
+
+#: The node labels a `DirectEdgeCreated` descriptor's endpoints can address on
+#: REPLAY, restated from the fold rather than guessed: pass-2b's
+#: `DirectEdgeCreated` leg sweeps exactly `EPISTEMIC_LABELS` (`Point`, `Subject`,
+#: `Object`, `Event`) and probes `p.id IN $ids` (`projection/__init__.py`, "fold
+#: `DirectEdgeCreated`"). A `:Source` endpoint is therefore NOT addressable — it
+#: is url-keyed and outside the sweep — which is why the lane declines to journal
+#: a write whose endpoint resolves to one, instead of filing a record the
+#: journal-sourced rebuild cannot consume (a record RICHER than the graph, the
+#: one direction Interface A forbids).
+RECORD_ADDRESSABLE_EDGE_LABELS = frozenset(
+    {"Point", "Subject", "Object", "Event"})
+
+#: The structural predicates this lane now JOURNALS a `DirectEdgeCreated` for
+#: (#9553 class 4). A LITERAL, not `frozenset(STRUCTURAL_EDGE_LANE_PREDICATES)`:
+#: derived from the write set, every assertion about it would be a tautology —
+#: the drift test compares the two, so adding a predicate to either mint must
+#: classify it here, by hand, as carried or not.
+#:
+#: ⛔ THE EXCLUSIONS ARE THE POINT (:data:`SOURCE_TARGETED_ABOUT_RELS`). A
+#: predicate whose CONTRACT target is a `:Source` has NO addressable endpoint at
+#: all — not "a subset of its writes" like `references` — so claiming it carried
+#: would make the ledger green for a family both rebuild routes still lose every
+#: time. That is why it is excluded here AND warned at the write.
+RECORD_CARRIED_STRUCTURAL_RELS = frozenset({
+    # create_edge's structural predicates, all of which take epistemic endpoints
+    # in practice (a Point, Subject, Object or Event on each side).
+    "performs", "produces", "uses", "authoredBy", "ownedBy", "managedBy",
+    "hasMember", "holdsRole", "memberOf", "reportsTo", "participatesIn",
+    "hasPart", "related", "dependsOn", "references", "wasDerivedFrom",
+    # The about* family whose target label is epistemic. `aboutAction` targets a
+    # Point; `aboutDocument`/`aboutSource` do not (see the set below).
+    "aboutSubject", "aboutObject", "aboutEvent", "aboutPoint", "aboutAction",
+})
+
+#: Lanes predicates whose CONTRACT endpoint is a `:Source`, i.e. **never**
+#: journaled by this lane (#9553 class 4's second stated gap):
+#:   * `aboutDocument` — `create_edge` REFUSES a non-document :Source target and
+#:     `create_about_edge`'s canonical target is a document `:Source`;
+#:   * `aboutSource` — a provenance `:Source` target by definition.
+#: The fold addresses endpoints by sweeping `EPISTEMIC_LABELS` on `p.id`; a
+#: `:Source` is url-keyed and outside it. Carrying them needs a FOLD change (a
+#: url-keyed Source branch in pass-2b), which is a different behaviour from this
+#: producer — so they are declared uncarried here, warned at every write, and
+#: named in `04-projection.md` §3 / `08-hosted-prerequisites.md` §R5.
+SOURCE_TARGETED_ABOUT_RELS = frozenset({"aboutDocument", "aboutSource"})
+
+assert SOURCE_TARGETED_ABOUT_RELS <= STRUCTURAL_EDGE_LANE_PREDICATES
+assert not (SOURCE_TARGETED_ABOUT_RELS & RECORD_CARRIED_STRUCTURAL_RELS)
+assert (STRUCTURAL_EDGE_LANE_PREDICATES
+        == RECORD_CARRIED_STRUCTURAL_RELS | SOURCE_TARGETED_ABOUT_RELS), (
+    "every predicate this lane can write must be classified: carried, or "
+    "declared uncarried with a reason — a new one must not be silently either")
+
+
+def structural_edge_record_carrier(rel: str) -> str | None:
+    """The RECORD carrier this lane emits for an edge of relation ``rel``.
+
+    ``"record"`` — the mint journals a flat `DirectEdgeCreated` descriptor
+    (`{src, tgt, edge_type, source_label, target_label}`) next to the edge, which
+    pass-2b re-creates on a journal-sourced rebuild and which
+    `record_projection` materialises as a `relation` row (the descriptor is
+    §4.4's canonical shape, shared with `DirectEdgeRepoint`).
+
+    ``None`` — either not a predicate this lane writes, or one of
+    :data:`SOURCE_TARGETED_ABOUT_RELS` (whose contract target the fold cannot
+    address at all).
+
+    ⚠️ The answer is per RELATION, and the emission is per WRITE: a write whose
+    endpoint is not :data:`RECORD_ADDRESSABLE_EDGE_LABELS` (a `:Source` —
+    `references` is the live case) is DECLINED at the mint and warned once, so
+    `"record"` here means "the lane carries this relation for the endpoints the
+    record can address", not "every instance of it is carried".
+    """
+    return "record" if rel in RECORD_CARRIED_STRUCTURAL_RELS else None
+
+
+#: Logged once per relation, not once per write: the decline is a DECLARED gap
+#: ("this endpoint class has no record carrier"), and a per-write line on the
+#: `references` fan-out would bury every other log in the process. The reason is
+#: stated at the code site and in `04-projection.md` §3 — never left to be found.
+_RECORD_GAP_WARNED: set[str] = set()
+
+
+def _record_addressable(end: Mapping[str, Any]) -> bool:
+    """Can a `DirectEdgeCreated` descriptor address this resolved endpoint?
+
+    TWO conditions, both the fold's rather than this module's invention:
+
+    * the LABEL is one pass-2b sweeps (:data:`RECORD_ADDRESSABLE_EDGE_LABELS`);
+    * the value the MERGE anchored on IS that node's `id` property — the fold's
+      `WHERE p.id IN $ids` probe, exact. An `Event` resolved through its
+      `eventId` branch is addressable only when the node really carries `id`
+      (`_upsert_event` sets both; an eventId-only legacy node does not), and a
+      `:Source` never is.
+
+    Reading `id` back from the resolved PROPERTIES is deliberate: the invariant
+    "Event.id == eventId" is what `_upsert_event` writes, not what every node in
+    every graph carries, and filing a descriptor for a node the fold will not
+    find is exactly the record-richer-than-graph defect this gate exists to
+    prevent.
+    """
+    if end.get("label") not in RECORD_ADDRESSABLE_EDGE_LABELS:
+        return False
+    props = end.get("properties") or {}
+    return props.get("id") is not None and props.get("id") == end.get("value")
 
 
 def _structural_edge_write_scope():
@@ -865,6 +979,80 @@ def _structural_edge_write_scope():
 
 class _EdgeHandlers:
     """Mixin: edge creation, about edges, source linking, edge stats."""
+
+    def _record_structural_edges(self, rel: str, sources: list[dict],
+                                 targets: list[dict]) -> None:
+        """Hand the edges this mint just wrote to the RECORD producer (#9553).
+
+        ONE producer for the lane's two mints, called with the endpoints
+        `_resolve_entity` ALREADY returned — so the descriptor names the node the
+        MERGE actually wrote to, not a re-resolution that a concurrent write could
+        point elsewhere.
+
+        The RECORDER is bound by the journal-owning door
+        (`TortoiseSDK._get_proj` → `_bind_structural_edge_recorder`), because the
+        journal handle lives there: a projection constructed on its own (a test,
+        a replay engine, `FalkorProjection.from_uri`) has none and emits
+        nothing, which is the pre-#9553 behaviour rather than a silent half-write.
+
+        ⛔ AND A REPLAY NEVER EMITS, even on a BOUND projection. `apply()` and
+        `rebuild_all`'s pass-2b drive `replay_about_links` → this very mint, on the
+        SDK's own live projection — so without the guard a RECOVERY WRITE would
+        append to the append-only journal it is reading: one `DirectEdgeCreated`
+        per journaled link per rebuild, unbounded, built from the endpoints
+        resolved AT REPLAY TIME (so any live↔replay drift becomes new durable
+        truth). Measured before the guard: a journal of 4 records re-grew to 5, 6,
+        7 over three successive `rebuild_all` runs. The journal is the truth
+        store; a rebuild reads it and never extends it
+        (`projection.replay_window_open`).
+
+        ⛔ THE NEXT GATE IS THE FOLD'S OWN PROBE, not a guess. Pass-2b addresses a
+        `DirectEdgeCreated` endpoint by sweeping `EPISTEMIC_LABELS` for `p.id IN
+        $ids`; a `:Source` endpoint is outside that sweep, so journaling one would
+        write a record the JOURNAL rebuild cannot consume while the RECORD rebuild
+        can — the two routes disagreeing, which is the one thing this family is
+        supposed to make impossible. Such a write is DECLINED (no partial
+        descriptor) and disclosed ONCE per relation, with the reason, rather than
+        dropped in silence (the failure mode that let R5 sit).
+        """
+        recorder = getattr(self, "_structural_edge_recorder", None)
+        if recorder is None:
+            return
+        # Lazy import: `tortoise.projection` imports THIS module.
+        from tortoise.projection import replay_window_open
+
+        if replay_window_open():
+            # Expected and silent: a replay reconstructs a graph from records that
+            # ALREADY describe these edges. Nothing is disclosed because nothing
+            # is missing — the journal is the source, not a consumer.
+            return
+        declined: list[str] = []
+        for s in sources:
+            for t in targets:
+                for end in (s, t):
+                    if not _record_addressable(end):
+                        declined.append(
+                            f"{end.get('label')}:{end.get('key')}")
+                        break
+                else:
+                    recorder({
+                        "edge_type": rel,
+                        "src": s["value"],
+                        "src_label": s["label"],
+                        "tgt": t["value"],
+                        "tgt_label": t["label"],
+                    })
+        if declined and rel not in _RECORD_GAP_WARNED:
+            _RECORD_GAP_WARNED.add(rel)
+            logger.warning(
+                "structural edge %r: %d endpoint(s) are NOT addressable by the "
+                "`DirectEdgeCreated` replay fold (%s) — the edge is written to "
+                "the graph and NOT journaled, so a record-sourced rebuild "
+                "cannot carry it. The fold sweeps %s on `p.id` only; a `:Source` "
+                "is url-keyed and outside it (#9553 class 4, declared at "
+                "`04-projection.md` §3 — not a silent drop).",
+                rel, len(declined), ", ".join(sorted(set(declined))[:4]),
+                sorted(RECORD_ADDRESSABLE_EDGE_LABELS))
 
     def _create_edges(self, p: dict) -> None:
         """Create typed edges for an operator Point. Auto-creates stub nodes
@@ -1534,6 +1722,12 @@ class _EdgeHandlers:
                     )
                     if r.result_set and r.result_set[0][0]:
                         created = True
+        # #9553 class 4: the RECORD carrier, emitted after the MERGE (the
+        # `create_direct_edge` discipline — a crash between the write and the
+        # emission is recovered by the retry's idempotent MERGE + emission, so
+        # there is no created-only gate).
+        if created:
+            self._record_structural_edges(edge_type, sources, targets)
         return created
 
     def replay_about_links(self, payload: dict, hard_delete_seqs=None,
@@ -2303,6 +2497,8 @@ class _EdgeHandlers:
                     )
                     if r.result_set and r.result_set[0][0]:
                         created = True
+        if created:
+            self._record_structural_edges(predicate, sources, targets)
         return created
 
     def create_owned_by(self, entity_id: str, subject_id: str) -> bool:
