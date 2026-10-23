@@ -326,12 +326,19 @@ class GraphTargetError(ValueError):
 def _is_default_graph_ref(ref: Any) -> bool:
     """True when `ref` names the workspace DEFAULT graph, which needs no lookup.
 
-    Only the exact id (stripped, case-insensitively) qualifies. A *name* is not
-    accepted here: a workspace may rename its default graph (`graph_metadata`
-    reads `graphs.name` for it), so a name can only be resolved against the
-    workspace's own rows.
+    Only the exact id (stripped) qualifies. A *name* is not accepted here: a
+    workspace may rename its default graph (`graph_metadata` reads `graphs.name`
+    for it), so a name can only be resolved against the workspace's own rows.
+
+    ⛔ EXACT, not case-insensitive (#9699 review P2). `graph_id` values are
+    minted lowercase, and `resolve_graph_target` matches names exactly, so a
+    case-folding test here made the two halves disagree about one string: a
+    custom graph NAMED `Default` (legal — names are the workspace's own) was
+    silently short-circuited to the workspace default graph by this predicate
+    while the resolver, asked the same question, would have matched that row.
+    One string must not mean two graphs depending on which half reads it.
     """
-    return isinstance(ref, str) and ref.strip().casefold() == _DEFAULT_GRAPH_ID
+    return isinstance(ref, str) and ref.strip() == _DEFAULT_GRAPH_ID
 
 
 def _retarget_refusal(requested: str) -> GraphTargetError:

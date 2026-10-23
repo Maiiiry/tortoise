@@ -1321,11 +1321,24 @@ def _take_graph_argument(name: str,
     a tool that does not target graphs is under-specified in the other
     direction, and quietly dropping the argument is how a caller concludes
     "that is the graph I asked for" about a workspace-wide operation.
+
+    ONE exception, and it is the same rule every other tool follows: the
+    workspace DEFAULT graph is the graph these tools already address, so
+    `graph="default"` is the documented no-op here too
+    (`tool_registry.GRAPH_ARGUMENT_DESCRIPTION`). Refusing it would take the
+    DISCOVERY surface (`tortoise_list_graphs`) — the tool the argument's own
+    description tells a caller to use to learn the graphs it can name — away
+    from a connector that sets one `graph` for the whole server, which is the
+    usage the argument exists for, and would answer a no-op with a hard error.
+    A real graph SELECTION is still refused: this surface has no single graph
+    to move.
     """
     if not isinstance(arguments, dict) or "graph" not in arguments:
         return None
     ref = arguments.pop("graph")
     if name in _mcp_auth.GRAPH_ARGUMENT_EXCLUDED:
+        if _mcp_auth._is_default_graph_ref(ref):
+            return ref
         raise ToolError(
             f"`{name}` does not take a `graph` argument — it targets the "
             "workspace or names its graph explicitly. Remove the argument.")
@@ -1418,14 +1431,27 @@ def _dispatch_graph_name() -> str:
     whose own `org_id` is THIS workspace (and refused a graph-bound credential
     a re-target), so the value is the resolver's verified row, never caller
     input — the #236 cross-tenant guard is intact.
+
+    ⛔ The branch is the PAIR, deliberately the same one `_get_org_sdk()`
+    takes, and the namespace alone is NOT enough (#9699 review P2). The
+    credential resolver populates `_current_graph_namespace` from the token
+    row's `graph_namespace` even when there is no selected graph id, and that
+    stored `teams.graph_name` need not equal `_derive_graph_name(org_id)` —
+    the pre-rename `team_{org_id}` orgs `#3543`'s dual probe exists for, which
+    no migration rewrites. Taking `ns` on its own then names a graph the SDK
+    never opened, so the handler reads the workspace default with HTTP 200 and
+    no signal: the exact silent-wrong-graph class this function exists to
+    close. Org-wide credentials therefore name `org_{org}` here, which is what
+    `_get_org_sdk()` opens for them.
     """
     # Read through `_mcp_auth` rather than a module-level import of the
     # ContextVar: adding that global binding re-compiles
     # `tortoise_session_capture`'s code object (its own local import of the
     # same name compiles differently), which re-stamps an owner-reviewed
     # `served_from` row for a handler this change does not touch.
-    return (_mcp_auth._current_graph_namespace.get()
-            or f"org_{_current_org_id.get()}")
+    if _mcp_auth._current_graph_id.get() and _mcp_auth._current_graph_namespace.get():
+        return _mcp_auth._current_graph_namespace.get()
+    return f"org_{_current_org_id.get()}"
 
 
 async def _wrapped_call_tool(name: str, arguments: dict[str, Any] | None = None, *,

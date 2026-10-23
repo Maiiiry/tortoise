@@ -1578,7 +1578,9 @@ def _with_graph_argument(tool: Any, name: str) -> Any:
 
     `GRAPH_ARGUMENT_EXCLUDED` tools keep their schema untouched; a caller that
     sends the argument to one of them is refused centrally, so an excluded tool
-    never silently ignores it.
+    never silently ignores it. The workspace DEFAULT graph is the one exception
+    (`graph="default"` is the same no-op it is everywhere else), because these
+    tools already address that graph.
     """
     if name in GRAPH_ARGUMENT_EXCLUDED:
         return tool

@@ -1022,11 +1022,17 @@ def test_the_selected_graph_reaches_the_navigation_call(
         return {"entity": {}, "connected": {}}
 
     monkeypatch.setattr(navigation, fn_name, _capture)
+    # A real SELECTION sets the PAIR (`apply_graph_target` writes both); the
+    # namespace alone is the credential-resolver state, where the SDK opens
+    # `org_{org}` instead — pinned by
+    # `test_the_dispatch_names_the_graph_the_sdk_opened`.
+    gid = mcp_auth._current_graph_id.set(FUND_A["graph_id"])
     ns = mcp_auth._current_graph_namespace.set(FUND_A["namespace"])
     try:
         getattr(mcp_server, handler)("e1")
     finally:
         mcp_auth._current_graph_namespace.reset(ns)
+        mcp_auth._current_graph_id.reset(gid)
 
     assert seen.get("graph_name") == FUND_A["namespace"], (
         f"{handler} read {seen.get('graph_name')!r} — the workspace default — "
@@ -1095,11 +1101,13 @@ def test_analyze_derives_its_anchors_from_the_selected_graph(
                         lambda *a, **kw: {"answer": "ok", "raw": []})
     monkeypatch.setattr(mcp_server, "_analyze_llm_budget_available", lambda: False)
 
+    gid = mcp_auth._current_graph_id.set(FUND_A["graph_id"])
     ns = mcp_auth._current_graph_namespace.set(FUND_A["namespace"])
     try:
         mcp_server.tortoise_analyze("where is the disagreement?", entityId="e1")
     finally:
         mcp_auth._current_graph_namespace.reset(ns)
+        mcp_auth._current_graph_id.reset(gid)
 
     assert seen.get("graph_name") == FUND_A["namespace"], (
         f"the anchors came from {seen.get('graph_name')!r} while the analysis "
@@ -1145,3 +1153,93 @@ def test_no_advertised_handler_names_the_workspace_default_itself():
                       "tortoise_analyze"}, (
         "a graph-naming handler stopped reading the dispatch's selection: "
         f"{sorted(routed)}")
+
+
+# ── #9699 review P2 round: the three ways the same graph was derived twice ──
+
+
+def test_the_default_graph_is_a_no_op_on_an_excluded_tool_too(monkeypatch):
+    """`graph="default"` must not be a ToolError on a workspace-level tool.
+
+    `GRAPH_ARGUMENT_DESCRIPTION` promises the explicit default is the same no-op
+    as omitting the argument, and the usage it is written for sets ONE `graph`
+    for the whole server. Refusing it on the 13 excluded tools takes the
+    DISCOVERY surface (`tortoise_list_graphs`) away from exactly the caller the
+    argument exists to serve — with a hard error rather than a no-op.
+
+    A REAL graph selection is still refused, and that half is asserted here so
+    the exception cannot widen: an excluded tool has no single graph to move.
+    """
+    imported = mcp_server._take_graph_argument(
+        "tortoise_list_graphs", {"graph": "default", "limit": 10})
+    assert imported == "default"
+    # The argument is still POPPED, so the tool body never receives it.
+    arguments = {"graph": "default"}
+    mcp_server._take_graph_argument("tortoise_list_graphs", arguments)
+    assert arguments == {}
+
+    for name in sorted(mcp_auth.GRAPH_ARGUMENT_EXCLUDED):
+        with pytest.raises(ToolError) as excinfo:
+            mcp_server._take_graph_argument(name, {"graph": "g_fund_a"})
+        assert "does not take a `graph` argument" in str(excinfo.value), name
+
+
+def test_the_dispatch_names_the_graph_the_sdk_opened(monkeypatch):
+    """`_dispatch_graph_name()` must branch on the PAIR, exactly as `_get_org_sdk()`.
+
+    The credential resolver sets `_current_graph_namespace` from the token row's
+    `graph_namespace` even with no selected graph id, and that stored
+    `teams.graph_name` need not equal `_derive_graph_name(org_id)` (the
+    pre-rename `team_{org_id}` orgs — #3543's dual probe exists for them, and no
+    migration rewrites the value). Taking the namespace alone then names a graph
+    `_get_org_sdk()` never opened: the handler reads the workspace DEFAULT with
+    HTTP 200 and no signal.
+    """
+    tokens = [mcp_auth._current_org_id.set(ORG_A),
+              mcp_auth._current_graph_id.set("g_fund_a"),
+              mcp_auth._current_graph_namespace.set("org_org_a_g_fund_a")]
+    try:
+        assert mcp_server._dispatch_graph_name() == "org_org_a_g_fund_a"
+    finally:
+        mcp_auth._current_graph_namespace.reset(tokens[2])
+        mcp_auth._current_graph_id.reset(tokens[1])
+        mcp_auth._current_org_id.reset(tokens[0])
+
+    # Org-wide credential whose STORED graph_name diverges from the derived one:
+    # `_get_org_sdk()` opens `org_{org_id}` (it branches on the pair), so the
+    # dispatch must name that same graph — not the stale stored value.
+    tokens = [mcp_auth._current_org_id.set(ORG_A),
+              mcp_auth._current_graph_id.set(None),
+              mcp_auth._current_graph_namespace.set("team_legacy_a")]
+    try:
+        assert mcp_server._dispatch_graph_name() == f"org_{ORG_A}", (
+            "the dispatch named a graph the SDK did not open — the silent "
+            "wrong-graph read this helper exists to prevent")
+    finally:
+        mcp_auth._current_graph_namespace.reset(tokens[2])
+        mcp_auth._current_graph_id.reset(tokens[1])
+        mcp_auth._current_org_id.reset(tokens[0])
+
+
+def test_the_default_graph_is_the_exact_id_never_a_case_folded_name(monkeypatch):
+    """`"Default"` must reach the RESOLVER, not the default short-circuit.
+
+    Graph ids are minted lowercase and names are the workspace's own, so
+    case-folding here made one string mean two graphs: the short-circuit read
+    `Default` as the default graph while `resolve_graph_target` — asked the same
+    question — would have matched a custom graph NAMED `Default`. With no
+    workspace there is nothing to resolve against, so `Default` must take the
+    documented no-workspace refusal rather than silently opening the default.
+    """
+    assert mcp_auth._is_default_graph_ref("default") is True
+    assert mcp_auth._is_default_graph_ref(" default ") is True
+    assert mcp_auth._is_default_graph_ref("Default") is False
+    assert mcp_auth._is_default_graph_ref("DEFAULT") is False
+
+    org = mcp_auth._current_org_id.set(None)
+    try:
+        with pytest.raises(mcp_auth.GraphTargetError) as excinfo:
+            mcp_auth.apply_graph_target("Default")
+        assert "requires a hosted workspace connection" in str(excinfo.value)
+    finally:
+        mcp_auth._current_org_id.reset(org)
