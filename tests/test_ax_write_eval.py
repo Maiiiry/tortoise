@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -356,6 +357,52 @@ def test_a_kind_written_on_another_layer_property_is_its_own_finding():
     assert "CROSS-AXIS" in rows[0]["finding"]
     assert "subjectKind='organization'" in rows[0]["finding"]
     assert result["mitigations"] == []
+
+
+def test_one_cross_axis_write_is_charged_once_even_when_the_gold_declares_a_kind():
+    """One act, one finding — a foreign-axis kind is not also a kind-set miss.
+
+    When a node carries its kind ONLY on another layer's property, its own
+    property is empty, so `kind_status("")` is NONE and `""` matches no allowed
+    kind. The item-level checks therefore used to fire a SECOND P1 for the same
+    write, whose text ("declared, but not the kind this item is", `written ''`)
+    is false in its own terms — nothing was written on this layer's property at
+    all, which is exactly what the cross-axis finding already said (#9695 review
+    P2). The census and `unkinded` already skipped such a node for this reason.
+
+    The gold here DECLARES a kind set (the fixture that could not catch this had
+    no `kind`, so the second finding could never fire), and the item-row verdict
+    is pinned too, so the double-charge cannot come back unnoticed.
+    """
+    node = _node("Object", "Northwind Logistics", foreign_kinds={"subjectKind": "organization"})
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {"item": "Northwind Logistics", "layer": "object", "kind": ["plan"]}
+            ],
+        }
+    )
+    result = axe.score(_record(nodes=[node]), gold, "x")
+    item_findings = [f for f in result["findings"] if f["item"] == "Northwind Logistics"]
+    assert len(item_findings) == 1, [f["finding"] for f in item_findings]
+    assert "CROSS-AXIS" in item_findings[0]["finding"]
+    assert "kind outside the frozen set" not in item_findings[0]["finding"]
+    assert result["severity_counts"] == {"P0": 0, "P1": 1, "P2": 0}, result["severity_counts"]
+    assert result["item_rows"][0]["verdict"] == "KIND-CROSS-AXIS"
+    assert len(result["item_rows"]) == 1, "the item row must still be emitted"
+
+    # CONTROL: the guard is scoped to the empty own-property. A node that wrote a
+    # declared-but-wrong kind on its OWN property beside a foreign one is a
+    # different write, and it must still be charged.
+    both = _node(
+        "Object", "Northwind Logistics", kind="tool",
+        foreign_kinds={"subjectKind": "organization"},
+    )
+    control = axe.score(_record(nodes=[both]), gold, "x")
+    control_findings = [f for f in control["findings"] if f["item"] == "Northwind Logistics"]
+    assert len(control_findings) == 2, [f["finding"] for f in control_findings]
+    assert any("kind outside the frozen set" in f["finding"] for f in control_findings)
 
 
 def test_the_graph_wide_census_catches_a_kind_on_the_wrong_axis():
@@ -812,6 +859,24 @@ def test_the_documented_failure_classes_reconcile_with_the_committed_records():
         "1 input, 1 finding",
     ):
         assert claim in doc, f"the class table no longer states {claim!r}"
+
+    # The census ENUMERATION is prose, so its `×N` multipliers drifted unpinned
+    # once — `role` ×2 beside three `role` Objects in the committed graph (#9695
+    # review). Pin every `kind` ×N the doc states to the node count in the
+    # committed graphs, so the next stale multiplier is a red test.
+    kind_totals: dict[str, int] = {}
+    for graph_path in sorted((GOLD.parent / "runs").glob("*/graph.json")):
+        for node in json.loads(graph_path.read_text())["nodes"]:
+            kind = (node.get("kind") or "").lower()
+            if kind:
+                kind_totals[kind] = kind_totals.get(kind, 0) + 1
+    multipliers = re.findall(r"`([\w:]+)` ×(\d+)", doc)
+    assert multipliers, "the census enumeration vanished — nothing left to check"
+    for kind, stated in multipliers:
+        assert kind_totals.get(kind) == int(stated), (
+            f"the doc states `{kind}` ×{stated}, the committed graphs carry "
+            f"{kind_totals.get(kind)}"
+        )
 
 
 def test_the_cli_re_scores_a_committed_graph_without_a_database(tmp_path):

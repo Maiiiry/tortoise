@@ -127,7 +127,7 @@ uv run python tools/ax_write_eval.py score \
 ```
 
 That is what makes these numbers auditable rather than asserted, and
-`test_rescoring_a_committed_graph_reproduces_its_score` pins it for all ten
+`test_every_committed_run_reproduces_from_its_own_graph` pins it for all ten
 runs. A `graph.json` written before the kind-axis fix carries one `kind` per
 node and no `kind_prop`/`foreign_kinds`; the scorer falls back to the layer's
 own property, so old records stay scorable and the ten committed verdicts are
@@ -158,25 +158,26 @@ steps are decisions rather than rules.
 | Class | Count | What it looked like |
 |---|---|---|
 | **Undeclared kind** (neither a core §5 kind nor one any loaded pack declares) | 16 scored items across 6 inputs | `subjectKind` ∈ {`person` ×6, `company` ×2, `investor`, `authorGroup`} · `objectKind: offering` · `pointKind: issue` ×2 · `sourceKind: research` · `eventKind: customerCommitment`, `employmentStart`. Every one accepted by the write path (warn-not-block, #1934). **Not** counted: `core:organization` (the declared key), `disbursement`/`tranche`/`estimate` (the venture/pm packs declare them) |
-| **Uncatalogued kinds beyond the gold** (the graph-wide census, 8 inputs) | 8 findings | the gold names some items; the census asks the whole graph, which is what keeps a near-miss from reading 0/0. Among them: `pointKind: incident`, `criterion` ×2, `option`, `objectKind: openQuestion`/`governanceSeat`/`role` ×2, `eventKind: correction`/`planRevision`/`observation`, `sourceKind: spec`/`note`/`contract`/`portfolioUpdateMemo`/`meetingTranscript` |
+| **Uncatalogued kinds beyond the gold** (the graph-wide census, 8 inputs) | 8 findings | the gold names some items; the census asks the whole graph, which is what keeps a near-miss from reading 0/0. Among them: `pointKind: incident`, `criterion` ×2, `option`, `objectKind: openQuestion`/`governanceSeat`/`role` ×3, `eventKind: correction`/`planRevision`/`observation`, `sourceKind: spec`/`note`/`contract`/`portfolioUpdateMemo`/`meetingTranscript` |
 | **Layer confusion — only the wrong layer holds the item** | 9 items across 5 inputs | portfolio: ARR + headcount as Points · decision request: goal, deadline, estimate · meeting: the decision · person appointment: organisation, role · product spec: the success bar |
 | **Two homes — the right layer holds it AND a second one does** | 2 items across 2 inputs | decision request: the request (the Event names it, a Point also holds it) · product spec: the ship date (plan Object + target Point). Weaker than an absence, and a different instruction: express the second reading as a claim *about* the node |
 | **Wrong-but-declared kind** (legacy-valid, not invented) | 5 | `pointKind: observation` where the state-centric ruling says `statement`; `eventKind: disbursement` where the occurrence is an occurrence/milestone. A different lesson from an invented kind, which is why the instrument separates them |
 | **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it, but the node says "probability" where the item says "chance" — a synonym, leaving 3 of 4 stems and a 0.375 partial score under the 0.5 floor) and product spec: v1's dates. Both are itemised below |
 | **Truth vs relevance** | 1 input, 1 finding | contradicting claim: no NAND, with the dampener named **inside** that finding (the record's `mitigations` shows the `mitigated_by` edge). One act, one finding — it used to be charged twice |
 | **NAND where nothing contradicts** | 1 | meeting: one NAND operator with two edges (onto the comms plan, onto the slip forecast). A judgment call, and the instrument treats it as a finding because a contradiction operator on a claim nobody attacked computes a wrong confidence |
-| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Of the other nine, eight wrote their own Source (the correction's was seeded by the fixture) and **seven stamped the edge with `create_point(extractedFrom=[url])`** — the create argument, not a separate `create_edge` call, which the structural verb refuses for this predicate. Two runs (correction, person appointment) reached provenance through `create_edge("wasDerivedFrom"|"references", …)` instead, and the instrument credits any provenance edge with a Source endpoint — so the fixture's stated measurable ("does the agent find the create argument") is **not** what the class measures |
+| **Provenance** | 1 | contradicting claim wrote **no Source at all**. Of the other nine, eight wrote their own Source (the correction's was seeded by the fixture) and **seven stamped the edge with `create_point(extractedFrom=[url])`** — the create argument, not a separate `create_edge` call, which the structural verb refuses for this predicate. Two runs (correction, person appointment) reached provenance through `create_edge("wasDerivedFrom"\|"references", …)` instead, and the instrument credits any provenance edge with a Source endpoint — so the fixture's stated measurable ("does the agent find the create argument") is **not** what the class measures |
 | **Duplicate identity** | 0 | the one input built to produce a duplicate produced none: the alias was folded onto the existing Object. This is the measurable the document must keep |
 
 ### Instrument limitations and corrections, stated rather than hidden
 
-This section exists because **three rounds of fresh-context review found the
-instrument lying about its own subject** (and a fourth found the sentences below
-still quoting the pre-fix causes), and the numbers above are what remains
+This section exists because **five rounds of fresh-context review found the
+instrument lying about its own subject** — each round also found the sentences
+below still quoting the pre-fix causes — and the numbers above are what remains
 after every fix. The corrections are recorded, not quietly absorbed: a
 measurement artifact that hides its own revisions teaches the wrong thing.
 
 Round 1:
+
 1. **The same-layer preference had no floor** — a same-layer mention scoring
    0.08 beat a different-layer containment match at 0.83, so findings accused
    nodes the agent never wrote the item as. Fixed with a floor and a margin rule.
@@ -345,9 +346,9 @@ Derived from the classes above, in the order an agent has to decide.
 
 ## What remains
 
-- **Steps 2–3** (the rewrite itself) stay gated behind **#4282 Phase 3**
+* **Steps 2–3** (the rewrite itself) stay gated behind **#4282 Phase 3**
   (live 81 → 27). Re-running this exact eval — same inputs, same gold — is
   Step 3's acceptance criterion: *the delta per input, not a review verdict*.
-- The served mirror is a **derived** artifact; the rewrite is authored upstream
+* The served mirror is a **derived** artifact; the rewrite is authored upstream
   and pulled with `uv run python tools/served_skills_parity.py --sync`
   (absorbed issue #4358), never edited by hand here.

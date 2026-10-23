@@ -52,11 +52,24 @@ Usage:
 
 from __future__ import annotations
 
+import sys
+
+# #5128: refuse a <3.12 interpreter before the imports below — this tool imports
+# `tortoise.*` (3.12 floor) and the eval's commands are documented as a bare
+# system-interpreter invocation, where the ambient interpreter can be older.
+# Without this the run dies with an UNATTRIBUTED error that reads as "the eval is
+# broken" (#5128, D9 shape).
+if sys.version_info < (3, 12):  # noqa: UP036 — intentional RUNTIME guard
+    raise SystemExit(
+        f"tools/ax_write_eval.py requires Python >= 3.12 (got "
+        f"{sys.version_info[0]}.{sys.version_info[1]}) — run it as "
+        f"`uv run python tools/ax_write_eval.py`"
+    )
+
 import argparse
 import json
 import os
 import re
-import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -142,8 +155,13 @@ def _pack_vocab() -> dict[str, set[str]]:
             for kind in declared:
                 by_layer[layer].add(str(kind))
                 by_layer[layer].add(f"{ns}:{kind}")
-        # `kindDefs` declare the same kinds again (with lifecycle), and are the
-        # only declaration for a kind that has no list membership.
+        # `kindDefs` carries lifecycle/retry metadata (`description`, `synonyms`,
+        # `statuses`, `nearMisses`, `enforcement`) — measured across every shipped
+        # `packs/*/manifest.yaml` — and says nothing about which LAYER a kind
+        # belongs to. A kindDefs-only name therefore has no node axis to be
+        # credited to here; the block below can only fire for an entry that spells
+        # `name` plus `layer`/`type`, which no manifest does today. It is NOT the
+        # declaration route for a kind with no list membership (#9695 review).
         for kind_def in getattr(pack, "kind_defs", None) or {}:
             name = kind_def.get("name") if isinstance(kind_def, dict) else None
             label = (kind_def.get("layer") or kind_def.get("type")) if isinstance(kind_def, dict) else None
@@ -655,7 +673,18 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                 f"write the kind to {own_prop} (§4 {best['layer']} / §5)",
             )
         status = kind_status(best["layer"], best["kind"])
-        if status == "UNDECLARED":
+        # ONE ACT, ONE FINDING. When the node's OWN kind property is empty and its
+        # kind sits on another layer's property, the cross-axis finding above has
+        # already charged that one write: `kind_status("")` is "NONE" and "" matches
+        # no allowed kind, so the checks below would fire a second P1 whose text
+        # ("declared, but not the kind this item is" / "written ''") is false in its
+        # own terms — nothing was written on this layer's property at all. The
+        # census and `unkinded` already skip such a node for this exact reason
+        # (#9695 review P2).
+        cross_axis_charged = bool(foreign) and not got_kind
+        if cross_axis_charged:
+            verdict = "KIND-CROSS-AXIS"
+        elif status == "UNDECLARED":
             findings.append(
                 {
                     "severity": "P1",

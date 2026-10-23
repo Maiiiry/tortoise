@@ -2031,13 +2031,18 @@ surfaces:
   - test_capture_backlog_4197.py
   - test_audit_fallback_home_isolation.py
   # #9675 Step 1: the write-pipeline eval instrument's scoring rules. Registered
-  # here because `tools/ax_write_eval.py` matches no SOURCE_PATTERNS rule — a
-  # change to the instrument falls through to `core`, and the ONE thing such a
-  # diff must run is the file pinning its P0/P1 rules. An unclassified
-  # `tests/**/test_*.py` also reds `--integrity`, which is a `needs:` leg of the
-  # REQUIRED `python-ci-gate` (`manifest-integrity` in python-ci.yml). Hermetic:
-  # no DB, no network — it reads the committed gold, the committed
-  # `graph.json`/`score.json` pairs, and the pack registry's own manifests.
+  # here because `tools/ax_write_eval.py` matches no SOURCE_PATTERNS rule, so the
+  # ONE thing a diff that edits the instrument must run is the file pinning its
+  # P0/P1 rules. NOTE: `tools/` is in NON_PYTHON_PREFIXES, so a tool-only change
+  # does NOT fall through to `core` — it takes the docs-only early return and
+  # lands on tier-1 smoke, where this file is absent. `CORE_ALSO` in
+  # `tools/ci_selection.py` (entry: `tools/ax_write_eval.py`, pinned by
+  # `tests/test_ci_selection.py::test_ax_write_eval_tool_change_selects_core_not_tier1`)
+  # is what makes this registration reachable on the diff that weakens a rule.
+  # An unclassified `tests/**/test_*.py` also reds `--integrity`, which is a
+  # `needs:` leg of the REQUIRED `python-ci-gate` (`manifest-integrity` in
+  # python-ci.yml). Hermetic: no DB, no network — it reads the committed gold, the
+  # committed `graph.json`/`score.json` pairs, and the pack registry's manifests.
   - test_ax_write_eval.py
   # #2655: guards `tortoise/calendar_anchors.py` (the deterministic
   # calendar-anchor resolver). That module matches no SOURCE_PATTERNS rule, so

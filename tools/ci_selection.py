@@ -1251,6 +1251,20 @@ CORE_ALSO = ("tortoise/api.py", "tortoise/hosted_backup.py", "tools/skip-guard.p
              # silent-drop class as tools/queue_resweep.py above. Pinned by
              # tests/test_ci_selection.py::test_docs_lint_baseline_tool_change_selects_core_not_tier1.
              "tools/docs_lint_baseline.py",
+             # #9695 review P1: tools/ax_write_eval.py owns
+             # tests/test_ax_write_eval.py (registered `core`), but `tools/` is
+             # swallowed by NON_PYTHON_PREFIXES and no SOURCE_PATTERNS entry
+             # matches it — so a tool-only edit selected NO surface, took the
+             # docs-only early return and fell back to tier-1 smoke, where the
+             # file pinning the instrument's P0/P1 rules is NOT registered. The
+             # eval's whole acceptance is "the delta, per input" read off this
+             # instrument, so weakening a rule had to be the one diff that ran
+             # its pins. Same #1349/#3332/#3616 silent-drop class as the entries
+             # above; MEASURED before this entry: `--changed-files
+             # tools/ax_write_eval.py` -> surfaces=[], full=False, 59 tier-1
+             # files, test_ax_write_eval.py ABSENT. Pinned by
+             # tests/test_ci_selection.py::test_ax_write_eval_tool_change_selects_core_not_tier1.
+             "tools/ax_write_eval.py",
              # #7814 review P2: the queue-reconcile schedule installer owns
              # tests/test_install_queue_reconcile_schedule.py, registered
              # `core`, but `tools/` is swallowed by NON_PYTHON_PREFIXES and no

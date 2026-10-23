@@ -2024,6 +2024,27 @@ def test_docs_lint_baseline_tool_change_selects_core_not_tier1():
     assert r["full"] is False, r
 
 
+def test_ax_write_eval_tool_change_selects_core_not_tier1():
+    """A change to the eval instrument must run the rules it pins (#9695 review).
+
+    `tests/test_ax_write_eval.py` is registered on the `core` surface and owns
+    the instrument's scoring semantics — the P0/P1 rules, the two-homes bar, the
+    one-act-one-finding guard — which is what #9675 Step 3 reads its per-input
+    delta against. That registration is INERT for a tool-only diff: `tools/` is
+    a flat NON_PYTHON_PREFIXES entry and no SOURCE_PATTERNS row matches
+    `tools/ax_write_eval.py`, so `select()` returned NO surface and fell back to
+    the tier-1 smoke set, which does not contain the file. Weakening a rule would
+    therefore be the one PR that never ran the tests pinning it — the same
+    #1349/#3332/#3616 silent-drop class as the entries beside it.
+
+    Mutation check: removing the CORE_ALSO entry fails the second assert.
+    """
+    r = _sel(["tools/ax_write_eval.py"])
+    assert "core" in r["surfaces"], r
+    assert "test_ax_write_eval.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
 def test_extractor_tooling_change_selects_core_and_ep_not_tier1():
     # #2786 review P2: `tools/probe_extractor.py` (the classification prompt put
     # in front of the model) and `tools/calibration_harness.py` (the harness whose
