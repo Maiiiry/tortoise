@@ -157,8 +157,11 @@ unaided.
   though the about\* family is declared valid and `create_about_edge` accepts
   it — and `TortoiseSDK` has no `create_about_edge` at all), and
   `create_event(aboutPoint=[id])` — the **list** form — creates **no edge and no
-  error** (verified: `[]`; the string form writes it). A silent write failure in
-  the surface this document teaches is a finding in its own right.
+  error** (verified: `[]`; the string form writes it), and outside the Event
+  create path the `about*` props wire nothing at all. Both are filed as
+  **#9696** rather than worked around here: a silent write failure in the
+  surface this document teaches is a finding in its own right, and fixing it is
+  not this issue's scope.
 
 ## The failure list = the document's outline
 
