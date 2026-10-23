@@ -51,7 +51,7 @@
       "written": "Event:disbursement",
       "node": "Acme Capital released tranche 2 to Solstice Robotics",
       "fuzzy": true,
-      "verdict": "KIND-UNDECLARED"
+      "verdict": "KIND"
     },
     {
       "item": "$8.4M",
@@ -72,26 +72,32 @@
     {
       "severity": "P1",
       "item": "Northwind Logistics",
-      "finding": "UNDECLARED kind 'company' on a Subject ('Northwind Logistics') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
-      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+      "layer": "Subject",
+      "kind": "company",
+      "finding": "UNDECLARED kind 'company' on a Subject ('Northwind Logistics') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P1",
       "item": "Acme Capital",
-      "finding": "UNDECLARED kind 'investor' on a Subject ('Acme Capital') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
-      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+      "layer": "Subject",
+      "kind": "investor",
+      "finding": "UNDECLARED kind 'investor' on a Subject ('Acme Capital') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P1",
       "item": "Solstice Robotics",
-      "finding": "UNDECLARED kind 'company' on a Subject ('Solstice Robotics') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
-      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+      "layer": "Subject",
+      "kind": "company",
+      "finding": "UNDECLARED kind 'company' on a Subject ('Solstice Robotics') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P1",
       "item": "tranche 2",
-      "finding": "UNDECLARED kind 'disbursement' on a Event ('Acme Capital released tranche 2 to Solstice Roboti') \u2014 no vocabulary declares it (declared Event kinds: 16); nothing routes to, finds or classifies it",
-      "fix": "use a declared Event kind (\u00a75 / pack kindDefs)"
+      "finding": "kind outside the frozen set: expected one of ['occurrence', 'milestone'], written 'disbursement' ('Acme Capital released tranche 2 to Solstice Robotics') \u2014 declared, but not the kind this item is",
+      "fix": "pick a kind the active vocabulary declares for this layer (\u00a75)"
     },
     {
       "severity": "P0",
@@ -104,6 +110,12 @@
       "item": "74 people",
       "finding": "LAYER confusion: expected object, written as Point ('Solstice Robotics headcount is 74 people as of 2026-09-30, up from 61 ') \u2014 now-state, not a claim",
       "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+    },
+    {
+      "severity": "P1",
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['portfolioUpdateMemo']; Object: ['governanceSeat']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -118,9 +130,25 @@
   "sources": [
     "memo://our-fund/portfolio/2026-08-quarterly-update"
   ],
+  "kind_census": {
+    "Source": [
+      "portfolioUpdateMemo"
+    ],
+    "Object": [
+      "governanceSeat"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
   "severity_counts": {
     "P0": 2,
-    "P1": 4,
+    "P1": 5,
     "P2": 0
   }
 }

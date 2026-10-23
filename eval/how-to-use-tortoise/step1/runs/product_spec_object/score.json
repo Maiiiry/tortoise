@@ -1,0 +1,113 @@
+{
+  "input": "product_spec_object",
+  "cell": "product spec / commitment",
+  "confuses": [
+    "Object-vs-Point",
+    "state-vs-occurrence"
+  ],
+  "counts": {
+    "Point": 4,
+    "Subject": 1,
+    "Object": 2,
+    "Event": 1,
+    "Source": 1
+  },
+  "item_rows": [
+    {
+      "item": "ship the memory API",
+      "expected": "object",
+      "written": "Point:target",
+      "node": "The beta memory API ships on 2026-11-15 (plan v2 ship target).",
+      "verdict": "LAYER"
+    },
+    {
+      "item": "40% of beta orgs",
+      "expected": "object",
+      "written": "Point:target",
+      "node": "Plan v2 success = 40% of beta orgs write at least one memory per week, measured ",
+      "verdict": "LAYER"
+    },
+    {
+      "item": "v1 said 2026-10-15",
+      "expected": "object",
+      "written": "(nothing)",
+      "verdict": "MISSING"
+    },
+    {
+      "item": "platform team",
+      "expected": "subject:team",
+      "written": "Subject:team",
+      "node": "Platform team",
+      "fuzzy": false,
+      "verdict": "OK"
+    },
+    {
+      "item": "owned by",
+      "expected": "edge ownedBy",
+      "written": "Beta memory API plan v2 -[ownedBy]-> Platform team",
+      "verdict": "OK"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "P0",
+      "item": "ship the memory API",
+      "finding": "LAYER confusion: expected object, written as Point ('The beta memory API ships on 2026-11-15 (plan v2 ship target).') \u2014 \u00a75 commitment-state: a plan is an Object; the milestone date is the state's window, not a belief",
+      "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+    },
+    {
+      "severity": "P0",
+      "item": "40% of beta orgs",
+      "finding": "LAYER confusion: expected object, written as Point ('Plan v2 success = 40% of beta orgs write at least one memory per week,') \u2014 a success criterion is a target \u2014 a commitment-state Object, not a Point",
+      "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+    },
+    {
+      "severity": "P0",
+      "item": "v1 said 2026-10-15",
+      "finding": "expected object \u2014 no node represents it (best overlap 0.40)",
+      "fix": "the item was absorbed into prose or written under a name nothing can find"
+    },
+    {
+      "severity": "P1",
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['spec']; Event: ['planRevision']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+    }
+  ],
+  "relations": [
+    "CORRECTS",
+    "aboutDocument",
+    "aboutObject",
+    "aboutSubject",
+    "extractedFrom",
+    "hasPart",
+    "ownedBy",
+    "references",
+    "wasDerivedFrom"
+  ],
+  "operators": [],
+  "sources": [
+    "internal://premise-labs/beta-memory-api/plan-spec-v2-2026-09-30"
+  ],
+  "kind_census": {
+    "Source": [
+      "spec"
+    ],
+    "Event": [
+      "planRevision"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
+  "severity_counts": {
+    "P0": 3,
+    "P1": 1,
+    "P2": 0
+  }
+}

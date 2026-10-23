@@ -23,11 +23,16 @@ Two subcommands:
     kind property, the operator points and their op_type, every edge with its
     relation and endpoints, and the Sources. Nothing is scored here.
 
-``score --db <path> --gold <inputs.json> --id <input id> [--out <json>]``
+``score --db <path> --gold <inputs.json> --id <input id> [--out <dir>]``
     Record, then compare against the FROZEN gold for that input, emitting
-    per-item findings in the P0/P1/P2 shape the review skills use. The gold is
-    frozen before any run (``eval/how-to-use-tortoise/step1/inputs.json``), so
-    the delta cannot be retrofitted to whatever the agent happened to do.
+    per-item findings. The gold is frozen before any run
+    (``eval/how-to-use-tortoise/step1/inputs.json``), so the delta cannot be
+    retrofitted to whatever the agent happened to do.
+
+    ``--out`` names a DIRECTORY and writes TWO files, because a verdict without
+    its evidence cannot be audited: ``score.json`` (the per-item verdicts) and
+    ``graph.json`` (the structural record it was read from — nodes, labels,
+    kinds, edges). The committed run directories hold both.
 
 The matching is deliberately dumb (token overlap over the node's name/content)
 because a clever matcher would hide the very failure being measured: a
@@ -68,11 +73,79 @@ KIND_PROP = {
     "Source": "sourceKind",
 }
 
-# The DECLARED vocabularies the write path validates against — imported, never
-# re-spelled here, so this instrument cannot drift from the product's own kind
-# sets. A kind outside every one of these is "a kind nothing declares", which
-# §5 of #9675 names as a write failure in its own right (nothing routes to it).
+# ── the declared vocabularies ─────────────────────────────────────────────
+#
+# A kind is judged against what the product ACTUALLY declares, at three levels,
+# and the three are NOT the same finding:
+#
+#   CORE        — declared by an ONTOLOGY §5 core set (`CANONICAL_*`, imported).
+#   PACK        — declared by a loaded expansion pack (bare or namespaced —
+#                 `disbursement` and `venture:disbursement` are one declaration,
+#                 and the packs are the product's own extension point).
+#   UNDECLARED  — nothing declares it, so nothing routes to, finds or classifies
+#                 it. This is the failure #9675 names ("a kind nothing declares
+#                 is a kind nothing routes to").
+#
+# Re-spelling the core sets here would let the instrument drift from the product,
+# and IGNORING the packs would manufacture failures out of writes that followed a
+# declared vocabulary — so the core sets are imported and the pack registry is
+# loaded, and the active pack set is recorded beside every verdict.
+
+_PACK_CACHE: dict | None = None
+
+
+def _pack_vocab() -> dict[str, set[str]]:
+    """Every kind the LOADED packs declare, per layer, namespaced and bare.
+
+    Cached: the registry parses six manifests and the eval scores ten graphs.
+    A registry that cannot load is NOT swallowed — an empty pack vocabulary would
+    report every pack-following write as undeclared, which is the false failure
+    this function exists to prevent.
+    """
+    global _PACK_CACHE
+    if _PACK_CACHE is not None:
+        return _PACK_CACHE
+    from tortoise.pack_registry import PackRegistry
+
+    registry = PackRegistry(REPO_ROOT / "packs")
+    registry.load_all()
+    by_layer: dict[str, set[str]] = {layer: set() for layer in LAYERS}
+    # The manifest is a dataclass, not a dict: the declared kind lists are
+    # read off its own attributes (`object_kinds` / `event_kinds` / …), so a
+    # rename in the manifest schema fails loudly here instead of quietly
+    # reporting every pack kind as undeclared.
+    attrs = {
+        "Object": "object_kinds",
+        "Event": "event_kinds",
+        "Point": "point_kinds",
+        "Source": "source_kinds",
+        "Subject": "subject_kinds",
+    }
+    for pack in registry.packs.values():
+        ns = pack.namespace
+        for layer, attr in attrs.items():
+            declared = getattr(pack, attr, None)
+            if not declared:
+                continue
+            for kind in declared:
+                by_layer[layer].add(str(kind))
+                by_layer[layer].add(f"{ns}:{kind}")
+        # `kindDefs` declare the same kinds again (with lifecycle), and are the
+        # only declaration for a kind that has no list membership.
+        for kind_def in getattr(pack, "kind_defs", None) or {}:
+            name = kind_def.get("name") if isinstance(kind_def, dict) else None
+            label = (kind_def.get("layer") or kind_def.get("type")) if isinstance(kind_def, dict) else None
+            if not name:
+                continue
+            for layer in LAYERS:
+                if label and label.lower() == layer.lower():
+                    by_layer[layer].update({str(name), f"{ns}:{name}"})
+    _PACK_CACHE = {"by_layer": by_layer, "packs": sorted(registry.packs)}
+    return _PACK_CACHE
+
+
 def _vocab() -> dict[str, frozenset[str]]:
+    """The CORE declared vocabularies, imported — never re-spelled here."""
     from tortoise.pack_registry import (
         CANONICAL_DOCUMENT_KINDS,
         CANONICAL_EVENT_KINDS,
@@ -81,17 +154,71 @@ def _vocab() -> dict[str, frozenset[str]]:
         registered_source_types,
     )
     from tortoise.source_credibility import SOURCE_KIND_DEFAULTS
+    from tortoise.subject_binding import subject_kind_names
 
-    subject_kinds = frozenset(
-        {"organization", "team", "role", "legalPerson", "naturalPerson", "other"}
-    )  # ONTOLOGY §4.2/§5, the closed Subject vocabulary
+    # Subject: the product's own declared set (`subject_kind_names()`), because
+    # the canonical spelling of a §5 Subject kind is `core:team` and the bare
+    # form is an accepted alias (`subject_binding.is_subject_kind`). Hardcoding
+    # the bare forms here reported `core:organization` — the DECLARED key — as an
+    # invention.
+    subject_kinds = frozenset(subject_kind_names()) | frozenset(
+        kind.split(":", 1)[1] for kind in subject_kind_names() if kind.startswith("core:")
+    )
     return {
-        "Point": CANONICAL_POINT_KINDS,
-        "Object": CANONICAL_OBJECT_KINDS,
-        "Event": CANONICAL_EVENT_KINDS,
+        "Point": frozenset(CANONICAL_POINT_KINDS) | frozenset(CANONICAL_DOCUMENT_KINDS - CANONICAL_DOCUMENT_KINDS),  # documentKind is its own axis
+        "Object": canonical_object_kinds(CANONICAL_OBJECT_KINDS),
+        "Event": frozenset(CANONICAL_EVENT_KINDS),
         "Source": registered_source_types() | frozenset(SOURCE_KIND_DEFAULTS),
         "Subject": subject_kinds,
     }
+
+
+def canonical_object_kinds(kinds) -> frozenset[str]:
+    """Core object kinds are matched case-insensitively (``Project`` vs ``project``).
+
+    The §5 object vocabulary deliberately mixes cases (`Project`, `WorkItem`,
+    `Problem`, `tag`), and the write path stores what the caller passed, so an
+    exact-case comparison would fail a write that used the documented spelling
+    with different capitalisation. The comparison set is lowercased; the finding
+    still quotes the kind as written.
+    """
+    return frozenset(k.lower() for k in kinds)
+
+
+def _kind_matches(got: str, allowed: list[str]) -> bool:
+    """Does a written kind match the gold's allowed set?
+
+    ``core:organization`` and ``organization`` are ONE kind — the namespaced
+    form is the declared key and the bare form its accepted alias
+    (``subject_binding.is_subject_kind``). Comparing raw strings reported the
+    canonical spelling as a missed kind.
+    """
+    candidates = {got.lower(), got.split(":", 1)[-1].lower()}
+    return bool(candidates & {a.split(":", 1)[-1].lower() for a in allowed})
+
+
+def kind_status(layer: str, kind: str) -> str:
+    """``CORE`` / ``PACK`` / ``UNDECLARED`` for one written kind.
+
+    The three-way answer is the point: "wrong kind" (declared, but not the kind
+    this item is) and "kind nothing declares" are different lessons for the
+    document, and collapsing them teaches neither.
+    """
+    if not kind:
+        return "NONE"
+    raw = kind.strip()
+    core = {k.lower() for k in _vocab().get(layer, frozenset())}
+    if raw.lower() in core:
+        return "CORE"
+    pack_kinds = _pack_vocab()["by_layer"].get(layer, set())
+    if raw in pack_kinds or raw.lower() in {p.lower() for p in pack_kinds}:
+        return "PACK"
+    if layer == "Subject":
+        from tortoise.subject_binding import is_subject_kind
+
+        if is_subject_kind(raw):
+            return "CORE"
+    return "UNDECLARED"
 
 
 _STOP = {
@@ -140,10 +267,10 @@ def record(uri_or_path: str) -> dict:
         "coalesce(n.name, n.content, n.title, n.url, ''), "
         "coalesce(n.pointKind, n.subjectKind, n.objectKind, n.eventKind, "
         "n.sourceKind, ''), n.is_operator, coalesce(n.op_type, ''), "
-        "coalesce(n.status, ''), coalesce(n.url, '')",
+        "coalesce(n.status, ''), coalesce(n.url, ''), coalesce(n.id, n.eventId, '')",
     )
     nodes = []
-    for labels, text, kind, is_op, op_type, status, url in rows:
+    for labels, text, kind, is_op, op_type, status, url, node_id in rows:
         labels = labels if isinstance(labels, list) else [labels]
         layer = next((label for label in LAYERS if label in labels), None)
         if layer is None:
@@ -158,14 +285,16 @@ def record(uri_or_path: str) -> dict:
                 "op_type": (op_type or "").strip(),
                 "status": (status or "").strip(),
                 "url": (url or "").strip(),
+                "id": str(node_id or "").strip(),
             }
         )
 
     edges = []
-    for rel, src, dst, sl, dl in _rows(
+    for rel, src, dst, sl, dl, a_id, b_id in _rows(
         proj,
         "MATCH (a)-[e]->(b) RETURN type(e), coalesce(a.name, a.content, ''), "
-        "coalesce(b.name, b.content, ''), labels(a), labels(b)",
+        "coalesce(b.name, b.content, ''), labels(a), labels(b), "
+        "coalesce(a.id, a.eventId, ''), coalesce(b.id, b.eventId, '')",
     ):
         sl = sl if isinstance(sl, list) else [sl]
         dl = dl if isinstance(dl, list) else [dl]
@@ -176,10 +305,13 @@ def record(uri_or_path: str) -> dict:
                 "to": (dst or "").strip(),
                 "from_layer": next((lab for lab in LAYERS if lab in sl), None),
                 "to_layer": next((lab for lab in LAYERS if lab in dl), None),
+                "from_id": str(a_id or "").strip(),
+                "to_id": str(b_id or "").strip(),
             }
         )
     sdk.close()
 
+    operator_ids = {n["id"] for n in nodes if n["is_operator"] and n["id"]}
     counts: dict[str, int] = {layer: 0 for layer in LAYERS}
     for node in nodes:
         counts[node["layer"]] += 1
@@ -192,11 +324,15 @@ def record(uri_or_path: str) -> dict:
         "relations": sorted({e["relation"] for e in edges}),
         # A mitigation is the relevance dampener on an OPERATOR: `mitigate_operator`
         # writes `mitigated_by`, and an INVALIDATES edge is the same lane under its
-        # epistemic name. Both are "relevance attacked", never "truth attacked".
+        # epistemic name. Both are "relevance attacked", never "truth attacked" —
+        # AND one endpoint must be the operator node, or the count says nothing
+        # about relevance (a mitigation edge between two plain claims would satisfy
+        # a bare relation-name test while damping nothing).
         "mitigations": [
             e
             for e in edges
-            if "MITIGAT" in e["relation"].upper() or "INVALID" in e["relation"].upper()
+            if ("MITIGAT" in e["relation"].upper() or "INVALID" in e["relation"].upper())
+            and (e["from_id"] in operator_ids or e["to_id"] in operator_ids)
         ],
     }
 
@@ -207,13 +343,14 @@ def record(uri_or_path: str) -> dict:
 def _tokens(text: str) -> set[str]:
     """Significant tokens of a node's text.
 
-    Trailing sentence punctuation is stripped — ``frozen.`` and ``frozen`` are
-    the same token, and leaving the dot on silently makes every expectation
-    whose word ends a sentence score as a miss.
+    Everything that is not alphanumeric (or ``$``/``%``) SEPARATES tokens, so
+    ``frozen.``, ``frozen`` and ``(frozen)`` are one token and ``sub-5-minute``
+    splits exactly as ``sub 5 minute`` does. Leaving punctuation attached
+    silently makes an expectation whose word ends a sentence — or is hyphenated
+    in the node — score as a miss (both were measured on committed runs).
     """
-    words = re.findall(r"[a-z0-9][a-z0-9$%.\-]*", text.lower())
-    out = {w.rstrip(".-") for w in words}
-    return {w for w in out if len(w) >= 2 and w not in _STOP}
+    words = re.findall(r"[a-z0-9$%]+", text.lower())
+    return {w for w in words if len(w) >= 2 and w not in _STOP}
 
 
 def _norm(text: str) -> str:
@@ -259,14 +396,24 @@ def _match(
     scored.sort(key=lambda pair: -pair[0])
     if not scored or scored[0][0] < 0.5:
         return None, scored[0][0] if scored else 0.0, []
-    # SAME-LAYER PREFERENCE. Layer confusion means the item is represented on a
-    # DIFFERENT layer and NOT on the expected one. If a node on the expected
-    # layer also mentions it (e.g. the claim AND its Object both name the
-    # figure), the item was filed correctly and the duplicate representation is
-    # the finding — not a layer error. Without this rule the matcher reports the
-    # shorter mention as a confusion and buries the real one.
-    same = [pair for pair in scored if pair[1]["layer"].lower() == want_layer.lower()]
-    if same:
+    # SAME-LAYER PREFERENCE — WITH A FLOOR. Layer confusion means the item is
+    # represented on a DIFFERENT layer and NOT on the expected one. If a node on
+    # the expected layer ALSO represents it (the claim AND its Object both name
+    # the figure), the item was filed correctly and the duplicate representation
+    # is the finding.
+    #
+    # The floor is load-bearing: without it a same-layer candidate scoring 0.08
+    # (one token of six, on a node that merely mentions the subject) outranks a
+    # different-layer containment match at 0.83, and the instrument then reports
+    # an unrelated node as the item — accusing a node the agent never wrote the
+    # item as, and losing the real layer failure underneath. Measured on two
+    # committed runs before this guard existed.
+    same = [
+        pair
+        for pair in scored
+        if pair[1]["layer"].lower() == want_layer.lower() and pair[0] >= 0.5
+    ]
+    if same and (scored[0][0] < 0.6 or same[0][0] >= scored[0][0] - 0.2):
         scored = same
     best, best_score = scored[0][1], scored[0][0]
     # Duplicates: another node carrying the SAME identity (one name is the
@@ -302,7 +449,6 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
     for exp in entry.get("expect", []):
         item = exp["item"]
         layer = exp["layer"]
-        allowed = [k.lower() for k in exp.get("kind", [])]
         best, best_score, dups = _match(item, nodes, layer)
         fuzzy = best is not None and best_score < 0.75
 
@@ -366,21 +512,29 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             continue
 
         allowed = [k.lower() for k in exp.get("kind", [])]
-        got_kind = (best["kind"] or "(none)").lower()
-        declared = _vocab()[best["layer"]]
-        declared_lower = {k.lower() for k in declared}
-        if got_kind and got_kind not in declared_lower:
-            add(
-                "P1",
-                item,
-                f"UNDECLARED kind {got_kind!r} on a {best['layer']} "
-                f"({best['text'][:50]!r}) — no vocabulary declares it "
-                f"(declared {best['layer']} kinds: {len(declared)}); nothing "
-                f"routes to, finds or classifies it",
-                f"use a declared {best['layer']} kind (§5 / pack kindDefs)",
+        got_kind = (best["kind"] or "").lower()
+        status = kind_status(best["layer"], best["kind"])
+        if status == "UNDECLARED":
+            findings.append(
+                {
+                    "severity": "P1",
+                    "item": item,
+                    "layer": best["layer"],
+                    "kind": got_kind,
+                    "finding": (
+                        f"UNDECLARED kind {got_kind!r} on a {best['layer']} "
+                        f"({best['text'][:50]!r}) — neither a core §5 kind nor one "
+                        f"any loaded pack declares; nothing routes to, finds or "
+                        f"classifies it"
+                    ),
+                    "fix": (
+                        f"use a declared {best['layer']} kind (§5 core, or a pack "
+                        f"kind spelled as the pack declares it)"
+                    ),
+                }
             )
             verdict = "KIND-UNDECLARED"
-        elif allowed and got_kind not in allowed:
+        elif allowed and not _kind_matches(got_kind, allowed):
             add(
                 "P1",
                 item,
@@ -422,11 +576,15 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                 "write the source (§4.6) and tie claims to it with extractedFrom",
             )
         else:
+            # One endpoint must BE the Source. A bare relation-name test passes on
+            # any `references`/`wasDerivedFrom` edge between two claim nodes, which
+            # says nothing about provenance.
             provenance_edges = [
                 e
                 for e in record_doc["edges"]
                 if e["relation"].lower()
-                in {"extractedfrom", "citedfrom", "sourcedfrom", "references", "derivedfrom"}
+                in {"extractedfrom", "citedfrom", "sourcedfrom", "references", "wasderivedfrom"}
+                and "Source" in (e["from_layer"], e["to_layer"])
             ]
             if not provenance_edges:
                 add(
@@ -439,6 +597,19 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                 )
 
     # Truth vs relevance — §3.1 / step 5 of the write pipeline.
+    nand_present = any(
+        (op.get("op_type") or "").upper() == "NAND" for op in record_doc["operators"]
+    )
+    if entry.get("expect_nand") is False and nand_present:
+        add(
+            "P1",
+            "(truth-vs-relevance)",
+            "a NAND was written where nothing contradicts — a contradiction "
+            "operator on a claim that was never attacked computes a wrong "
+            "confidence, not a missing one",
+            "NAND is for a claim that is WRONG; anything else is either plain "
+            "support (IMPL) or a relevance question (mitigation on the operator)",
+        )
     if entry.get("expect_nand") and not any(
         (op.get("op_type") or "").upper() == "NAND" for op in record_doc["operators"]
     ):
@@ -452,6 +623,10 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             "a contradiction attacks the TRUTH of the Point (NAND); mitigation "
             "dampens an operator's RELEVANCE (w_eff = w x (1-strength))",
         )
+    # Three-state, deliberately: ABSENT means "not scored" (most inputs neither
+    # need nor forbid a dampener — the research input legitimately mitigates an
+    # under-evidenced inference, and a boilerplate `false` on every input turned
+    # that sanctioned write into a P0). Only an explicit `false` forbids one.
     if entry.get("expect_mitigation") is False and record_doc["mitigations"]:
         add(
             "P0",
@@ -469,6 +644,76 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             f"expected supersession ({entry['expect_supersede']}) — no node carries "
             f"status=superseded, so 'what did we believe then' is unanswerable",
             "supersede with edge transfer (§4.1 supersede_point), never edit in place",
+        )
+
+    # Duplicate identity — the gold's own measurable for the duplicate input.
+    dup_rule = entry.get("duplicate_expected")
+    if dup_rule:
+        target = _norm(dup_rule["of"])
+        # A second node for one identity means the NAME is duplicated — a
+        # sentence that merely STARTS with the name ("Northwind Logistics
+        # confirmed …") is a claim about it, not a second entity. So: same
+        # normalised name, or the name plus a legal-form suffix ("Ltd", "Inc"),
+        # and only on an entity layer. Without those two constraints the check
+        # reports every claim mentioning the company as a duplicate.
+        suffixes = {
+            "ltd", "limited", "inc", "incorporated", "plc", "llc", "gmbh",
+            "corp", "corporation", "co", "sa", "bv", "ag",
+        }
+
+        def _same_identity(text: str) -> bool:
+            norm = _norm(text)
+            if not norm:
+                return False
+            if norm == target:
+                return True
+            for form in (target, norm):
+                other = norm if form == target else target
+                if other.startswith(form + " "):
+                    residual = set(other[len(form) + 1 :].split()) - suffixes
+                    if not residual:
+                        return True
+            return False
+
+        same_identity = [
+            n for n in nodes if n["layer"] in ("Object", "Subject") and _same_identity(n["text"])
+        ]
+        if len(same_identity) > dup_rule["max_nodes"]:
+            add(
+                "P0",
+                dup_rule["of"],
+                f"{len(same_identity)} nodes carry one identity "
+                f"({[n['text'][:40] for n in same_identity]}) — a re-mention minted "
+                f"a second node, so nothing ever updates",
+                "match the existing node and update it (alias on the same node)",
+            )
+
+    # Graph-wide kind census — INDEPENDENT of the gold. Score() otherwise audits
+    # only the nodes the gold names, so a run can read "clean" while writing
+    # undeclared kinds the gold never asked about (measured: the correction run,
+    # whose two gold items both landed and whose other nodes carried undeclared
+    # kinds). The census keeps "clean" honest.
+    census: dict[str, list[str]] = {}
+    reported = {
+        (f.get("layer"), (f.get("kind") or "").lower()) for f in findings if f.get("kind")
+    }
+    for node in nodes:
+        if node["is_operator"]:
+            continue
+        if kind_status(node["layer"], node["kind"]) != "UNDECLARED":
+            continue
+        # Do not double-count a kind already reported against a gold item: the
+        # census exists to catch what the gold did NOT name.
+        if (node["layer"], (node["kind"] or "").lower()) in reported:
+            continue
+        census.setdefault(node["layer"], []).append(node["kind"] or "(none)")
+    if census:
+        add(
+            "P1",
+            "(kinds)",
+            "graph-wide: kinds no vocabulary declares, beyond the gold items — "
+            + "; ".join(f"{layer}: {sorted(set(kinds))}" for layer, kinds in census.items()),
+            "every node needs a kind from the core §5 vocabulary or a loaded pack",
         )
 
     # Kind completeness — a node with no kind property routes nowhere.
@@ -492,6 +737,8 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
         "relations": record_doc["relations"],
         "operators": [n["op_type"] or "(none)" for n in record_doc["operators"]],
         "sources": [s["url"] or s["text"] for s in record_doc["sources"]],
+        "kind_census": census,
+        "packs": _pack_vocab()["packs"],
         "severity_counts": {
             sev: sum(1 for f in findings if f["severity"] == sev)
             for sev in ("P0", "P1", "P2")
@@ -511,7 +758,11 @@ def main(argv: list[str] | None = None) -> int:
     sc.add_argument("--db", required=True)
     sc.add_argument("--gold", default=str(DEFAULT_GOLD))
     sc.add_argument("--id", required=True, help="gold input id")
-    sc.add_argument("--out", default=None)
+    sc.add_argument(
+        "--out",
+        default=None,
+        help="directory: writes score.json (verdicts) and graph.json (the record read)",
+    )
 
     args = ap.parse_args(argv)
     if args.cmd == "record":
@@ -530,8 +781,12 @@ def main(argv: list[str] | None = None) -> int:
     result = score(doc, gold, args.id)
     text = json.dumps(result, indent=2)
     if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(text + "\n")
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "score.json").write_text(text + "\n")
+        (out_dir / "graph.json").write_text(json.dumps(doc, indent=2) + "\n")
+        print(f"scored {args.id}: P0={result['severity_counts']['P0']} "
+              f"P1={result['severity_counts']['P1']} -> {out_dir}")
     print(text)
     return 1 if result["severity_counts"]["P0"] else 0
 

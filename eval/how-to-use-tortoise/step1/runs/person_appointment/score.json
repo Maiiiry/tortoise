@@ -45,11 +45,10 @@
     },
     {
       "item": "joined Northwind Logistics",
-      "expected": "event:roleCreated|occurrence",
-      "written": "Event:employmentStart",
-      "node": "Marta Reyes joins Northwind Logistics as CFO",
-      "fuzzy": true,
-      "verdict": "KIND-UNDECLARED"
+      "expected": "event",
+      "written": "Point:statement",
+      "node": "Marta Reyes joined Northwind Logistics as CFO on 2026-09-08.",
+      "verdict": "LAYER"
     },
     {
       "item": "reports to",
@@ -62,14 +61,18 @@
     {
       "severity": "P1",
       "item": "Marta Reyes",
-      "finding": "UNDECLARED kind 'person' on a Subject ('Marta Reyes') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
-      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+      "layer": "Subject",
+      "kind": "person",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Marta Reyes') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P1",
       "item": "Tobias Lund",
-      "finding": "UNDECLARED kind 'person' on a Subject ('Tobias Lund') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
-      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
+      "layer": "Subject",
+      "kind": "person",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Tobias Lund') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P0",
@@ -84,16 +87,16 @@
       "fix": "re-file as subject; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
     },
     {
-      "severity": "P1",
+      "severity": "P0",
       "item": "joined Northwind Logistics",
-      "finding": "UNDECLARED kind 'employmentstart' on a Event ('Marta Reyes joins Northwind Logistics as CFO') \u2014 no vocabulary declares it (declared Event kinds: 16); nothing routes to, finds or classifies it",
-      "fix": "use a declared Event kind (\u00a75 / pack kindDefs)"
+      "finding": "LAYER confusion: expected event, written as Point ('Marta Reyes joined Northwind Logistics as CFO on 2026-09-08.') \u2014 \u00a74.5/\u00a73.5 Subject\u2192Event\u2192Object: the appointment is the dated occurrence; the employment edge is current state",
+      "fix": "re-file as event; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
     },
     {
       "severity": "P1",
-      "item": "(provenance)",
-      "finding": "1 Source node(s) but ZERO claim\u2192source edges (relations present: ['aboutEvent', 'aboutObject', 'aboutSource', 'aboutSubject', 'hasPart', 'holdsRole', 'memberOf', 'related', 'reportsTo', 'wasDerivedFrom'])",
-      "fix": "attach each extracted claim to its source; a Source with no edge is a scrapbook entry, not provenance"
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['note']; Object: ['organization', 'role']; Event: ['employmentStart']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -112,9 +115,32 @@
   "sources": [
     "memory://note/person_appointment"
   ],
+  "kind_census": {
+    "Source": [
+      "note"
+    ],
+    "Object": [
+      "organization",
+      "organization",
+      "role",
+      "role",
+      "role"
+    ],
+    "Event": [
+      "employmentStart"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
   "severity_counts": {
-    "P0": 2,
-    "P1": 4,
+    "P0": 3,
+    "P1": 3,
     "P2": 0
   }
 }

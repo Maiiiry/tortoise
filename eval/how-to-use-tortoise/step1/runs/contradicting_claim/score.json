@@ -34,8 +34,10 @@
     {
       "severity": "P1",
       "item": "two open findings",
-      "finding": "UNDECLARED kind 'issue' on a Point ('Auditors have flagged two open findings in the Sol') \u2014 no vocabulary declares it (declared Point kinds: 9); nothing routes to, finds or classifies it",
-      "fix": "use a declared Point kind (\u00a75 / pack kindDefs)"
+      "layer": "Point",
+      "kind": "issue",
+      "finding": "UNDECLARED kind 'issue' on a Point ('Auditors have flagged two open findings in the Sol') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Point kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P0",
@@ -54,6 +56,12 @@
       "item": "(truth-vs-relevance)",
       "finding": "1 INVALIDATES/mitigation edge(s) written on an input that needs none \u2014 relevance dampening applied where truth is at issue",
       "fix": "do not dampen an operator when the claim itself is wrong; NAND the Point"
+    },
+    {
+      "severity": "P1",
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Event: ['observation']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -67,9 +75,22 @@
     "IMPL"
   ],
   "sources": [],
+  "kind_census": {
+    "Event": [
+      "observation"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
   "severity_counts": {
     "P0": 3,
-    "P1": 1,
+    "P1": 2,
     "P2": 0
   }
 }

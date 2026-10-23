@@ -1,0 +1,98 @@
+{
+  "input": "duplicate_entity",
+  "cell": "duplicate entity",
+  "confuses": [
+    "Object-vs-Point",
+    "identity-vs-belief"
+  ],
+  "counts": {
+    "Point": 3,
+    "Subject": 1,
+    "Object": 1,
+    "Event": 1,
+    "Source": 1
+  },
+  "item_rows": [
+    {
+      "item": "Northwind Logistics",
+      "expected": "object:other|organization",
+      "written": "Object:other",
+      "node": "Northwind Logistics",
+      "fuzzy": false,
+      "verdict": "OK"
+    },
+    {
+      "item": "Marta Reyes",
+      "expected": "subject:naturalPerson",
+      "written": "Subject:person",
+      "node": "Marta Reyes",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "renew in January",
+      "expected": "event",
+      "written": "Point:statement",
+      "node": "Northwind Logistics confirmed on 2026-10-04 that it will renew in January 2027.",
+      "verdict": "LAYER"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "P1",
+      "item": "Marta Reyes",
+      "layer": "Subject",
+      "kind": "person",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Marta Reyes') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+    },
+    {
+      "severity": "P0",
+      "item": "renew in January",
+      "finding": "LAYER confusion: expected event, written as Point ('Northwind Logistics confirmed on 2026-10-04 that it will renew in Janu') \u2014 a confirmed future occurrence \u2014 the state ('renewal status') folds from it",
+      "fix": "re-file as event; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+    },
+    {
+      "severity": "P1",
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['contract']; Event: ['customerCommitment']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+    }
+  ],
+  "relations": [
+    "aboutDocument",
+    "aboutEvent",
+    "aboutObject",
+    "aboutSource",
+    "aboutSubject",
+    "extractedFrom",
+    "hasMember",
+    "managedBy",
+    "wasDerivedFrom"
+  ],
+  "operators": [],
+  "sources": [
+    "urn:document:northwind-logistics-sow"
+  ],
+  "kind_census": {
+    "Source": [
+      "contract"
+    ],
+    "Event": [
+      "customerCommitment"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
+  "severity_counts": {
+    "P0": 1,
+    "P1": 2,
+    "P2": 0
+  }
+}

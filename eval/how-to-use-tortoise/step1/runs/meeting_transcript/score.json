@@ -1,0 +1,177 @@
+{
+  "input": "meeting_transcript",
+  "cell": "meeting transcript",
+  "confuses": [
+    "Point-vs-Event",
+    "Event-vs-Object"
+  ],
+  "counts": {
+    "Point": 7,
+    "Subject": 3,
+    "Object": 4,
+    "Event": 1,
+    "Source": 1
+  },
+  "item_rows": [
+    {
+      "item": "self-serve tier",
+      "expected": "object:plan|strategy|other",
+      "written": "Object:offering",
+      "node": "self-serve tier",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "killing the self-serve tier",
+      "expected": "event",
+      "written": "(nothing)",
+      "verdict": "MISSING"
+    },
+    {
+      "item": "Dana",
+      "expected": "subject:naturalPerson|role",
+      "written": "Subject:person",
+      "node": "Dana",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "Ravi",
+      "expected": "subject:naturalPerson|role",
+      "written": "Subject:person",
+      "node": "Ravi",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "Priya",
+      "expected": "subject:naturalPerson|role",
+      "written": "Subject:person",
+      "node": "Priya",
+      "fuzzy": false,
+      "verdict": "KIND-UNDECLARED"
+    },
+    {
+      "item": "80% chance we slip a week",
+      "expected": "point",
+      "written": "(nothing)",
+      "verdict": "MISSING"
+    },
+    {
+      "item": "EU data-residency question",
+      "expected": "point:statement|observation",
+      "written": "Point:issue",
+      "node": "Open question: EU data residency requirements. Raised by Dana 2026-09-14, explic",
+      "fuzzy": true,
+      "verdict": "KIND-UNDECLARED"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "P1",
+      "item": "self-serve tier",
+      "layer": "Object",
+      "kind": "offering",
+      "finding": "UNDECLARED kind 'offering' on a Object ('self-serve tier') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Object kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+    },
+    {
+      "severity": "P0",
+      "item": "killing the self-serve tier",
+      "finding": "expected event \u2014 no node represents it (best overlap 0.38)",
+      "fix": "the item was absorbed into prose or written under a name nothing can find"
+    },
+    {
+      "severity": "P1",
+      "item": "Dana",
+      "layer": "Subject",
+      "kind": "person",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Dana') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+    },
+    {
+      "severity": "P1",
+      "item": "Ravi",
+      "layer": "Subject",
+      "kind": "person",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Ravi') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+    },
+    {
+      "severity": "P1",
+      "item": "Priya",
+      "layer": "Subject",
+      "kind": "person",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Priya') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+    },
+    {
+      "severity": "P0",
+      "item": "80% chance we slip a week",
+      "finding": "expected point \u2014 no node represents it (best overlap 0.25)",
+      "fix": "the item was absorbed into prose or written under a name nothing can find"
+    },
+    {
+      "severity": "P1",
+      "item": "EU data-residency question",
+      "layer": "Point",
+      "kind": "issue",
+      "finding": "UNDECLARED kind 'issue' on a Point ('Open question: EU data residency requirements. Rai') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "fix": "use a declared Point kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+    },
+    {
+      "severity": "P1",
+      "item": "(truth-vs-relevance)",
+      "finding": "a NAND was written where nothing contradicts \u2014 a contradiction operator on a claim that was never attacked computes a wrong confidence, not a missing one",
+      "fix": "NAND is for a claim that is WRONG; anything else is either plain support (IMPL) or a relevance question (mitigation on the operator)"
+    },
+    {
+      "severity": "P1",
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['meetingTranscript']; Object: ['deliverable', 'openQuestion', 'productSurface']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+    }
+  ],
+  "relations": [
+    "IMPL",
+    "INPUT",
+    "NAND",
+    "aboutEvent",
+    "aboutObject",
+    "aboutSubject",
+    "dependsOn",
+    "extractedFrom",
+    "ownedBy",
+    "participatesIn"
+  ],
+  "operators": [
+    "IMPL",
+    "NAND"
+  ],
+  "sources": [
+    "transcript://meetings/2026-09-14-pricing"
+  ],
+  "kind_census": {
+    "Source": [
+      "meetingTranscript"
+    ],
+    "Object": [
+      "deliverable",
+      "productSurface",
+      "openQuestion"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
+  "severity_counts": {
+    "P0": 2,
+    "P1": 7,
+    "P2": 0
+  }
+}

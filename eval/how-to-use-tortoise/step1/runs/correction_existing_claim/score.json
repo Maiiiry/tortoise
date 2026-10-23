@@ -30,7 +30,14 @@
       "verdict": "OK"
     }
   ],
-  "findings": [],
+  "findings": [
+    {
+      "severity": "P1",
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Point: ['incident']; Event: ['correction']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
+    }
+  ],
   "relations": [
     "CORRECTS",
     "IMPL",
@@ -47,9 +54,25 @@
   "sources": [
     "https://dash.internal.example/churn/q3"
   ],
+  "kind_census": {
+    "Point": [
+      "incident"
+    ],
+    "Event": [
+      "correction"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
   "severity_counts": {
     "P0": 0,
-    "P1": 0,
+    "P1": 1,
     "P2": 0
   }
 }

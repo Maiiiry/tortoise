@@ -15,19 +15,17 @@
   "item_rows": [
     {
       "item": "moving the ingestion workers from Celery to Temporal",
-      "expected": "event:decision",
-      "written": "Event:occurrence",
-      "node": "Decision request raised: approve Celery->Temporal migration for ingestion worker",
-      "fuzzy": true,
-      "verdict": "KIND"
+      "expected": "event",
+      "written": "Point:decision",
+      "node": "Approve moving the ingestion workers from Celery to Temporal (requested 2026-09-",
+      "verdict": "LAYER"
     },
     {
       "item": "sub-5-minute end-to-end ingestion latency",
-      "expected": "object:goal|target",
-      "written": "Object:workflow",
-      "node": "Ingestion pipeline",
-      "fuzzy": true,
-      "verdict": "KIND"
+      "expected": "object",
+      "written": "Point:target",
+      "node": "Platform team goal: sub-5-minute end-to-end ingestion latency by 2027-03-31.",
+      "verdict": "LAYER"
     },
     {
       "item": "before the Q1 freeze",
@@ -46,16 +44,16 @@
   ],
   "findings": [
     {
-      "severity": "P1",
+      "severity": "P0",
       "item": "moving the ingestion workers from Celery to Temporal",
-      "finding": "kind outside the frozen set: expected one of ['decision'], written 'occurrence' ('Decision request raised: approve Celery->Temporal migration ') \u2014 declared, but not the kind this item is",
-      "fix": "pick a kind the active vocabulary declares for this layer (\u00a75)"
+      "finding": "LAYER confusion: expected event, written as Point ('Approve moving the ingestion workers from Celery to Temporal (requeste') \u2014 the REQUEST is an ask for a resolution \u2014 the record that it was asked at a moment is a timeline Event",
+      "fix": "re-file as event; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
     },
     {
-      "severity": "P1",
+      "severity": "P0",
       "item": "sub-5-minute end-to-end ingestion latency",
-      "finding": "kind outside the frozen set: expected one of ['goal', 'target'], written 'workflow' ('Ingestion pipeline') \u2014 declared, but not the kind this item is",
-      "fix": "pick a kind the active vocabulary declares for this layer (\u00a75)"
+      "finding": "LAYER confusion: expected object, written as Point ('Platform team goal: sub-5-minute end-to-end ingestion latency by 2027-') \u2014 a commitment-state \u2014 \u00a75 commitment-state family (goal/target are Object kinds; the canonical representation of a goal is an Object)",
+      "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
     },
     {
       "severity": "P0",
@@ -68,6 +66,12 @@
       "item": "3 engineer-weeks",
       "finding": "LAYER confusion: expected object, written as Point ('The Celery->Temporal migration is estimated to cost approximately 3 en') \u2014 an estimate attached to the work \u2014 if it is asserted as belief it belongs on a Point; if it is a commitment it belongs on the Object. Passing requires it lands on exactly one layer with a stated reason, not on both halves.",
       "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
+    },
+    {
+      "severity": "P1",
+      "item": "(kinds)",
+      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Point: ['criterion', 'evidence', 'option']",
+      "fix": "every node needs a kind from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -90,9 +94,25 @@
     "tortoise://inbox/platform-team/2026-09-20-celery-to-temporal",
     "session:ax-eval/run-decision_request"
   ],
+  "kind_census": {
+    "Point": [
+      "option",
+      "criterion",
+      "criterion",
+      "evidence"
+    ]
+  },
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
   "severity_counts": {
-    "P0": 2,
-    "P1": 2,
+    "P0": 4,
+    "P1": 1,
     "P2": 0
   }
 }

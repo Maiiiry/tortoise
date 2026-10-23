@@ -43,7 +43,7 @@
       "written": "Subject:core:organization",
       "node": "Solstice Robotics Inc.",
       "fuzzy": false,
-      "verdict": "KIND-UNDECLARED"
+      "verdict": "OK"
     }
   ],
   "findings": [
@@ -58,12 +58,6 @@
       "item": "14 investors",
       "finding": "kind outside the frozen set: expected one of ['statement'], written 'observation' ('The SEC Form D filed by Solstice Robotics Inc. on 2026-06-11') \u2014 declared, but not the kind this item is",
       "fix": "pick a kind the active vocabulary declares for this layer (\u00a75)"
-    },
-    {
-      "severity": "P1",
-      "item": "Solstice Robotics",
-      "finding": "UNDECLARED kind 'core:organization' on a Subject ('Solstice Robotics Inc.') \u2014 no vocabulary declares it (declared Subject kinds: 6); nothing routes to, finds or classifies it",
-      "fix": "use a declared Subject kind (\u00a75 / pack kindDefs)"
     }
   ],
   "relations": [
@@ -79,9 +73,18 @@
   "sources": [
     "https://www.sec.gov/Archives/edgar/data/0001234567/000123456726000001/xslFormDX01/primary_doc.xml"
   ],
+  "kind_census": {},
+  "packs": [
+    "agent-ops",
+    "dev",
+    "marketing",
+    "pm",
+    "product-strategy",
+    "venture"
+  ],
   "severity_counts": {
     "P0": 0,
-    "P1": 3,
+    "P1": 2,
     "P2": 0
   }
 }
