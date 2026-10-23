@@ -308,10 +308,105 @@ def test_the_default_graph_sets_no_override(monkeypatch):
     monkeypatch.setattr(mcp_auth, "reachable_graph_rows", lambda org_id: OWN_ROWS)
     org = mcp_auth._current_org_id.set(ORG_A)
     try:
-        row = mcp_auth.apply_graph_target("default")
-        assert row["graph_id"] == "default"
+        assert mcp_auth.apply_graph_target("default") is None
         assert mcp_auth._current_graph_id.get() is None
         assert mcp_auth._current_graph_namespace.get() is None
+    finally:
+        mcp_auth._current_org_id.reset(org)
+
+
+def test_the_default_graph_needs_no_listed_row(monkeypatch):
+    """A workspace whose graph list comes back EMPTY still HAS a default graph.
+
+    `supabase_control.graph_metadata` returns `[]` when the workspace's stored
+    `graph_name` is empty (an anticipated, fail-soft shape), and
+    `reachable_graph_rows` reads a non-list reader answer as `[]`. A resolver
+    that can only match a `graph_id="default"` ROW therefore refuses
+    `graph="default"` — while the SAME call with the argument omitted reads
+    that very graph — and the refusal actively misinforms the caller by
+    reporting "Reachable graphs: none".
+    """
+    monkeypatch.setattr(mcp_auth, "reachable_graph_rows", lambda org_id: [])
+    org = mcp_auth._current_org_id.set(ORG_A)
+    try:
+        assert mcp_auth.apply_graph_target("default") is None
+        assert mcp_auth._current_graph_id.get() is None
+        assert mcp_auth._current_graph_namespace.get() is None
+        # …and it is the same no-op as omitting the argument.
+        assert mcp_auth.apply_graph_target(None) is None
+    finally:
+        mcp_auth._current_org_id.reset(org)
+
+
+def test_the_dispatch_accepts_the_default_graph_with_an_empty_row_set(monkeypatch):
+    """The user-visible half: `graph="default"` must not be a ToolError."""
+    monkeypatch.setattr(mcp_auth, "reachable_graph_rows", lambda org_id: [])
+    org = mcp_auth._current_org_id.set(ORG_A)
+
+    async def _dispatch():
+        stack = contextlib.ExitStack()
+        try:
+            await mcp_server._resolve_graph_argument("default", stack)
+            return mcp_auth._current_graph_id.get()
+        finally:
+            stack.close()
+
+    try:
+        assert asyncio.run(_dispatch()) is None
+    finally:
+        mcp_auth._current_org_id.reset(org)
+
+
+def test_the_default_graph_needs_no_workspace_either(monkeypatch):
+    """stdio / self-host: `"default"` is trivially satisfiable, so accept it.
+
+    `graph` is advertised on the registered tools for EVERY transport, so a
+    connector that sets it uniformly (the usage the argument exists for) would
+    otherwise lose every tool on stdio/self-host — for a no-op. A NAME still
+    refuses there, because there is no graph set to check it against.
+    """
+    org = mcp_auth._current_org_id.set(None)
+    try:
+        assert mcp_auth.apply_graph_target("default") is None
+        assert mcp_auth._current_graph_id.get() is None
+        assert mcp_auth._current_graph_namespace.get() is None
+        with pytest.raises(mcp_auth.GraphTargetError) as excinfo:
+            mcp_auth.apply_graph_target("Fund A / Research")
+        assert "requires a hosted workspace connection" in str(excinfo.value)
+    finally:
+        mcp_auth._current_org_id.reset(org)
+
+
+def test_a_bound_credential_cannot_ask_for_the_default_graph(monkeypatch):
+    """The short-circuit must NOT widen a graph-bound key past its mint.
+
+    Accepting `"default"` without a lookup is only safe while the bound check
+    still fires: a key minted for graph X asked for "default" would otherwise
+    be told "default" while every call kept reading X.
+    """
+    monkeypatch.setattr(mcp_auth, "reachable_graph_rows", lambda org_id: [])
+    tokens = [mcp_auth._current_org_id.set(ORG_A),
+              mcp_auth._current_graph_id.set("g_fund_a")]
+    try:
+        with pytest.raises(mcp_auth.GraphTargetError) as excinfo:
+            mcp_auth.apply_graph_target("default")
+        assert "bound to one graph" in str(excinfo.value)
+        assert mcp_auth._current_graph_id.get() == "g_fund_a", (
+            "a refused re-target moved the credential's own graph")
+    finally:
+        mcp_auth._current_graph_id.reset(tokens[1])
+        mcp_auth._current_org_id.reset(tokens[0])
+
+
+def test_a_non_string_graph_is_the_type_refusal_on_every_transport():
+    """A caller's type error must not be answered as "this transport"."""
+    org = mcp_auth._current_org_id.set(None)
+    try:
+        with pytest.raises(mcp_auth.GraphTargetError) as excinfo:
+            mcp_auth.apply_graph_target(5)
+        message = str(excinfo.value)
+        assert "must be a graph id or name (a string)" in message, message
+        assert "hosted workspace connection" not in message, message
     finally:
         mcp_auth._current_org_id.reset(org)
 

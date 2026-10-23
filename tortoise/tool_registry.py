@@ -1551,14 +1551,16 @@ GRAPH_ARGUMENT_EXCLUDED: frozenset[str] = frozenset({
 })
 
 GRAPH_ARGUMENT_DESCRIPTION = (
-    "Optional graph to act on. Omitted = the workspace's default graph. "
+    "Optional graph to act on. Omitted = the workspace's default graph, and an "
+    "explicit `graph=\"default\"` is the same no-op. "
     "Accepts, in order of preference: the graph's id, the namespace string "
     "`tortoise_list_graphs` returns for it (e.g. `org_<workspace>_<graph_id>` "
     "— that tool lists namespaces, not ids), "
     "or its name when that name is unique in this workspace. An unknown, "
-    "ambiguous, deleted or other-workspace graph is refused. A HOSTED "
-    "workspace connection only: a stdio or self-host server has no workspace "
-    "graph set, so it refuses this argument rather than guessing a target."
+    "ambiguous, deleted or other-workspace graph is refused. Any graph OTHER "
+    "than `default` needs a HOSTED workspace connection: a stdio or self-host "
+    "server has no workspace graph set to resolve a name or id against, so it "
+    "refuses one rather than guessing a target."
 )
 
 

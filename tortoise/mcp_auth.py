@@ -277,6 +277,22 @@ GRAPH_ARGUMENT_EXCLUDED = _GRAPH_ARGUMENT_EXCLUDED
 GRAPH_ARGUMENT_DESCRIPTION = _GRAPH_ARGUMENT_DESCRIPTION
 
 
+#: The bad-argument refusal for a `graph` that is not even a string. ONE
+#: constant because the refusal must not depend on the TRANSPORT either: an
+#: int/list arriving on stdio must be the type error it is, not "this
+#: transport has no graph set".
+_GRAPH_TYPE_REFUSAL = (
+    "The `graph` argument must be a graph id or name (a string). "
+    "Omit it to use this workspace's default graph."
+)
+
+#: The `graph` id of the workspace-default graph in BOTH readers
+#: (`supabase_control.graph_metadata` derives the default row with
+#: `graph_id: "default"`; the registry lane carries the same literal). Naming
+#: it is a NO-OP that needs no lookup at all — see :func:`plan_graph_target`.
+_DEFAULT_GRAPH_ID = "default"
+
+
 class GraphTargetError(ValueError):
     """A `graph` argument named no graph this caller may reach (#9340).
 
@@ -290,6 +306,24 @@ class GraphTargetError(ValueError):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.code = "invalid_graph"
+
+
+def _is_default_graph_ref(ref: Any) -> bool:
+    """True when `ref` names the workspace DEFAULT graph, which needs no lookup.
+
+    Only the exact id (stripped, case-insensitively) qualifies. A *name* is not
+    accepted here: a workspace may rename its default graph (`graph_metadata`
+    reads `graphs.name` for it), so a name can only be resolved against the
+    workspace's own rows.
+    """
+    return isinstance(ref, str) and ref.strip().casefold() == _DEFAULT_GRAPH_ID
+
+
+def _retarget_refusal(requested: str) -> GraphTargetError:
+    """The ONE refusal for a `graph` that would widen a graph-bound credential."""
+    return GraphTargetError(
+        "This credential is bound to one graph and cannot be re-targeted "
+        f"by a `graph` argument (requested {requested}).")
 
 
 def _describe_graph(row: dict) -> str:
@@ -365,9 +399,7 @@ def resolve_graph_target(org_id: str, ref: str, *,
         # declare the argument). An int/list/object here would otherwise raise
         # AttributeError out of the dispatch and be classified a SERVER error
         # rather than the bad-argument refusal it is.
-        raise GraphTargetError(
-            "The `graph` argument must be a graph id or name (a string). "
-            "Omit it to use this workspace's default graph.")
+        raise GraphTargetError(_GRAPH_TYPE_REFUSAL)
     # An injected row set is filtered HERE too, so the tenancy + tombstone
     # rules hold on both entry points rather than depending on which one the
     # caller used.
@@ -421,6 +453,34 @@ def plan_graph_target(ref: Any) -> dict | None:
     """
     if ref is None:
         return None
+    if not isinstance(ref, str):
+        # Before the transport check, so a caller's TYPE error is answered as
+        # one on every transport instead of being blamed on the transport.
+        raise GraphTargetError(_GRAPH_TYPE_REFUSAL)
+    if _is_default_graph_ref(ref):
+        # `"default"` names the graph the untouched path ALREADY opens, so it
+        # needs neither a workspace nor a reachable-set lookup. Two refusals
+        # below must therefore not fire on it (#9340 review P2):
+        #
+        #   * the no-workspace refusal — otherwise a connector that sets
+        #     `graph` uniformly, the usage this whole argument is designed for,
+        #     loses EVERY tool on stdio/self-host for a ref that is trivially
+        #     satisfiable;
+        #   * the reachability resolution — a workspace whose stored
+        #     `graph_name` is empty makes `graph_metadata` return `[]` (and any
+        #     reader answering with a non-list reads as `[]`), so there is no
+        #     default ROW to match, while the SAME call with the argument
+        #     omitted reads that very graph. Refusing it tells the caller
+        #     "Reachable graphs: none" about a graph it is reading.
+        #
+        # The one thing still refused: a credential ALREADY bound to another
+        # graph, because telling it "default" while every call keeps reading
+        # its own graph is the silent wrong-graph outcome the bound check
+        # exists to prevent.
+        bound = _current_graph_id.get()
+        if bound and bound != _DEFAULT_GRAPH_ID:
+            raise _retarget_refusal("the workspace default graph")
+        return None
     org_id = _current_org_id.get()
     if not org_id or org_id == SELFHOST_ORG_ID:
         # No workspace to resolve against: stdio/self-host has no control-plane
@@ -440,10 +500,8 @@ def plan_graph_target(ref: Any) -> dict | None:
         # otherwise a bound key asking for the workspace default would be told
         # "default" while every call kept reading its own graph: the silent
         # wrong-graph outcome, with the caller's intent freshly confirmed.
-        raise GraphTargetError(
-            "This credential is bound to one graph and cannot be re-targeted "
-            f"by a `graph` argument (requested {_describe_graph(row)}).")
-    if (row.get("kind") or "") == "default":
+        raise _retarget_refusal(_describe_graph(row))
+    if (row.get("kind") or "") == _DEFAULT_GRAPH_ID:
         return row
     graph_id = row.get("graph_id")
     namespace = row.get("namespace")
