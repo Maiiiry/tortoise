@@ -258,6 +258,7 @@ the shapes the path produces:
 | `skipped (state unreadable, supabase 401\|403\|5xx)` | the read failed for another reason: a rotated/wrong service-role key, or a Supabase fault | check the key / the Supabase status — **the migration will not help here**. Nothing was submitted |
 | `skipped (state unreadable, upstream unreachable)` | the state read timed out or the network failed — **not** a migration problem | nothing urgent; the publish is live and the next publish of that article will submit |
 | `skipped (state unreadable, no row)` | the row was gone when the stamp was read (a concurrent delete) | nothing — but note the state was unknown, so nothing was submitted |
+| `skipped (not live: status=…, hold_for_review=…)` | the console asked for a submission and the row is not publicly readable (a draft, or a published-but-held post), so nothing was submitted and the endpoint answered 409 `not_live` | this is the answer to "why was my publish not submitted?" — clear the hold, then publish again |
 | `admin path read failed (supabase <n>)` | the editor's endpoint could not read the row, so it answered 503 `skipped-unreadable` and submitted nothing | check the service-role key and Supabase status — the migration is **not** implicated |
 | `admin path read failed (upstream unreachable)` | same, when the read timed out or the network failed | as above; nothing was submitted |
 | `unexpected failure` | a bug-shaped error inside the notification | file it; the publish itself already succeeded |
@@ -275,6 +276,8 @@ read the corresponding `submit failed` log line above for which), `skipped-windo
 window) or `skipped-unreadable` (the state could not be read, so nothing was submitted). Only
 `submitted` means an engine received the URL. A `skipped-unreadable` from the endpoint's own row read
 arrives as a **503**; the same arm from the submission stamp arrives as a 200 carrying that result.
+The console logs every arm other than `submitted` as `[indexnow] <slug>: <arm>`, so the browser console
+and the server log answer the same question.
 
 ⚠️ **Known limit of the 24-hour window.** The stamp is per post *row* and is read before the
 submission and written after it. Two publish transitions of the same post that overlap (both read the

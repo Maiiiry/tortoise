@@ -51,13 +51,17 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
     return json({ error: "unauthorized", message: "Session expired or not an admin — refresh and log in again" }, 401);
   }
 
-  let input: { slug?: unknown };
+  let input: unknown;
   try {
-    input = (await request.json()) as { slug?: unknown };
+    input = await request.json();
   } catch {
     return json({ error: "invalid_json" }, 400);
   }
-  const slug = typeof input.slug === "string" ? input.slug : "";
+  // `?.` is load-bearing: a body of literally `null` parses fine and then throws
+  // on `.slug`, which would be a 500 out of a handler whose contract is 400.
+  const slug = typeof (input as { slug?: unknown } | null)?.slug === "string"
+    ? ((input as { slug: string }).slug)
+    : "";
   if (!slug || !isValidSlug(slug)) {
     return json({ error: "invalid_slug" }, 400);
   }
@@ -104,6 +108,11 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
   // written this way so relaxing that constraint cannot silently re-open the hole.
   const live = row.status === "published" && row.hold_for_review === false;
   if (!live) {
+    // Logged as well as refused: "why was my publish not submitted?" is answered
+    // by `grep [indexnow]`, and a silent 409 leaves that question unanswerable.
+    console.warn(
+      `[indexnow] skipped (not live: status=${row.status}, hold_for_review=${String(row.hold_for_review)}): ${slug}`,
+    );
     // Deliberate, and not softened: no retraction exists in this protocol.
     return json({ error: "not_live", status: row.status, hold_for_review: row.hold_for_review ?? null }, 409);
   }

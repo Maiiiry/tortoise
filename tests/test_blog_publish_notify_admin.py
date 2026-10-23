@@ -122,7 +122,13 @@ globalThis.fetch = async (url, init) => {
     }
     if (method === 'GET') {
       const m = u.match(/[?&]select=([^&]*)/);
-      return Response.json(c.row ? [projectRow(m ? decodeURIComponent(m[1]) : '')] : []);
+      // HONOUR `slug=eq.` too: the stub must not answer for a slug the endpoint
+      // did not ask about, or "the status is read from the store FOR THIS SLUG"
+      // is asserted by nothing and a mis-targeted read passes.
+      const s = u.match(/[?&]slug=eq\.([^&]*)/);
+      const want = s ? decodeURIComponent(s[1]) : null;
+      if (want === null || !c.row || want !== c.row.slug) return Response.json([]);
+      return Response.json([projectRow(m ? decodeURIComponent(m[1]) : '')]);
     }
     if (method === 'PATCH') return Response.json([{ ...rows[0] }]);
   }
@@ -247,6 +253,17 @@ def test_v2b_unknown_slug_is_404_and_never_submitted():
     assert out["submissions"] == []
 
 
+def test_v2f_refusal_is_logged_for_the_operator():
+    """A 409 with no log line leaves "why was my publish not submitted?"
+    unanswerable from the only place the docs tell the operator to look."""
+    out = _run({
+        "row": {"slug": "agent-memory", "status": "published", "hold_for_review": True},
+        "body": {"slug": "agent-memory"},
+    })
+    assert out["status"] == 409
+    assert any("[indexnow] skipped (not live" in line for line in out["logs"]), out["logs"]
+
+
 def test_v3_published_slug_submits_exactly_one_canonical_url():
     out = _run({"row": {"slug": "agent-memory", "status": "published"}, "body": {"slug": "agent-memory"}})
     assert out["status"] == 200
@@ -302,6 +319,15 @@ def test_v5_unreadable_row_is_503_not_a_publish_failure():
 def test_v5d_malformed_body_is_400():
     out = _run({"body": "{not json"})
     assert out["status"] == 400
+    assert out["submissions"] == []
+
+
+def test_v5e_json_null_body_is_400_not_500():
+    """A body of literally `null` parses successfully and then threw on `.slug` —
+    a 500 out of a handler whose documented answer is 400."""
+    out = _run({"row": {"slug": "agent-memory", "status": "published"}, "body": "null"})
+    assert out["status"] == 400
+    assert out["body"]["error"] == "invalid_slug"
     assert out["submissions"] == []
 
 

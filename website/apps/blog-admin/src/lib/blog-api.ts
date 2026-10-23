@@ -402,12 +402,22 @@ export async function notifyPublished(slug: string): Promise<void> {
       // #3501/#4171: no token to attach — the HttpOnly `__Host-session` cookie
       // rides along on this same-origin request, and the app-origin /blog/api
       // proxy attaches the server-minted credential upstream.
-      await fetch('/blog/api/notify-publish', {
+      const res = await fetch('/blog/api/notify-publish', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ slug }),
       });
+      // The endpoint answers with an OUTCOME, and an outcome nobody reads is not
+      // an improvement on a boolean: every arm other than `submitted` is
+      // surfaced, so "why was my publish not submitted?" has an answer in the
+      // console as well as in the server log. Not a toast: a skipped
+      // notification is normal (the 24h window), and a publish never fails here.
+      const body = (await res.json().catch(() => ({}))) as { result?: string; error?: string };
+      const result = body.result ?? (res.ok ? "unknown" : body.error ?? `http-${res.status}`);
+      if (result !== 'submitted') {
+        console.warn(`[indexnow] ${slug}: ${result}`);
+      }
     } catch {
       // fail-open — a missed notification is never a failed publish
     } finally {
