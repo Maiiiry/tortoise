@@ -756,6 +756,52 @@ class TestKindsAreMintable:
         assert sdk.validate_domain(NS)["ok"] is True
 
     @requires_db
+    def test_a_bare_spelled_kind_is_not_blind_to_the_rule(self, sdk):
+        """The write gate admits BOTH spellings of a pack kind —
+        ``extractor_v2._object_kind_forms`` lowercases ``portfolio:mandate`` and
+        ``mandate`` — and the projection stores ``objectKind`` verbatim. A rule
+        that queried only the namespaced spelling therefore reported CLEAN over
+        an Object the gate had just produced: the fail-open half of the same
+        problem the supersession exemption fixes on the other side.
+
+        Both directions are pinned: the BARE spelling is now seen, and a
+        NAMESPACED kind whose local part carries a capital
+        (``portfolio:allocationTarget``) is still seen after the vocabulary was
+        case-folded — a case-sensitive query over lowercased forms would miss
+        it, which is the same blindness with a smaller blast radius.
+        """
+        # (a) bare spelling, out-of-vocabulary status → REPORTED
+        sdk.create_object("Mandate M-11 (bare kind)", objectKind="mandate",
+                          status="active")
+        # (b) namespaced spelling stored verbatim with a capital, out-of-
+        #     vocabulary status → REPORTED
+        sdk.create_object("Allocation Target AT-2",
+                          objectKind=f"{NS}:allocationTarget",
+                          status="active")
+        stored = dict(sdk._get_proj().g.query(
+            "MATCH (o:Object) RETURN o.name, o.objectKind").result_set)
+        assert stored["Mandate M-11 (bare kind)"] == "mandate", stored
+        assert stored["Allocation Target AT-2"] == f"{NS}:allocationTarget", (
+            stored)
+
+        verdict = sdk.validate_domain(NS)
+        flagged = {(v["rule"], v["kind"]) for v in verdict["violations"]}
+        assert flagged == {
+            ("undeclared_object_status", "mandate"),
+            ("undeclared_object_status", f"{NS}:allocationTarget"),
+        }, verdict
+
+        # (c) the bare spelling carrying a DECLARED status is not a violation —
+        #     the rule reads the kind's own vocabulary, not the prefix.
+        sdk._get_proj().g.query(
+            "MATCH (o:Object {name:'Mandate M-11 (bare kind)'}) "
+            "SET o.status = 'adopted'")
+        sdk._get_proj().g.query(
+            "MATCH (o:Object {name:'Allocation Target AT-2'}) "
+            "SET o.status = 'proposed'")
+        assert sdk.validate_domain(NS)["ok"] is True
+
+    @requires_db
     def test_each_object_kind_mints_with_its_own_status(self, sdk):
         sdk.create_object("Mandate M-1: no sector above 25%",
                           objectKind=f"{NS}:mandate", status="adopted")

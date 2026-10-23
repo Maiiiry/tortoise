@@ -363,13 +363,23 @@ POSITION_KIND = "venture:investment"
 MARK_RELATION = "marks"
 
 
-def _portfolio_declared_statuses() -> dict[str, list[str]]:
-    """``{bare kind: declared statuses}`` from the loaded `portfolio` pack.
+def _portfolio_declared_statuses() -> dict[str, frozenset[str]]:
+    """``{case-folded kind spelling: declared statuses}`` for the pack.
 
     Read from the registry at call time (never a hardcoded copy — that is the
     map `#2729` exists to remove). ``{}`` when the pack machinery is unavailable:
     the same degradation ``_expand`` accepts, since a validator that raised here
     would be swallowed by ``run_domain_graph_validators`` and read as CLEAN.
+
+    Keyed on EVERY spelling the write gate admits for the kind — the namespaced
+    ``portfolio:mandate`` AND the bare ``mandate`` — because the gate admits both
+    (``extractor_v2._object_kind_forms`` lowercases every form) and the
+    projection stores ``objectKind`` verbatim. Keyed on the namespaced spelling
+    alone, the rule is BLIND to a bare-spelled Object the gate produced: an
+    out-of-vocabulary status on it is never reported, i.e. a false CLEAN. The
+    spellings come from the canonical seam
+    (``StatusFoldIndex.kind_forms_for`` — the same map the declared fold uses,
+    #2729) instead of being re-derived here.
     """
     try:
         from .domain_loader import _get_registry
@@ -379,11 +389,23 @@ def _portfolio_declared_statuses() -> dict[str, list[str]]:
         return {}
     if pack is None:
         return {}
-    out: dict[str, list[str]] = {}
+    try:
+        fold_index = reg.status_fold_index
+    except Exception:  # advisory surface, see docstring — never raise into the swallow
+        fold_index = None
+    out: dict[str, frozenset[str]] = {}
     for kind, spec in (pack.kind_defs or {}).items():
         statuses = spec.get("statuses") if isinstance(spec, dict) else None
-        if isinstance(statuses, list) and statuses:
-            out[kind] = [s for s in statuses if isinstance(s, str)]
+        if not (isinstance(statuses, list) and statuses):
+            continue
+        namespaced = f"{_PORTFOLIO_DOMAIN}:{kind}"
+        if fold_index is not None:
+            forms = fold_index.kind_forms_for(namespaced)
+        else:  # registry without a fold index — the same two admitted forms
+            forms = [namespaced.lower(), str(kind).lower()]
+        allowed = frozenset(s for s in statuses if isinstance(s, str))
+        for form in forms:
+            out[str(form).lower()] = allowed
     return out
 
 
@@ -402,7 +424,9 @@ def validate_portfolio_shape(graph) -> list[dict]:
          declared ``statuses``. A declared-statuses kind OWNS its state (the
          connector fold no longer applies to it), so an out-of-vocabulary status
          is a state nothing declared — and every "what is the current position?"
-         read misses it.
+         read misses it. The rule reads the BARE kind spelling too (the write
+         gate admits `mandate` as well as `portfolio:mandate`), because an
+         address the gate accepts but the rule cannot see is a false CLEAN.
       2. ``orphaned_valuation_mark`` — a `portfolio:valuationMark` Event not
          attached to a POSITION (a `venture:investment`), by the declared
          relation (`marks`, an operator edge) or by the structural
@@ -433,17 +457,20 @@ def validate_portfolio_shape(graph) -> list[dict]:
 
     declared = _portfolio_declared_statuses()
     if declared:
-        kinds = [f"{_PORTFOLIO_DOMAIN}:{k}" for k in declared]
-        allowed = {f"{_PORTFOLIO_DOMAIN}:{k}": set(v) for k, v in declared.items()}
+        # BOTH sides case-folded. The vocabulary keys are the write gate's
+        # lowercased forms, while `objectKind` is stored VERBATIM
+        # (`portfolio:allocationTarget` keeps its capital) — a case-sensitive
+        # `IN` over lowercased forms would miss the namespaced spelling
+        # entirely, which is the wider half of the same blindness.
         rows = graph.g.query(
-            "MATCH (o:Object) WHERE o.objectKind IN $kinds "
+            "MATCH (o:Object) WHERE toLower(o.objectKind) IN $kinds "
             "AND o.status IS NOT NULL "
             "RETURN o.id, o.objectKind, o.name, o.status",
-            params={"kinds": kinds},
+            params={"kinds": sorted(declared)},
         ).result_set
         exempt = OBJECT_TERMINAL_STATUSES | _OBJECT_UNSET_STATUSES
         for node_id, object_kind, name, status in rows:
-            valid = allowed.get(object_kind)
+            valid = declared.get((object_kind or "").lower())
             if not valid or status in valid or status in exempt:
                 continue
             violations.append({
