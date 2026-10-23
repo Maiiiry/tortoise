@@ -143,24 +143,24 @@ claims below are STALE, which is what the capstone run is built on:
    runner is now this probe rather than nothing.
 3. **⚠️ CORRECTED — a single entry point CAN drive all eight steps.** The body asks this
    as an open question. It resolves YES: `TortoiseSDK.capture_session` →
-   `sdk._extract_session_v2` (`sdk.py:11397`; called at `:10434`) →
-   `extractor_v2.extract_session_v2` (`extractor_v2.py:7767`), which calls, in one pass
-   (line numbers re-derived at `13ad17c8c`, the merge-up of `origin/main` whose
+   `sdk._extract_session_v2` (`sdk.py:11472`; called at `:10509`) →
+   `extractor_v2.extract_session_v2` (`extractor_v2.py:7804`), which calls, in one pass
+   (line numbers re-derived at the merge-up of `origin/main` `ce581e9c5`, whose
    `sdk.py`/`extractor_v2.py` commits moved the def, its call site and every step below
-   under the previous cites — +317 lines for the `sdk.py` pair, +36 for the extractor def
-   and +39 for every call site below; the symbol is authoritative and the line is a
+   under the previous cites — +75 lines for the `sdk.py` pair, +37 for the extractor def
+   and +37 for every call site below; the symbol is authoritative and the line is a
    convenience, which is why `tests/test_7949_capstone_verdict_check.py` re-resolves them
    against the tree on every run):
 
    | step | call site | witness the probe reads | on the receipt? |
    |---|---|---|---|
-   | S0 READ | `_edus_from_conversation` `:7878` | `stats["edus"]`, `stats["chunks"]` | ✅ |
-   | S1 NARRATE | `run_s1` `:7911` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
-   | S2.1 EXTRACT | `run_s2` `:7935` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
-   | S2.2 VET | `_run_vet_pass` `:7964` | `result["vet"]` | ❌ **#9116** |
-   | S2.3 CLASSIFY | `_apply_classify_kinds` `:7980` | `result["classify_later"]` | ❌ **#9116** |
-   | S3 RESOLVE | `search_graph` `:7996` | `result["search"]` | ❌ **#9116** |
-   | S5 CONNECT | `execute_embed` `:8216` (+ `run_s4` `:8017` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
+   | S0 READ | `_edus_from_conversation` `:7915` | `stats["edus"]`, `stats["chunks"]` | ✅ |
+   | S1 NARRATE | `run_s1` `:7948` | `stats["llm"]["by_stage"]["s1"]`, `story_arc` | ✅ (`story_arc` is off-receipt; `by_stage` carries it) |
+   | S2.1 EXTRACT | `run_s2` `:7972` | `by_stage["s2"]`, item counts | ✅ (`embed_list` is off-receipt; `by_stage` carries it) |
+   | S2.2 VET | `_run_vet_pass` `:8001` | `result["vet"]` | ❌ **#9116** |
+   | S2.3 CLASSIFY | `_apply_classify_kinds` `:8017` | `result["classify_later"]` | ❌ **#9116** |
+   | S3 RESOLVE | `search_graph` `:8033` | `result["search"]` | ❌ **#9116** |
+   | S5 CONNECT | `execute_embed` `:8253` (+ `run_s4` `:8054` gap filler) | `stats["s4_merge"]` | ✅ (gap-filler counters — see the labelling note below) |
    | S6 COMMIT | `execute_embed` payload | `result["payload"]` | ❌ **#9116** |
 
    So the capstone drives the **real entry point**, which is what the epic's phrase *"the

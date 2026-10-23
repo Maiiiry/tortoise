@@ -654,6 +654,34 @@ def _pins_mapping(pins: dict, key: str) -> dict:
     return _mapping(pins, key, "pins")
 
 
+def _measured_locations(record: dict) -> list[str]:
+    """Every place the machine record carries a MEASUREMENT, as human-readable labels.
+
+    WHY IT WALKS THE WHOLE RECORD (#9089 review P1): the exemption asks "did this log produce a
+    number AT ALL", and a number is not confined to ``rows``. The E4 receipt is written to
+    ``run.e4_receipt`` on the completed path, so a REFUSED run never carries one — a log that
+    carries both a REFUSED status and receipt numbers is claiming a measurement its own run says
+    it never took, and reading only ``rows`` exempted exactly that document. A hand-editable
+    artifact can put a number in any container, so the predicate asks the document instead of the
+    one field it happens to know about.
+    """
+    found: list[str] = []
+    stack: list[tuple[str, object]] = [("record", record)]
+    while stack:
+        where, node = stack.pop()
+        if isinstance(node, dict):
+            label = str(node.get("criterion") or where)
+            for key, item in node.items():
+                if key in ("numerator", "denominator") and item is not None:
+                    found.append(label)
+                else:
+                    stack.append((f"{where}.{key}", item))
+        elif isinstance(node, list):
+            for index, item in enumerate(node):
+                stack.append((f"{where}[{index}]", item))
+    return found
+
+
 def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
     """Does the LOG ITSELF prove it produced NO measurement? Returns (ok, reason).
 
@@ -664,9 +692,20 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
       * no row carries a ``numerator`` or a ``denominator`` (a measurement is *absent*, not
         merely unverdicted);
       * ``run.status`` is not ``COMPLETED`` — the run did not finish, so it did not measure;
-      * ``prereg.status`` is not ``PRESENT`` — the log states that NO pre-registration existed at
+      * ``prereg.status`` is ``ABSENT`` — the log states that NO pre-registration existed at
         its head, which is the only condition under which "scored before the thresholds" is not
         even a possible history.
+
+    ⛔ THE VOCABULARY IS THE PRODUCER'S, NOT AN INVENTED ONE (#9089 review P1). This arm used to
+    test ``prereg.status == "PRESENT"`` and to read numbers out of ``rows`` only. Neither value nor
+    container is what the probe writes: ``capstone_run.py::refuse`` records ``ABSENT`` (G0 looked
+    and found none), ``OK`` (G0 read the frozen registration) or ``UNREAD`` (the run stopped
+    before G0), and the E4 receipt lives in ``run.e4_receipt``. So the old arm was INERT — it could
+    never fire on a log the probe produced — and a log declaring ``OK`` (a registration WAS read)
+    was exempted from the ordering check that exists precisely to bind such a log to thresholds
+    written BEFORE it. Both halves are now fail-closed: only ``ABSENT`` exempts (any other value,
+    known or not, refuses), and the measurement test walks the WHOLE machine record rather than
+    the one container the predicate happens to know.
 
     ⛔ WHY THIS IS NOT A PINNED EXEMPTION (#9089). `pre_existing_unscored_logs` grandfathers a
     FILE and therefore has to prove, forever, that the file was never edited into a scored one.
@@ -721,13 +760,7 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
     rows = record.get("rows")
     if not isinstance(rows, list) or not rows:
         return False, "its machine record carries no rows"
-    measured = [
-        str(row.get("criterion") if isinstance(row, dict) else row)
-        for row in rows
-        if not isinstance(row, dict)
-        or row.get("numerator") is not None
-        or row.get("denominator") is not None
-    ]
+    measured = sorted(set(_measured_locations(record)))
     if measured:
         return False, (
             f"it carries a measurement for {', '.join(measured)} — a number in the log is exactly "
@@ -743,10 +776,14 @@ def _log_declares_no_measurement(log: Path) -> tuple[bool, str]:
     prereg_status = str(prereg.get("status") or "")
     if not prereg_status:
         return False, "its machine record declares no prereg.status"
-    if prereg_status == "PRESENT":
+    if prereg_status != "ABSENT":
         return False, (
-            "it declares prereg.status=PRESENT — it WAS measured against a registration, so the "
-            "ordering applies to it"
+            f"it declares prereg.status={prereg_status!r}, which does not say that NO "
+            "pre-registration existed at its head — the probe writes ABSENT for that fact, OK "
+            "when G0 read a registration and UNREAD when the run stopped before G0. Only ABSENT "
+            "rules out the history this rule protects (a number scored against thresholds "
+            "written afterwards); every other value, including one this predicate has never "
+            "seen, is a refusal."
         )
     return True, ""
 

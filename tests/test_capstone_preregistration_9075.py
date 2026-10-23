@@ -2230,16 +2230,21 @@ def test_the_ci_pin_still_catches_a_shallow_checkout():
 
 
 def _capstone_body(*, run_status="REFUSED", prereg_status="ABSENT",
-                   numerator=None, denominator=None, schema=None, blocks=1) -> str:
+                   numerator=None, denominator=None, schema=None, blocks=1,
+                   receipt=None) -> str:
     """A capstone log whose machine record is the only thing the exemption may read."""
     from tools import capstone_verdict_check as cvc
 
+    run = {"status": run_status, "steps_observed": [], "steps_required": ["S0"]}
+    if receipt is not None:
+        # `run.e4_receipt` is where the probe writes the E4 number on the COMPLETED path.
+        run["e4_receipt"] = receipt
     record = {
         # The REAL schema, imported: the exemption pins it, so a fixture with an invented one would
         # test a shape the gate refuses (#9089 review P2).
         "schema": schema if schema is not None else cvc.SCHEMA,
         "prereg": {"status": prereg_status, "sha": "0" * 40},
-        "run": {"status": run_status, "steps_observed": [], "steps_required": ["S0"]},
+        "run": run,
         "rows": [{"criterion": "E1", "verdict": "BLOCKED", "numerator": numerator,
                   "denominator": denominator, "blocked_by": "#9075"}],
     }
@@ -2267,13 +2272,22 @@ def test_a_log_that_proves_it_measured_nothing_needs_no_ordering(tmp_path, monke
 @pytest.mark.parametrize("overrides", [
     {"numerator": 0, "denominator": 5},
     {"run_status": "COMPLETED"},
-    {"prereg_status": "PRESENT"},
+    # #9089 review P1: this arm used to test `prereg.status="PRESENT"` — a value the
+    # PRODUCER never writes. `capstone_run.py::refuse` writes ABSENT / OK / UNREAD, so the
+    # old pin exercised a shape no real log can carry and the arm it guarded was inert.
+    # The producer's own values are the ones that must red.
+    {"prereg_status": "OK"},
+    {"prereg_status": "UNREAD"},
+    # #9089 review P1: a number is not confined to `rows`. The old predicate read only that
+    # container, so a REFUSED log carrying the E4 receipt numbers was exempted while claiming a
+    # measurement its own run status says it never took.
+    {"receipt": {"numerator": 14, "denominator": 15}},
 ])
 def test_the_content_arm_stops_covering_the_log_the_moment_it_could_score(
         tmp_path, monkeypatch, overrides):
     """Self-healing, and each of the three conditions is load-bearing on its own.
 
-    A row that gains a number, a run that COMPLETED, or a registration that was PRESENT at the
+    A row that gains a number, a run that COMPLETED, or a registration that was READ at the
     log's head all mean the log could have been scored against thresholds written after it — so
     the exemption must stop applying with no second edit anywhere.
     """

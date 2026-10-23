@@ -16,14 +16,14 @@ the corrected reading:
 1. **A single entry point DOES exist.** The body says *"whether any single
    entry point … can drive all eight in one pass"* is an open question. It can:
    ``TortoiseSDK.capture_session`` → ``sdk._extract_session_v2``
-   (``sdk.py:11397``, called at ``:10434``) →
-   ``extractor_v2.extract_session_v2`` (``extractor_v2.py:7767``) calls
-   ``_edus_from_conversation`` (S0, ``:7878``), ``run_s1`` (S1, ``:7911``),
-   ``run_s2`` (S2.1, ``:7935``), ``_run_vet_pass`` (S2.2, ``:7964``),
+   (``sdk.py:11472``, called at ``:10509``) →
+   ``extractor_v2.extract_session_v2`` (``extractor_v2.py:7804``) calls
+   ``_edus_from_conversation`` (S0, ``:7915``), ``run_s1`` (S1, ``:7948``),
+   ``run_s2`` (S2.1, ``:7972``), ``_run_vet_pass`` (S2.2, ``:8001``),
    ``kind_classifier.classify_items``/``_apply_classify_kinds`` (S2.3,
-   ``:7980``), ``search_graph`` (S3, ``:7996``), ``run_s4`` (the gap filler,
-   ``:8017``), and ``execute_embed`` (S5+S6, ``:8216``). Line numbers re-derived
-   at ``13ad17c8c`` — the merge-up of ``origin/main``, which moved ``sdk.py``
+   ``:8017``), ``search_graph`` (S3, ``:8033``), ``run_s4`` (the gap filler,
+   ``:8054``), and ``execute_embed`` (S5+S6, ``:8253``). Line numbers re-derived
+   at the merge-up of ``origin/main`` ``ce581e9c5``, which moved ``sdk.py``
    under the cites again while this branch was open (the merge before this one
    numbers were right at their own head): the symbol is authoritative and the
    line is a convenience, which is how the pin's earlier numbers went stale
