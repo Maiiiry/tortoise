@@ -70,8 +70,8 @@
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['spec']; Event: ['planRevision']",
-      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
+      "finding": "graph-wide: kinds the product's vocabulary does not declare, beyond the gold items \u2014 Source: ['spec']; Event: ['planRevision']",
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary, the SDK's registered kinds, or a loaded pack"
     }
   ],
   "relations": [

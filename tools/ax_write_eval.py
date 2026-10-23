@@ -97,21 +97,28 @@ KIND_PROPS = tuple(KIND_PROP[label] for label in LAYERS)
 
 # ── the declared vocabularies ─────────────────────────────────────────────
 #
-# A kind is judged against what the product ACTUALLY declares, at three levels,
-# and the three are NOT the same finding:
+# A kind is judged against what the product ACTUALLY declares, at four levels,
+# and the four are NOT the same finding:
 #
 #   CORE        — declared by an ONTOLOGY §5 core set (`CANONICAL_*`, imported).
 #   PACK        — declared by a loaded expansion pack (bare or namespaced —
 #                 `disbursement` and `venture:disbursement` are one declaration,
 #                 and the packs are the product's own extension point).
-#   UNDECLARED  — nothing declares it, so nothing routes to, finds or classifies
-#                 it. This is the failure #9675 names ("a kind nothing declares
-#                 is a kind nothing routes to").
+#   LEGACY      — declared by the product's own registry: the SDK's module-level
+#                 `register_kind` calls (`option`, `evidence`, `criterion`, …)
+#                 and the legacy flat vocabulary behind `known_kinds(bucket)`.
+#                 The hosted write validator accepts these, so calling them
+#                 inventions is a false failure (#9695 review P1).
+#   UNDECLARED  — the product's own predicate does not know it on this layer, so
+#                 nothing routes to, finds or classifies it. This is the failure
+#                 #9675 names ("a kind nothing declares is a kind nothing routes
+#                 to").
 #
 # Re-spelling the core sets here would let the instrument drift from the product,
-# and IGNORING the packs would manufacture failures out of writes that followed a
-# declared vocabulary — so the core sets are imported and the pack registry is
-# loaded, and the active pack set is recorded beside every verdict.
+# and IGNORING the packs (or the registry) would manufacture failures out of
+# writes that followed a declared vocabulary — so the core sets are imported, the
+# pack registry is loaded, and the product's own `kind_is_known` predicate is
+# consulted, with the active pack set recorded beside every verdict.
 
 _PACK_CACHE: dict | None = None
 
@@ -119,10 +126,13 @@ _PACK_CACHE: dict | None = None
 def _pack_vocab() -> dict[str, set[str]]:
     """Every kind the LOADED packs declare, per layer, namespaced and bare.
 
-    Cached: the registry parses six manifests and the eval scores ten graphs.
-    A registry that cannot load is NOT swallowed — an empty pack vocabulary would
-    report every pack-following write as undeclared, which is the false failure
-    this function exists to prevent.
+    Cached: the registry parses one manifest per pack in `packs/` — the count
+    follows the tree and is deliberately NOT restated here, because a new pack
+    would silently invalidate the number (a stale flag in the instrument's own
+    docstring is the failure class this eval exists to remove) — and the eval
+    scores ten graphs. A registry that cannot load is NOT swallowed — an empty
+    pack vocabulary would report every pack-following write as undeclared, which
+    is the false failure this function exists to prevent.
     """
     global _PACK_CACHE
     if _PACK_CACHE is not None:
@@ -230,11 +240,20 @@ def _kind_matches(got: str, allowed: list[str]) -> bool:
 
 
 def kind_status(layer: str, kind: str) -> str:
-    """``CORE`` / ``PACK`` / ``UNDECLARED`` for one written kind.
+    """``CORE`` / ``PACK`` / ``LEGACY`` / ``UNDECLARED`` for one written kind.
 
-    The three-way answer is the point: "wrong kind" (declared, but not the kind
+    The four-way answer is the point: "wrong kind" (declared, but not the kind
     this item is) and "kind nothing declares" are different lessons for the
     document, and collapsing them teaches neither.
+
+    ``LEGACY`` is the fourth source and it is NOT a corner case: the product
+    declares kinds through ``domain_loader.register_kind`` (``option`` /
+    ``evidence`` / ``criterion``, registered by ``tortoise.sdk`` itself) and
+    through the legacy flat registry, and ``known_kinds(bucket)`` — the
+    predicate the hosted write validator uses — accepts both. Reading only the
+    §5 canonical set made the decide flow's OWN kinds read as inventions and put
+    them in the document's outline as failures (#9695 review P1, measured on
+    `decision_request`: `option`, `criterion` ×2).
     """
     if not kind:
         return "NONE"
@@ -250,7 +269,35 @@ def kind_status(layer: str, kind: str) -> str:
 
         if is_subject_kind(raw):
             return "CORE"
+    if _registry_declares(layer, raw):
+        return "LEGACY"
     return "UNDECLARED"
+
+
+# The node buckets `domain_loader.known_kinds()` answers for. `subjectKind` has
+# no pack category and `sourceKind` is not a bucket at all, so those two layers
+# keep the vocabularies `_vocab()` imports.
+_REGISTRY_BUCKETS = {"Point": "pointKind", "Object": "objectKind", "Event": "eventKind"}
+
+
+def _registry_declares(layer: str, kind: str) -> bool:
+    """Does the PRODUCT's own vocabulary know this kind on this layer?
+
+    The single predicate behind the hosted write validator
+    (``domain_loader.kind_is_known(kind, bucket)``), not a second list spelled
+    here — a per-layer whitelist of the canonical sets is what let two declared
+    kinds through as inventions (#9695 review P1). ``tortoise.sdk`` is imported
+    before the question is asked because its module-level ``register_kind`` calls
+    ARE part of the declaration; without them the answer would depend on whether
+    some other code path had imported the SDK first.
+    """
+    bucket = _REGISTRY_BUCKETS.get(layer)
+    if bucket is None:
+        return False
+    import tortoise.sdk  # noqa: F401 — importing it is what registers its kinds
+    from tortoise.domain_loader import kind_is_known
+
+    return kind_is_known(kind, bucket)
 
 
 _STOP = {
@@ -411,10 +458,23 @@ def _stem(word: str) -> str:
     failure on a write that was right — measured on three committed runs. A real
     stemmer is a dependency this eval does not need; the failure mode it removes
     is a plural/tense mismatch, and that is what this covers.
+
+    The final `-e` drop is what makes the `-e` noun class work: `es` is stripped
+    before a word's own trailing `e` is considered, so `values` stemmed to
+    `valu` while `value` stayed `value` and the two shared NO token — a correct
+    write could then fall under the 0.5 acceptance floor and be reported as a P0
+    ABSENT item, the harshest verdict the instrument emits, for a plural/tense
+    difference (`value`, `estimate`, `deadline`, `slide`, `principle`, …).
+    Canonicalising BOTH sides to the `e`-dropped form fixes the class without
+    inflating either side's token count — which an "add the other form too" fix
+    would do, silently moving every partial-overlap ratio (#9695 review P1).
     """
     for suffix in _SUFFIXES:
         if len(word) > len(suffix) + 3 and word.endswith(suffix):
-            return word[: -len(suffix)]
+            word = word[: -len(suffix)]
+            break
+    if len(word) > 3 and word.endswith("e"):
+        word = word[:-1]
     return word
 
 
@@ -426,6 +486,9 @@ def _tokens(text: str) -> set[str]:
     splits exactly as ``sub 5 minute`` does. Leaving punctuation attached
     silently makes an expectation whose word ends a sentence — or is hyphenated
     in the node — score as a miss (both were measured on committed runs).
+
+    Every stem that ENDS in ``e`` is canonicalised to its ``e``-dropped form by
+    `_stem`, so a plural and its singular meet (`value`/`values` → `valu`).
     """
     words = re.findall(r"[a-z0-9$%]+", text.lower())
     return {_stem(w) for w in words if len(w) >= 2 and w not in _STOP}
@@ -471,7 +534,23 @@ def _match(
             hit = want & have
             if hit:
                 scored.append((0.5 * len(hit) / len(want), node))
-    scored.sort(key=lambda pair: -pair[0])
+    # A TIE must not be resolved by list order. The record query has no ORDER BY
+    # and a live run's row order is not something the instrument controls, so an
+    # `_match` that sorted on the score alone let two equally-scored nodes swap
+    # the winner — and the winner picks the layer the verdict is computed from.
+    # `_expected_layer_twin` already breaks its ties explicitly; this is the same
+    # key: score, then the expected layer, then not-superseded, then the tighter
+    # text, then the text itself so even a full tie is deterministic (#9695
+    # review P2).
+    scored.sort(
+        key=lambda pair: (
+            -pair[0],
+            pair[1]["layer"].lower() != want_layer.lower(),
+            pair[1]["status"].lower() == "superseded",
+            len(pair[1]["text"]),
+            pair[1]["text"],
+        )
+    )
     if not scored or scored[0][0] < 0.5:
         return None, scored[0][0] if scored else 0.0, []
     # SAME-LAYER PREFERENCE — WITH A FLOOR. Layer confusion means the item is
@@ -494,21 +573,52 @@ def _match(
     if same and (scored[0][0] < 0.6 or same[0][0] >= scored[0][0] - 0.2):
         scored = same
     best, best_score = scored[0][1], scored[0][0]
-    # Duplicates: another node carrying the SAME identity (one name is the
-    # other, or one is a prefix of the other — "Ltd"/"Inc"/"Plc" spellings).
-    bnorm = _norm(best["text"])
+    # Duplicates: another node carrying the SAME identity. This is `score()`'s
+    # own rule (`_same_identity`, below), not a looser second definition: a bare
+    # prefix test made "Acme" and "Acme Capital" one identity, so a graph that
+    # minted nothing twice could read as a duplicate-identity P1 (the realistic
+    # portfolio/company case). One instrument, one meaning (#9695 review P2).
     dups = [
         node
         for _, node in scored[1:]
         if node is not best
         and node["layer"] == best["layer"]
-        and (
-            _norm(node["text"]) == bnorm
-            or _norm(node["text"]).startswith(bnorm)
-            or bnorm.startswith(_norm(node["text"]))
-        )
+        and _same_identity(node["text"], best["text"])
     ]
     return best, best_score, dups
+
+
+# Legal-form suffixes that do NOT make a second entity: "Northwind Logistics"
+# and "Northwind Logistics Ltd" are one company.
+_LEGAL_FORM_SUFFIXES = frozenset(
+    {
+        "ltd", "limited", "inc", "incorporated", "plc", "llc", "gmbh",
+        "corp", "corporation", "co", "sa", "bv", "ag",
+    }
+)
+
+
+def _same_identity(text: str, target: str) -> bool:
+    """Is ``text`` the SAME entity name as ``target``?
+
+    Same normalised name, or one name plus a legal-form suffix — and a name that
+    merely STARTS with the other ("Northwind Logistics confirmed …", "Acme" vs
+    "Acme Capital") is a different entity or a claim ABOUT it, never a duplicate.
+    The word boundary is what keeps the two apart, so it is shared by the
+    duplicate-identity rule and `_match` rather than spelled twice.
+    """
+    norm, target_norm = _norm(text), _norm(target)
+    if not norm or not target_norm:
+        return False
+    if norm == target_norm:
+        return True
+    for form in (target_norm, norm):
+        other = norm if form == target_norm else target_norm
+        if other.startswith(form + " "):
+            residual = set(other[len(form) + 1 :].split()) - _LEGAL_FORM_SUFFIXES
+            if not residual:
+                return True
+    return False
 
 
 def _expected_layer_twin(item: str, nodes: list[dict], layer: str) -> dict | None:
@@ -679,11 +789,27 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
         # no allowed kind, so the checks below would fire a second P1 whose text
         # ("declared, but not the kind this item is" / "written ''") is false in its
         # own terms — nothing was written on this layer's property at all. The
-        # census and `unkinded` already skip such a node for this exact reason
-        # (#9695 review P2).
+        # census skips such a node for this exact reason (#9695 review P2).
         cross_axis_charged = bool(foreign) and not got_kind
         if cross_axis_charged:
             verdict = "KIND-CROSS-AXIS"
+        elif not got_kind and allowed:
+            # The other half of the same invariant: an EMPTY own property with NO
+            # foreign kind. It used to fall into the branch below and be told it
+            # had written a kind "declared, but not the kind this item is" — false
+            # in its own terms, since nothing was written — and `unkinded` then
+            # charged the same node a second time (#9695 review P1/P2). One
+            # finding, with honest text, and `unkinded` skips gold-named nodes.
+            add(
+                "P1",
+                item,
+                f"no kind written on {own_prop} for {best['layer']} "
+                f"{best['text'][:60]!r} — the item expects one of {exp['kind']}, "
+                f"so nothing routes to, finds or classifies it as a "
+                f"{best['layer']}",
+                f"write the kind to {own_prop} (§4 {best['layer']} / §5)",
+            )
+            verdict = "KIND-MISSING"
         elif status == "UNDECLARED":
             findings.append(
                 {
@@ -693,9 +819,9 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
                     "kind": got_kind,
                     "finding": (
                         f"UNDECLARED kind {got_kind!r} on a {best['layer']} "
-                        f"({best['text'][:50]!r}) — neither a core §5 kind nor one "
-                        f"any loaded pack declares; nothing routes to, finds or "
-                        f"classifies it"
+                        f"({best['text'][:50]!r}) — not a core §5 kind, not one the "
+                        f"SDK registers, and not one any loaded pack declares; "
+                        f"nothing routes to, finds or classifies it"
                     ),
                     "fix": (
                         f"use a declared {best['layer']} kind (§5 core, or a pack "
@@ -828,34 +954,19 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
     # Duplicate identity — the gold's own measurable for the duplicate input.
     dup_rule = entry.get("duplicate_expected")
     if dup_rule:
-        target = _norm(dup_rule["of"])
         # A second node for one identity means the NAME is duplicated — a
         # sentence that merely STARTS with the name ("Northwind Logistics
         # confirmed …") is a claim about it, not a second entity. So: same
         # normalised name, or the name plus a legal-form suffix ("Ltd", "Inc"),
         # and only on an entity layer. Without those two constraints the check
-        # reports every claim mentioning the company as a duplicate.
-        suffixes = {
-            "ltd", "limited", "inc", "incorporated", "plc", "llc", "gmbh",
-            "corp", "corporation", "co", "sa", "bv", "ag",
-        }
-
-        def _same_identity(text: str) -> bool:
-            norm = _norm(text)
-            if not norm:
-                return False
-            if norm == target:
-                return True
-            for form in (target, norm):
-                other = norm if form == target else target
-                if other.startswith(form + " "):
-                    residual = set(other[len(form) + 1 :].split()) - suffixes
-                    if not residual:
-                        return True
-            return False
-
+        # reports every claim mentioning the company as a duplicate. The
+        # predicate is module level and shared with `_match`, so the two halves
+        # of the instrument cannot disagree about what "one identity" means.
         same_identity = [
-            n for n in nodes if n["layer"] in ("Object", "Subject") and _same_identity(n["text"])
+            n
+            for n in nodes
+            if n["layer"] in ("Object", "Subject")
+            and _same_identity(n["text"], dup_rule["of"])
         ]
         if len(same_identity) > dup_rule["max_nodes"]:
             add(
@@ -894,7 +1005,11 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             # kind" honest — a single coalesce used to hide it (#9695 review P2).
             carried = ", ".join(f"{p}={v!r}" for p, v in sorted(foreign.items()))
             cross_axis.append(f"{node['layer']} {node['text'][:30]!r} carries {carried}")
-            continue
+            # …and it is NOT a reason to stop looking at the node's OWN kind: a
+            # node can carry an undeclared own kind AND a foreign one, and the
+            # item-level rule charges both (the own kind on its own property is a
+            # second, separate write). The `continue` that used to sit here made
+            # the census the one place that rule was inverted (#9695 review P2).
         if kind_status(node["layer"], node["kind"]) != "UNDECLARED":
             continue
         census.setdefault(node["layer"], []).append(node["kind"] or "(none)")
@@ -911,20 +1026,35 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
         add(
             "P1",
             "(kinds)",
-            "graph-wide: kinds no vocabulary declares, beyond the gold items — "
-            + " | ".join(parts),
+            "graph-wide: kinds the product's vocabulary does not declare, beyond "
+            "the gold items — " + " | ".join(parts),
             "every node needs a kind on ITS OWN layer's property, from the core "
-            "§5 vocabulary or a loaded pack",
+            "§5 vocabulary, the SDK's registered kinds, or a loaded pack",
         )
 
     # Kind completeness — a node with no kind on its own layer routes nowhere.
     # A node carrying a kind on the WRONG property is reported by the census
     # above (it does carry one); counting it here too would charge one write
     # twice.
+    #
+    # A node whose missing kind was ALREADY charged at item level (verdict
+    # KIND-MISSING) is skipped for the same reason: `score()` billed that one
+    # write once, with text that says what happened, and counting it again here
+    # reported the same node twice — the double-charge class this PR fixed for
+    # the cross-axis case, still open for the plain empty-kind case (#9695
+    # review P1/P2). The skip is keyed on the CHARGE, not on "the gold named
+    # it": a gold-named node whose gold declares no kind at all was never
+    # charged above, so this rule must still report it rather than fail open.
+    charged_missing = {
+        row["node"] for row in item_rows if row.get("verdict") == "KIND-MISSING"
+    }
     unkinded = [
         n
         for n in nodes
-        if not n["kind"] and not n["is_operator"] and not (n.get("foreign_kinds"))
+        if not n["kind"]
+        and not n["is_operator"]
+        and not n.get("foreign_kinds")
+        and n["text"][:80] not in charged_missing
     ]
     if unkinded:
         add(

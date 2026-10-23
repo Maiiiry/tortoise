@@ -60,7 +60,7 @@
       "item": "Retrieval-Augmented Generation",
       "layer": "Source",
       "kind": "research",
-      "finding": "UNDECLARED kind 'research' on a Source ('Retrieval-Augmented Generation for Knowledge-Inten') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'research' on a Source ('Retrieval-Augmented Generation for Knowledge-Inten') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Source kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
@@ -68,7 +68,7 @@
       "item": "Lewis",
       "layer": "Subject",
       "kind": "authorgroup",
-      "finding": "UNDECLARED kind 'authorgroup' on a Subject ('Lewis et al. (2020)') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'authorgroup' on a Subject ('Lewis et al. (2020)') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {

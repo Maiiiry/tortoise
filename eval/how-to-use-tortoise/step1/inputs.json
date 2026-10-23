@@ -303,7 +303,7 @@
         "Object-vs-Point",
         "identity-vs-belief"
       ],
-      "setup": "The graph already contains Object O1: 'Northwind Logistics' (objectKind organization).",
+      "setup": "The graph already contains Object O1: 'Northwind Logistics' (objectKind other) — exactly what eval/how-to-use-tortoise/step1/setup.py seeds, so a re-run rebuilt from this note has the before-graph the measured run had.",
       "text": "2026-10-04: Northwind Logistics (also written 'Northwind Logistics Ltd' in the signed SOW) confirmed they will renew in January. Their new CFO is Marta Reyes.",
       "expect": [
         {

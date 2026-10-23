@@ -170,7 +170,39 @@ def test_pack_declared_kind_is_not_an_undeclared_kind():
     assert axe.kind_status("Event", "disbursement") == "PACK"
     assert axe.kind_status("Object", "tranche") == "PACK"
     assert axe.kind_status("Point", "statement") == "CORE"
-    assert axe.kind_status("Point", "issue") == "UNDECLARED"
+    # `issue` is a LEGACY point spelling the product's own registry accepts (see
+    # the test below), so it is NOT the undeclared-kind example any more.
+    assert axe.kind_status("Point", "guesstimate") == "UNDECLARED"
+
+
+def test_the_products_own_registry_is_a_vocabulary_source():
+    """`option`/`criterion` are DECLARED — by `tortoise.sdk`'s own register_kind.
+
+    `_vocab()` imported only the §5 canonical sets, so the decide flow's kinds —
+    the ones `register_kind("option")` / `register_kind("criterion")` declare and
+    `domain_loader.known_kinds("pointKind")` (the hosted write validator) accepts
+    — read as UNDECLARED. The document then taught that a decision request's own
+    kinds were invented, and the census billed them as failures (#9695 review
+    P1, measured on `decision_request`: `option`, `criterion` ×2).
+
+    The answer comes from the product's predicate, never from a second list here.
+    """
+    from tortoise.domain_loader import known_kinds
+
+    for kind in ("option", "criterion"):
+        assert axe.kind_status("Point", kind) == "LEGACY", kind
+        assert known_kinds("pointKind") >= {kind}, kind
+    # …and the census must not bill them: one Point per declared kind, nothing else.
+    gold = _gold({"id": "x", "expect": []})
+    doc = _record(
+        nodes=[
+            _node("Point", "ship on 2026-11-01 or later", kind="option"),
+            _node("Point", "cost under 40k", kind="criterion"),
+        ]
+    )
+    result = axe.score(doc, gold, "x")
+    assert result["kind_census"] == {}
+    assert result["severity_counts"] == {"P0": 0, "P1": 0, "P2": 0}, result["findings"]
 
 
 def test_the_declared_subject_spelling_is_not_a_failure():
@@ -510,13 +542,13 @@ def test_the_graph_wide_census_reports_what_the_gold_never_names():
     doc = _record(
         nodes=[
             _node("Point", "churn was 3.2%", kind="statement"),
-            _node("Point", "dashboard double-counted an account", kind="incident"),
+            _node("Point", "dashboard double-counted an account", kind="guesstimate"),
         ]
     )
     result = axe.score(doc, gold, "x")
     census = [f for f in result["findings"] if f["finding"].startswith("graph-wide")]
     assert len(census) == 1
-    assert result["kind_census"] == {"Point": ["incident"]}
+    assert result["kind_census"] == {"Point": ["guesstimate"]}
     # the negative control: a kind already reported against a gold ITEM is not
     # counted a second time by the census
     gold2 = _gold(
@@ -573,6 +605,21 @@ def test_the_stemmer_is_what_keeps_tense_from_reading_as_absence():
     assert axe._tokens("renewal") == axe._tokens("renew")
     assert axe._tokens("joins") == axe._tokens("joined") == axe._tokens("join")
     assert axe._tokens("3 engineer-weeks") == {"engineer", "week"}
+    # The `-e` noun class: `es` strips before the word's own trailing `e`, so
+    # `values` stemmed to `valu` while `value` stayed `value` and the two shared
+    # no token at all — a fully-written item could then fall under the 0.5 floor
+    # and be reported P0 ABSENT (#9695 review P1).
+    for singular, plural in (
+        ("value", "values"),
+        ("estimate", "estimates"),
+        ("deadline", "deadlines"),
+        ("slide", "slides"),
+        ("principle", "principles"),
+    ):
+        assert axe._tokens(singular) == axe._tokens(plural), (singular, plural)
+    # …and it must not inflate either side's token COUNT, which would silently
+    # move every partial-overlap ratio in the report.
+    assert len(axe._tokens("estimate for the quarter")) == 2
     gold = _gold(
         {
             "id": "x",
@@ -586,6 +633,138 @@ def test_the_stemmer_is_what_keeps_tense_from_reading_as_absence():
     assert result["item_rows"][0]["verdict"] == "OK", (
         "a singular/plural difference must not read as an absent item"
     )
+
+
+def test_an_e_final_plural_is_not_an_absent_item():
+    """`estimates` vs `Estimate` used to mint the harshest verdict there is.
+
+    The item and the node below ARE the same fact; only the number differs. With
+    the `-e` stem split, the shared content word contributed zero overlap, the
+    match fell under the 0.5 acceptance floor, and `score()` emitted a P0 "no
+    node represents it" — a false absence on a correct write (#9695 review P1).
+    """
+    gold = _gold(
+        {"id": "x", "expect": [{"item": "estimates for the quarter", "layer": "point"}]}
+    )
+    doc = _record(
+        nodes=[_node("Point", "Estimate for the quarter is 3 engineer weeks", kind="statement")]
+    )
+    result = axe.score(doc, gold, "x")
+    assert result["item_rows"][0]["verdict"] == "OK", result["findings"]
+    assert result["severity_counts"] == {"P0": 0, "P1": 0, "P2": 0}
+
+
+def test_one_unkinded_gold_named_write_is_charged_once_with_honest_text():
+    """One act, one finding — and the finding must not describe the opposite act.
+
+    A gold item resolving to a node whose own kind property is EMPTY fell into
+    the "kind outside the frozen set" branch, whose text says "declared, but not
+    the kind this item is" — false in its own terms, since nothing was declared
+    or written — AND `unkinded` charged the same node a second time. The
+    cross-axis twin of this bug was fixed in round 6; this is the plain case
+    (#9695 review P1/P2).
+    """
+    gold = _gold(
+        {"id": "x", "expect": [{"item": "Dana", "layer": "subject", "kind": ["naturalPerson"]}]}
+    )
+    result = axe.score(_record(nodes=[_node("Subject", "Dana", kind="")]), gold, "x")
+    findings = [f for f in result["findings"] if f["item"] == "Dana"]
+    assert len(findings) == 1, [f["finding"] for f in findings]
+    assert "no kind written on subjectKind" in findings[0]["finding"]
+    assert "declared, but not the kind" not in findings[0]["finding"]
+    assert not any("carry no kind property" in f["finding"] for f in result["findings"]), (
+        "the same write was billed twice"
+    )
+    assert result["severity_counts"] == {"P0": 0, "P1": 1, "P2": 0}
+    assert result["item_rows"][0]["verdict"] == "KIND-MISSING"
+
+    # CONTROL: the graph-wide rule still sees an unkinded node the gold does NOT
+    # name — the skip is keyed on the charge, not on the gold naming the node.
+    control = axe.score(
+        _record(nodes=[_node("Subject", "Dana", kind=""), _node("Object", "Renewal", kind="")]),
+        gold,
+        "x",
+    )
+    assert any("carry no kind property" in f["finding"] for f in control["findings"]), (
+        control["findings"]
+    )
+
+
+def test_one_node_carrying_both_an_undeclared_and_a_foreign_kind_reports_both():
+    """The census must not let a foreign-axis kind hide the node's OWN kind.
+
+    Item level already charges both (the declared-kinds control in
+    `test_one_cross_axis_write_is_charged_once…`), but the census `continue`d on
+    `foreign_kinds`, so a node carrying `pointKind: guesstimate` AND
+    `subjectKind: person` reported only the cross-axis half — a false negative in
+    the measurement (#9695 review P2).
+    """
+    gold = _gold({"id": "x", "expect": []})
+    node = _node(
+        "Point", "the tier is being retired", kind="guesstimate",
+        foreign_kinds={"subjectKind": "person"},
+    )
+    result = axe.score(_record(nodes=[node]), gold, "x")
+    assert result["kind_census"] == {"Point": ["guesstimate"]}, result["kind_census"]
+    assert len(result["cross_axis_kinds"]) == 1
+    census = next(f for f in result["findings"] if f["finding"].startswith("graph-wide"))
+    assert "guesstimate" in census["finding"]
+    assert "subjectKind='person'" in census["finding"]
+
+
+def test_a_shared_name_prefix_is_not_one_identity():
+    """`Acme` and `Acme Capital` are two companies, not a duplicate-identity P1.
+
+    `_match` tested `startswith` on the normalised name, so any two entities
+    sharing a name prefix read as "duplicate nodes for one identity" — on a
+    portfolio/company input that is the ordinary case. `_same_identity` already
+    had the word boundary (a legal-form suffix is the only thing that may
+    differ); the two halves of one instrument now agree (#9695 review P2).
+    """
+    gold = _gold({"id": "x", "expect": [{"item": "acme", "layer": "subject"}]})
+    result = axe.score(
+        _record(nodes=[_node("Subject", "Acme Capital", kind="company"),
+                       _node("Subject", "Acme", kind="company")]),
+        gold,
+        "x",
+    )
+    assert not any("duplicate nodes for one identity" in f["finding"] for f in result["findings"]), (
+        result["findings"]
+    )
+
+    # CONTROL: the legal-form case IS one identity, and it must still be caught.
+    control = axe.score(
+        _record(nodes=[_node("Subject", "Northwind Logistics", kind="company"),
+                       _node("Subject", "Northwind Logistics Ltd", kind="company")]),
+        _gold({"id": "x", "expect": [{"item": "northwind logistics", "layer": "subject"}]}),
+        "x",
+    )
+    assert any("duplicate nodes for one identity" in f["finding"] for f in control["findings"]), (
+        control["findings"]
+    )
+
+
+def test_a_tie_between_two_candidates_is_resolved_by_the_same_key_either_way():
+    """A tie must not be decided by list order (the record query has no ORDER BY).
+
+    `_match` sorted on the score alone, so two equally-scored nodes swapped the
+    winner when a live run's row order changed — and the winner picks the layer
+    the verdict is computed from, which injects a verdict change with no
+    behaviour change behind it. Step 3's acceptance is exactly that per-input
+    delta (#9695 review P2).
+    """
+    gold = _gold({"id": "x", "expect": [{"item": "churn", "layer": "point", "kind": ["statement"]}]})
+    # Two same-layer candidates at the SAME containment score (one shared stem of
+    # a two-stem node either way), carrying different kinds — so whichever wins
+    # decides the verdict, and the two orders used to disagree.
+    first = _node("Point", "churn alpha", kind="guesstimate")
+    second = _node("Point", "churn beta", kind="statement")
+    forward = axe.score(_record(nodes=[first, second]), gold, "x")
+    backward = axe.score(_record(nodes=[second, first]), gold, "x")
+    assert forward["item_rows"][0]["verdict"] == backward["item_rows"][0]["verdict"], (
+        forward["item_rows"][0], backward["item_rows"][0]
+    )
+    assert forward["item_rows"][0]["verdict"] == "OK", forward["findings"]
 
 
 def test_the_gold_file_does_not_carry_boilerplate_operator_rules():
@@ -609,9 +788,12 @@ def test_every_committed_run_reproduces_from_its_own_graph():
     """The single gate that keeps the report honest.
 
     Re-scores each committed `graph.json` and demands the committed `score.json`
-    back, EXACTLY — which pins the matcher's thresholds (including the two-thirds
-    two-homes bar), the tie-breaks, the class rules, and the link between a
-    record's verdicts and its own findings list. Without it, a compensated pair of
+    back, field for field — which pins the matcher's thresholds (including the
+    two-thirds two-homes bar), the tie-breaks, the class rules, and the link
+    between a record's verdicts and its own findings list. The ONE excluded field
+    is `packs` (the vocabulary the run was scored under), asserted on its own
+    below so a real vocabulary-driven verdict change still reds while a pure
+    pack-list delta does not. Without this gate, a compensated pair of
     edits to two records leaves the totals intact while the report's per-input
     table contradicts them, and loosening the two-homes bar from two thirds to a
     third left all 25 tests green.
@@ -623,9 +805,23 @@ def test_every_committed_run_reproduces_from_its_own_graph():
         committed = json.loads(path.read_text())
         graph = json.loads((path.parent / "graph.json").read_text())
         recomputed = axe.score(graph, gold, path.parent.name)
-        assert recomputed == committed, (
+        # `packs` is the vocabulary the run was scored UNDER, recorded as
+        # provenance — a repo-global constant, not a verdict about the run. It is
+        # deliberately EXCLUDED from the equality: including it meant any PR that
+        # added a pack anywhere (a supported extension point, unrelated to this
+        # eval) reddened this `core` test on main and forced a rewrite of ten
+        # committed evidence files. That already happened once inside this PR
+        # (`origin/main` added the `portfolio` pack, #9694, and every verdict was
+        # byte-identical). The provenance is asserted separately, below.
+        assert {k: v for k, v in recomputed.items() if k != "packs"} == {
+            k: v for k, v in committed.items() if k != "packs"
+        }, (
             f"{path.parent.name}: re-scoring its graph.json does not reproduce the "
             f"committed verdicts — the report and the record have diverged"
+        )
+        assert committed["packs"], f"{path.parent.name}: the score record lost its vocabulary"
+        assert committed["packs"] == sorted(committed["packs"]), (
+            f"{path.parent.name}: the recorded pack set is not in its canonical order"
         )
         # A record's own severity counts must follow from its own findings.
         counted = {
@@ -683,6 +879,11 @@ def test_the_incremental_inputs_all_state_their_before_graph():
 
     `product_spec_object` depends on a pre-existing plan Object and was the one
     incremental input whose gold carried no `setup` note.
+
+    The note must also match the ONLY fixture that builds that graph: it said
+    `objectKind organization` while `setup.py` seeds `other`, so a lane that
+    rebuilt the before-graph from the gold would seed a different node than the
+    measured run had (#9695 review P2).
     """
     gold = json.loads(GOLD.read_text())
     seeded = [e["id"] for e in gold["inputs"] if e.get("setup")]
@@ -692,6 +893,15 @@ def test_the_incremental_inputs_all_state_their_before_graph():
         "contradicting_claim",
         "product_spec_object",
     ], f"incremental inputs must state their before-graph: {seeded}"
+    note = next(e["setup"] for e in gold["inputs"] if e["id"] == "duplicate_entity")
+    setup_src = (GOLD.parent / "setup.py").read_text()
+    seeded_kind = re.search(
+        r'create_object\("Northwind Logistics", objectKind="([\w:]+)"\)', setup_src
+    )
+    assert seeded_kind, "the duplicate_entity fixture no longer seeds that Object"
+    assert f"objectKind {seeded_kind.group(1)}" in note, (
+        f"the gold's before-state note disagrees with setup.py: {note!r}"
+    )
 
 
 def test_the_committed_gold_file_has_ten_inputs_with_pairwise_confusions():
@@ -746,10 +956,10 @@ def test_the_reported_totals_match_the_committed_records():
         totals["P0"] += record["severity_counts"]["P0"]
         totals["P1"] += record["severity_counts"]["P1"]
         with_p0 += 1 if record["severity_counts"]["P0"] else 0
-    assert totals == {"P0": 13, "P1": 32}, f"report claims 13/32, records say {totals}"
+    assert totals == {"P0": 13, "P1": 31}, f"report claims 13/31, records say {totals}"
     assert with_p0 == 6, f"report claims 6 of 10 inputs carry a P0, records say {with_p0}"
     doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
-    assert "13 P0 and 32 P1" in doc, "the evidence doc's headline drifted from the records"
+    assert "13 P0 and 31 P1" in doc, "the evidence doc's headline drifted from the records"
 
     # PER-INPUT pin. The totals and the class aggregates cannot see a COMPENSATED
     # pair of record edits (one input gaining a finding as another loses one), so
@@ -770,7 +980,7 @@ def test_the_reported_totals_match_the_committed_records():
         "portfolio_update": (2, 5),
         "meeting_transcript": (2, 7),
         "research_paper": (0, 4),
-        "decision_request": (3, 2),
+        "decision_request": (3, 1),
         "correction_existing_claim": (0, 1),
         "duplicate_entity": (0, 3),
         "regulatory_filing": (0, 2),
@@ -799,7 +1009,7 @@ def test_the_reported_totals_match_the_committed_records():
         )
     assert "6 of 10 inputs" in doc
     index = (REPO_ROOT / "docs" / "00_index.md").read_text()
-    assert "13 P0 / 32 P1" in index, "the docs index headline drifted from the records"
+    assert "13 P0 / 31 P1" in index, "the docs index headline drifted from the records"
 
 
 def test_the_documented_failure_classes_reconcile_with_the_committed_records():
@@ -826,11 +1036,11 @@ def test_the_documented_failure_classes_reconcile_with_the_committed_records():
         return len(hits), len({name for name, _ in hits})
 
     classes = {
-        "UNDECLARED kind": (16, 6),  # a kind no vocabulary declares, on a gold item
-        "graph-wide": (8, 8),  # the census beyond the gold
+        "UNDECLARED kind": (14, 5),  # a kind the product does not know, on a gold item
+        "graph-wide": (7, 7),  # the census beyond the gold
         "LAYER confusion": (9, 5),
         "two homes:": (2, 2),
-        "kind outside the frozen set": (5, 3),
+        "kind outside the frozen set": (7, 5),
         "no node represents it": (2, 2),
         "a NAND was written where nothing contradicts": (1, 1),
         "(provenance)": (1, 1),
@@ -853,7 +1063,7 @@ def test_the_documented_failure_classes_reconcile_with_the_committed_records():
 
     doc = (REPO_ROOT / "docs" / "ax" / "how-to-use-tortoise-step1-eval.md").read_text()
     for claim in (
-        "16 scored items across 6 inputs",
+        "14 scored items across 5 inputs",
         "9 items across 5 inputs",
         "2 items across 2 inputs",
         "1 input, 1 finding",

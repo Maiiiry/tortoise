@@ -27,17 +27,15 @@
       "written": "Point:issue",
       "node": "Auditors have flagged two open findings in the Solstice Robotics firmware-scope ",
       "fuzzy": true,
-      "verdict": "KIND-UNDECLARED"
+      "verdict": "KIND"
     }
   ],
   "findings": [
     {
       "severity": "P1",
       "item": "two open findings",
-      "layer": "Point",
-      "kind": "issue",
-      "finding": "UNDECLARED kind 'issue' on a Point ('Auditors have flagged two open findings in the Sol') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
-      "fix": "use a declared Point kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+      "finding": "kind outside the frozen set: expected one of ['statement'], written 'issue' ('Auditors have flagged two open findings in the Solstice Robo') \u2014 declared, but not the kind this item is",
+      "fix": "pick a kind the active vocabulary declares for this layer (\u00a75)"
     },
     {
       "severity": "P0",
@@ -54,8 +52,8 @@
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Event: ['observation']",
-      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
+      "finding": "graph-wide: kinds the product's vocabulary does not declare, beyond the gold items \u2014 Event: ['observation']",
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary, the SDK's registered kinds, or a loaded pack"
     }
   ],
   "relations": [

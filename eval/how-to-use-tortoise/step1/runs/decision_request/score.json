@@ -66,12 +66,6 @@
       "item": "3 engineer-weeks",
       "finding": "LAYER confusion: expected object, written as Point ('The Celery->Temporal migration is estimated to cost approximately 3 en') \u2014 an estimate attached to the work \u2014 if it is asserted as belief it belongs on a Point; if it is a commitment it belongs on the Object. Passing requires it lands on exactly one layer with a stated reason, not on both halves.",
       "fix": "re-file as object; a wrong layer cannot be rescued downstream (kind_classifier partitions by type before choosing a kind)"
-    },
-    {
-      "severity": "P1",
-      "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Point: ['criterion', 'option']",
-      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
     }
   ],
   "relations": [
@@ -95,13 +89,7 @@
     "session:ax-eval/run-decision_request"
   ],
   "mitigations": [],
-  "kind_census": {
-    "Point": [
-      "option",
-      "criterion",
-      "criterion"
-    ]
-  },
+  "kind_census": {},
   "cross_axis_kinds": [],
   "packs": [
     "agent-ops",
@@ -114,7 +102,7 @@
   ],
   "severity_counts": {
     "P0": 3,
-    "P1": 2,
+    "P1": 1,
     "P2": 0
   }
 }

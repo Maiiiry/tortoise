@@ -44,7 +44,7 @@
       "item": "Marta Reyes",
       "layer": "Subject",
       "kind": "person",
-      "finding": "UNDECLARED kind 'person' on a Subject ('Marta Reyes') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Marta Reyes') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
@@ -52,14 +52,14 @@
       "item": "renew in January",
       "layer": "Event",
       "kind": "customercommitment",
-      "finding": "UNDECLARED kind 'customercommitment' on a Event ('Northwind Logistics confirmed January renewal (202') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'customercommitment' on a Event ('Northwind Logistics confirmed January renewal (202') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Event kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['contract']",
-      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
+      "finding": "graph-wide: kinds the product's vocabulary does not declare, beyond the gold items \u2014 Source: ['contract']",
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary, the SDK's registered kinds, or a loaded pack"
     }
   ],
   "relations": [

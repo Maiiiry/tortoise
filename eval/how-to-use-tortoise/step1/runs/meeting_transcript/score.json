@@ -64,7 +64,7 @@
       "written": "Point:issue",
       "node": "Open question: EU data residency requirements. Raised by Dana 2026-09-14, explic",
       "fuzzy": true,
-      "verdict": "KIND-UNDECLARED"
+      "verdict": "KIND"
     }
   ],
   "findings": [
@@ -73,7 +73,7 @@
       "item": "self-serve tier",
       "layer": "Object",
       "kind": "offering",
-      "finding": "UNDECLARED kind 'offering' on a Object ('self-serve tier') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'offering' on a Object ('self-serve tier') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Object kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
@@ -87,7 +87,7 @@
       "item": "Dana",
       "layer": "Subject",
       "kind": "person",
-      "finding": "UNDECLARED kind 'person' on a Subject ('Dana') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Dana') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
@@ -95,7 +95,7 @@
       "item": "Ravi",
       "layer": "Subject",
       "kind": "person",
-      "finding": "UNDECLARED kind 'person' on a Subject ('Ravi') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Ravi') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
@@ -103,7 +103,7 @@
       "item": "Priya",
       "layer": "Subject",
       "kind": "person",
-      "finding": "UNDECLARED kind 'person' on a Subject ('Priya') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
+      "finding": "UNDECLARED kind 'person' on a Subject ('Priya') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Subject kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
@@ -115,10 +115,8 @@
     {
       "severity": "P1",
       "item": "EU data-residency question",
-      "layer": "Point",
-      "kind": "issue",
-      "finding": "UNDECLARED kind 'issue' on a Point ('Open question: EU data residency requirements. Rai') \u2014 neither a core \u00a75 kind nor one any loaded pack declares; nothing routes to, finds or classifies it",
-      "fix": "use a declared Point kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
+      "finding": "kind outside the frozen set: expected one of ['statement', 'observation'], written 'issue' ('Open question: EU data residency requirements. Raised by Dan') \u2014 declared, but not the kind this item is",
+      "fix": "pick a kind the active vocabulary declares for this layer (\u00a75)"
     },
     {
       "severity": "P1",
@@ -129,8 +127,8 @@
     {
       "severity": "P1",
       "item": "(kinds)",
-      "finding": "graph-wide: kinds no vocabulary declares, beyond the gold items \u2014 Source: ['meetingTranscript']; Object: ['deliverable', 'openQuestion', 'productSurface']",
-      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary or a loaded pack"
+      "finding": "graph-wide: kinds the product's vocabulary does not declare, beyond the gold items \u2014 Source: ['meetingTranscript']; Object: ['deliverable', 'openQuestion', 'productSurface']",
+      "fix": "every node needs a kind on ITS OWN layer's property, from the core \u00a75 vocabulary, the SDK's registered kinds, or a loaded pack"
     }
   ],
   "relations": [
