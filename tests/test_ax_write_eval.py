@@ -1086,6 +1086,7 @@ def test_the_documented_failure_classes_reconcile_with_the_committed_records():
         "two homes:": (2, 2),
         "kind outside the frozen set": (7, 5),
         "no node represents it": (2, 2),
+        "EDGE-LAYER confusion": (0, 0),  # an edge item is graded on both ends
         "a NAND was written where nothing contradicts": (1, 1),
         "(provenance)": (1, 1),
         "nodes carry one identity": (0, 0),
@@ -1146,9 +1147,19 @@ def test_the_cli_re_scores_a_committed_graph_without_a_database(tmp_path):
         ["score", "--graph", str(run_dir / "graph.json"), "--id", "contradicting_claim",
          "--out", str(out)]
     ) == 1  # that run carries P0s, so the exit status is non-zero by contract
-    assert json.loads((out / "score.json").read_text()) == json.loads(
-        (run_dir / "score.json").read_text()
-    )
+    rescored = json.loads((out / "score.json").read_text())
+    committed = json.loads((run_dir / "score.json").read_text())
+    # `packs` is the vocabulary the run was scored UNDER — a repo-global constant,
+    # not a verdict about the run. Comparing it here would red this `core` test on
+    # any PR that adds a pack anywhere (the same coupling
+    # `test_every_committed_run_reproduces_from_its_own_graph` excludes it for, and
+    # the reason ten evidence files once had to be rewritten for #9694). The
+    # verdicts are what this audit path claims to reproduce; `packs` is pinned per
+    # record by the reproduction gate.
+    assert {k: v for k, v in rescored.items() if k != "packs"} == {
+        k: v for k, v in committed.items() if k != "packs"
+    }
+    assert rescored["packs"] == sorted(rescored["packs"])
     assert json.loads((out / "graph.json").read_text()) == json.loads(
         (run_dir / "graph.json").read_text()
     )
@@ -1174,3 +1185,137 @@ def test_the_subject_vocabulary_is_the_products_own(kind):
 
     assert axe.kind_status("Subject", kind) == "CORE"
     assert is_subject_kind(kind)
+
+
+def _edge(relation, from_layer, to_layer, from_text="plan v2", to_text="platform team"):
+    return {
+        "relation": relation,
+        "from": from_text,
+        "to": to_text,
+        "from_layer": from_layer,
+        "to_layer": to_layer,
+        "from_id": "a",
+        "to_id": "b",
+    }
+
+
+def test_an_edge_item_wired_between_the_wrong_layers_is_not_ok():
+    """Catch a false PASS in the one number Step 3 reads as its delta.
+
+    The gold item says `ownedBy` is "an EDGE to a Subject"; the graph wires it
+    between two Points. Grading that by relation NAME answered `OK` for a write
+    that says the opposite of what the item is about, and the whole branch had
+    no fixture at all (#9695 review P1). The endpoint constraint is stated by
+    the gold — its `why` always said it — so it is now scored.
+    """
+    record = _record(
+        nodes=[_node("Point", "plan v2", kind="plan"), _node("Point", "platform team")],
+        edges=[_edge("ownedBy", "Point", "Point")],
+    )
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {
+                    "item": "owned by",
+                    "layer": "edge",
+                    "kind": ["ownedBy"],
+                    "endpoints": {"to": ["Subject"]},
+                    "why": "§3.5-3.6 — responsibility is an EDGE to a Subject",
+                }
+            ],
+        }
+    )
+    verdict = axe.score(record, gold, "x")
+    assert verdict["item_rows"][0]["verdict"] == "EDGE-LAYER", verdict["item_rows"]
+    (finding,) = [f for f in verdict["findings"] if f["item"] == "owned by"]
+    assert finding["severity"] == "P0"
+    assert "EDGE-LAYER confusion" in finding["finding"]
+    assert "Point -> Point" in finding["finding"]
+
+
+def test_an_edge_item_with_the_endpoints_the_gold_names_is_ok():
+    """The control: the same gold, the same relation, wired the way §3 describes."""
+    record = _record(
+        nodes=[_node("Object", "plan v2", kind="plan"), _node("Subject", "platform team")],
+        edges=[_edge("ownedBy", "Object", "Subject")],
+    )
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {
+                    "item": "owned by",
+                    "layer": "edge",
+                    "kind": ["ownedBy"],
+                    "endpoints": {"to": ["Subject"]},
+                    "why": "§3.5-3.6 — responsibility is an EDGE to a Subject",
+                }
+            ],
+        }
+    )
+    verdict = axe.score(record, gold, "x")
+    assert verdict["item_rows"][0]["verdict"] == "OK"
+    # no item-level finding: the ONLY finding is the graph-wide census, which is
+    # about the fixture's unkinded nodes and not about this edge.
+    assert verdict["severity_counts"]["P0"] == 0
+    assert not [f for f in verdict["findings"] if f["item"] == "owned by"]
+
+
+def test_an_edge_item_that_does_not_declare_its_endpoints_is_refused():
+    """A gold that states only a relation name cannot be graded honestly.
+
+    Left as a warning at most, the constraint could silently disappear the way
+    it did here: the item is graded, the answer is `OK`, and the layer the item
+    is ABOUT is never checked. Refusing to answer is the honest failure.
+    """
+    record = _record(
+        nodes=[_node("Object", "plan v2", kind="plan"), _node("Subject", "platform team")],
+        edges=[_edge("ownedBy", "Object", "Subject")],
+    )
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {
+                    "item": "owned by",
+                    "layer": "edge",
+                    "kind": ["ownedBy"],
+                    "why": "§3.5-3.6 — responsibility is an EDGE to a Subject",
+                }
+            ],
+        }
+    )
+    with pytest.raises(SystemExit) as exc:
+        axe.score(record, gold, "x")
+    assert "endpoints" in str(exc.value)
+
+
+def test_every_committed_edge_item_declares_the_endpoints_it_is_graded_on():
+    """The gold is the reference standard, so an edge item states BOTH ends.
+
+    This is the pin that keeps the refusal above from being reachable only by a
+    future lane: the frozen gold's two edge items declare the shape their `why`
+    already described in prose.
+    """
+    gold = json.loads(GOLD.read_text())
+    edge_items = [
+        exp
+        for entry in gold["inputs"]
+        for exp in entry.get("expect", [])
+        if exp["layer"] == "edge"
+    ]
+    assert edge_items, "the gold states no edge item — nothing left to check"
+    layers = {layer.lower() for layer in axe.LAYERS}
+    for exp in edge_items:
+        ends = exp.get("endpoints")
+        assert isinstance(ends, dict) and ends, (
+            f"{exp['item']!r}: an edge item must declare `endpoints` — a relation "
+            f"name alone passes between the wrong layers"
+        )
+        for side, wanted in ends.items():
+            assert side in ("from", "to"), f"{exp['item']!r}: unknown endpoint side {side!r}"
+            assert wanted, f"{exp['item']!r}: {side} names no layer"
+            assert {str(layer).lower() for layer in wanted} <= layers, (
+                f"{exp['item']!r}: {side} names a layer that is not one of {sorted(layers)}"
+            )

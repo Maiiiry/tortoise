@@ -662,6 +662,57 @@ def _same_identity(text: str, target: str) -> bool:
     return False
 
 
+def _edge_endpoints(spec: dict, item: str, input_id: str) -> dict[str, set[str]]:
+    """The endpoint shape a gold EDGE item states, or a refusal to grade it.
+
+    An edge is a claim about BOTH ends: `reportsTo` written Point -> Point (or
+    `ownedBy` between two Points) satisfies a relation-name test while saying
+    the opposite of what the item is about — a false PASS in the one number
+    Step 3 reads as its acceptance delta (#9695 review P1). The gold already
+    states the shape in prose (`"an ORG edge between Subjects"`); this reads it
+    as a declaration. A gold edge item that does NOT declare its endpoints is
+    refused rather than graded by name alone — refusing to answer beats
+    answering the wrong question, and the refusal names the field to add.
+    """
+    ends = spec.get("endpoints")
+    known = {layer.lower() for layer in LAYERS}
+    wanted: dict[str, set[str]] = {}
+    problem = None if isinstance(ends, dict) else f"expected an object, got {ends!r}"
+    for side in ("from", "to") if isinstance(ends, dict) else ():
+        raw = ends.get(side)
+        if raw is None:
+            continue
+        values = raw if isinstance(raw, list) else [raw]
+        got = {str(v).strip().lower() for v in values if str(v).strip()}
+        unknown = got - known
+        if problem is None and (not got or unknown):
+            problem = f"{side}: {sorted(got)} (unknown layer(s) {sorted(unknown)})"
+        wanted[side] = got
+    stray = sorted(set(ends) - {"from", "to"}) if isinstance(ends, dict) else []
+    if problem is None and stray:
+        problem = f"unknown key(s) {stray} — only `from` / `to` are endpoint sides"
+    if problem is None and not wanted:
+        problem = "neither `from` nor `to` given"
+    if problem is not None:
+        raise SystemExit(
+            f"gold item {item!r} (input {input_id!r}) is an EDGE item with no usable "
+            f"`endpoints`: {problem}. An edge is a claim about both ends, and a "
+            f"relation-name test alone passes when the relationship is wired between "
+            f"the wrong layers. State the shape the item's `why` describes, naming a "
+            f"layer: " + ", ".join(LAYERS) + '. e.g. "endpoints": '
+            '{"from": ["Subject"], "to": ["Subject"]}'
+        )
+    return wanted
+
+
+def _edge_fits(edge: dict, wanted: dict[str, set[str]]) -> bool:
+    """True when the edge's endpoints are the layers the gold item requires."""
+    return all(
+        (edge.get(f"{side}_layer") or "").lower() in allowed
+        for side, allowed in wanted.items()
+    )
+
+
 def _expected_layer_twin(item: str, nodes: list[dict], layer: str) -> dict | None:
     """A node on the EXPECTED layer that genuinely carries this item, if any.
 
@@ -716,8 +767,38 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
 
         if layer == "edge":
             rels = [r.lower() for r in exp.get("kind", [])]
-            got = [e for e in record_doc["edges"] if e["relation"].lower() in rels]
-            if not got:
+            # The endpoint constraint the gold states in its `why` is scored, not
+            # just the relation name (`_edge_endpoints` explains the false PASS
+            # this closes).
+            wanted = _edge_endpoints(exp, item, input_id)
+            named = [e for e in record_doc["edges"] if e["relation"].lower() in rels]
+            got = [e for e in named if _edge_fits(e, wanted)]
+            if not got and named:
+                bad = named[0]
+                shape = " / ".join(
+                    f"{side} ∈ {sorted(allowed)}" for side, allowed in sorted(wanted.items())
+                )
+                add(
+                    "P0",
+                    item,
+                    f"EDGE-LAYER confusion: {bad['relation']} is written "
+                    f"{bad['from_layer'] or '?'} -> {bad['to_layer'] or '?'} "
+                    f"({bad['from'][:40]!r} -> {bad['to'][:40]!r}), but the gold "
+                    f"requires {shape} — {exp.get('why','')}",
+                    "wire the relationship between the layers §3 names: the "
+                    "endpoints are part of the claim, and a relation name between "
+                    "the wrong pair answers a question nobody asked",
+                )
+                item_rows.append(
+                    {
+                        "item": item,
+                        "expected": f"edge {bad['relation']} ({shape})",
+                        "written": f"{bad['from_layer'] or '?'}:[{bad['relation']}]-> "
+                        f"{bad['to_layer'] or '?'}",
+                        "verdict": "EDGE-LAYER",
+                    }
+                )
+            elif not got:
                 add(
                     "P0",
                     item,

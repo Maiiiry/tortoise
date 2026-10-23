@@ -446,6 +446,14 @@
             "reportsTo",
             "memberOf"
           ],
+          "endpoints": {
+            "from": [
+              "Subject"
+            ],
+            "to": [
+              "Subject"
+            ]
+          },
           "why": "\u00a73.6 \u2014 an ORG edge between Subjects, not a node and not a Point"
         }
       ],
@@ -533,6 +541,11 @@
           "kind": [
             "ownedBy"
           ],
+          "endpoints": {
+            "to": [
+              "Subject"
+            ]
+          },
           "why": "\u00a73.5-3.6 \u2014 responsibility is an EDGE to a Subject, never a node property (\u00a74.3 note)"
         }
       ],

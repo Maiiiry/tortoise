@@ -166,6 +166,7 @@ steps are decisions rather than rules.
 | **Layer confusion — only the wrong layer holds the item** | 9 items across 5 inputs | portfolio: ARR + headcount as Points · decision request: goal, deadline, estimate · meeting: the decision · person appointment: organisation, role · product spec: the success bar |
 | **Two homes — the right layer holds it AND a second one does** | 2 items across 2 inputs | decision request: the request (the Event names it, a Point also holds it) · product spec: the ship date (plan Object + target Point). Weaker than an absence, and a different instruction: express the second reading as a claim *about* the node |
 | **Wrong-but-declared kind** (legacy-valid, not invented) | 7 | `pointKind: observation` where the state-centric ruling says `statement`; `eventKind: disbursement` where the occurrence is an occurrence/milestone; `pointKind: issue` where the item is a statement ×2. A different lesson from an invented kind, which is why the instrument separates them |
+| **Edge on the wrong endpoints** | 0 | the two gold edge items (`reports to`, `owned by`) are graded on the ENDS as well as the relation: `reportsTo` written Point → Point satisfies a relation-name test while saying the opposite of the item, so the shape the gold's `why` always stated is now declared as `endpoints` and scored. Both committed runs wired it correctly (`reportsTo` Subject → Subject, `ownedBy` Object → Subject) |
 | **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it, but the node says "probability" where the item says "chance" — a synonym, leaving 3 of 4 stems and a 0.375 partial score under the 0.5 floor) and product spec: v1's dates. Both are itemised below |
 | **Truth vs relevance** | 1 input, 1 finding | contradicting claim: no NAND, with the dampener named **inside** that finding (the record's `mitigations` shows the `mitigated_by` edge). One act, one finding — it used to be charged twice |
 | **NAND where nothing contradicts** | 1 | meeting: one NAND operator with two edges (onto the comms plan, onto the slip forecast). A judgment call, and the instrument treats it as a finding because a contradiction operator on a claim nobody attacked computes a wrong confidence |
@@ -331,6 +332,18 @@ Round 6:
     per run (so an unrelated vocabulary change cannot red the gate at all) would
     need a committed snapshot artifact with its own pin; that is not this
     issue's scope and is recorded here as the known residual.
+
+**Round 7 — correction 29: an edge item was graded by relation NAME alone.**
+The two edge items state their shape in prose ("an ORG edge between Subjects",
+"an EDGE to a Subject") and `score()` checked only the relation, so an `ownedBy`
+written Point → Point answered `OK`: a false PASS in the number Step 3 reads as
+its acceptance delta, on a branch that had no fixture at all. The gold now
+declares `endpoints`, the instrument scores the ends as well as the name, and it
+REFUSES to grade an edge item that declares neither — refusing to answer beats
+answering the wrong question. Both committed runs are unchanged (they were wired
+correctly, and the class row above is 0). The list numbering above is left as
+the source of record: rendering these as one ordered list would need every
+prefix to start at 1, which the cross-references to correction numbers rule out.
 
 Still true, and stated as a limit rather than a rule: the matcher is token
 overlap with a crude stemmer, and **the class table above is the MACHINE
