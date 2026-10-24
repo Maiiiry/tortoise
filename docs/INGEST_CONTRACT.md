@@ -467,11 +467,22 @@ the `{error}`-only shape whose retry action is different.
   refusal is about the instance and not about anything you wrote). This is a
   **throttle, not a cap**: it never refuses your data, the window self-heals
   within 60 s, and the correct action is **backoff-and-retry** — the opposite
-  of the cumulative `ERR_QUOTA` advice above. A refused request is **not** an
-  attempt you have to reason about later: it writes nothing and leaves no
-  commit record of its own, so retrying the same `client_commit_id` after the
-  backoff is a **first** attempt — the same `held[]` adjudication a clean
-  request would have received, not a second one. (The repo's bundled SDK does not
+  of the cumulative `ERR_QUOTA` advice above. A request refused by THIS throttle
+  leaves no record of its own: the `:CommitRecord` it opened is removed when
+  that request created it, so the retry cannot be judged against it. If that
+  attempt was the first for this `client_commit_id`, the retry is therefore a
+  **first** attempt — the same `held[]` adjudication a clean request would have
+  received, not a second one. When an EARLIER attempt of the same id left a
+  record — a `held` deferral, a crash mid-write, or a refusal by a gate that
+  does not clean up after itself (see #9826) — that record is preserved and the
+  retry is a re-submission: it is not re-adjudicated against the 25-item
+  first-adjudication band, only against the 50-item ceiling. A `fully_written`
+  record is not re-run at all: the replay check returns `duplicate: true` with
+  zero writes before the org-cap and ingest gates are consulted (the per-key
+  rate limiter and Layer-1 validation still run first, so a re-POST of a
+  written id whose non-canonical fields changed can still be refused 429 or
+  422).
+  (The repo's bundled SDK does not
   yet auto-retry a 429 — see #9799 — so a client driving the endpoint directly
   should honour `Retry-After` itself.) It exists because the removal of the
   flat session cap (#4010 — sessions are unlimited for every tier, by owner
