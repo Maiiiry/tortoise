@@ -142,8 +142,17 @@ class TextOutcome:
         the claim and then the evidence, in one screenful.
         """
         if self.session is None:
+            # ⛔ The key's KIND comes from `resolved_by`, and the trailing
+            # parenthetical is only true for ONE of the two doors: a
+            # `--source-url` fetch said `no §9.1 text in the record for
+            # source-url 'session:abc' (session 'session:abc')` — the same value
+            # twice, labelled a session it is not (PR #9862 review, P3).
+            if self.resolved_by == BY_SOURCE:
+                return (f"no §9.1 text in the record behind {self.resolved_by} "
+                        f"{self.key!r} (the source's session was resolved, and "
+                        f"the record holds no text for it)")
             return (f"no §9.1 text in the record for {self.resolved_by} "
-                    f"{self.key!r} (session {self.key!r})")
+                    f"{self.key!r} (the tenant was scoped and read)")
         sess = self.session
         head = [
             f"session: {sess.session_id}",

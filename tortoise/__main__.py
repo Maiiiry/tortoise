@@ -1411,6 +1411,34 @@ def _cmd_record_text(args):
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             return EXIT_UNAVAILABLE
+        except Exception as e:
+            # ⛔ THE READ LEG IS WRAPPED LIKE `record-reconcile`'S, and the arm
+            # is `2`, not a traceback (PR #9862 review, P2). `record_read`
+            # executes plain cursor SQL and raises the DRIVER's own exceptions
+            # (it has no try/except of its own), so without this every read-time
+            # failure escapes `main()` — which has no dispatch-level handler —
+            # and the process dies with a traceback and exit `1`: an exit code
+            # the contract does not define, so a scheduler keyed on `0/2/3`
+            # cannot classify the failure it just got.
+            #
+            # Three reachable causes, none exotic:
+            #   * `UndefinedTable` — the record DB has not had
+            #     `20261023000001_record_session_narrative.sql` applied. The most
+            #     likely FIRST-run failure for the operator this verb is for.
+            #   * `QueryCanceled` — this verb installs
+            #     `RECORD_STATEMENT_TIMEOUT_MS` for the session, so a large
+            #     tenant's turn read is cancelled and RAISES.
+            #   * `OperationalError` — a connection dropped between the scope
+            #     prologue and the read.
+            #
+            # `RecordReadError` / `ValueError` stay ABOVE this arm so their
+            # specific diagnostics still win; this is the catch-all that keeps
+            # "unreadable" inside the documented vocabulary.
+            print(f"Error: the record is unreadable ({type(e).__name__}) — no "
+                  f"text was served and no verdict was produced. This is exit "
+                  f"2, NOT an absence (exit 3): nothing was proven about what "
+                  f"the record holds.", file=sys.stderr)
+            return EXIT_UNAVAILABLE
     finally:
         if conn is not None:
             conn.close()

@@ -1897,15 +1897,33 @@ def _producer_emit_vocabulary() -> set[str]:
     producers' half made executable, so a new `_emit_event("NewType", ...)`
     (or a new `_*_RECORD_TYPE = "NewType"` constant it is called with) reds the
     suite even before a fold arm or a torn-tail classification names it.
+
+    ⛔ THE CONSTANT MAP IS BUILT OVER THE WHOLE PACKAGE, NOT PER FILE, and that
+    is the difference between a census and a claim (PR #9862 review, P3). A
+    producer may DECLARE the constant in one module and CALL the emit in
+    another — #9555 does exactly that: `NARRATIVE_RECORD_TYPE = "SessionNarrated"`
+    lives in `record_projection.py` and the
+    `sdk._emit_event(NARRATIVE_RECORD_TYPE, ...)` call lives in `hosted_api.py`.
+    Two per-file scans pair the two halves in no file at all, so the type was
+    INVISIBLE here and a second carrier of that shape would be too. The emit
+    regex was already package-wide; the constant map now is as well.
     """
+    texts = {path: path.read_text(encoding="utf-8")
+             for path in sorted((REPO_ROOT / "tortoise").glob("*.py"))}
+
+    # Pass 1 — every `*_RECORD_TYPE` the package declares, as ONE vocabulary.
+    constants: dict[str, str] = {}
+    for text in texts.values():
+        for name, record_type in re.findall(
+                r'([A-Za-z_][A-Za-z0-9_]*_RECORD_TYPE)\s*=\s*"([A-Z][A-Za-z0-9_]*)"',
+                text):
+            constants[name] = record_type
+
+    # Pass 2 — every emit, resolved against that vocabulary.
     found: set[str] = set()
-    for path in sorted((REPO_ROOT / "tortoise").glob("*.py")):
-        text = path.read_text(encoding="utf-8")
+    for text in texts.values():
         found |= set(re.findall(
             r'(?:_emit_event|_emit)\(\s*"([A-Z][A-Za-z0-9_]*)"', text))
-        constants = dict(re.findall(
-            r'([A-Za-z_][A-Za-z0-9_]*_RECORD_TYPE)\s*=\s*"([A-Z][A-Za-z0-9_]*)"',
-            text))
         for name, record_type in constants.items():
             if re.search(r'(?:_emit_event|_emit)\(\s*' + re.escape(name) + r'\b',
                          text):
@@ -1919,6 +1937,15 @@ def test_every_type_a_producer_emits_has_a_record_mutation():
     # the types emitted only through a `_*_RECORD_TYPE` constant. A stale regex
     # would silently stop proving anything.
     assert {"EntityMutated", "BatchIdStamped"} <= emitted
+    # ⛔ THE CROSS-MODULE CONSTANT SHAPE, named so it cannot regress silently: the
+    # declaration and the emit live in two different files, which is precisely
+    # the case a per-file scan cannot see. Without this assertion the census is
+    # green over a producer it never found (PR #9862 review, P3).
+    assert rp.NARRATIVE_RECORD_TYPE in emitted, (
+        "`SessionNarrated` is declared in `record_projection.py` and emitted "
+        "in `hosted_api.py` — a per-file scan pairs the two halves in NO file, "
+        "so the census stopped seeing this producer (and would see none of "
+        "its shape)")
     assert len(emitted) >= 28, (
         f"the producer scan found only {len(emitted)} emit types — the regex "
         "went stale and this leg stopped proving anything"

@@ -306,6 +306,100 @@ def test_the_verb_is_WIRED_to_the_composition():
     assert routes, "`record-text` is not dispatched in main()"
 
 
+def test_a_read_time_database_error_is_EXIT_UNAVAILABLE_not_a_traceback(
+        monkeypatch, capsys):
+    """`2` is "no verdict" — including when the READ itself blows up.
+
+    PR #9862 review (P2): the verb wrapped `record_dsn`, `psycopg2.connect` and
+    `scoped(...)`, then caught only `RecordReadError` / `ValueError` around the
+    read. `record_read` executes plain cursor SQL and raises the DRIVER's own
+    exceptions, and `main()` has no dispatch-level handler — so a read-time
+    failure escaped as an uncaught traceback and exit `1`, a code the contract
+    does not define. A scheduler keyed on `0/2/3` could not classify it, and the
+    operator lost the diagnostic the verb exists to print. The sibling verb
+    (`record-reconcile`) already maps its read failure to `EXIT_UNAVAILABLE`.
+
+    ⛔ NON-VACUOUS ON THE PRE-FIX CODE: the arm this exercises did not exist, so
+    the fake's exception propagated out of `cli.main(...)` and this test errored
+    instead of asserting. Three causes are reachable in production and all three
+    take this path: `UndefinedTable` (this migration not applied — the likely
+    FIRST run), `QueryCanceled` (the verb installs a 5 s `statement_timeout`),
+    `OperationalError` (connection dropped between the prologue and the read).
+
+    DB-FREE on purpose: only `psycopg2` and the connection are faked, so the
+    arm is measured wherever the suite runs rather than only in the armed
+    Postgres job.
+    """
+    import sys as _sys
+    import types as _types
+
+    from tortoise import __main__ as cli
+
+    org_id, graph_id = "org-9555-read-boom", "g-9555-read-boom"
+
+    class _UndefinedTable(Exception):
+        """The driver's own class of failure — a name, not a contract."""
+
+    class _Cursor:
+        def __init__(self):
+            self.rows: list = []
+            self.row = None
+
+        def execute(self, sql, params=None):
+            self.rows, self.row = [], None
+            if sql == rp.TENANT_GUC_SQL:
+                return                      # the transaction-local set
+            if sql == rp.TENANT_SCOPE_SQL:  # the read-back: scoped, non-bypassing
+                self.row = (org_id, False)
+                return
+            if rp.NARRATIVE_TABLE in sql:
+                raise _UndefinedTable(
+                    f'relation "public.{rp.NARRATIVE_TABLE}" does not exist')
+            # every other read is an honest miss
+
+        def fetchone(self):
+            return self.row
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class _Conn:
+        """The two assignments the verb makes, then the reads above."""
+
+        def __init__(self):
+            self.autocommit = True
+            self.closed = False
+
+        def cursor(self):
+            return _Cursor()
+
+        def close(self):
+            self.closed = True
+
+    conn = _Conn()
+    monkeypatch.setitem(_sys.modules, "psycopg2", _types.SimpleNamespace(
+        connect=lambda dsn, **kw: conn))
+
+    rc = cli.main(["record-text", "--record-dsn", "postgresql://fake/record",
+                   "--org", org_id, "--graph", graph_id,
+                   "--session", SESSION])
+    err = capsys.readouterr().err
+
+    assert rc == record_text.EXIT_UNAVAILABLE, (
+        f"a read-time DB error exited {rc}, not {record_text.EXIT_UNAVAILABLE} "
+        f"— `2` is 'no verdict' and an uncaught traceback is not in the "
+        f"contract at all (stderr: {err})")
+    assert rc != record_text.EXIT_ABSENT, (
+        "an unreadable record was reported as an ABSENCE (exit 3): nothing was "
+        "proven about what the record holds")
+    # The diagnostic: what failed, and which exit code the operator got.
+    assert "unreadable" in err, err
+    assert "_UndefinedTable" in err, (
+        f"the failure's type is not named, so the operator cannot tell a "
+        f"missing migration from a cancelled query (stderr: {err})")
+    assert conn.closed, "the connection was not closed on the failure path"
+
+
 class _Cursor:
     def __init__(self, rows):
         self._rows = rows
@@ -434,6 +528,37 @@ def test_an_unrepresentable_limit_never_claims_the_transcript_is_empty():
         key=SESSION, resolved_by=record_text.BY_SESSION, session=bare).render()
 
 
+def test_the_absent_line_names_the_key_the_door_actually_used():
+    """A `--source-url` miss is not a session id, and must not be called one.
+
+    PR #9862 review (P3): both doors printed
+    ``no §9.1 text in the record for <door> '<key>' (session '<key>')`` — the
+    same value twice, and the parenthetical asserted a KIND the `--source-url`
+    door does not have. An operator reading that string is told the key is a
+    session and goes looking for a session that does not exist.
+    """
+    absent_by_source = record_text.TextOutcome(
+        key=f"session:{SESSION}", resolved_by=record_text.BY_SOURCE)
+    by_source = absent_by_source.render()
+    assert "source-url" in by_source, by_source
+    assert "(session" not in by_source, (
+        f"the `--source-url` miss labels its key a SESSION — the key is the "
+        f"source url, and nothing proved it is a session id: {by_source}")
+    assert by_source.count(f"session:{SESSION}") == 1, (
+        f"the key is printed twice, so one of the two labels is a guess: "
+        f"{by_source}")
+
+    absent_by_session = record_text.TextOutcome(
+        key=SESSION, resolved_by=record_text.BY_SESSION)
+    by_session = absent_by_session.render()
+    assert "session" in by_session, by_session
+    assert by_session.count(SESSION) == 1, by_session
+    # Both arms still say what an absence IS — the record was readable and held
+    # nothing — because that is the whole 3-versus-2 distinction.
+    assert "no §9.1 text" in by_session, by_session
+    assert "no §9.1 text" in by_source, by_source
+
+
 def test_the_exit_code_for_a_served_and_an_absent_answer():
     served = record_text.TextOutcome(
         key=SESSION, resolved_by=record_text.BY_SESSION,
@@ -517,12 +642,20 @@ def _tenant() -> tuple[str, str]:
     return f"org-{tag}", f"g-{tag}"
 
 
-def _seed(conn, *, org_id: str, graph_id: str) -> None:
+def _seed(conn, *, org_id: str, graph_id: str, with_source: bool = False) -> None:
     """Journal-replay the capture's records into a FRESH tenant scope.
 
     A NEW `org_id`/`graph_id` pair per run, so a re-run (or a sibling lane on
     the same container) cannot inherit a previous narrative and pass on it —
     the isolation is the tenant, which is what the record's own key shape gives.
+
+    ``with_source`` adds the capture's own transcript `:Source` record, which is
+    the record that carries `story_arc` onto a NODE (`hosted_api`
+    `_execute_commit_writes` step 2 does exactly that MERGE). The cache rebuild
+    needs it: without a `:Source` record there is nothing in the record for the
+    rebuild to reproduce the narrative ON, so "the cache holds the narrative" is
+    unmeasurable and a rebuild that writes only the turn Points satisfies every
+    count.
     """
     # The record's tenancy parents: `organizations(id)` and `graphs(org_id, id)`.
     # `session_narrative`'s FK is `(org_id, graph_id) -> graphs(org_id, id)`, so
@@ -561,6 +694,20 @@ def _seed(conn, *, org_id: str, graph_id: str) -> None:
             _narrative_record(),
             _counts_record(redactions=4, turns=2),
         ]
+        if with_source:
+            # The transcript `:Source` the commit's raw MERGE writes
+            # `s.story_arc=$arc` onto — the SAME text the carrier states, so the
+            # record and the cache state one fact (and the rebuild has to
+            # reproduce it on a node, not merely re-count rows).
+            records.append({
+                "type": "SourceCreated",
+                "id": f"session:{SESSION}",
+                "ts": "2026-10-24T00:00:02Z",
+                "url": f"session:{SESSION}",
+                "sessionId": SESSION,
+                "story_arc": NARRATIVE,
+                "summary": SUMMARY,
+            })
         rp.replay(records, replay_conn, org_id=org_id, graph_id=graph_id)
         replay_conn.commit()
     except Exception:
