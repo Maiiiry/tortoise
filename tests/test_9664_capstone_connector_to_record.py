@@ -325,6 +325,11 @@ def test_the_connector_advertises_the_journey_tools_and_nothing_retired(
 
 # ── 2. the failure path, before the happy one ──────────────────────────────
 
+#: The payload this leg sends, kept as ONE literal because it is also the
+#: tenant-agnostic probe below: a row carrying this exact content was written by
+#: an unauthenticated call, wherever it landed.
+_UNAUTHENTICATED_CONTENT = "unauthenticated must not land"
+
 
 def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypatch):
     """No credential ⇒ a refusal that names the fix, and NOTHING recorded.
@@ -349,8 +354,17 @@ def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypa
 
     All three layer tables the fold touches are then asserted empty, because
     `point` alone would miss a partial write that stopped at the identity row.
+
+    ⛔ THE TENANT-SCOPED COUNTS ARE NOT THE WHOLE RECORD HALF (P3, PR #9852
+    review): they only see a row under the tenant THIS fixture resolved, so a
+    regressed tenancy resolver that installed a different (default/static)
+    tenant would write happily and leave all three at 0. Two further assertions
+    close that: a GLOBAL count on this leg's own unique payload, and an unmoved
+    `record_write_failure_counts()` delta — which is also what separates "auth
+    refused before the tool ran" from "the tool ran and the seam refused it for
+    want of a tenant (`no_tenant`)".
     """
-    from tortoise import record_writer
+    from tortoise import monitoring, record_writer
 
     client, _api_key, tenant = connector
     conn, seed_tenant = _database(monkeypatch)
@@ -359,13 +373,15 @@ def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypa
         "the record seam is NOT armed, so an empty table below would be about an "
         "unarmed deployment rather than about the refusal: check "
         f"{record_writer.RECORD_DSN_ENV}")
+    before = dict(monitoring.record_write_failure_counts())
     try:
         response = client.post("/mcp", json={
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "tortoise_create_point",
                        "arguments": {"kind": "statement",
-                                     "content": "unauthenticated must not land"}},
+                                     "content": _UNAUTHENTICATED_CONTENT}},
         })
+        after = dict(monitoring.record_write_failure_counts())
         assert response.status_code == 401, (
             f"an unauthenticated connector call returned {response.status_code}, "
             f"not a refusal: {response.text[:400]}")
@@ -388,6 +404,22 @@ def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypa
         for table in ("point", "node_identity", "journal_event"):
             assert _rows(conn, tenant, table)[0] == 0, (
                 f"an unauthenticated call wrote a {table} row into the record")
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM public.point WHERE content=%s",
+                        (_UNAUTHENTICATED_CONTENT,))
+            elsewhere = cur.fetchone()[0]
+        assert elsewhere == 0, (
+            "an unauthenticated call filed a Point into the record under SOME "
+            "tenant — possibly not this one, e.g. if a regressed resolver "
+            "installed a default tenant, which the tenant-scoped counts above "
+            "cannot see")
+        moved = {key: after.get(key, 0) - before.get(key, 0)
+                 for key in set(after) | set(before)}
+        moved = {key: value for key, value in moved.items() if value}
+        assert not moved, (
+            "the record seam recorded a write FAILURE, so the unauthorised call "
+            f"reached the write path and was refused there instead of at the "
+            f"credential: counters moved {moved}")
     finally:
         conn.close()
 
@@ -513,8 +545,10 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
 #: (`tortoise/tool_registry.py`, "EXCLUDED from tenant HTTP" in its own
 #: description), so it is absent from a connector's `tools/list` and the
 #: CONNECTOR-facing half of this defect is `tortoise_query` alone
-#: (`tortoise_get_point` is the exact read the journey's "read it back by id"
-#: step performs).
+#: — `tortoise_get_point` is the RETIRED spelling of the read the journey's
+#: "read it back by id" step performs, which the journey makes with
+#: `tortoise_get_entity(id, type="point")` (the registry's own
+#: `RETIRED_USE_INSTEAD` entry says so).
 #:
 #: The stdio-only half is still measured, because the rule is about the text a
 #: MODEL reads: a stdio client receives the same `description` and the retired
@@ -555,9 +589,10 @@ def _retired_names_named_by_live_descriptions() -> dict[str, tuple[str, ...]]:
         "payload the model reads, and TWO live tools name FOUR RETIRED tools "
         "that are absent from that same payload. `tortoise_query` → "
         "`tortoise_get_point` / `tortoise_get` is the CONNECTOR-facing half "
-        "(`tortoise_query` itself IS advertised) and is the exact read the "
-        "journey's 'read it back by id' step performs, so a tool-grant client is "
-        "told to call a tool it was never granted; `tortoise_index_files` → "
+        "(`tortoise_query` itself IS advertised) and names the RETIRED spelling "
+        "of the read that step performs (`tortoise_get_entity(id, "
+        "type=\"point\")`), so a tool-grant client is told to "
+        "call a tool it was never granted; `tortoise_index_files` → "
         "`tortoise_index_sessions`/`tortoise_ingest_corpus` is stdio-only "
         "(`http_policy=False`), so it mis-instructs a stdio client rather than a "
         "connector. This marker DELETE-ITSELF when the copy is fixed (the "
@@ -608,9 +643,10 @@ def test_the_stale_description_set_says_which_half_is_the_connectors():
     P3, PR #9852 review: the constant and the `xfail` reason above first read as
     though four *advertised* descriptions were stale and a ChatGPT-style
     tool-grant client was mis-instructed four times over. `tortoise_index_files`
-    carries `http_policy=False` (`tortoise/tool_registry.py`), and `HTTP_ALLOWED`
-    is derived from exactly that flag (`tortoise/mcp_auth.py::get_http_allowed`),
-    so by this file's OWN definition of advertised
+    carries `http_policy=False` (`tortoise/tool_registry.py`), and
+    `HTTP_ALLOWED` is derived from exactly that flag (`get_http_allowed` in
+    `tortoise/tool_registry.py`, bound as `HTTP_ALLOWED` in
+    `tortoise/mcp_auth.py`), so by this file's OWN definition of advertised
     (`test_the_connector_advertises_the_journey_tools_and_nothing_retired`:
     `{t.name for t in TOOL_REGISTRY if t.http_policy}`) only `tortoise_query`
     reaches the connector. The impact claim is therefore pinned mechanically
