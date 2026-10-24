@@ -1615,6 +1615,27 @@ surfaces:
   # FastMCP app over an embedded registry with planted credentials and spies on
   # `record_writer.write_records`, so it needs no graph and no URI.
   - test_9192_tenant_armed_by_request.py
+  # #9664 (the capstone): an authenticated CONNECTOR request (`POST /mcp`,
+  # `tools/call`) puts a Point in the Postgres RECORD, under the request's own
+  # tenant, and the identifier the client is handed reads it back. Registered
+  # `core` because `tortoise/record_writer.py` — the seam whose rows are asserted
+  # — matches no `SOURCE_PATTERN`, so a diff to it selects the `core` fallback and
+  # this file must be in that pool or the row-count assertion runs nowhere; its
+  # other subjects (`tortoise/mcp_server.py`, `tortoise/tool_registry.py`) are
+  # `SHARED_MODULES` and run the FULL matrix regardless (the `#6211` idiom — do
+  # not read this entry as covering those diffs). `.github/workflows/*.yml` is
+  # unclassified → FULL, so the workflow half also runs on its own diffs.
+  # DB-free for THREE of its five legs (the surface, the description pin and the
+  # CI-wiring pin). The other two need `TEST_RECORD_DB_URI`: the capstone's rows,
+  # and the unauthenticated refusal — which skips rather than guesses because it
+  # asserts that NO row was written, and without a database that assertion would
+  # be about nothing. Both are ARMED in the dedicated `test-record-postgres` job,
+  # which this file is wired into (pinned by its own
+  # `test_ci_runs_this_file_in_the_armed_record_job`, so deleting it from that
+  # job's `run:` cannot leave a green job). Same shape as the `#9551` entry above:
+  # the fast matrix keeps the surface/description/wiring legs, the armed job keeps
+  # the record.
+  - test_9664_capstone_connector_to_record.py
   # #9190: `EventLog.append()` returns the record's journal position (the `seq`
   # `record_projection.replay_plan` keys `journal_event` on) and
   # `EventLog.position()` exposes the count. Same anchor as the #5612 entry
@@ -7793,6 +7814,17 @@ durations:
   # Entered LOW per the #2517/#4883 precedent for a newly-added file, so the
   # duration-coverage floor is not spent; the first post-merge push re-measures.
   test_9192_tenant_armed_by_request.py: 3.8  # ci-timing top-15 2026-10-20 (run 39467226356); was 2.0
+  # #9664 capstone connector→record. Six tests: THREE DB-free (surface,
+  # stale-description pin, CI-wiring pin), TWO that SKIP by name without
+  # `TEST_RECORD_DB_URI` (the capstone's rows and the unauthenticated refusal,
+  # which asserts no row was written), and one strict xfail — measured on this
+  # host 2026-10-24, DB-free
+  # (`TORTOISE_TEST_CARVE_OUT=1`, `TORTOISE_DB_URI` unset): "3 passed, 2 skipped,
+  # 1 xfailed in 3.09s", and armed against a throwaway `postgres:16`:
+  # "5 passed, 1 xfailed in 3.67s". Entered LOW per the #2517/#4883 precedent for
+  # a newly-added file so the duration-coverage floor is not spent; the first
+  # post-merge push re-measures it.
+  test_9664_capstone_connector_to_record.py: 2.0
   test_5917_torn_tail_seal.py: 2.0
   test_longmem_costing.py: 0.2
   test_longmem_errors.py: 0.1
