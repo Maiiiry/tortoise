@@ -1002,8 +1002,23 @@ async function sweepWithShim(
   mkdirSync(spool, { recursive: true });
   const storeDir = join(parent, "store-sync");
   // The shim is written AFTER the store path is known, so a row can have the
-  // "CLI" write its own status exactly where the extension will look.
-  writeFileSync(join(dir, "tortoise"), `#!/bin/sh\n${build(storeDir)}\n`, { mode: 0o755 });
+  // "CLI" write its own status exactly where the extension will look — and it
+  // checks the ARGV it was called with. The spawn must NAME the store it writes
+  // to: without `--cursor-dir` the CLI defaults to `$HOME/.tortoise/store-sync`
+  // while both legs of the health line read `<spool-parent>/store-sync`, so under
+  // the documented `TORTOISE_CAPTURE_SPOOL_DIR` override the writer and the
+  // readers silently split (dead-letter count reads 0, the reason degrades to
+  // `exit_N`). The argv is the only place that shows, and nothing else asserts it.
+  writeFileSync(
+    join(dir, "tortoise"),
+    '#!/bin/sh\n'
+      + 'case " $* " in\n'
+      + `  *" --cursor-dir ${storeDir} "*) ;;\n`
+      + '  *) exit 9 ;;\n'
+      + 'esac\n'
+      + `${build(storeDir)}\n`,
+    { mode: 0o755 },
+  );
   try {
     const pi = mockPi();
     const { fetchImpl } = mockFetch([]);
@@ -1048,6 +1063,40 @@ test("#3515: a sweep that fails is RECORDED, not just warned about", async () =>
     await sweepWithShim(() => "exit 3"),
     "exit_3",
     "a non-zero sweep must reach the disk, because its stderr goes nowhere",
+  );
+});
+
+test("#3515: a STALE failure does not suppress this sweep's reason", async () => {
+  if (process.platform === "win32") return;
+  // The precedence rule is "a record from THIS sweep wins", and the `at`
+  // comparison is the only thing that makes that true. Without it, a failure
+  // recorded by any EARLIER sweep suppresses every later one forever — the line
+  // would report `worker_missing` long after `node` was fixed and the sweep was
+  // failing for a different reason.
+  const status = await sweepWithShim((store) =>
+    `node -e 'const f=require("fs");f.mkdirSync(${JSON.stringify(store)},{recursive:true});`
+      + `f.writeFileSync(${JSON.stringify(join(store, "sweep-status.json"))},`
+      + `JSON.stringify({version:1,ok:false,reason:"worker_missing",`
+      + `at:Date.now()/1000-3600}))'; exit 3`);
+  assertSweepFailure(
+    status,
+    "exit_3",
+    "an HOUR-old failure must be replaced by this sweep's own outcome",
+  );
+});
+
+test("#3515: exit 0 without a fresh status is NOT reported as healthy", async () => {
+  if (process.platform === "win32") return;
+  // Exit 0 is not proof the sweep RAN. The CLI's bookkeeping write is
+  // best-effort (`except OSError: pass`) and a `tortoise` on PATH that is not the
+  // shipped CLI exits 0 without sweeping — either way no record is written and
+  // the line keeps rendering the PREVIOUS verdict over a backstop that never ran.
+  // This is the only remaining silent-OK path the extension can detect from data
+  // it already holds.
+  assertSweepFailure(
+    await sweepWithShim(() => "exit 0"),
+    "exit_0_without_status",
+    "a zero exit that left no fresh status must not read as a working backstop",
   );
 });
 

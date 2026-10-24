@@ -1,4 +1,4 @@
-// tortoise-hook-version: 11
+// tortoise-hook-version: 12
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
@@ -41,6 +41,18 @@
 // wording is imprecise for this one generation; the classification and the
 // repair it prompts are right.
 //
+// Generation 12 (#3515 review): exit 0 is corroborated, and the health line's
+// reason is a TOKEN. A sweep that exits 0 without writing a fresh status left the
+// PREVIOUS verdict standing — the CLI's bookkeeping write is best-effort, and a
+// `tortoise` on PATH that is not the shipped CLI can exit 0 without sweeping — so
+// the extension now reads the status on a zero exit and records
+// `exit_0_without_status` when it is absent or older than this spawn. The
+// persisted `reason` is also a token now (`no_credential`) instead of the CLI's
+// free-form stderr prose: the precedence fix is what made that prose reach the
+// line, where it duplicated the line's own "no TORTOISE_API_KEY" and embedded an
+// unquoted sentence in a comma-delimited field. The full text stays on stderr and
+// in `--json`.
+//
 // Generation 11 (#3515 review): the extension's record is now SUBORDINATE to the
 // CLI's own, and the spawn names the directory it writes to. `close` fires AFTER
 // the CLI's `main` has already written `{ok: false, reason: "worker_missing"}`
@@ -53,7 +65,8 @@
 // `<spool-parent>/store-sync`: under the documented `TORTOISE_CAPTURE_SPOOL_DIR`
 // override the two silently disagreed (the dead-letter count read 0 and the
 // failure degraded to `exit_N`). The bookkeeping directory is created `0o700`
-// with a `0o600` status file, like every other writer in the tree.
+// with a `0o600` status file for the extension's own write (the CLI's writer sets
+// its own mode).
 //
 // Generation 10 (#3515 review): a sweep's failure is recorded from EVERY path
 // that can produce one, and a killed sweep names its SIGNAL. Generation 9 wired
@@ -141,6 +154,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import {
   appendFileSync,
+  chmodSync,
   closeSync,
   existsSync,
   fsyncSync,
@@ -2469,6 +2483,16 @@ export function recordSweepFailure(storeDir: string, reason: string): void {
     // yet), and a umask-derived 0755 would be the one place in the tree that is
     // world-readable.
     mkdirSync(storeDir, { recursive: true, mode: 0o700 });
+    // `mkdirSync`'s `mode` applies ONLY when it creates the directory. The other
+    // way this directory comes to exist is an EARLIER generation of this
+    // extension, which created it with no mode at all (0755) — so on every
+    // upgraded box the 0700 intent was silently unmet, permanently. Narrow the
+    // existing one too; best-effort, inside the same try.
+    try {
+      chmodSync(storeDir, 0o700);
+    } catch {
+      // Windows / a directory we do not own: the write below still decides.
+    }
     const payload = { version: 1, ok: false, reason, shipped: 0, at: Date.now() / 1000 };
     const tmp = join(storeDir, "sweep-status.json.tmp");
     writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
@@ -2943,7 +2967,23 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
       // null there, and `exit_null` would throw the reason away exactly where it
       // matters.
       child.on("close", (code, signal) => {
-        if (code === 0) return;
+        if (code === 0) {
+          // EXIT 0 IS NOT PROOF THE SWEEP RAN. This seam's whole premise is that
+          // the status file is the truth, and the CLI's own bookkeeping write is
+          // best-effort (`except OSError: pass`) — so a healthy-looking exit can
+          // leave NO record, and the line then renders the PREVIOUS verdict over
+          // a backstop that never swept. A `tortoise` on PATH that is not the
+          // shipped CLI does the same. Corroborate with data already in hand.
+          const after = readSweepStatus(storeDir);
+          if (!after || (after.at ?? 0) < sweepStartedAt) {
+            noteFailure("exit_0_without_status");
+            if (_SWEEP_UNAVAILABLE_WARNED) return;
+            _SWEEP_UNAVAILABLE_WARNED = true;
+            warn("store-sync sweep exited 0 but wrote no fresh status — killed/crashed "
+              + "sessions may not be recovered; run `tortoise store-sync --json`");
+          }
+          return;
+        }
         const why = code === null ? `signal_${String(signal)}` : `exit_${String(code)}`;
         noteFailure(why);
         if (_SWEEP_UNAVAILABLE_WARNED) return;

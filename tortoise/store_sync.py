@@ -333,6 +333,16 @@ def _summary_dict(summary) -> dict[str, Any]:
     }
 
 
+def _reason_token(errors: list[Any]) -> str | None:
+    """The first error as a short TOKEN for the health line (never prose)."""
+    for err in errors:
+        text = str(err)
+        if "TORTOISE_API_KEY" in text:
+            return "no_credential"
+        return text.strip()[:80] or None
+    return None
+
+
 def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
     """Persist the last sweep's outcome where a caller that DISCARDED our output can read it.
 
@@ -355,7 +365,11 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
         log = receipt.get("log") or {}
         errors = log.get("errors") or []
-        reason = log.get("worker_status") or (errors[0] if errors else None)
+        # The persisted reason is a TOKEN, because the health line embeds it in a
+        # comma-delimited field: a free-form sentence there duplicated the line's
+        # own "no TORTOISE_API_KEY" and put an unquoted em-dash clause inside a
+        # comma-separated list. The full text is still on stderr and in --json.
+        reason = log.get("worker_status") or _reason_token(errors)
         if not reason and receipt.get("ok") is False:
             spool = receipt.get("spool") or {}
             reason = spool.get("error") if isinstance(spool, dict) else None
@@ -379,6 +393,14 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
         }
         tmp = target / "sweep-status.json.tmp"
         tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        try:
+            # `write_text` uses the umask (0644), while the extension writes the
+            # same file 0600 — so the SAME filename carried two modes, and the
+            # COMMON one was the loose one. The directory is 0700 either way, so
+            # this is consistency rather than exposure.
+            tmp.chmod(0o600)
+        except OSError:
+            pass
         tmp.replace(target / "sweep-status.json")
     except OSError:
         pass

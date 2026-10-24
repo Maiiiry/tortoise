@@ -685,6 +685,30 @@ def test_MAIN_persists_the_failure_it_reports(tmp_path, monkeypatch):
     assert status["reason"] == "worker_missing", status
 
 
+def test_the_persisted_reason_is_a_TOKEN_and_the_file_is_0600(tmp_path):
+    """The health line embeds `reason` in a comma-delimited field.
+
+    The precedence fix is what made the CLI's `reason` reach that line, so a
+    free-form stderr sentence would arrive there: a real no-credential box
+    printed the same fact twice and put an unquoted em-dash clause inside a
+    comma-separated list. The full text stays on stderr and in `--json`.
+    """
+    from tortoise import store_sync
+
+    store = tmp_path / "store"
+    store_sync.write_sweep_status(
+        {"ok": False, "log": {"errors": [
+            "no TORTOISE_API_KEY configured — the log half shipped nothing"]}},
+        str(store),
+    )
+    status = json.loads((store / "sweep-status.json").read_text())
+    assert status["reason"] == "no_credential", "the reason must be a token"
+    # ... and the SAME filename must not carry two modes depending on which
+    # writer made it: the extension writes 0600, and the CLI used to write 0644.
+    assert (store / "sweep-status.json").stat().st_mode & 0o777 == 0o600
+    assert store.stat().st_mode & 0o777 == 0o700
+
+
 def test_a_dry_run_never_overwrites_a_real_failure(tmp_path, monkeypatch):
     """A PLAN is not an outcome — `--dry-run` must not turn a failure healthy.
 
