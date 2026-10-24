@@ -1251,6 +1251,150 @@ def _cmd_record_restore(args):
     return EXIT_RESTORED
 
 
+def _cmd_record_text(args):
+    """#9555 / R7 — serve §9.4's VERBATIM text from the record alone.
+
+    ``record_read`` (the record-only reader, #9638) had **no production caller**
+    (measured: its own test was the only importer), so §9.4's *"send the
+    source's VERBATIM text, not the extracted claim"* had a reader and no path.
+    This verb is the path; the composition and its one refusal live in
+    :mod:`tortoise.record_text`, and the runbook section is
+    ``docs/infra-runbook.md`` §9b.
+
+    Exit codes are the operator's next step, and the 3-versus-2 split is the
+    reason the verb exists at all:
+
+    * ``0`` — the record served the text (§9.1's narrative and/or the raw
+      turns). The numbers are a MEASUREMENT: the turn count is what was read,
+      not what ``--limit`` allowed to be printed.
+    * ``3`` — the record was READABLE for this scope and holds nothing for the
+      key. An honest absence (a session captured before the narrative carrier
+      landed, or one whose distillation produced no narrative).
+    * ``2`` — no verdict. No DSN, a malformed DSN, no ``psycopg2``, an
+      unreadable record — or **a scope this connection cannot see**. That last
+      one is not pedantry: a tenancy-filtered read returns 0 rows SILENTLY, so
+      reporting it as an absence would state a falsehood about a customer's
+      evidence (§9555 G1, #9600's app role).
+    """
+    import json as _json
+
+    from tortoise.record_text import (
+        EXIT_ABSENT,
+        EXIT_SERVED,
+        EXIT_UNAVAILABLE,
+        log_result,
+        record_scope_readable,
+        serve_from_record,
+    )
+
+    # Resolved by the module that DECLARES the arming surface, so a rename
+    # cannot silently disarm this verb while `RecordWriter` stays armed.
+    from tortoise.record_writer import RecordWriteError, record_dsn
+
+    try:
+        dsn = record_dsn(args.record_dsn)
+    except RecordWriteError as e:
+        print(f"Error: {e} — no text was served and no verdict was produced.",
+              file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    if not dsn:
+        print("Error: no record DSN — pass --record-dsn or set "
+              "TORTOISE_RECORD_DSN. This verb reads the record only; with no "
+              "record there is nothing it can honestly answer.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+
+    # Usage-shaped refusals BEFORE the optional-dependency check: an operator
+    # who passed both keys (or neither) must not be told to install an extra
+    # first (the `record-restore` ordering, measured there).
+    if bool(getattr(args, "session", None)) == bool(getattr(args, "source_url", None)):
+        print("Error: pass exactly one of --session / --source-url. "
+              "--session reads §9.1's narrative + turns by the session's own "
+              "identity; --source-url is §9.4's shape (the text behind a "
+              "claim), resolved through public.source.session_id. Two keys "
+              "make the answer's meaning ambiguous; neither makes it "
+              "unanswerable.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+    if args.limit is not None and args.limit < 0:
+        print(f"Error: --limit must be >= 0, got {args.limit}.", file=sys.stderr)
+        return EXIT_UNAVAILABLE
+
+    try:
+        import psycopg2
+    except ImportError:
+        print("Error: psycopg2 is not installed — the record cannot be read, "
+              "so no text was served. Install the `postgres` extra.",
+              file=sys.stderr)
+        return EXIT_UNAVAILABLE
+
+    from tortoise.record_read import RecordReadError
+    from tortoise.record_reconcile import (
+        RECORD_CONNECT_TIMEOUT_S,
+        RECORD_STATEMENT_TIMEOUT_MS,
+    )
+
+    conn = None
+    try:
+        try:
+            conn = psycopg2.connect(
+                dsn,
+                connect_timeout=RECORD_CONNECT_TIMEOUT_S,
+                options=f"-c statement_timeout={RECORD_STATEMENT_TIMEOUT_MS}",
+            )
+        except Exception as e:
+            print(f"Error: the record is unreadable ({type(e).__name__}) — no "
+                  f"text was served and no verdict was produced.",
+                  file=sys.stderr)
+            return EXIT_UNAVAILABLE
+
+        # ⛔ A MISS IS PROVEN BEFORE IT IS REPORTED. Without this read, a
+        # tenancy-filtered connection (the app role with no GUC, or a
+        # transaction-mode pooler that dropped it) answers "this session has
+        # no narrative" about a session that has one.
+        try:
+            readable = record_scope_readable(conn, org_id=args.org,
+                                             graph_id=args.graph)
+        except Exception as e:
+            print(f"Error: the record's scope could not be read "
+                  f"({type(e).__name__}) — that is NOT an absence, and this "
+                  f"verb will not report it as one.", file=sys.stderr)
+            return EXIT_UNAVAILABLE
+        if not readable:
+            print(f"Error: scope org={args.org!r} graph={args.graph!r} is not "
+                  f"visible to this connection. A tenancy-filtered read "
+                  f"returns 0 rows SILENTLY, so this run cannot tell a "
+                  f"mistyped --org/--graph from a role that may not see the "
+                  f"tenant. No verdict was produced; use a record DSN whose "
+                  f"role can read this scope.", file=sys.stderr)
+            return EXIT_UNAVAILABLE
+
+        try:
+            outcome = serve_from_record(
+                conn,
+                org_id=args.org,
+                graph_id=args.graph,
+                session_id=getattr(args, "session", None),
+                source_url=getattr(args, "source_url", None),
+                limit=args.limit,
+            )
+        except RecordReadError as e:
+            print(f"Error: the record is MALFORMED for this key — {e}",
+                  file=sys.stderr)
+            return EXIT_UNAVAILABLE
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return EXIT_UNAVAILABLE
+    finally:
+        if conn is not None:
+            conn.close()
+
+    log_result(outcome)
+    if args.json:
+        print(_json.dumps(outcome.as_dict(), indent=2, sort_keys=True))
+    else:
+        print(outcome.render())
+    return EXIT_SERVED if outcome.served else EXIT_ABSENT
+
+
 def _cmd_init(args):
     """Auto-detect FalkorDB and create default graph — onboarding."""
     import json as _json  # noqa: I001
@@ -11863,6 +12007,40 @@ def main(argv: list[str] | None = None) -> int:
                           "puts nothing back")
     rr2.add_argument("--json", action="store_true",
                      help="Machine-readable JSON output")
+    # #9555 / R7: §9.4's VERBATIM-EVIDENCE FETCH, served from the record. The
+    # reader (`tortoise/record_read.py`) landed with #9638 and had no production
+    # caller; this verb is the path, and the composition is
+    # `tortoise/record_text.py`. Exit 0 served / 3 readable-and-absent / 2 no
+    # verdict — the 3-vs-2 split is the whole point (a tenancy-filtered read
+    # returns 0 rows silently, so an unreadable SCOPE must never be reported as
+    # an absent SESSION).
+    rt = sp.add_parser(
+        "record-text",
+        help="Serve §9.4's verbatim source text (the S1 narrative + the raw "
+             "turns) from the Postgres record alone (R7). Exit 0 served / 3 "
+             "readable-and-absent / 2 no verdict")
+    rt.add_argument("--record-dsn", default=None,
+                    help="Postgres record DSN (default: $TORTOISE_RECORD_DSN)")
+    rt.add_argument("--org", required=True, help="Record org_id (the scope)")
+    rt.add_argument("--graph", required=True,
+                    help="Record graph_id (the scope)")
+    # The key is EITHER a session or a source url, and the verb refuses both /
+    # neither: `--session` reads §9.1's own identity, `--source-url` is §9.4's
+    # shape ("show me the verbatim text behind this claim"), which resolves
+    # through `public.source.session_id` — a COLUMN, so the link survives the
+    # graph being destroyed.
+    rt.add_argument("--session", default=None,
+                    help="Session id whose narrative + turns to serve")
+    rt.add_argument("--source-url", default=None,
+                    help="A :Source's url; serves the text behind the claim "
+                         "that links to it (§9.4)")
+    rt.add_argument("--limit", type=int, default=None,
+                    help="Render at most N turns. The Served/reported turn "
+                         "COUNT is never capped by this — only the rendering "
+                         "— so a bound cannot make a served answer understate "
+                         "the transcript it holds")
+    rt.add_argument("--json", action="store_true",
+                    help="Machine-readable JSON output")
     bk = sp.add_parser("backup", help="Backup events.jsonl + FalkorDB to timestamped dir")
     bk.add_argument("--db", required=True, help="Path to database file")
     bk.add_argument("--events", default="events.jsonl", help="Path to event log")
@@ -12456,6 +12634,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_record_backup(args)
     elif args.cmd == "record-restore":
         return _cmd_record_restore(args)
+    elif args.cmd == "record-text":
+        return _cmd_record_text(args)
     elif args.cmd == "backfill":
         _cmd_backfill(args)
         return 0

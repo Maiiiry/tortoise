@@ -221,6 +221,15 @@ _MINIMAL_RECORDS: dict[str, dict] = {
                         "previousContentHash": "h1", "previousValidTo": "t0"},
     "DocumentCreated": {"id": "u1", "url": "u1"},
     "SessionRecorded": {"id": "sess1", "turn_count": 2, "is_episodic": True},
+    # #9555/R7: the narrative carrier's PRODUCER shape
+    # (`hosted_api._execute_commit_writes` → `sdk._emit_event("SessionNarrated",
+    # id=event_id, sessionId=, story_arc=, summary=, capturedAt=)`), not an
+    # invented one. It carries the narrative, so it DOES produce a statement
+    # through the shape-keyed secondary projection while declaring
+    # `NoRecordEffect` — see the branch in the totality test below.
+    "SessionNarrated": {"id": "e1", "sessionId": "sess1",
+                       "story_arc": "the session, told as prose",
+                       "summary": "one line"},
     "SessionDeleted": {"id": "sess1"},
     "EntityLinked": {"id": "p1", "source_label": "Point", "source_id": "p1",
                      "target_label": "Object", "target_id": "o1",
@@ -248,7 +257,21 @@ def test_each_declared_type_materializes_or_declares_a_no_effect(record_type):
     statements = rp.mutations_for(record, org_id="o", graph_id="g")
     effect = rp.RECORD_MUTATIONS[record_type].effect
     if isinstance(effect, rp.NoRecordEffect):
-        assert statements == []
+        # #9555/R7: a declared no-effect record can still carry a SECONDARY
+        # projection's payload — the §9.1 narrative home is shape-keyed on
+        # purpose (any producer carrying `story_arc` lands it, including one
+        # nobody listed in a type whitelist), so "no declared NODE effect" does
+        # not mean "no statements". Asserting `statements == []` unconditionally
+        # would force every future narrative carrier into the very whitelist
+        # #9555 removed.
+        if record.get("story_arc"):
+            assert statements, (
+                f"{record_type} carries the §9.1 narrative and produced no "
+                "statement — the shape-keyed secondary projection did not fire")
+            assert any(rp.NARRATIVE_TABLE in s.sql for s in statements), (
+                f"{record_type}'s statements do not touch {rp.NARRATIVE_TABLE}")
+        else:
+            assert statements == []
         # A declared no-op must say WHY. "No reason" is the silent skip.
         assert len(effect.reason) > 40, (
             f"{record_type} declares NoRecordEffect with a reason too thin to "

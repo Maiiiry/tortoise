@@ -125,6 +125,25 @@ class Turn:
         _role, body = _role_and_body(self.content)
         return body
 
+    @property
+    def line(self) -> str:
+        """This turn as ONE labelled line — the transcript's own rendering rule.
+
+        Declared ONCE, here, because two readers need it and a second copy is
+        how the writer's frame and its readers drift: the per-turn `body` alone
+        loses the speaker, which for a transcript is part of the evidence (a
+        claim quoted from the assistant is not a claim the user made).
+        """
+        role, body = _role_and_body(self.content)
+        # `"unknown"` is the inverse's SENTINEL, not a speaker the record knows,
+        # and the writer stores it in `point.speaker` too, so it has to be
+        # filtered on BOTH sides or every role-less turn is served `unknown: …`.
+        speaker = self.speaker
+        if speaker == _UNFRAMED_ROLE:
+            speaker = None
+        label = speaker or (role if role != _UNFRAMED_ROLE else None)
+        return f"{label}: {body}" if label else body
+
 
 @dataclass(frozen=True)
 class SessionText:
@@ -155,20 +174,7 @@ class SessionText:
         §9.4's verbatim path reads; it is derived from the turn rows, never
         stored a second time.
         """
-        lines = []
-        for turn in self.turns:
-            role, body = _role_and_body(turn.content)
-            # `"unknown"` is the INVERSE's sentinel, not a speaker the record
-            # knows — and the writer stores it in `point.speaker` too
-            # (`_capture_turn_frame` emits `[unknown] …` for a role-less turn),
-            # so the sentinel has to be filtered on BOTH sides or every
-            # role-less turn is served as `"unknown: …"`.
-            speaker = turn.speaker
-            if speaker == _UNFRAMED_ROLE:
-                speaker = None
-            label = speaker or (role if role != _UNFRAMED_ROLE else None)
-            lines.append(f"{label}: {body}" if label else body)
-        return "\n\n".join(lines)
+        return "\n\n".join(turn.line for turn in self.turns)
 
     @property
     def verbatim_available(self) -> bool:

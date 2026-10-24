@@ -2987,9 +2987,61 @@ not put them in this section, where they would rot.
   graph that never reached the record is not in the record to restore from.
 - **It does not serve reads** — that is #7970. It does not reconcile
   (`record-reconcile`) and it does not write the record (`record_writer`).
+  ⚠️ **§9.4's verbatim fetch is its own verb, `record-text` (#9555 / R7)** — see
+  the section immediately below. This one restores the CACHE; that one serves the
+  RECORD's text, and neither reads the other's store.
 - **It is not a backup of the record.** Restoring the *record* itself is the
   backup/restore posture in #9557; this verb restores the **cache** from an
   already-restored record.
+
+## 9b. Serve §9.4's VERBATIM source text from the record (#9555 / R7)
+
+**When to run this.** §9.4 makes the claim→source link load-bearing: *"at answer
+time, send the source's VERBATIM text, not the extracted claim"* (measured 15.9 /
+22.0 pts). §9.1 places that text in Postgres — the S1 narrative in
+`public.session_narrative`, the raw turns in the episodic `public.point` rows —
+so this verb serves BOTH from the record alone: **not the journal, not the graph.**
+It is therefore the one evidence path that still answers with the graph gone.
+
+```bash
+# By session (the narrative + its transcript + the redaction count):
+python -m tortoise record-text \
+    --org <org_id> --graph <graph_id> --session <session_id>
+
+# §9.4's own shape — "the verbatim text behind this claim" — by source url.
+# The link is public.source.session_id, a COLUMN, so it survives the cache:
+python -m tortoise record-text --org … --graph … --source-url 'session:<session_id>'
+
+# Rendering bound only (the REPORTED turn count is never capped):
+python -m tortoise record-text … --session <id> --limit 20 --json
+```
+
+**Exit codes — and the 3-versus-2 split is the reason the verb exists:**
+
+| code | meaning | next step |
+|---|---|---|
+| `0` | served: the narrative and/or the turns came back, with `redactions`, `turn_count` and `turns` **read from the record** | use the text; `--json` carries the same numbers |
+| `3` | the record was **READABLE for this scope** and holds no §9.1 text for that key — an honest absence (a session captured before the narrative carrier landed, or one whose distillation produced no narrative) | check the session id; do NOT read it as "the record lost the data" |
+| `2` | **no verdict**: no/invalid DSN, `psycopg2` absent, an unreadable record — **or a scope this connection cannot see** | fix the DSN/scope. ⛔ A scope that does not resolve is reported HERE, never as `3` |
+
+⛔ **Why an unreadable scope is `2` and not `3`.** A tenancy-filtered read returns
+**0 rows silently**: the app role with no tenant GUC, or a transaction-mode pooler
+that dropped it, answers "this session has no narrative" about a session that has
+one. The verb therefore reads the scope row (`public.graphs`) before it reports a
+miss, and refuses to call an unseeable scope an absence — a false absence about a
+customer's evidence is worse than no answer. This is #9555's G1 note and #9600's
+app role, not a hypothetical.
+
+**What it does NOT do.** The hosted ask/answer path's own verbatim fetch is not
+wired here: it is an MCP/SDK **surface** change, and `AGENTS.md` → *MCP/SDK Surface
+Approval* puts that behind Daniel's sign-off. This verb is the operator path.
+
+**Verification.** `tests/test_9555_narrative_carrier.py` — the carrier in the
+write path, the shape-keyed projection, the record-only read, and this verb's exit
+codes against a real Postgres (armed in CI's `test-record-postgres` job).
+`tests/test_9555_narrative_cache_rebuild.py` — the cache destroyed and rebuilt
+from the record alone, with the narrative and the redaction count identical across
+the wipe.
 
 ## Secrets Matrix
 

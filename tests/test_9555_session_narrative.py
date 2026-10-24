@@ -20,13 +20,14 @@ journal unavailable. Five claims, each a test here:
    app-role policy with BOTH `USING` and `WITH CHECK`, guarded on the role
    existing because R6's migration (which creates it) is the one that sorts
    first.
-3. **IT IS PROJECTED FROM THE RECORDS THAT CARRY IT — AND THE TEXT COLUMNS ARE
-   PRIMARY-WITHOUT-CARRIER TODAY.** `capture_redactions`/`turn_count` ride
-   `SessionRecorded` (PRIMARY, journal-carried). `narrative`/`summary` are the
-   text the record must keep but whose journal carrier does not exist in this
-   tree yet (`story_arc` reaches the graph by raw Cypher, which is not a journal
-   record) — see the migration's ⚠️ block. The projection is written and pinned
-   for the day it does; this suite never pretends a live capture fills it.
+3. **IT IS PROJECTED FROM THE RECORDS THAT CARRY IT — AND BOTH CARRIERS NOW
+   EXIST.** `capture_redactions`/`turn_count` ride `SessionRecorded` (PRIMARY,
+   journal-carried). `narrative`/`summary` were PRIMARY-WITHOUT-CARRIER when
+   this suite was written — `story_arc` reached the graph by raw Cypher, which
+   is not a journal record — and **#9555 has since landed the carrier**
+   (`record_projection.NARRATIVE_RECORD_TYPE`, emitted by the layer-1 commit
+   path; see the migration's ✅ block). This suite still pins the PROJECTION
+   only: the carrier's own pins live in `tests/test_9555_narrative_carrier.py`.
 4. **THE TWO CARRIERS DO NOT CLOBBER EACH OTHER.** They write ONE row, each
    naming only its own columns in the `DO UPDATE SET`. This is the leg that
    makes a replay in journal order equal to a live build: an upsert that wrote
@@ -106,75 +107,80 @@ def test_the_foreign_key_cascades_so_erasure_reaches_it():
     assert "ON DELETE CASCADE" in sql
 
 
-def test_the_carrier_gap_block_states_only_the_gap_that_is_real():
-    """`#9638` review P2: the ⚠️ CARRIER GAP block must not invent a second gap.
+def test_the_carrier_block_states_the_carrier_THAT_LANDED():
+    """The migration's carrier block must state the PRESENT, and keep the past.
 
-    Before this pin the block described `capture_redactions` as an UNSETTLED
-    gap too — *"NULL because the record's OWN column,
-    `public.session.capture_redactions`, is jsonb while the producer emits an
-    integer, so a `SessionRecorded` carrying one is refused
-    (`DatatypeMismatch`)"* — plus a fragment ("— which is exactly why …") left
-    hanging off it. All of that is false in this tree, and it contradicted the
-    migration's OWN header (which classes the column PRIMARY /
-    journal-carried), `08-hosted-prerequisites.md`'s R7 table, and
-    `docs/00_index.md`'s row ("fixed since (#9264)"). Migrations are
-    append-only, so the false sentence lands permanently.
+    This pin has now been re-derived twice, and both times for the same reason:
+    a migration comment is where the next lane reads what is true. It first
+    guarded against the block inventing a `capture_redactions` gap that the
+    #9264/R4 narrowing had already closed. #9555 has since landed the OTHER half
+    — the journal carrier for `story_arc`/`summary` — so the block that used to
+    disclose a GAP (`⚠️ THE CARRIER GAP`) now discloses the CARRIER
+    (`✅ THE CARRIER`), and a pin still indexing the old heading would fail
+    without saying anything about the truth.
 
-    The narrowing is derived from the tree, not re-typed: the settling
-    migration is read, so this pin cannot rot into asserting a fact that has
-    moved. The positive half keeps the fix from becoming a deletion — the gap
-    that IS real (no journal carrier for `story_arc`/`summary`) must still be
-    stated.
+    Two halves, because a comment can fail in either direction:
 
-    RED on the pre-fix text: `DatatypeMismatch` present, and
-    "`capture_redactions` NULL" stated as the live-capture outcome.
+    * the CLOSED claims must be gone (no `DatatypeMismatch` refusal, no
+      "`capture_redactions` NULL" as the live outcome) — those are false in this
+      tree;
+    * the CARRIER must be named (`SessionNarrated`, the shape-keyed projection,
+      `NoRecordEffect`) AND its HISTORY kept (`raw Cypher`,
+      `story_arc`/`summary`), because the history is what makes the claim
+      checkable — deleting it would leave an assertion nobody can audit.
+
+    Derived from the tree, not re-typed: the narrowing migration and the
+    registry constant are both read.
     """
     sql = _migration_sql()
-    start = sql.index("⚠️ THE CARRIER GAP")
+    assert "✅ THE CARRIER" in sql, (
+        "the migration's carrier block is gone — if the heading moved again, "
+        "re-derive this pin rather than deleting it")
+    start = sql.index("✅ THE CARRIER")
     block = sql[start:sql.index("\n-- ====", start)]
 
     # The #9264/R4 settling migration is in THIS tree, and it narrows the
-    # column the block said would refuse the carrier.
+    # column the old block said would refuse the carrier.
     narrowing = (MIGRATIONS
                  / "20261022000001_record_session_capture_redactions_integer.sql")
     assert narrowing.exists(), (
         "the #9264/R4 narrowing migration is gone — re-derive this pin's premise "
-        "instead of deleting the assertion"
-    )
+        "instead of deleting the assertion")
     assert re.search(
         r"ALTER TABLE\s+public\.session\s+ALTER COLUMN\s+capture_redactions\s+TYPE\s+integer",
         narrowing.read_text(encoding="utf-8"),
     ), (
         "the narrowing no longer ALTERs `public.session.capture_redactions` to "
-        "`integer` — the carrier-gap block's premise changed, so this pin must "
-        "be re-derived rather than loosened"
-    )
-
-    # So the refusal the block described cannot occur, and a block that still
-    # claims it mis-states the projection this suite exercises below.
-    assert "DatatypeMismatch" not in block, (
-        "the carrier-gap block claims the `SessionRecorded` carrying "
-        "`capture_redactions` is refused `DatatypeMismatch` — the column is "
-        "`integer` since 20261022000001 (#9264/R4 settled), so the count LANDS"
-    )
-    for claim in ("`capture_redactions` NULL", "`capture_redactions` is NULL"):
+        "`integer` — the carrier block's premise changed, so this pin must be "
+        "re-derived rather than loosened")
+    for claim in ("DatatypeMismatch", "`capture_redactions` NULL",
+                  "`capture_redactions` is NULL"):
         assert claim not in block, (
-            f"the carrier-gap block still states {claim!r} as the live-capture "
-            "outcome: `capture_redactions` rides a `SessionRecorded` and its "
-            "column is `integer`, so the row lands with BOTH counts filled"
+            f"the carrier block still states the CLOSED gap {claim!r} — the "
+            "column is `integer` since 20261022000001 (#9264/R4 settled) and "
+            "the count LANDS"
         )
 
-    # The positive half: the ONE real gap is still stated, in the block that
-    # exists to state it — the fix deletes a false claim, not the disclosure.
-    assert "story_arc" in block and "summary" in block, (
-        "the carrier-gap block no longer names the columns whose journal "
-        "carrier is genuinely absent (`story_arc`/`summary`) — the disclosure "
-        "was deleted instead of corrected"
-    )
-    assert "raw Cypher" in block, (
-        "the block no longer says WHY there is no carrier (the layer-1 commit "
-        "writes `story_arc` by raw Cypher, which is not a journal record)"
-    )
+    # The CARRIER that landed is named, and named the way the code names it —
+    # read off the registry so the comment cannot drift from the constant.
+    from tortoise import record_projection as rp
+    assert rp.NARRATIVE_RECORD_TYPE in block, (
+        f"the block does not name {rp.NARRATIVE_RECORD_TYPE!r} — a reader would "
+        "conclude the narrative still has no journal carrier and rebuild it")
+    assert "_narrative_statements" in block, (
+        "the block does not say WHICH projection lands the narrative "
+        "(the shape-keyed `_narrative_statements`), so its 'record effect' "
+        "claim is unfalsifiable")
+    assert "NoRecordEffect" in block, (
+        "the block does not say the carrier materialises NO node — which is "
+        "the whole §9.1 reason it is a carrier and not a node record")
+
+    # History kept: the gap's CAUSE stays stated, because that is what a
+    # reader checks the claim against.
+    for kept in ("story_arc", "summary", "raw Cypher"):
+        assert kept in block, (
+            f"the carrier block dropped {kept!r} — the history is what makes the "
+            "claim auditable, and deleting it is not a correction")
 
 
 def test_the_row_does_not_depend_on_the_session_row_landing_first():
