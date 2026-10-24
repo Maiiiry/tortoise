@@ -12330,7 +12330,8 @@ class TortoiseSDK:
 
             for _m in merges:
                 _m_res = apply_merge_union(proj, _m, session_id=session_id,
-                                           sdk=self)
+                                           sdk=self,
+                                           subject_names=subject_entity_names)
                 for _w in (_m_res.get("warnings") or []):
                     warnings.append(f"merge {_m_res.get('point_id')}: {_w}")
                 if _m_res.get("unresolved"):
@@ -12341,6 +12342,19 @@ class TortoiseSDK:
                         "merge " + str(_m_res.get("point_id")) +
                         ": unresolved attachment(s) " +
                         ", ".join(_m_res["unresolved"][:5]))
+                if _m_res.get("skipped_subject"):
+                    # #5006 review (F2): a subject-kind name must NOT get the
+                    # un-gated `aboutObject` edge — the same skip this method's
+                    # own attachment pass makes above (`_n in
+                    # subject_entity_names`). It is a DROP, not a resolution
+                    # failure, so it is named separately from `unresolved`: a
+                    # merge emits no payload point, so `bind_point_subjects`
+                    # never runs for the candidate and that binding is lost.
+                    warnings.append(
+                        "merge " + str(_m_res.get("point_id")) +
+                        ": subject-kind attachment(s) skipped (the binder owns "
+                        "the gated aboutSubject edge): " +
+                        ", ".join(_m_res["skipped_subject"][:5]))
 
         # ── events ──
         # #2552: payload events are created under their CONTENT-ADDRESSED

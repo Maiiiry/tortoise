@@ -99,7 +99,7 @@ both.
     RESTORE from ``prior`` (``vet_gate.py`` Rule 4), which re-emits an entity an
     EARLIER pass discarded, needs a surviving candidate to reference the name,
     and so cannot fire from a coverage gap. (``OUTCOMES`` =
-    KEEP/NOOP/DISCARD/MERGE, with MERGE recorded-not-applied, #5006.)
+    KEEP/NOOP/DISCARD/MERGE, with MERGE routed to S3's fusion, #5006.)
   * S2.3 CLASSIFY only LABELS: ``classify_items`` returns ``assignments`` (a
     kind per EXISTING id) and ``_apply_classify_kinds`` writes that kind onto an
     item already in the list. It adds none.
@@ -7031,7 +7031,8 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
         if not isinstance(p, dict):
             warnings.append(f"non-dict point entry {p!r} skipped")
             continue
-        content = str(p.get("content", "")).strip()[:_MAX_CONTENT]
+        _raw_content = str(p.get("content") or "").strip()
+        content = _raw_content[:_MAX_CONTENT]
         if not content:
             continue
         pkind = str(p.get("pointKind", "")).strip() or "statement"
@@ -7083,7 +7084,14 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
              "search_keys": search_keys, "when": when_valid,
              "tier": str(p.get("tier") or "")},
             idx["points"], entity_mentions=about_list,
-            merge_flagged=n in merge_flagged,
+            # Probe with the SAME key `_merge_flagged_contents` emits
+            # (`_merge_verdict_keys`): the un-clipped content, and the item
+            # text VET actually keyed on (`name or content`). A single clipped
+            # `n` here silently drops the verdict for any candidate over
+            # `_MAX_CONTENT`, and for any point item that also carries a
+            # `name`.
+            merge_flagged=bool(_merge_verdict_keys(
+                str(p.get("name") or _raw_content).strip()) & merge_flagged),
             current_date=when_valid or session_date)
         pid = _content_id("pt", content)
         if decision.decision == "NOOP":
@@ -7892,6 +7900,40 @@ def _edus_from_conversation(conversation: list[dict]) -> list[dict]:
             for i, t in enumerate(conversation) if t.get("content")]
 
 
+def _merge_verdict_keys(text: object) -> frozenset[str]:
+    """The normalised spellings a S2.2b VET ``MERGE`` verdict may be keyed under.
+
+    **One definition of the key, used by BOTH ends of the routing** (#5006):
+    :func:`_merge_flagged_contents` emits these and ``execute_embed`` probes
+    with them. Two spellings, for two real asymmetries between VET and the
+    write path:
+
+    1. **The cap.** ``execute_embed`` keys on ``content[:_MAX_CONTENT]``
+       (``_MAX_CONTENT = 1000``) while VET's ``_item_text`` never truncates, so
+       a candidate over 1000 characters keys two DIFFERENT strings and the
+       verdict is silently dropped — ``merge_flagged`` is then ``False``, the
+       ``#9424`` guard refuses the fold, and the pair falls through to ``ADD``:
+       a second Point minted for a pair the arbiter marked ``MERGE``, with no
+       warning and ``stats["merges"]`` still 0. Both spellings are accepted,
+       exactly as ``vet_gate._resolution_variants`` (the same clip, on the
+       #2552 mint surface) already keeps ``_norm(raw)`` and
+       ``_norm(raw[:_MAX_CONTENT])``.
+    2. **The field.** VET keys on ``_item_text`` = ``name or content``
+       (``vet_gate`` documents that it follows the extractor's own rule), while
+       the point write path keys on ``content``. A point item carrying both
+       keys is therefore keyed on its NAME by VET, so the caller passes the
+       same ``name or content`` expression this helper normalises — one rule,
+       not two.
+
+    A blank text yields the empty set (no verdict ⇒ no merge — the fail-closed
+    direction for a write).
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset({_norm(raw), _norm(raw[:_MAX_CONTENT])})
+
+
 def _merge_flagged_contents(*surfaces: dict | None) -> frozenset[str]:
     """The normalised candidate contents S2.2b VET recorded a ``MERGE`` verdict
     for (#5006 — the verdict's consumer).
@@ -7918,6 +7960,22 @@ def _merge_flagged_contents(*surfaces: dict | None) -> frozenset[str]:
 
     A missing/malformed surface contributes nothing (no verdict ⇒ no merge),
     which is the fail-closed direction for a write.
+
+    ⚠️ **ACCEPTED RESIDUAL — the key is TEXT, not the item id, so a verdict can
+    flag a SIBLING.** Two same-text candidates in one pass are distinguished by
+    ``vet_gate``'s index-bearing ``_item_id``, and this hand-off drops the index
+    (deliberately: ``apply_vet`` removes items between the passes, so an
+    index-keyed read would flag the WRONG candidate). The cost is the converse
+    — a verdict recorded for one candidate also flags a *different* candidate
+    whose text collides with it, and the consumer then probes with
+    ``name or content``, so a NAME can collide too. The mechanical ladder still
+    has to admit the pair (the ~0.95 bar against a prior, no distinguishing
+    difference, a readable union), so a misfire needs a text collision AND a
+    near-identical prior. **Pre-existing and unchanged by this routing**
+    (measured identical at ``3e669aa6``); tracked on tortoise#9869. ⚠️ Do not
+    read the SECTION key above as closing it: that KEY stops a verdict on a
+    different KIND of candidate from being widened, not a verdict on a
+    different candidate of the same kind.
     """
     flagged: set[str] = set()
     for surface in surfaces:
@@ -7932,9 +7990,11 @@ def _merge_flagged_contents(*surfaces: dict | None) -> frozenset[str]:
             outcome = str(d.get("outcome") or "").strip().upper()
             if outcome != _MERGE_DECISION:
                 continue
-            text = str(d.get("text") or "").strip()
-            if text:
-                flagged.add(_norm(text))
+            # Both spellings, and the item-text rule — see
+            # :func:`_merge_verdict_keys`: a text-only, un-clipped key drops
+            # every verdict on a candidate over ``_MAX_CONTENT``, which is the
+            # silent duplicate this whole mechanism exists to prevent.
+            flagged |= _merge_verdict_keys(d.get("text"))
     return frozenset(flagged)
 
 

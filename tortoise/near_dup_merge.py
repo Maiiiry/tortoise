@@ -268,12 +268,21 @@ def near_dup_merge(candidate: dict, prior: dict, *, overlap: float,
 
 
 def apply_merge_union(proj: Any, record: dict, *, session_id: str,
-                      sdk: Any = None) -> dict:
+                      sdk: Any = None,
+                      subject_names: Any = frozenset()) -> dict:
     """Execute one fusion against a live graph: union the attachments, keep the
     losing document's provenance. Returns an evidence dict; NEVER raises.
 
     ``record`` is one entry of ``execute_embed``'s ``result["merges"]``:
     ``{point_id (the SURVIVOR), about_entities (the union), ...}``.
+
+    ``subject_names`` is the SUBJECT-KIND names the caller's payload declared
+    (capture's ``subject_entity_names``, ``sdk.py:11857``). They are SKIPPED —
+    see "the subject channel" below — and reported in ``skipped_subject``.
+    Omitting it is safe rather than silently wider: with no set there is
+    nothing to skip, which is exactly what a capture whose payload declares no
+    subject-kind entity has. It is a name SET; a bare string is read as ONE
+    name, never iterated as characters.
 
     What is written:
 
@@ -300,23 +309,36 @@ def apply_merge_union(proj: Any, record: dict, *, session_id: str,
     `unresolved` therefore means one thing only: *no node in this graph has
     that name*.
 
-    ⚠️ **A DESIGN GAP, stated here rather than closed (and PRE-EXISTING, not
-    introduced by this module).** `about_entities` is not object-only — the
+    ⚠️ **THE SUBJECT CHANNEL IS SKIPPED, not mis-bound — and the skip is what
+    makes the coincidence case safe.** `about_entities` is not object-only: the
     SUBJECT channel (team/role/person, the gated `aboutSubject` edge) also
-    contributes names to it, and capture skips those explicitly (`sdk.py:12124`:
-    *"the #1370 binder owns the gated `aboutSubject` edge; the topic channel
-    must not produce an un-gated one"*). This write has no binder and resolves
-    only `:Object {name:$n}`, so a subject-kind attachment the candidate alone
-    names lands in `unresolved` instead of being bound; and because a merge
-    emits no payload point, `bind_point_subjects` never runs for the candidate,
-    so its confidence-gated subject binding is dropped. *"Nothing it argued
-    for is silently dropped"* is therefore true of OBJECT attachments only. This is
-    the same blind spot `extractor_v2._attachment_ids` already has, which is
-    why it is not a regression — but it is a gap, and closing it needs a
-    subject-resolution path here, not a wider `MATCH`.
+    contributes names to it. `subject_names` carries the payload's subject-kind
+    names, and a union name in that set is reported in `skipped_subject` and
+    **never written**.
+
+    Why the skip is by NAME and not by "resolution failed": an `:Object` may
+    legitimately share a subject's EXACT name — that is why capture's own pass
+    skips on the name (`sdk.py:12124`, and the F6 note at `sdk.py:11849-11857`
+    explains why the comparison is exact and not case-folded). So
+    `MATCH (o:Object {name:$n})` in that case RESOLVES, and a write without
+    this skip would attach the claim to an Object under a subject's name — the
+    un-gated `aboutObject` edge capture deliberately refuses to write there
+    (`#1370` / the `#4934` label leak). Bounding the consequence to "lands in
+    `unresolved`" was therefore FALSE for exactly that case.
+
+    ⚠️ **The pre-existing gap this makes VISIBLE instead of silent.** A merge
+    emits no payload point, so `bind_point_subjects` never runs for the
+    candidate and its confidence-gated `aboutSubject` binding is dropped — the
+    binder is the only gated `aboutSubject` producer and this write has no
+    binder. `skipped_subject` names those names, so "nothing it argued for is
+    silently dropped" is true of OBJECT attachments and is now REPORTED, not
+    assumed, for subject binding. Closing that needs a subject-resolution path
+    here; it is not a wider `MATCH` (which is the defect above), and it is not
+    introduced by this module. The same blind spot
+    `extractor_v2._attachment_ids` already has.
     """
     out: dict = {"point_id": "", "contained": 0, "linked": 0,
-                 "unresolved": [], "warnings": []}
+                 "unresolved": [], "skipped_subject": [], "warnings": []}
     point_id = str((record or {}).get("point_id") or "")
     out["point_id"] = point_id
     if not point_id:
@@ -356,10 +378,24 @@ def apply_merge_union(proj: Any, record: dict, *, session_id: str,
     if not isinstance(names, (list, tuple, set, frozenset)):
         out["warnings"].append("merge record's about_entities is unreadable")
         return out
+    # Capture's own skip (`sdk.py:12124`), applied here so a merge cannot write
+    # an edge the SAME capture refuses to write on the normal route. Exact
+    # names, case-preserved: the resolution below is case-SENSITIVE too.
+    # A bare string is ONE name — iterating it would skip single characters and
+    # silently drop a one-letter Object attachment for the rest of the capture.
+    if isinstance(subject_names, str):
+        subject_names = (subject_names,)
+    subject_skip = {str(n).strip() for n in (subject_names or ())
+                    if isinstance(n, str)}
     for name in names:
         if not isinstance(name, str) or not name.strip():
             continue
         _n = name.strip()
+        if _n in subject_skip:
+            # Reported, never written: the #1370 binder owns this edge and a
+            # merge runs no binder. See the docstring's subject-channel note.
+            out["skipped_subject"].append(_n)
+            continue
         try:
             rows = proj.g.query(
                 "MATCH (o:Object {name:$n}) RETURN o.id",

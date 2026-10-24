@@ -68,6 +68,13 @@ from tortoise import vet_gate  # noqa: E402, RUF100
 PRIOR_CONTENT = "the team meets weekly in main office"
 CANDIDATE_CONTENT = "the team meets weekly in main office"
 
+#: A candidate LONGER than `extractor_v2._MAX_CONTENT` (1000). `execute_embed`
+#: keys its consolidation on `content[:_MAX_CONTENT]` while VET's `_item_text`
+#: never truncates, so this length is the boundary at which a text-only routing
+#: key silently stops matching (#5006 review, F1). No sentence punctuation: the
+#: length is the variable under test, not E3's multi-sentence warning.
+LONG_CONTENT = ("the team meets weekly in the main office " * 40).strip()
+
 
 def _prior(**kw) -> dict:
     row = {"id": "pt_prior", "content": PRIOR_CONTENT,
@@ -242,6 +249,101 @@ class TestTheWritePathEmitsOneEntityAndKeepsTheLosersEvidence:
         # the surviving claim is the prior's, byte-identical — never fused
         assert record["content"] == PRIOR_CONTENT
 
+    def test_a_verdict_on_a_candidate_over_the_cap_still_merges(self):
+        """F1's END-TO-END arm: route → `execute_embed` really fuses.
+
+        The unit test above pins the key; this pins the CONSEQUENCE the finding
+        named. Pre-fix the verdict routed (unclipped) and the write path probed
+        (clipped), so the two never met and the pair was ADDed — one extra Point
+        for a pair the arbiter had already ruled identical.
+
+        The PRIOR carries the clipped content on purpose: `execute_embed` stores
+        `content[:_MAX_CONTENT]`, so a real graph point is never longer than the
+        cap. The divergence the finding is about is therefore in the ROUTING
+        key alone (1720-char verdict vs 1000-char probe), not in the claim
+        comparison — the classifier compares 1000 against 1000 and sees 1.0.
+        """
+        prior = _prior(pointKind="statement",
+                       content=LONG_CONTENT[:v2._MAX_CONTENT],
+                       about_entities=["Team"])
+        embed = {
+            "entities": [{"name": "Team", "kind": "core:team"},
+                         {"name": "Office", "kind": "core:location"}],
+            "points": [{"content": LONG_CONTENT,
+                        "pointKind": "statement",
+                        "about_entities": ["Team", "Office"],
+                        "quote": LONG_CONTENT}],
+            "events": [], "operators": [], "chain_notes": [],
+            "link_before_create": [],
+        }
+        # The verdict as `_run_vet_pass` emits it — the UNCLIPPED text keyed
+        # through the real routing function, not a hand-built key.
+        flagged = v2._merge_flagged_contents({"decisions": {"points:0": {
+            "section": "points", "outcome": "MERGE",
+            "text": LONG_CONTENT}}})
+        result = v2.execute_embed(
+            embed, {"points": [prior], "entities": []},
+            session_id="s_second_document", session_date="2026-10-24",
+            merge_flagged=flagged)
+
+        assert result["stats"]["merges"] == 1, result.get("warnings")
+        assert result["payload"]["points"] == []
+        (record,) = result["merges"]
+        assert record["point_id"] == "pt_prior"
+
+    def test_a_candidate_carrying_a_name_is_keyed_the_way_vet_keys_it(self):
+        """F1's other half: `_item_text` is `name or content`.
+
+        `vet_gate._item_text` follows the extractor's own rule (`name or
+        content`) for every section, while the point write path keys on
+        `content`. An item carrying BOTH is therefore keyed on its NAME by VET,
+        and a consumer probing only `content` drops the verdict — the same
+        silently-minted duplicate as the clip above, reached by a different
+        field.
+        """
+        item_text = "the team meets weekly in main office, per Dana"
+        flagged = v2._merge_flagged_contents({"decisions": {"points:0": {
+            "section": "points", "outcome": "MERGE", "text": item_text}}})
+        embed = {
+            "entities": [], "events": [], "operators": [], "chain_notes": [],
+            "link_before_create": [],
+            "points": [{"name": item_text,          # ← what VET keyed on
+                        "content": CANDIDATE_CONTENT,
+                        "pointKind": "statement",
+                        "about_entities": ["Team", "Office"],
+                        "quote": CANDIDATE_CONTENT}],
+        }
+        result = v2.execute_embed(
+            embed,
+            {"points": [_prior(pointKind="statement",
+                                about_entities=["Team"])], "entities": []},
+            session_id="s_second_document", session_date="2026-10-24",
+            merge_flagged=flagged)
+
+        assert result["stats"]["merges"] == 1, result.get("warnings")
+        assert result["payload"]["points"] == []
+
+    def test_a_null_content_point_is_skipped_not_written_as_none(self):
+        """`content: null` must be SKIPPED, not minted as the claim "None".
+
+        `_parse_json_robust` rung 1 returns unvalidated JSON, so this shape
+        reaches here from real model output (`_clip`'s own docstring says as
+        much). `str(None)` is `"None"`, which is truthy, so the
+        `if not content: continue` guard did not fire and a Point whose CLAIM IS
+        THE STRING "None" landed in the graph with no warning — a fabricated
+        claim. `str(x or "")` is the rule `_classify_item_id` already uses and
+        the rule `vet_gate._item_text` applies, so it also removes the one
+        shape where the verdict probe could diverge from VET's key.
+        """
+        embed = {"entities": [], "events": [], "operators": [],
+                 "chain_notes": [], "link_before_create": [],
+                 "points": [{"content": None, "pointKind": "statement"},
+                            {"content": 0, "pointKind": "statement"}]}
+        result = v2.execute_embed(
+            embed, {"points": [], "entities": []},
+            session_id="s_null", session_date="2026-10-24")
+        assert result["payload"]["points"] == [], result["payload"]["points"]
+
     def test_an_unflagged_embed_list_emits_no_merge_record(self):
         """The default is inert — the fusion is verdict-gated, not automatic."""
         prior = _prior(pointKind="statement")
@@ -292,6 +394,12 @@ class TestTheVetVerdictReachesTheFusion:
         That is a write authorised by a verdict recorded for a different
         candidate object: D12's "the verdict is the arbiter's" satisfied by a
         text collision.
+
+        ⚠️ Scoped to a different KIND of candidate. A verdict on a different
+        candidate of the SAME kind (two same-text point items) is NOT closed by
+        this key — the hand-off drops the index deliberately, so that class is
+        `extractor_v2._merge_flagged_contents`'s recorded residual, tracked on
+        #9869. Do not read this test as covering it.
         """
         for section in ("events", "entities"):
             surface = {"decisions": {f"{section}:0": {
@@ -304,6 +412,26 @@ class TestTheVetVerdictReachesTheFusion:
             "text": PRIOR_CONTENT}}}
         assert v2._merge_flagged_contents(points) == frozenset(
             {v2._norm(PRIOR_CONTENT)})
+
+    def test_a_candidate_over_the_content_cap_is_still_routed(self):
+        """F1 (#5006 review): the routing key must survive `_MAX_CONTENT`.
+
+        `execute_embed` keys on `content[:_MAX_CONTENT]`; VET's `_item_text`
+        never truncates. A text-only key therefore missed EVERY verdict on a
+        candidate over 1000 characters — `merge_flagged` came back `False`, the
+        `#9424` guard refused the fold, and the pair fell through to `ADD`: a
+        SECOND Point minted for a pair the arbiter marked `MERGE`, with no
+        warning and `stats["merges"]` still 0. Both spellings must be keyed,
+        which is the same clip `vet_gate._resolution_variants` already keeps.
+        """
+        assert len(LONG_CONTENT) > v2._MAX_CONTENT
+        surface = {"decisions": {"points:0": {
+            "section": "points", "outcome": "MERGE",
+            "text": LONG_CONTENT}}}
+        flagged = v2._merge_flagged_contents(surface)
+        # both spellings: the write path's clipped key AND VET's unclipped one
+        assert v2._norm(LONG_CONTENT[:v2._MAX_CONTENT]) in flagged
+        assert v2._norm(LONG_CONTENT) in flagged
 
     def test_the_point_section_is_vets_own_token(self):
         """The section key is VET's vocabulary, not a local invention.
@@ -542,6 +670,76 @@ class TestApplyMergeUnionWritesTheUnionAndTheLostProvenance:
             params={"c": PRIOR_CONTENT}).result_set
         assert len(same) == 1, same
 
+    def test_a_subject_kind_name_is_skipped_not_bound_to_its_object_twin(
+            self, sdk):
+        """F2 (#5006 review): the COINCIDENCE case, which capture refuses.
+
+        `about_entities` is not object-only — the subject channel (team/role/
+        person, the gated `aboutSubject` edge) contributes names too, and an
+        `:Object` may legitimately share a subject's EXACT name (that is why
+        capture's skip is by name and not case-folded, `sdk.py:11849-11857`).
+        The `MATCH (o:Object {name:$n})` therefore RESOLVES, and a fusion with no
+        skip writes the un-gated `aboutObject` edge the same capture refuses on
+        the normal route (`sdk.py:12124`, #1370 / the #4934 label leak).
+
+        The control assertion below is what makes this discriminating: without
+        `subject_names` the very same write DOES link — so the skip, not the
+        absence of a node, is what prevents the edge.
+        """
+        from tortoise.near_dup_merge import apply_merge_union
+
+        proj = sdk._get_proj()
+        # The Object that shares the SUBJECT's name — the coincidence case.
+        twin = sdk.create_object("Dana", objectKind="core:naturalPerson")
+        pt = sdk.create_point("statement", PRIOR_CONTENT)
+        proj.g.query("MERGE (s:Session {id:$sid})", params={"sid": "s_sub"})
+        record = {"point_id": pt["id"], "about_entities": ["Dana"]}
+
+        CONTROL = apply_merge_union(proj, record, session_id="s_sub", sdk=sdk)
+        assert CONTROL["linked"] == 1, CONTROL   # ← the edge a skip prevents
+        proj.g.query(
+            "MATCH (:Point {id:$pid})-[r:aboutObject]->(:Object {name:'Dana'}) "
+            "DELETE r", params={"pid": pt["id"]})
+
+        res = apply_merge_union(proj, record, session_id="s_sub", sdk=sdk,
+                                subject_names={"Dana"})
+        assert res["skipped_subject"] == ["Dana"], res
+        assert res["linked"] == 0, res
+        # NOT `unresolved`: the name DID resolve. That is precisely the hazard —
+        # a skip reported as `unresolved` would misdescribe a resolved node.
+        assert res["unresolved"] == [], res
+        assert res["warnings"] == [], res["warnings"]
+        rows = proj.g.query(
+            "MATCH (:Point {id:$pid})-[:aboutObject]->(:Object {name:'Dana'}) "
+            "RETURN count(*)", params={"pid": pt["id"]}).result_set
+        assert rows[0][0] == 0, rows             # ← no un-gated edge minted
+        assert proj.g.query(
+            "MATCH (o:Object {id:$oid}) RETURN count(*)",
+            params={"oid": twin["id"]}).result_set[0][0] == 1
+
+    def test_the_subject_skip_is_exact_and_case_preserved(self, sdk):
+        """A case-folded skip would drop a legitimately-cased Object.
+
+        `subject_entity_names` is derived from payload entities whose KIND is a
+        subject kind and compared with `in` — exact, case-preserved — because
+        the resolution it guards (`Object {name:$n}`) is case-SENSITIVE too
+        (`sdk.py:11849-11857`, F6). A `.lower()` fold on either side would
+        conflate two names the graph keeps distinct.
+        """
+        from tortoise.near_dup_merge import apply_merge_union
+
+        proj = sdk._get_proj()
+        sdk.create_object("Dana", objectKind="core:naturalPerson")
+        pt = sdk.create_point("statement", PRIOR_CONTENT)
+        proj.g.query("MERGE (s:Session {id:$sid})", params={"sid": "s_sub"})
+
+        res = apply_merge_union(
+            proj, {"point_id": pt["id"], "about_entities": ["Dana"]},
+            session_id="s_sub", sdk=sdk,
+            subject_names={"dana"})          # ← a different name
+        assert res["skipped_subject"] == [], res
+        assert res["linked"] == 1, res
+
     def test_a_missing_survivor_is_reported_not_fabricated(self, sdk):
         """Fail-closed: no point ⇒ no edges, and the caller is told."""
         from tortoise.near_dup_merge import apply_merge_union
@@ -707,6 +905,61 @@ class TestTheCapturePathExecutesTheFusion:
         #     names no unresolved attachment and no merge failure.
         assert not [w for w in receipt.get("warnings") or []
                     if "merge" in w.lower()], receipt.get("warnings")
+
+    def test_capture_skips_a_subject_kind_attachment(self, sdk, monkeypatch):
+        """F2 at the SEAM: the call site passes the payload's subject names.
+
+        `apply_merge_union`'s skip is only as good as the set handed to it. A
+        call site that forgot `subject_names=` would leave every unit test above
+        green and still write, on a real capture, the un-gated `aboutObject`
+        edge capture itself refuses — so this drives the real
+        `_extract_session_v2` write path with a payload that declares a
+        SUBJECT-kind entity whose Object twin also exists.
+        """
+        import tortoise.extractor_v2 as ev2
+
+        # The coincidence: an :Object sharing the SUBJECT's exact name.
+        sdk.create_object("Dana", objectKind="core:naturalPerson")
+        sdk.create_object("Office", objectKind="core:location")
+        prior = sdk.create_point("statement", PRIOR_CONTENT)
+
+        record = {"point_id": prior["id"], "content": PRIOR_CONTENT,
+                  "about_entities": ["Dana", "Office"],
+                  "merged_content": CANDIDATE_CONTENT,
+                  "merged_quote": CANDIDATE_CONTENT,
+                  "session_ref": "s_subject_doc"}
+        out = {"payload": {"entities": [{"name": "Dana",
+                                             "kind": "core:naturalPerson"}],
+                              "points": [], "events": [], "operators": [],
+                              "supersessions": [], "chain_notes": [],
+                              "link_before_create": []},
+               "errors": [], "warnings": [], "stats": {},
+               "merges": [record], "noops": [], "supersessions": [],
+               "chain_notes": [], "link_before_create": [],
+               "minted_kinds": [], "story_arc": "", "search": {},
+               "error_census": {}}
+        monkeypatch.setattr(ev2, "extract_session_v2", lambda *a, **k: out)
+
+        receipt = sdk.capture_session(
+            [{"role": "user", "content": "a session naming a person"},
+             {"role": "assistant", "content": "noted"}],
+            session_id="s_subject_doc")
+        assert receipt.get("ok") is True, receipt
+        proj = sdk._get_proj()
+
+        # the Object attachment still lands — the skip is NARROW
+        assert proj.g.query(
+            "MATCH (:Point {id:$pid})-[:aboutObject]->(:Object {name:'Office'}) "
+            "RETURN count(*)", params={"pid": prior["id"]}).result_set[0][0] == 1
+        # …and the subject-kind name did NOT get one
+        assert proj.g.query(
+            "MATCH (:Point {id:$pid})-[:aboutObject]->(:Object {name:'Dana'}) "
+            "RETURN count(*)", params={"pid": prior["id"]}).result_set[0][0] == 0
+        # the DROP is named, not silent: `bind_point_subjects` never runs for a
+        # merge, so that binding is lost and the receipt must say so
+        assert any("Dana" in w and "subject-kind" in w
+                   for w in (receipt.get("warnings") or [])), receipt.get(
+                       "warnings")
 
     def test_an_empty_merge_list_writes_nothing(self, sdk, monkeypatch):
         """The default path stays inert — the block is data-driven.
