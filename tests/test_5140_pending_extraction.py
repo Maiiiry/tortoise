@@ -721,3 +721,48 @@ def test_sweeping_a_transcript_does_not_move_it_into_the_documents_meter(monkeyp
         f"moves it into the `documents` meter (metered={is_metered_document_kind(kind)});"
         f" output was:\n{out}")
     assert nx is False, f"the sweep did not complete the document (got {nx!r}):\n{out}"
+
+
+@_live_db
+def test_upgrade_makes_no_claim_for_a_document_with_nothing_to_extract():
+    """Review round 7: ``--upgrade`` must decide "is there anything here?"
+    BEFORE ``begin_ingest`` claims the content.
+
+    ``begin_ingest`` MINTS a claim, and at a bumped extractor version it takes
+    the reprocess path and supersedes/retracts that source's earlier Points.
+    Claiming first therefore did destructive work for a file the same call then
+    declines to extract, and it printed ``upgrading …`` immediately before
+    saying the file is not a Document. The sweep was hoisted in round 2 for the
+    same reason; this pins the ``--upgrade`` half.
+
+    Observable: the ``upgrading`` banner is emitted only on the extracting path,
+    and the claim is what carries it. The completion marker still clears, which
+    is pinned separately — that is the one thing ``--upgrade`` keeps from
+    pre-D10 for a no-sections document.
+    """
+    if not _require_live_falkor():
+        return
+    uri = _live_uri(f"test_5140_noclaim_{os.urandom(4).hex()}")
+    _reset(uri)
+    t = _transcript("prose with no headers at all.\n", "no_claim.md")
+    doc_id = t.name
+    _seed_document(uri, doc_id, str(t),
+                   doc_status="captured", needs_extraction=False)
+
+    out = _run([str(t), "--db", uri,
+                "--log", _tmp("events.jsonl"), "--out", _tmp("graph.html"),
+                "--upgrade", "--point-model", "mock:cheap",
+                "--relation-model", "mock:reason"], capture=True)
+
+    assert "upgrading" not in out, (
+        f"`--upgrade` announced an upgrade (and so claimed the content via "
+        f"begin_ingest) for a document with no ## sections, which it then "
+        f"declines to extract; output was:\n{out}")
+    assert "no claim made" in out, (
+        f"expected the no-sections warning to say no claim was made; "
+        f"output was:\n{out}")
+    nx, ds = _read(uri, doc_id)
+    assert (nx, ds) == (False, None), (
+        f"the completion transition must still run for a no-sections document "
+        f"named explicitly (got needs_extraction={nx!r}, doc_status={ds!r}); "
+        f"output was:\n{out}")

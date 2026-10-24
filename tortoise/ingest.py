@@ -343,7 +343,9 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
       is upgraded rather than reported as already done. ``draft`` is parity, not
       evidence — it is what every pre-D10 full ingest left behind; see
       ``_document_is_pending``.
-    - Non-Document transcript (no ``##`` sections) → warns, then still runs the
+    - Non-Document transcript (no ``##`` sections) → warns and, since review
+      round 7, makes NO claim (``begin_ingest`` mints one and can retract a
+      prior run's Points for work this call declines), then still runs the
       completion SET: there is nothing to extract, and the operator named this
       document. (The SWEEP is stricter and keeps the marker — see
       ``_document_is_pending``.)
@@ -378,25 +380,35 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
         print(f"doc already extracted, skipped: {source_id}")
         return
 
-    # 2. Idempotency gate — re-extract only if not already processed
-    #    at this extractor version (begin_ingest key: content-hash + version)
-    result = api.begin_ingest(source_id, api.agent_id or "extractor@0",
-                              document_key(text), force=args.force)
-    if result and result.skip:
-        print(f"upgrade skip: {result.reason} (run {result.run_id}); use --force to reprocess")
-        return
-
-    print(f"upgrading {source_id} "
-          f"(needs_extraction={needs_ext}, doc_status={doc_status}) …")
-
-    # 3. Re-run full extraction (the same path as normal full ingest)
-    from .extractor import extract_from_document  # noqa: I001
-    from .ids import ulid
-    from .domain_loader import resolve_domain_from_path
-
-    # Emit fresh DocumentCreated for metadata (idempotent via MERGE)
+    # 2. "Has anything to extract?" is answered BEFORE the idempotency claim
+    #    (review round 7). `begin_ingest` MINTS a claim, and at a bumped
+    #    extractor version it takes the reprocess path and supersedes/retracts
+    #    that source's earlier Points (``api.begin_ingest``) — for work this
+    #    call then declines to do. `_document_sections` is pure text parsing, so
+    #    asking first changes no extraction behaviour, and it puts this path in
+    #    the same order as `_do_upgrade_all` (hoisted in round 2 for the same
+    #    reason). Unlike the sweep, `--upgrade` STILL records the completion
+    #    transition for a no-sections document (step 4): the operator named this
+    #    document, pre-D10 `--upgrade` flipped it unconditionally, and leaving
+    #    the marker would re-report it on every run.
     is_doc, _ = _document_sections(text)
     if is_doc:
+        from .idempotency import document_key
+        result = api.begin_ingest(source_id, api.agent_id or "extractor@0",
+                                  document_key(text), force=args.force)
+        if result and result.skip:
+            print(f"upgrade skip: {result.reason} (run {result.run_id}); use --force to reprocess")
+            return
+
+        print(f"upgrading {source_id} "
+              f"(needs_extraction={needs_ext}, doc_status={doc_status}) …")
+
+        # 3. Re-run full extraction (the same path as normal full ingest)
+        from .extractor import extract_from_document  # noqa: I001
+        from .ids import ulid
+        from .domain_loader import resolve_domain_from_path
+
+        # Emit fresh DocumentCreated for metadata (idempotent via MERGE)
         fm = _parse_frontmatter(text)
         domain = fm.get("domain", fm.get("documentKnowledgeDomain", ""))
         if not domain:
@@ -439,7 +451,8 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
         if stats.get("failed_sections"):
             print(f"  warning: {len(stats['failed_sections'])} sections failed extraction")
     else:
-        print(f"  warning: {source_id} is not a Document (no ## headers) — extraction skipped")
+        print(f"  warning: {source_id} is not a Document (no ## headers) — "
+              f"extraction skipped (no claim made)")
 
     # 4. Mark extracted: clear the live signal AND retire the legacy marker.
     #    The pre-D10 code flipped doc_status to 'extracted' here; D10 retired
