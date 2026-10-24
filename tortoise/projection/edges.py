@@ -724,8 +724,9 @@ def source_change_notices(g, source_refs, current_versions: dict[str, str] | Non
 # WHY DECLARED AND NOT JOURNALLED, PRECISELY. Two shapes would have made this
 # write honest without a declaration, and the evidence rejects BOTH:
 #   * `_live_write_scope` — its contract is "journal appended first, then the
-#     fold", and NOTHING is appended on this path: `sdk.create_edge` →
-#     `proj.create_edge` emits no record, so the scope would state a false
+#     fold", and NOTHING was appended on this path when this declaration was
+#     written: `sdk.create_edge` → `proj.create_edge` emitted no record (the SDK
+#     door emits since #9553, below), so the scope would have stated a false
 #     ordering.
 #   * journalling — the replay half ALREADY EXISTS and this is NOT a request for
 #     a new resolver: `DirectEdgeCreated` is a flat `{src, tgt, edge_type,
@@ -757,24 +758,91 @@ def source_change_notices(g, source_refs, current_versions: dict[str, str] | Non
 #     which is how the sanctioned writers write it (`create_point(aboutSubject=
 #     …)`, `extractedFrom=…`) — and NOT when it is a bare assertion on a node
 #     whose record never held it.
-#   * **no carrier emitted by this lane** — every other predicate in
-#     `STRUCTURAL_EDGE_LANE_PREDICATES` (`related`, `dependsOn`, `ownedBy`, `managedBy`,
-#     `authoredBy`, `memberOf`, `hasMember`, `holdsRole`, `reportsTo`,
-#     `participatesIn`, `hasPart`, `performs`, `produces`, `uses`,
-#     `wasDerivedFrom`, `references`, `aboutSource`, `aboutAction`). MEASURED at
-#     this head: mint them live and `rebuild_all` reports `edges: 0` — they are
-#     GONE, whether minted bare or carried by an `ownedBy`/`managedBy`/
-#     `authoredBy` node property, because nothing emitted a record for them.
-#     **This lane does NOT claim durability for them.** It discloses the gap so
-#     the next reader meets it here instead of discovering it, and so that
-#     `#9124`'s census has the class enumerated rather than assumed: the
-#     missing half is the EMISSION from the edge doors (the record type, the
-#     fold and the resolver exist — `DirectEdgeCreated`), tracked on `#9079`'s
-#     census (the folded write-surface map of `#2296`, whose per-write-class
-#     obligation (`#7951`) this row discharges only for the LIVE side).
-#     Declaring this lane does not create that gap and does not bless it — the
-#     gap exists on `origin/main` today, with no declaration anywhere (measured
-#     the same way).
+#   * **the CARRIER is emitted by the SDK DOOR, not by this projection method**
+#     — every other predicate in `STRUCTURAL_EDGE_LANE_PREDICATES` (`related`,
+#     `dependsOn`, `ownedBy`, `managedBy`, `authoredBy`, `memberOf`, `hasMember`,
+#     `holdsRole`, `reportsTo`, `participatesIn`, `hasPart`, `performs`,
+#     `produces`, `uses`, `wasDerivedFrom`, `references`, `aboutSource`,
+#     `aboutAction`). MEASURED at the pre-#9553 head: mint them live and
+#     `rebuild_all` reported `edges: 0` — they were GONE, whether minted bare or
+#     carried by an `ownedBy`/`managedBy`/`authoredBy` node property, because
+#     nothing emitted a record for them.
+#     **Since #9553 (R5 class 4) the public SDK door (`sdk.create_edge`, reached
+#     by the MCP tool `tortoise_create_edge` and the onboarding seed) emits the
+#     carrier** — the flat `DirectEdgeCreated` descriptor the pass-2b fold
+#     consumes, carrying the RESOLVED node ids, emitted on every minted edge
+#     (a `MERGE` dedup-hit included, so the crash window between the write and
+#     its record closes). It resolves the endpoints itself rather than accepting
+#     a value here: this signature is pinned by §9.6 /
+#     `tests/test_references_boundary_5213.py`.
+#
+#     ⛔ WHAT THAT DOES **NOT** COVER — measured, not inferred, and named here so
+#     the next reader meets it at the point of enforcement instead of
+#     discovering it. Five lanes are STILL live-only:
+#       1. **the typed wrappers and the node-property lane.**
+#          `_EdgeHandlers.create_owned_by`/`create_managed_by`/
+#          `create_authored_by` are `return self.create_edge(...)` on the
+#          PROJECTION, and `sdk.py`'s entity wiring calls them there directly —
+#          so `sdk.create_edge`'s emission never runs. MEASURED (embedded,
+#          journal-backed): `sdk.create_object(name, "product", ownedBy=team)`
+#          journals no `DirectEdgeCreated`, live `ownedBy` count 1, post-rebuild
+#          **0**. This is the commonest `ownedBy` producer.
+#       2. **any endpoint that is a `:Source`.** Two sub-cases, and they are NOT
+#          the same mechanism:
+#          * an ID-BEARING `:Source` (`create_source` writes
+#            `id = coalesce($id, $url)`) gets a record EMITTED, but the fold's
+#            per-label id sweep covers `EPISTEMIC_LABELS`
+#            (`Point`/`Subject`/`Object`/`Event`) only, so the record is skipped
+#            at replay. MEASURED: `create_edge("references", point, source)`
+#            writes the carrier, live count 1, post-rebuild **0**; identical for
+#            `aboutSource`. `aboutSource`/`aboutDocument` targets are `:Source`
+#            by definition, so those two can NEVER be restored by this record
+#            without widening the fold.
+#          * a URL-ONLY STUB (`_mint_source_stub` — what `_link_source` and the
+#            capture path mint) carries NO `id` at all, so the emission has no
+#            identity to name and writes **no record**. It is not silent: the
+#            source OR-set carries `by_url=True` precisely so such a stub
+#            RESOLVES, so the edge is minted LIVE with no carrier — and that is a
+#            data-loss signal, not an ordinary absent identity, so
+#            `sdk.create_edge` routes it through `projection._log_identity_skip`
+#            (`absent_is_ordinary=False, drops_record=True`). MEASURED:
+#            `link_source_to_entity` mints the stub, then
+#            `create_edge("references", <stub url>, <id>)` → live count 1, no
+#            `DirectEdgeCreated`, post-rebuild **0**, one reported skip.
+#          ⚠️ Three different mechanisms now share the visible outcome "not
+#          restored": record emitted + fold skips it (id-bearing `:Source`),
+#          record never written + REPORTED (url-only stub, here), and a
+#          deliberate record-free skip (bound 3). Do not collapse them.
+#          ⚠️ This bound also ABSORBS the source-migration re-point family, so it
+#          is not an uncarried case of its own: every relation in
+#          `session_source_migration.MOVABLE_SOURCE_RELS` (`extractedFrom`,
+#          `references`, `aboutSource`, `aboutDocument`, `wasDerivedFrom`,
+#          `produces`) is SOURCE-SIDE by ontology — each has a `:Source` endpoint
+#          — and `_move_out`/`_move_in` journal nothing. Because the fold's id
+#          sweep cannot resolve a `:Source`, the record is skipped at replay
+#          either way, so a live re-point cannot put the record AHEAD of the
+#          graph: both post-migration states resolve to "not restored".
+#       3. **a self-edge** (`src == tgt`). The door mints it live; the fold
+#          refuses to re-create one (`E2E-11.6` no-self contract), so live and
+#          replay disagree by design. Pre-existing, and the emission skips it
+#          rather than writing a record the fold will drop.
+#       4. **an edge at an endpoint that is later superseded.** The record is
+#          emitted, but `dependsOn`/`wasDerivedFrom`/… are not in
+#          `SUPERSEDE_STRUCTURAL_RELS`, so `supersede_point` journals no
+#          `DirectEdgeRepoint` and the fold drops the creation (the endpoint is
+#          in `succ`). MEASURED: live keeps the edge at the dead endpoint,
+#          post-rebuild 0. Closing it means adding the structural family to the
+#          supersede transfer — R5 scope, not this change's.
+#       5. **every other direct `proj.create_edge` caller** — the ingest
+#          bundle-connection writer (`sdk.py`, inside `ingest`), the
+#          approver/event writes (`performs`/`uses`/`produces`) and the
+#          `wasDerivedFrom` writer. Their emission is the same pass and belongs
+#          with `#9079`'s census (the folded write-surface map of `#2296`, whose
+#          per-write-class obligation (`#7951`) this row discharges for the
+#          public door only), not to a declaration child.
+#     The gap was never created by declaring this lane and is not blessed by it;
+#     what changed is that the PUBLIC DOOR, for epistemic endpoints, is no longer
+#     part of it.
 #
 # ⛔ WHAT THIS LANE DOES NOT COVER — stated, so a reader does not infer it from
 # a green suite. `_EdgeHandlers` holds OTHER edge-minting verbs; they are not
@@ -839,7 +907,8 @@ def structural_edge_carrier(rel: str) -> str | None:
     ``None`` — **this verb emits no record and the endpoint snapshot carries no
     such link, so a rebuild drops the edge.** That is NOT a claim that no replay
     carrier can exist: the ENGINE has one (`DirectEdgeCreated` + its pass-2b
-    fold), and emitting that record restores these edges (measured). The gap is
+    fold), and the public SDK door emits it since #9553 (epistemic endpoints
+    only — a `:Source` endpoint is skipped by the fold's id sweep). The gap is
     the EMISSION — this projection verb has no journal handle — so ``None``
     reads "nothing carried from here", never "nothing could carry it".
 
@@ -2234,7 +2303,15 @@ class _EdgeHandlers:
 
     def create_edge(self, source_id: str, target_id: str, predicate: str) -> bool:
         """Create a named edge between two entities by their IDs.
-        Matches target by id OR eventId (Event nodes use eventId as key)."""
+        Matches target by id OR eventId (Event nodes use eventId as key).
+
+        ⛔ This verb takes NO property parameter and NO ``**kwargs`` — §9.6's
+        boundary (a derivation edge minted here carries no ``sourceVersion``
+        anchor and nothing can supply one) is pinned by
+        ``tests/test_references_boundary_5213.py``. The record CARRIER for the
+        edge is emitted one level up, by the SDK door, which resolves the
+        endpoints and writes ``DirectEdgeCreated`` (#9553, R5 class 4).
+        """
         valid_predicates = _VALID_EDGE_PREDICATES
         if predicate not in valid_predicates:
             raise ValueError(f"Unknown predicate: {predicate}")
