@@ -934,7 +934,7 @@ class TestDocsPageAndSkillConfig:
             "Install the Tortoise skills",  # 4 — the hand-over is an INSTALL, not a paste
             "Upload from your computer", # 4 — ChatGPT's own Skills surface is the hand-off
             "Replace existing",          # 4 — the only update path a user-owned snapshot has
-            "select all four files",     # 4 — one pick installs the set (verified: multi-select)
+            "select all three files",   # 4 — one pick installs the set (verified: multi-select)
             "verifies the connection",  # 5 — the row names the verification hand-off
             "files your first memory",   # 5 — the journey's outcome
             "plan-dependent",            # 5 — which tools appear is plan-dependent
@@ -964,14 +964,25 @@ class TestDocsPageAndSkillConfig:
         # #9660: the hand-over is a `.skill` ARCHIVE per skill, not a `SKILL.md`
         # download. The uploader enforces the filename — a file named
         # `tortoise-file-finding.md` is refused ("Choose a .zip, .skill, or
-        # SKILL.md file") — so four `SKILL.md` downloads collide in the user's
+        # SKILL.md file") — so several `SKILL.md` downloads collide in the user's
         # Downloads folder and the renamed copies cannot be uploaded at all.
         # This pins card → artifact: every href must name an archive that exists,
         # and no `download="SKILL.md"` link may come back, because that shape
         # instructs the user to do something the uploader rejects.
+        #
+        # #4365: THREE archives, and `tortoise-onboarding` is not one of them. The
+        # row briefly handed over a fourth, so a ChatGPT user uploaded a document
+        # whose own first screen says it is never installed as a skill — and the
+        # agent reading it was told both "never a skill" and "install this as a
+        # skill". The served document is still linked from this row (it is read,
+        # not installed), so the reachability claim is unaffected.
         hrefs = re.findall(r'href="(/skills/[^"]+\.skill)"', steps)
-        assert len(hrefs) == 4, (
-            f"step 4 must hand over one .skill archive per skill (got {hrefs})")
+        assert len(hrefs) == 3, (
+            f"step 4 must hand over one .skill archive per REUSABLE skill, and no "
+            f"archive for the onboarding instructions (got {hrefs})")
+        assert "/skills/tortoise-onboarding.skill" not in hrefs, (
+            "the onboarding document must never ship as an installable archive "
+            "(#4365: it is delivered as instructions)")
         for href in hrefs:
             on_disk = (REPO_ROOT / "website" / href.lstrip("/"))
             assert on_disk.is_file(), (

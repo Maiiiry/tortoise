@@ -269,7 +269,7 @@
       "renders": [
         {
           "label": "",
-          "text": "One-time — after this they apply to every chat. Download the four files:",
+          "text": "One-time — after this they apply to every chat. Download the three files:",
           "tags": []
         }
       ]
@@ -280,7 +280,7 @@
       "renders": [
         {
           "label": "",
-          "text": "Then open chatgpt.com/skills → Add → Upload from your computer and select all four files together.",
+          "text": "Then open chatgpt.com/skills → Add → Upload from your computer and select all three files together.",
           "tags": [
             "code",
             "strong",

@@ -234,23 +234,42 @@ test('DE2E-5: the RENDERED self-install prompts carry the MCP URL and the skill 
   }
 })
 
-test('DE2E-5: EVERY harness verifies through tortoise_health — the clause is 6 harnesses, not 4', () => {
+test('DE2E-5: EVERY harness verifies through an ADVERTISED tool — the clause is 7 harnesses, not 4', () => {
   // #3430 review, cycle 1: the deleted universal commands for the SIX
-  // agent/connector harnesses each ended in a `tortoise_health` verify (chatgpt's
-  // was the one deliberate exception — it verifies IN CHAT, which is why the loop
-  // below excludes it and why the old block's pin said so). Dropping them silently
-  // narrowed a CONTRACT; `HARNESS_SELF_INSTALL` is only 4 of the 6 that
-  // render a prompt, and the two connector leaves (claude-desktop, claude-web)
-  // were left covered by nothing but a snapshot `deepEqual` — which passes for
-  // any text change regenerated in the same commit, so it cannot protect a
-  // semantic claim. Asserted here on the RENDERED text instead.
-  const rendered = HARNESS_ORDER.filter((h) => h !== 'chatgpt')
+  // agent/connector harnesses each ended in a `tortoise_health` verify. Dropping
+  // them silently narrowed a CONTRACT; `HARNESS_SELF_INSTALL` is only 4 of the
+  // harnesses that render a prompt, and the two connector leaves
+  // (claude-desktop, claude-web) were left covered by nothing but a snapshot
+  // `deepEqual` — which passes for any text change regenerated in the same
+  // commit, so it cannot protect a semantic claim. Asserted here on the RENDERED
+  // text instead.
+  //
+  // #9660: `chatgpt` was the one exclusion (`HARNESS_ORDER.filter(h => h !==
+  // 'chatgpt')`), and that exclusion hid a real defect — its first job's verify
+  // half named `tortoise_health`, which a tool-grant client cannot call because
+  // `_RetiredToolTransform` strips retired names from `tools/list`. The leaf this
+  // PR makes live was the leaf the guard skipped. It is now IN the population,
+  // with its own expectation: the ADVERTISED name, not the retired one.
+  const rendered = [...HARNESS_ORDER]
   assert.deepEqual(rendered.slice().sort(),
-    ['claude', 'claude-desktop', 'claude-web', 'codex', 'cursor', 'pi'],
+    ['chatgpt', 'claude', 'claude-desktop', 'claude-web', 'codex', 'cursor', 'pi'],
     'the verify contract covers every harness with a rendered surface')
   for (const h of rendered) {
     const step2 = wizardPromptText(h, 2, KEY, 'included') || ''
-    assert.match(step2, /tortoise_health/, `${h}: rendered step 2 names the verify tool`)
+    assert.match(step2, /tortoise_(health|overview)/, `${h}: rendered step 2 names the verify tool`)
+    assert.match(step2, /tortoise_create_point/, `${h}: rendered step 2 files the first memory`)
+    if (h === 'chatgpt') {
+      assert.match(step2, /tortoise_overview\(section="health"\)/,
+        'chatgpt: the verify call is the ADVERTISED tool (tools/list), not the retired alias')
+      assert.ok(!step2.includes('tortoise_health'),
+        'chatgpt: never the retired tortoise_health — it is absent from tools/list (#3883)')
+      // the same body must be what its step-1 first job ends with, or the
+      // copyable prompt and the pinned step disagree.
+      assert.ok(wizardPromptText('chatgpt', 1, KEY, 'included').endsWith(step2),
+        'chatgpt: the first-job prompt must end with that same verify/file body')
+    } else {
+      assert.match(step2, /tortoise_health/, `${h}: the shared body keeps the legacy name`)
+    }
   }
   // …and the connector leaves' other delivery surface: the workflows prompt. This is
   // belt-and-braces on the SAME fact, not independent coverage — WORKFLOWS_PROMPT
@@ -326,7 +345,7 @@ test('#1701 DE2E-5: chatgpt is the key-less OAuth harness — steps + skills-as-
   assert.ok(urlStep, 'the rendered steps carry the canonical no-slash URL')
   assert.equal(HARNESS_COPY_LABEL.chatgpt, 'Copy prompt')
   assert.equal(HARNESS_CONTINUE_LABEL.chatgpt, "I've connected it — Continue →")
-  assert.ok(HARNESS_INTRO.chatgpt && HARNESS_INTRO.chatgpt.includes('skill you installed above'), 'chatgpt intro names the installed skill')
+  assert.ok(HARNESS_INTRO.chatgpt && HARNESS_INTRO.chatgpt.includes('skills you installed above'), 'chatgpt intro names the installed skills')
   assert.ok(HARNESS_INTRO.chatgpt.includes('paste the prompt below instead'), 'chatgpt intro keeps the paste as the fallback (#9660)')
   // session capture: disabled-with-reason (cloud-hosted — no local signal)
   assert.equal(HARNESS_CAPTURE_SUPPORT.chatgpt, false)

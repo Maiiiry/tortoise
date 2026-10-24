@@ -52,8 +52,14 @@ export const servedSkillUrl = (name) => `${SERVED_SKILLS_ORIGIN}/skills/${name}/
 // #9660 owner ruling: the ChatGPT journey installs the skills instead of pasting
 // them, because (verified in the live ChatGPT uploader) an upload is the only
 // hand-off that (a) works at all — a file named `SKILL.md` is the ONLY accepted
-// `.md` name, so four skills cannot ship as four `SKILL.md` downloads — and
+// `.md` name, so several skills cannot ship as several `SKILL.md` downloads — and
 // (b) is one-time rather than re-read every chat.
+//
+// ⛔ ONBOARDING IS NOT ONE OF THEM (#4365). `tortoise-onboarding` is a one-time
+// setup FLOW, not a reusable capability: it is READ at its served URL and never
+// copied into a skills namespace — a rule its own first screen states, and one
+// #4365 recorded as an owner decision. Installing it here would ship a document
+// whose banner forbids its own install, permanently, into every chat.
 //
 // The archives are `.skill` files (a zip whose single entry is
 // `<name>/SKILL.md`): each downloads under its own filename, and several can be
@@ -70,11 +76,14 @@ export const servedSkillUrl = (name) => `${SERVED_SKILLS_ORIGIN}/skills/${name}/
 // own name instead of depending on how the host guesses an unknown extension.
 export const DOCS_ORIGIN = 'https://tortoise.premiselabs.co'
 export const skillArchiveUrl = (name) => `${DOCS_ORIGIN}/skills/${name}.skill`
-//: The four skills the ChatGPT journey installs, in reading order. Kept in step
-//: with `tools/build_skill_archives.py` (SKILL_NAMES) by
-//: tests/test_onboarding_variants.py, which fails if an archive is stale.
+//: The three REUSABLE skills the ChatGPT journey installs, in reading order —
+//: the same three the shell installer ships (#4365: onboarding is delivered as
+//: instructions, never installed). Kept in step with
+//: `tools/build_skill_archives.py` (SKILL_NAMES) by tests/test_onboarding_variants.py,
+//: which reads BOTH lists and fails on any divergence, and by the archive test,
+//: which fails if an archive is stale or `tortoise-onboarding` reappears here.
 export const SKILL_ARCHIVE_NAMES = Object.freeze([
-  'how-to-use-tortoise', 'tortoise-decide', 'tortoise-file-finding', 'tortoise-onboarding',
+  'how-to-use-tortoise', 'tortoise-decide', 'tortoise-file-finding',
 ])
 
 // #1701: the skills-as-prompt body shared by every filesystem-less harness
@@ -262,7 +271,7 @@ export const HARNESS_STEPS = (harness, key) => ({
     { label: 'Server URL — paste this into the dialog', code: CHATGPT_MCP_URL, copy: CHATGPT_MCP_URL },
     'Now tick "I understand and want to continue" and click Create as a plugin.',
     'Open chatgpt.com/settings/plugins-settings → Tortoise → View details → Connect, sign in to Tortoise and click Authorize, then pick your Organization.',
-    'Install the Tortoise skills once — on tortoise.premiselabs.co/docs#chatgpt download the four files (how-to-use-tortoise, tortoise-decide, tortoise-file-finding, tortoise-onboarding), then open chatgpt.com/skills → Add → Upload from your computer and pick them together. To update one, upload that file again and choose Replace existing. Rather not install? Paste the document below into one chat instead.',
+    'Install the Tortoise skills once — on tortoise.premiselabs.co/docs#chatgpt download the three files (how-to-use-tortoise, tortoise-decide, tortoise-file-finding), then open chatgpt.com/skills → Add → Upload from your computer and pick them together. To update one, upload that file again and choose Replace existing. Rather not install? Paste the document below into one chat instead.',
     'The tortoise_* tools follow that connection — if they do not appear, re-open chatgpt.com/settings/plugins-settings and check Tortoise shows as connected, then ask the chat which tools it can call. Write actions ask for confirmation in chat.',
   ],
 })[harness]
@@ -282,9 +291,10 @@ export const HARNESS_INTRO = {
   // #2328: Desktop variant intro (no terminal).
   codexDesktop: 'Edit ~/.codex/config.toml (create it if missing) — Codex Desktop and the CLI share this file. Copy the block, paste it in, then fully quit and reopen Codex Desktop:',
   pi: 'Paste this into your Pi agent:',
-  // #9660: the workflows now arrive as an installed ChatGPT skill, so the paste
-  // below is the FALLBACK rather than the default hand-off.
-  chatgpt: 'Start a new chat at chatgpt.com — the Tortoise skill you installed above gives it the workflows. (If you skipped the skill, paste the prompt below instead.)',
+  // #9660: the workflows now arrive as installed ChatGPT skills, so the paste
+  // below is the FALLBACK rather than the default hand-off. (The onboarding
+  // DOCUMENT is not one of them — #4365: it is read at its served URL.)
+  chatgpt: 'Start a new chat at chatgpt.com — the Tortoise skills you installed above give it the workflows. (If you skipped the install, paste the prompt below instead.)',
 }
 
 export const HARNESS_NAMES = {
@@ -968,14 +978,19 @@ export function analyticsHarnessOf(leaf) {
 // chatgpt is key-less/OAuth (HARNESS_OAUTH) and is a live dashboard surface
 // since the #9660 owner ruling (2026-10-23), which reversed the #2698/#2912
 // exclusion: the connect step renders the same verified connector recipe the
-// public setup docs page carries (website/docs.html#chatgpt), then the four
-// `.skill` installs, then the paste-able first job.
+// public setup docs page carries (website/docs.html#chatgpt), then the three
+// `.skill` installs (#4365: onboarding is read, not installed), then the
+// paste-able first job.
 //
 // Contract (DE2E-5), and where each clause is now pinned:
-//   • every harness reaching a connected state verifiable via tortoise_health —
-//     pinned on the RENDERED step-2 prompt for all six non-chatgpt harnesses
-//     (harnesses.test.js; the workflows prompt is asserted too, but it embeds
-//     that same step-2 text, so it is a restatement, not second coverage);
+//   • every harness reaching a connected state verifiable through an ADVERTISED
+//     tool — pinned on the RENDERED step-2 prompt for all SEVEN harnesses
+//     (harnesses.test.js). Six of them call `tortoise_health` (still answered on
+//     `get_tool`); chatgpt cannot, because its grant is built from `tools/list`
+//     and retired names are not advertised there, so its body names
+//     `tortoise_overview(section="health")` (wizardPrompts.js
+//     VERIFY_FILE_STEP_TEXT). The workflows prompt is asserted too, but it embeds
+//     that same step-2 text, so it is a restatement, not second coverage;
 //   • the key never lands in a project-scoped/committable config (env-var
 //     indirection) — pinned on the rendered prompt, never on a literal (the
 //     test key is itself `tt_`-prefixed, so "contains tt_" proves nothing).

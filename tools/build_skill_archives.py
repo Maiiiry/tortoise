@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the ChatGPT-installable `.skill` archives for the docs-origin skills.
+"""Build the ChatGPT-installable `.skill` archives for the served skills.
 
 Why an archive at all (#9660): the ChatGPT skill uploader accepts ONLY a file
 named `SKILL.md`, a `.zip`, or a `.skill` (verified in the live UI — a file
@@ -33,16 +33,40 @@ import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: The SERVED copies are the archive source (one source, one mirror): the
+#: dashboard's `public/skills/<name>/SKILL.md` is the byte the parity gate
+#: (`tools/served_skills_parity.py`) compares against the upstream MIT repo, and
+#: it is also the file `dist/` publishes at
+#: app.premiselabs.co/skills/<name>/SKILL.md. Building from it means the archive
+#: cannot disagree with either. A third copy under `website/skills/` was tried
+#: and removed: it added a hand-kept duplicate of every skill's markdown, which
+#: the `docs` lint gate then flagged per new file, for no consumer.
+SERVED_SKILLS = REPO_ROOT / "website" / "apps" / "dashboard" / "public" / "skills"
+
+#: The docs origin serves the built archives at
+#: https://tortoise.premiselabs.co/skills/<name>.skill.
 SKILLS_DIR = REPO_ROOT / "website" / "skills"
 
 #: Every skill the ChatGPT card hands over. Keep in step with
-#: tests/test_onboarding_variants.py::SERVED_SKILL_NAMES + tortoise-onboarding.
+#: website/apps/dashboard/src/harnesses.js (SKILL_ARCHIVE_NAMES) and
+#: tests/test_onboarding_variants.py::SERVED_SKILL_NAMES — the test reads all
+#: three lists and fails on any divergence.
+#:
+#: ⛔ `tortoise-onboarding` is deliberately ABSENT (#4365): it is a one-time setup
+#: flow that is READ at its served URL, never installed into a skills namespace.
+#: Building an archive for it here would hand the card a file to upload that its
+#: own first screen forbids uploading.
 SKILL_NAMES = (
     "how-to-use-tortoise",
     "tortoise-decide",
     "tortoise-file-finding",
-    "tortoise-onboarding",
 )
+
+#: The only arguments this tool accepts. Anything else is REJECTED: a tool whose
+#: job is to refuse drift must not silently fall through to WRITE mode when a
+#: flag is mistyped (a `--chek` used to rewrite the tree and exit 0).
+_ALLOWED_ARGV = frozenset({(), ("--check",)})
 
 #: A fixed timestamp keeps the archive byte-stable, so regenerating without a
 #: source change produces no diff.
@@ -54,7 +78,7 @@ def archive_path(name: str) -> Path:
 
 
 def source_path(name: str) -> Path:
-    return SKILLS_DIR / name / "SKILL.md"
+    return SERVED_SKILLS / name / "SKILL.md"
 
 
 def build(name: str) -> bytes:
@@ -74,7 +98,17 @@ def build(name: str) -> bytes:
 
 
 def main(argv: list[str]) -> int:
-    check = "--check" in argv
+    if tuple(argv) not in _ALLOWED_ARGV:
+        # Fail LOUD rather than defaulting to write mode: an unrecognised
+        # argument is a caller mistake, and the destructive path must never be
+        # the fallback for one (#9660 review).
+        print(
+            f"unrecognised argument(s): {' '.join(argv)}\n"
+            "usage: build_skill_archives.py [--check]",
+            file=sys.stderr,
+        )
+        return 2
+    check = argv == ["--check"]
     stale: list[str] = []
     for name in SKILL_NAMES:
         target = archive_path(name)

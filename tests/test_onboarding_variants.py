@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -39,19 +40,25 @@ PUBLIC_SKILLS = (REPO_ROOT / "website" / "apps" / "dashboard" / "public"
                  / "skills")
 MIRROR_SKILL = PUBLIC_SKILLS / "tortoise-onboarding" / "SKILL.md"
 
-# Docs-origin copy (tortoise.premiselabs.co/skills/<name>/SKILL.md). The docs
-# page itself links the `.skill` archives, and a same-origin <a download> is what
-# names the saved file, so the archives live on the same origin as the page that
-# offers them. The DASHBOARD card links the same URLs cross-origin, where
+# The served copies (app.premiselabs.co/skills/<name>/SKILL.md) are ALSO the
+# source each `.skill` archive is BUILT from, so there is no third copy to keep
+# in step: the archive is derived from the byte the parity gate pins and the
+# dashboard serves.
+#
+# The DOCS origin (tortoise.premiselabs.co) carries the built archives only. The
+# docs page itself links them, and a same-origin <a download> is what names the
+# saved file. The DASHBOARD card links the same URLs cross-origin, where
 # `download` is IGNORED — that path relies on `website/_headers` pinning
 # `/skills/*.skill` to Content-Type octet-stream + Content-Disposition
 # attachment, so it downloads instead of rendering.
-DOCS_SKILL = (REPO_ROOT / "website" / "skills" / "tortoise-onboarding"
-              / "SKILL.md")
 
 # The three sha256-pinned served skills (config/served-skills-upstream.yml) get a
-# docs-origin copy for the same reason: the ChatGPT card hands them over as
-# installable skills, and a one-click download must be SAME-ORIGIN.
+# docs-origin `.skill` archive: the ChatGPT card hands them over as installable
+# skills and a one-click download must be SAME-ORIGIN.
+#
+# ⛔ `tortoise-onboarding` is NOT among them (#4365): onboarding is delivered as
+# instructions the agent READS at its served URL, never installed as a skill, so
+# there is no archive for it. Its served document is MIRROR_SKILL.
 SERVED_SKILL_NAMES = ("how-to-use-tortoise", "tortoise-decide",
                       "tortoise-file-finding")
 
@@ -147,28 +154,43 @@ def test_m8_deploy_mirror_matches_canonical():
     carried forward).
 
     #3673: every tracked copy is compared to the canonical one, so this is a
-    parity gate and not a one-file no-op gate. #9660 added a THIRD tracked copy
-    (the docs-origin download artifact); the gate covers it too, so the copy the
-    user downloads cannot drift from the care the other two get.
+    parity gate and not a one-file no-op gate. The two copies are the canonical
+    live skill and the dashboard deploy mirror; the `.skill` archives of the
+    THREE served skills are one hop further out and are covered by
+    test_9660_skill_archive_holds_exactly_its_own_skill, which compares each
+    archive's payload to its served `SKILL.md` byte for byte. #9660 briefly added
+    a THIRD copy of the onboarding document on the docs origin, for an archive
+    that made onboarding an installed skill — removed with that archive, because
+    #4365 says onboarding is read, not installed.
     Watched failing in BOTH directions — a canonical-only edit and a served-only
     edit each exit non-zero — then restored to green."""
     assert_copies_parity(LIVE_SKILL, MIRROR_SKILL)
-    assert_copies_parity(LIVE_SKILL, DOCS_SKILL)
+
 
 @pytest.mark.parametrize("name", SERVED_SKILL_NAMES)
-def test_9660_docs_download_copy_matches_the_served_skill(name):
-    """#9660: the ChatGPT card downloads these from the DOCS origin (a
-    cross-origin <a download> is ignored by browsers), so each docs copy must be
-    the same bytes the dashboard serves. The upstream pin lives in
-    config/served-skills-upstream.yml; this closes the last hop, docs-origin
-    copy vs served copy, byte for byte."""
+def test_9660_skill_archive_is_built_from_the_SERVED_source(name):
+    """#9660: one source per skill — the served copy, not a third duplicate.
+
+    The archive must be derived from the byte the parity gate pins
+    (`config/served-skills-upstream.yml` → `public/skills/<name>/SKILL.md`), so a
+    docs-origin `SKILL.md` under `website/skills/` is an unpinned duplicate: it
+    must not exist, and nothing may link it. (It was tried and removed — besides
+    duplicating every skill's markdown, each new file is a whole-file subject of
+    the `docs` lint gate.)
+    """
     served = PUBLIC_SKILLS / name / "SKILL.md"
-    docs_copy = REPO_ROOT / "website" / "skills" / name / "SKILL.md"
-    assert_copies_parity(served, docs_copy)
+    assert served.is_file(), f"the served skill is the archive source: {served}"
+    duplicate = REPO_ROOT / "website" / "skills" / name / "SKILL.md"
+    assert not duplicate.exists(), (
+        f"{duplicate.relative_to(REPO_ROOT)} duplicates the served skill and is "
+        "pinned by nothing — the archive is built from the served copy")
+    docs = (REPO_ROOT / "website" / "docs.html").read_text(encoding="utf-8")
+    assert f"/skills/{name}/SKILL.md" not in docs, (
+        "docs.html must not link a docs-origin SKILL.md that does not exist")
 
 
 #: Every skill the ChatGPT card hands over, archive included.
-SKILL_ARCHIVE_NAMES = SERVED_SKILL_NAMES + ("tortoise-onboarding",)
+SKILL_ARCHIVE_NAMES = SERVED_SKILL_NAMES
 
 
 @pytest.mark.parametrize("name", SKILL_ARCHIVE_NAMES)
@@ -188,11 +210,11 @@ def test_9660_skill_archive_holds_exactly_its_own_skill(name):
     * the entry is `<name>/SKILL.md` at the archive root, with the skill's own
       frontmatter `name`, which is how the uploader derives the skill name.
 
-    Built by tools/build_skill_archives.py; a source edit without a rebuild
-    fails here rather than shipping a stale skill to users.
+    Built by tools/build_skill_archives.py from the SERVED copy; a source edit
+    without a rebuild fails here rather than shipping a stale skill to users.
     """
     archive = REPO_ROOT / "website" / "skills" / f"{name}.skill"
-    source = REPO_ROOT / "website" / "skills" / name / "SKILL.md"
+    source = PUBLIC_SKILLS / name / "SKILL.md"
     assert archive.is_file(), (
         f"missing skill archive: {archive} — run "
         "python3 tools/build_skill_archives.py")
@@ -211,6 +233,161 @@ def test_9660_skill_archive_holds_exactly_its_own_skill(name):
         f"{name}.skill frontmatter name must be {name!r} (got "
         f"{declared.group(1) if declared else None!r}); the uploader names the "
         "skill from it")
+
+
+def _js_skill_archive_names() -> tuple[str, ...]:
+    """`SKILL_ARCHIVE_NAMES` from harnesses.js — the set the CARD hands over."""
+    src = (REPO_ROOT / "website" / "apps" / "dashboard" / "src"
+           / "harnesses.js").read_text(encoding="utf-8")
+    start = src.index("export const SKILL_ARCHIVE_NAMES")
+    block = src[start:src.index("])", start)]
+    return tuple(re.findall(r"'([a-z0-9-]+)'", block))
+
+
+def _build_skill_names() -> tuple[str, ...]:
+    """`SKILL_NAMES` from tools/build_skill_archives.py — the BUILT set."""
+    src = (REPO_ROOT / "tools" / "build_skill_archives.py").read_text(
+        encoding="utf-8")
+    start = src.index("\nSKILL_NAMES = (")
+    block = src[start:src.index(")", start)]
+    return tuple(re.findall(r'"([a-z0-9-]+)"', block))
+
+
+def test_9660_onboarding_is_never_installed_as_a_skill():
+    """#4365: `tortoise-onboarding` is READ, never INSTALLED — pin every list.
+
+    The served document states this twice in its own first screen: the ⛔ banner
+    ("delivered as INSTRUCTIONS, never installed as a skill … never copied into a
+    harness's skills namespace") and the ChatGPT note, which originally told a
+    ChatGPT user to install this very document. #4365 records the rule as an owner
+    decision, with an exception allowed only if it is named and justified there.
+
+    The #9660 card shipped a `tortoise-onboarding.skill`, so the journey handed a
+    user a file whose own first screen forbids its upload, and the agent reading it
+    was told both "never installed as a skill" and "install this as a skill". No
+    guard observed any list: the archive test was parametrized over a literal that
+    contained `tortoise-onboarding`, i.e. it pinned the MECHANISM of that upload.
+    This asserts the RULE, against all three lists that decide what is installed —
+    the card's JS list, the archives the tool BUILDS, and the served set — and
+    against the artifacts on disk. A fourth entry in any one of them fails here.
+    """
+    assert _js_skill_archive_names() == _build_skill_names() == SERVED_SKILL_NAMES, (
+        "the card's install set, the set build_skill_archives.py BUILDS and the "
+        "served set must be ONE set — divergence ships a 404 link on the card or "
+        "an archive nothing hands over "
+        f"(js={_js_skill_archive_names()}, "
+        f"build={_build_skill_names()}, served={SERVED_SKILL_NAMES})")
+    for label, names in (("harnesses.js SKILL_ARCHIVE_NAMES", _js_skill_archive_names()),
+                         ("build_skill_archives.py SKILL_NAMES", _build_skill_names()),
+                         ("the served set", SERVED_SKILL_NAMES)):
+        assert "tortoise-onboarding" not in names, (
+            f"{label} includes tortoise-onboarding — #4365 says onboarding is "
+            "delivered as INSTRUCTIONS and never installed as a skill; if a "
+            "harness genuinely needs it installed, that is a RECORDED exception "
+            "on #4365 (naming the harness and the reason) plus an OVERRIDES: "
+            "line, not a list edit")
+    # …and the artifacts: no archive to upload, no docs-origin copy to build one
+    # from. A leftover archive is exactly the file a user would still download.
+    stray = (REPO_ROOT / "website" / "skills" / "tortoise-onboarding.skill")
+    assert not stray.is_file(), (
+        f"{stray.relative_to(REPO_ROOT)} exists — remove it: the card installs "
+        "three skills, and #4365 forbids this fourth")
+    assert not (REPO_ROOT / "website" / "skills" / "tortoise-onboarding").exists(), (
+        "the docs-origin copy of the onboarding document has no consumer once "
+        "onboarding is not archived; it would be an unpinned duplicate")
+    # The served document must not contradict itself either: the banner that
+    # forbids the install is still there, so the two halves of the journey agree.
+    served = LIVE_SKILL.read_text(encoding="utf-8")
+    assert "never installed as a skill" in served, (
+        "the served onboarding document must keep the #4365 banner — it is the "
+        "artifact a ChatGPT user reads, and it must not be reworded into "
+        "agreeing with an install it forbids")
+    assert "never copied into a harness's skills namespace" in served
+    # The docs card is the reference copy of the same journey: a link to a
+    # removed archive is a 404 that nothing else observes.
+    docs = (REPO_ROOT / "website" / "docs.html").read_text(encoding="utf-8")
+    assert "/skills/tortoise-onboarding.skill" not in docs, (
+        "website/docs.html still links the removed onboarding archive")
+    for name in SERVED_SKILL_NAMES:
+        assert f'href="/skills/{name}.skill"' in docs, (
+            f"website/docs.html must still hand over {name}.skill")
+
+
+def test_9660_build_skill_archives_rejects_an_unrecognised_argument():
+    """A drift gate must not fall through to WRITE mode on a typo.
+
+    `main` read `check = "--check" in argv`, so every other argument was silently
+    ignored: `--chek` wrote the tree and exited 0 — the tool whose job is to refuse
+    drift mutating the checkout and reporting success. A caller now gets exit 2 and
+    a usage line, and nothing is written (asserted on the artifact, not the exit
+    code alone).
+    """
+    tool = REPO_ROOT / "tools" / "build_skill_archives.py"
+    before = {p.name: p.read_bytes()
+              for p in (REPO_ROOT / "website" / "skills").glob("*.skill")}
+    result = subprocess.run(
+        [sys.executable, str(tool), "--chek"],
+        capture_output=True, text=True, cwd=REPO_ROOT)
+    assert result.returncode == 2, (
+        f"an unrecognised argument must be refused (got {result.returncode}: "
+        f"{result.stdout}{result.stderr})")
+    assert "unrecognised argument" in result.stderr, result.stderr
+    assert "all " not in result.stdout, (
+        "the refusal must not also report the tree as current — that is the "
+        "success line of a run that did not happen")
+    after = {p.name: p.read_bytes()
+             for p in (REPO_ROOT / "website" / "skills").glob("*.skill")}
+    assert after == before, "a refused invocation must not rewrite any archive"
+
+
+def test_9660_chatgpt_first_job_names_only_ADVERTISED_tools():
+    """ChatGPT builds its tool grant from `tools/list`, so a RETIRED name in its
+    first job is a call it can never make.
+
+    The step used to end with the SHARED verify body — "Call tortoise_health" —
+    while three artifacts in the same tree said that call is impossible from
+    ChatGPT: `tool_registry.py` retires `tortoise_health` in favour of
+    `tortoise_overview(section="health")`; `_RetiredToolTransform` serves retired
+    names on `get_tool` **without advertising them in `list_tools`**; and the
+    onboarding document this journey hands over tells the agent to use the
+    ADVERTISED form. The verify half of the journey's first action therefore
+    asked for a tool ChatGPT has no grant for.
+
+    Asserted on the RENDERED snapshot (the value both suites share) against the
+    REGISTRY itself, so a future retirement cannot pass here: any `tortoise_*`
+    token the copy names must be advertised, never merely retired.
+    """
+    from tortoise.tool_registry import RETIRED_USE_INSTEAD, TOOL_REGISTRY
+
+    snap = _rendered_snapshot()
+    body = snap["prompts"]["chatgpt/1"]
+    advertised = {t.name for t in TOOL_REGISTRY}
+    mentioned = set(re.findall(r"tortoise_[a-z_]+", body))
+    assert mentioned, (
+        "the ChatGPT first job must name the tools it calls — otherwise the step "
+        "that proves the connection proves nothing")
+    retired_mentioned = mentioned & set(RETIRED_USE_INSTEAD)
+    assert not retired_mentioned, (
+        f"the ChatGPT first job names RETIRED tool(s) {sorted(retired_mentioned)} — "
+        "they are absent from tools/list, so a tool-grant client cannot call them; "
+        f"use the advertised form {RETIRED_USE_INSTEAD[sorted(retired_mentioned)[0]]!r}")
+    assert mentioned <= advertised, (
+        f"the ChatGPT first job names unknown tool(s) "
+        f"{sorted(mentioned - advertised)}")
+    # The substance, so a rewrite cannot satisfy the rule with a tool that is
+    # advertised but does nothing for onboarding.
+    assert 'tortoise_overview(section="health")' in body, (
+        "the ChatGPT first job must verify through the advertised health section")
+    assert "tortoise_create_point" in body, (
+        "…and must still file the first memory, which is what marks it connected")
+    # The shared body is correct where the legacy name still answers (get_tool):
+    # the other six harnesses keep it, so this is a per-harness fix, not a
+    # rewrite of everyone's copy.
+    for harness in ("pi", "cursor", "claude", "codex", "claude-desktop",
+                    "claude-web"):
+        assert "tortoise_health" in snap["prompts"][f"{harness}/2"], (
+            f"{harness}: the shared verify body is unchanged for config-file "
+            "harnesses — a per-harness fix must not reword theirs")
 
 
 def test_parity_gate_fails_closed_on_a_missing_or_unreadable_copy(tmp_path):

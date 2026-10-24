@@ -9857,7 +9857,7 @@ function claimIntentInFlight() {
                               </WizardBlock>
                               <WizardBlock step={2} title="Install the Tortoise skills">
                                 <p className="wizard-caption">
-                                  One-time — after this they apply to every chat. Download the four files:
+                                  One-time — after this they apply to every chat. Download the three files:
                                 </p>
                                 <ul className="wizard-fields">
                                   {SKILL_ARCHIVE_NAMES.map((name) => (
@@ -9867,7 +9867,7 @@ function claimIntentInFlight() {
                                   ))}
                                 </ul>
                                 <p className="wizard-caption">
-                                  Then open <code>chatgpt.com/skills</code> → <strong>Add</strong> → <strong>Upload from your computer</strong> and select all four files together.
+                                  Then open <code>chatgpt.com/skills</code> → <strong>Add</strong> → <strong>Upload from your computer</strong> and select all three files together.
                                 </p>
                                 <p className="wizard-note">
                                   To update one later, upload that file again and choose <strong>Replace existing</strong>. Pack and taxonomy changes need no update — your agent reads those from Tortoise.

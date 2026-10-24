@@ -29,11 +29,34 @@ import {
 // connector leaves via wizardWorkflowsText. It must never be re-typed inline.
 export const ONBOARDING_INSTRUCTIONS = `Onboarding is instructions, not a skill — read and follow them at ${ONBOARDING_INSTRUCTIONS_URL}.`
 
-// #2827: the verify/file step every harness shares — step 2 for pi/cursor, the
-// only body for the two filesystem-less leaves, and appended to the workflows
-// prompt. Without it a connector user never calls tortoise_health /
-// tortoise_create_point, so onboarding never auto-completes.
+// #2827: the verify/file step every CONFIG-WRITING harness shares — step 2 for
+// pi/cursor/claude/codex, the only body for the two filesystem-less Claude
+// leaves, and appended to the workflows prompt. Without it a connector user
+// never calls tortoise_health / tortoise_create_point, so onboarding never
+// auto-completes.
 export const WIZARD_STEP2_TEXT = `Call tortoise_health to verify the connection, then tortoise_create_point to file my first memory.\nDocs: https://tortoise.premiselabs.co/docs`
+
+// #9660 review: ChatGPT is the ONE harness whose tools arrive as a GRANT built
+// from `tools/list`, so it cannot call `tortoise_health` at all — that name is
+// RETIRED and `_RetiredToolTransform` strips retired names from `list_tools`
+// while still serving them on `get_tool` (tortoise/mcp_server.py;
+// tortoise/tool_registry.py retires it in favour of
+// `tortoise_overview(section="health")`). Shipping the shared body to a
+// grant-based client asks it for a call it can never make, so the verify half of
+// its first job fails or reports a missing tool.
+//
+// ONE table, so the two texts sit side by side and neither can drift into the
+// other's harness:
+export const VERIFY_FILE_STEP_TEXT = {
+  // Shared by every harness that reads a config file or runs an installer: the
+  // legacy name still answers there (`get_tool`), so the copy stays as it is.
+  default: WIZARD_STEP2_TEXT,
+  // Chatgpt: the ADVERTISED tool, i.e. the one a tool-grant client can call.
+  // tests/test_harness_mcp_config.py pins the same rule on the docs row.
+  chatgpt: `Call tortoise_overview(section="health") to verify the connection, then tortoise_create_point to file my first memory.\nDocs: https://tortoise.premiselabs.co/docs`,
+}
+
+export const verifyFileStepText = (harness) => VERIFY_FILE_STEP_TEXT[harness] || VERIFY_FILE_STEP_TEXT.default
 
 export function wizardPromptText(harness, step, key, mode) {
   // #2865: the keyed URL comes from harnesses.js — a third hardcoded copy
@@ -116,8 +139,11 @@ export function wizardPromptText(harness, step, key, mode) {
     // the alternative), so this sentence may not assert that it is installed —
     // a skipper would copy a first job that tells its agent to read a file it
     // does not have. Name the served document as the fallback instead.
-    if (step === 1) return `You have Tortoise connected over MCP (the tortoise_* tools).\nRead the how-to-use-tortoise skill before your first write — it is the source of truth for how to add memories, the links between them, and when to use which. If it is not installed, read it at ${servedSkillUrl('how-to-use-tortoise')} first.\n${onboardingInstructions}\n${WIZARD_STEP2_TEXT}`
-    if (step === 2) return WIZARD_STEP2_TEXT
+    // The verify call is `tortoise_overview(section="health")`, NOT the retired
+    // `tortoise_health`: a tool-grant client builds its grant from `tools/list`,
+    // which does not advertise retired names (see VERIFY_FILE_STEP_TEXT above).
+    if (step === 1) return `You have Tortoise connected over MCP (the tortoise_* tools).\nRead the how-to-use-tortoise skill before your first write — it is the source of truth for how to add memories, the links between them, and when to use which. If it is not installed, read it at ${servedSkillUrl('how-to-use-tortoise')} first.\n${onboardingInstructions}\n${verifyFileStepText('chatgpt')}`
+    if (step === 2) return verifyFileStepText('chatgpt')
   }
   return ''
 }

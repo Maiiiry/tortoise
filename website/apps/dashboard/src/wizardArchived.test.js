@@ -1487,7 +1487,8 @@ const COPY_READ_CENSUS = Object.freeze({
   HARNESS_SKILLS_IN_STEPS: [0, 2],
   HARNESS_STEPS: [0, 2],
   // #9660: the ChatGPT install block reads these two in the LIVE render
-  // (the four .skill links), so their reachability is live, not archived.
+  // (one link per archive in SKILL_ARCHIVE_NAMES), so their reachability is
+  // live, not archived.
   SKILL_ARCHIVE_NAMES: [1, 0],
   skillArchiveUrl: [1, 0],
   CODEX_DESKTOP_COMMAND: [1, 0],
