@@ -1016,6 +1016,15 @@ test("a window that shrinks with NO compaction entry is refused too", async () =
   assert.equal(r2.shrunk, 1, "the refusal is COUNTED, never silent");
   assert.equal(r2.files[0].reason, "window_shrunk");
   assert.equal(loadCursor(cursorDir).state.files[path].maxWindow, 4, "the high-water mark is kept");
+  // ISSUE 4: `failures` is the POST retry SCHEDULE's position, and a refusal is
+  // not a failed POST. Since the length arm now fires on any branch re-point,
+  // spending the budget here would let routine refusals saturate it and leave
+  // the eventual real ship with ONE attempt instead of the full schedule.
+  assert.equal(
+    loadCursor(cursorDir).state.files[path].failures ?? 0,
+    0,
+    "a refusal must not spend the POST retry budget",
+  );
 });
 
 test("a ZERO-BYTE session file is DEFERRED, not reported as a hard error", async () => {

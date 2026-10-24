@@ -110,12 +110,15 @@ shorter-re-capture rule **DELETES the turns beyond the new window** (`sdk.py`; t
 `#1920` behaviour, journaled as a delete) — so a post-compaction backstop ship can
 remove turns the hook filed.
 
-The worker therefore **REFUSES to ship a shrinking window**: when the active branch
-carries a `compaction` entry and the window is shorter than the high-water mark of
-what this file may already have delivered, the cursor is RETAINED, nothing is posted,
-and the refusal is counted (`receipt.shrunk`) and logged. A compacted window with **no
-cursor at all** is refused too: this lane cannot prove the server holds nothing older,
-and refusing is the only direction that cannot destroy turns the hook filed. That
+The worker therefore **REFUSES to ship a shrinking window** — of ANY cause, not only
+a `/compact` cut: when the window is shorter than the high-water mark of what this
+file may already have delivered, the cursor is RETAINED, nothing is posted, and the
+refusal is counted (`receipt.shrunk`) and logged. A window carrying a `compaction`
+entry that this lane **cannot prove it delivered anything behind** is refused too:
+it cannot prove the server holds nothing older, and refusing is the only direction
+that cannot destroy turns the hook filed. The length arm's ONE exception is a
+**re-anchored** plan (Pi's truncate-then-rewrite), where the cursor was reset and the
+old offset is not the same index space — and even then the unproven arm still applies. That
 narrows the deletion path to the residual below without deciding the open design
 question — posting the *union* of shipped + kept, or a server-side monotone window —
 which stays on #3515 and is named in §9. Recovery for anything already filed is still
@@ -166,7 +169,7 @@ and are not renumbered). Status against the tree at this commit:
 | **Half-written trailing line** | The cursor never crosses a line's terminating newline, so the partial line is neither parsed (garbage) nor skipped (loss). It ships whole on the next pass. | `a partial trailing line is NOT consumed and NOT lost`; `a half-written tail neither ships garbage nor blocks the next run` (process level). Mutation control: making the cursor jump to `buf.length` reds 3 rows. |
 | **Restart** | The cursor is written `tmp`+`fsync`+`rename`, with the previous good copy kept as `.bak`. A restart resumes at the same byte and **POSTs nothing** for an up-to-date file. | `the cursor SURVIVES a restart and neither re-emits nor skips`; `test_cursor_survives_a_restart_and_does_not_re_emit` (two processes, zero POSTs on the second). |
 | **Corrupt cursor** | Fails **closed to the last good offset** (`.bak`), with the recovery recorded — never 0 (duplicate storm) and never EOF (silent loss) **while the backup is usable**. When BOTH copies are unusable it re-ships from offset **0** and says so: at-least-once is the contract and the duplicate is absorbed by the server's turn MERGE. A save made straight after a recovery does not copy the still-corrupt main over the backup, so the fallback survives the next checkpoint. | `a CORRUPT cursor fails closed to the last good offset (recorded, not silent)`; `a cursor from a future version is not silently interpreted` (pins the empty state that IS the double-corrupt contract); `a RECOVERY save does not overwrite the last good backup with the corrupt bytes`. |
-| **`/compact` shrink** | A window shorter than what this file already delivered is **REFUSED**: cursor retained, nothing posted, the refusal counted (`shrunk`). Shipping it would make the turn store hard-delete the turns past the new window (#1920). The rule is not gated on a `compaction` entry — a tree append whose `parentId` bypasses the old leaf shortens the branch too — with ONE exception: a **re-anchored** plan (truncate-then-rewrite, dev/ino or header change) resets the cursor to 0 and is shipped, because that is Pi's `_rewriteFile` and the old offset is not the same index space. | `a /compact SHRINK is refused, never shipped (it would delete filed turns)`. Mutation control: delete the guard → the row POSTs. |
+| **Shrinking window** | A window shorter than what this file already delivered is **REFUSED**: cursor retained, nothing posted, the refusal counted (`shrunk`). Shipping it would make the turn store hard-delete the turns past the new window (#1920). The rule is not gated on a `compaction` entry — a tree append whose `parentId` bypasses the old leaf shortens the branch too — with ONE exception: a **re-anchored** plan (truncate-then-rewrite, dev/ino or header change) resets the cursor to 0 and is shipped, because that is Pi's `_rewriteFile` and the old offset is not the same index space — unless it ALSO hits the unproven arm (a `compaction` window with no provable prior delivery), which still refuses it. | `a /compact SHRINK is refused, never shipped (it would delete filed turns)`. Mutation control: delete the guard → the row POSTs. |
 | **Truncation / rotation / replacement** | `cursor > file_size` (L6), an inode change, or a changed header sha ⇒ **re-read from the header and re-ship**, reason recorded. | `planFile re-anchors to the header on cursor > file_size`; `…when the file is REPLACED under the same path`; `test_a_truncated_file_is_re_anchored_not_silently_skipped`. Mutation control: deleting the past-EOF branch reds the planFile row. |
 
 Two workers over one file cannot corrupt the cursor (single `rename`), and both may

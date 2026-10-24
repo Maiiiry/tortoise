@@ -66,9 +66,11 @@
  *    branch shorter while the FILE grows. Either way the turn store's
  *    shorter-re-capture rule hard-DELETES the turns beyond the new window, so a
  *    shrinking window is REFUSED (cursor retained, counted) rather than shipped.
- *    The ONE exception is a RE-ANCHORED plan (truncate-then-rewrite, dev/ino or
- *    header change): the cursor was reset to 0 and the file is being read as a
- *    new one, so what was delivered before is not the same index space.
+ *    The length arm has ONE exception: a RE-ANCHORED plan (truncate-then-rewrite,
+ *    dev/ino or header change) reset the cursor to 0 and is reading the file as a
+ *    new one, so what was delivered before is not the same index space. It is
+ *    still refused if it ALSO hits the unproven arm below (a window carrying a
+ *    `compaction` entry this lane cannot prove it has delivered anything behind).
  *  - **Bounded per run** (piece 10): files SHIPPED, requests, and attempts. An
  *    up-to-date file is skipped from its `stat`, its header line and at most a
  *    64 KiB tail read (`completeThroughCheap`), so a sweep does not read whole
@@ -510,7 +512,8 @@ export interface RunReceipt {
    *  sweep that examined real work reads as "0 shipped, 0 up to date". */
   noTurns: number;
   /** Files REFUSED because their window is shorter than what was already
-   *  delivered (a `/compact` cut). Counted, never silent. */
+   *  delivered — a `/compact` cut OR a tree append that re-points the branch at
+   *  a shorter chain. Counted, never silent. */
   shrunk: number;
   dropped: number;
   deadLettered: number;
@@ -861,7 +864,14 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
             maxWindow: priorWindow,
             updatedAt: prior?.updatedAt ?? 0,
             attemptedAt: now(),
-            failures: (prior?.failures ?? 0) + 1,
+            // `failures` is the POST retry schedule's position, so a REFUSAL
+            // must not spend it: a refusal is not a failed POST, and since the
+            // length arm now fires on any branch re-point (not only an
+            // occasional `/compact`), incrementing here would let a handful of
+            // routine tree-append refusals saturate the counter and leave the
+            // first legitimate ship with ONE attempt instead of the full
+            // schedule. Carried forward untouched.
+            failures: prior?.failures ?? 0,
           };
           checkpoint();
         }
@@ -878,8 +888,9 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
       });
       log(
         `store-sync: REFUSED a shrunk window for ${sessionId} ` +
-          `(${turns.length} turns vs ${priorWindow || "an unknown"} already held — a ` +
-          "/compact cut; shipping it would delete the turns past the new window)",
+          `(${turns.length} turns vs ${priorWindow || "an unknown"} already held — ` +
+          `${compacted ? "a /compact cut" : "a shorter branch"}` +
+          "; shipping it would delete the turns past the new window)",
       );
       continue;
     }
