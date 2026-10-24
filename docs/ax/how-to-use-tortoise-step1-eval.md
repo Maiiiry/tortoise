@@ -84,7 +84,7 @@ NAND vs mitigate).
 `tools/ax_write_eval.py record` opens the graph the agent wrote and records every
 node's **label** (the layer), its kind property, the operator points and
 `op_type`, every edge, and the Sources. `tools/ax_write_eval.py score` compares
-that record against the frozen gold and emits P0/P1/P2 findings with the
+that record against the frozen gold and emits P0/P1 findings with the
 severity rules the review skills use:
 
 | Severity | Rule |
@@ -154,11 +154,11 @@ unchanged by that fix.
 |---|---|---|---|---|---|
 | 1 | portfolio update | 2 | 5 | 5 Point · 3 Subject · 2 Object · 3 Event · 1 Source | ARR and headcount (state) written as **Points**; `subjectKind: company\|investor` undeclared; the release event's `eventKind: disbursement` is a declared *pack* kind but not the kind this occurrence is |
 | 2 | meeting transcript | 2 | 7 | 7 Point · 3 Subject · 4 Object · 1 Event · 1 Source | the **decision has no Event of its kind** — only a Point (the meeting Event is the session, not the decision); `subjectKind: person` ×3, `objectKind: offering`, `pointKind: issue`; one **unexplained NAND** (two edges, onto the comms plan and onto the slip forecast) |
-| 3 | research paper | 0 | 4 | 6 Point · 1 Subject · 3 Object · 1 Event · 1 Source | `sourceKind: research` — that is the **documentKind (genre) axis**; `subjectKind: authorGroup` undeclared; the findings use the legacy `observation` kind instead of `statement` |
+| 3 | research paper | 0 | 4 | 6 Point · 1 Subject · 3 Object · 1 Event · 1 Source | `sourceKind: research` — that is the **documentKind (genre) axis**; `subjectKind: authorGroup` undeclared; the findings use the §5 **core** `observation` kind where the state-centric ruling says `statement` (not a legacy kind — `observation` is canonical, the ruling is about which claim-kind fits) |
 | 4 | decision request | 3 | 1 | 7 Point · 1 Subject · 4 Object · 2 Event · 2 Source | **two homes** for the request (an Event names it *and* a Point holds it); the **goal** is a Point not an Object; the **deadline** is an Event; the **estimate** is a Point. Its `option`/`criterion` Points are **declared** (`tortoise.sdk` registers both) — a correction: they used to be billed as inventions |
 | 5 | correction to a claim | 0 | 1 | 6 Point · 1 Event · 1 Source | both gold items perfect — supersession with the old claim kept, provenance written — and two undeclared kinds elsewhere (`eventKind: correction`, plus `pointKind: incident`, which the product's legacy registry *does* accept and is therefore a correction, not a finding) |
 | 6 | duplicate entity | 0 | 3 | 3 Point · 1 Subject · 1 Object · 1 Event · 1 Source | the **alias was correctly folded onto the existing node** (no duplicate — the measurable this input exists for); the renewal lands on an Event, but with `eventKind: customerCommitment` (undeclared) and a `subjectKind: person` |
-| 7 | regulatory filing | 0 | 2 | 5 Point · 2 Subject · 1 Object · 1 Event · 1 Source | no layer failure and no undeclared kind: Source + subject kinds correct (`core:organization` is the **declared** spelling); the two figures use the legacy `observation` kind rather than `statement` |
+| 7 | regulatory filing | 0 | 2 | 5 Point · 2 Subject · 1 Object · 1 Event · 1 Source | no layer failure and no undeclared kind: Source + subject kinds correct (`core:organization` is the **declared** spelling); the two figures use the §5 **core** `observation` kind where the state-centric ruling says `statement` |
 | 8 | person appointment | 2 | 4 | 4 Point · 2 Subject · 5 Object · 1 Event · 1 Source | the **organisation and the role** written as Objects; `subjectKind: person` ×2; the appointment Event carries an undeclared `eventKind: employmentStart` |
 | 9 | contradicting claim | 2 | 2 | 7 Point · 1 Event | **no NAND** — the contradiction was answered by *mitigating the IMPL operator*: relevance dampened where truth was at issue. No Source written at all |
 | 10 | product spec | 2 | 2 | 4 Point · 1 Subject · 2 Object · 1 Event · 1 Source | **two homes** for the ship date (plan Object + target Point); the success bar is only a Point; v1's dates are Points, not on the v1 Object |
@@ -179,7 +179,7 @@ steps are decisions rather than rules.
 | **Layer confusion — only the wrong layer holds the item** | 9 items across 5 inputs | portfolio: ARR + headcount as Points · decision request: goal, deadline, estimate · meeting: the decision · person appointment: organisation, role · product spec: the success bar |
 | **Two homes — the right layer holds it AND a second one does** | 2 items across 2 inputs | decision request: the request (the Event names it, a Point also holds it) · product spec: the ship date (plan Object + target Point). Weaker than an absence, and a different instruction: express the second reading as a claim *about* the node |
 | **Wrong-but-declared kind** (legacy-valid, not invented) | 7 | `pointKind: observation` where the state-centric ruling says `statement`; `eventKind: disbursement` where the occurrence is an occurrence/milestone; `pointKind: issue` where the item is a statement ×2. A different lesson from an invented kind, which is why the instrument separates them |
-| **Edge on the wrong endpoints** | 0 | the two gold edge items (`reports to`, `owned by`) are graded on the ENDS as well as the relation: `reportsTo` written Point → Point satisfies a relation-name test while saying the opposite of the item, so the shape the gold's `why` always stated is now declared as `endpoints` and scored. Both committed runs wired it correctly (`reportsTo` Subject → Subject, `ownedBy` Object → Subject) |
+| **Edge on the wrong endpoints** | 0 | the two gold edge items (`reports to`, `owned by`) are graded on BOTH ENDS as well as the relation, and the gold must declare both: `reportsTo` written Point → Point satisfies a relation-name test while saying the opposite of the item, so the shape the gold's `why` always stated is now declared as `endpoints` and scored. Both committed runs wired it correctly (`reportsTo` Subject → Subject, `ownedBy` Object → Subject). Correction 30: `owned by` had declared only its `to` end, so its `from` end was ungraded — an `ownedBy` written Point → Subject scored `OK`; `_edge_endpoints` now refuses a one-sided declaration |
 | **Item absent from the graph** | 2 | meeting: the 80% slip forecast (the run wrote a Point about it, but the node says "probability" where the item says "chance" — a synonym, leaving 3 of 4 stems and a 0.375 partial score under the 0.5 floor) and product spec: v1's dates. Both are itemised below |
 | **Truth vs relevance** | 1 input, 1 finding | contradicting claim: no NAND, with the dampener named **inside** that finding (the record's `mitigations` shows the `mitigated_by` edge). One act, one finding — it used to be charged twice |
 | **NAND where nothing contradicts** | 1 | meeting: one NAND operator with two edges (onto the comms plan, onto the slip forecast). A judgment call, and the instrument treats it as a finding because a contradiction operator on a claim nobody attacked computes a wrong confidence |
@@ -188,7 +188,7 @@ steps are decisions rather than rules.
 
 ### Instrument limitations and corrections, stated rather than hidden
 
-This section exists because **six rounds of fresh-context review found the
+This section exists because **seven rounds of fresh-context review found the
 instrument lying about its own subject** — each round also found the sentences
 below still quoting the pre-fix causes — and the numbers above are what remains
 after every fix. The corrections are recorded, not quietly absorbed: a
@@ -352,11 +352,25 @@ The two edge items state their shape in prose ("an ORG edge between Subjects",
 written Point → Point answered `OK`: a false PASS in the number Step 3 reads as
 its acceptance delta, on a branch that had no fixture at all. The gold now
 declares `endpoints`, the instrument scores the ends as well as the name, and it
-REFUSES to grade an edge item that declares neither — refusing to answer beats
+REFUSES to grade an edge item that declares neither end — or only one — refusing to answer beats
 answering the wrong question. Both committed runs are unchanged (they were wired
 correctly, and the class row above is 0). The list numbering above is left as
 the source of record: rendering these as one ordered list would need every
 prefix to start at 1, which the cross-references to correction numbers rule out.
+
+**Correction 30: `owned by` declared only ONE end, so the other was ungraded.**
+Correction 29 required an edge item to declare `endpoints` and refused one that
+declared neither — but it graded whichever sides were present. `owned by`
+declared `to: [Subject]` and no `from`, so `_edge_fits` constrained only `to`
+and an `ownedBy` written **Point → Subject** answered `OK`. That is the same
+false PASS correction 29 exists to close, one round later and half-closed: the
+class row above claimed both ends were graded, and for one of the two edge items
+they were not. The gold now declares `from: [Subject, Object, Source]`
+(`docs/ONTOLOGY.md` §3.6 — `ownedBy | Entity → Subject`), `_edge_endpoints`
+refuses a one-sided declaration instead of half-grading it, and
+`test_an_ownedBy_written_FROM_a_Point_is_not_ok` is the fixture for the write it
+used to bless. No committed number moves: both runs wired `Object → Subject`,
+which is inside `Entity`.
 
 Still true, and stated as a limit rather than a rule: the matcher is token
 overlap with a crude stemmer, and **the class table above is the MACHINE

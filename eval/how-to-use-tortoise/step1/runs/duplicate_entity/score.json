@@ -51,8 +51,8 @@
       "severity": "P1",
       "item": "renew in January",
       "layer": "Event",
-      "kind": "customercommitment",
-      "finding": "UNDECLARED kind 'customercommitment' on a Event ('Northwind Logistics confirmed January renewal (202') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
+      "kind": "customerCommitment",
+      "finding": "UNDECLARED kind 'customerCommitment' on a Event ('Northwind Logistics confirmed January renewal (202') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Event kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {

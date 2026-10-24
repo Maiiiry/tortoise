@@ -364,6 +364,20 @@ def _open(uri_or_path: str):
         os.environ["TORTOISE_DB_URI"] = uri_or_path
         os.environ.pop("TORTOISE_DB_PATH", None)
     else:
+        # ⛔ A mistyped path must never be answered with a graph (#9695 review
+        # P2). The embedded lane CREATES a missing file/dir and hands back an
+        # empty graph, so scoring a typo produced a full-finding record
+        # indistinguishable from "the agent wrote nothing" — an artifact a
+        # Step-3 lane would commit as evidence. `setup.py` already refuses a
+        # target it cannot positively identify; this is the same refusal on the
+        # READ side, which is where fabricated evidence would enter.
+        if not Path(uri_or_path).exists():
+            raise SystemExit(
+                f"no graph at {uri_or_path!r}: the embedded lane would CREATE an "
+                f"empty one and score it as a total-failure run, which cannot be "
+                f"told apart from an agent that wrote nothing. Fix the path "
+                f"(`--db`), or score an already-recorded graph with --graph."
+            )
         os.environ.pop("TORTOISE_DB_URI", None)
         os.environ["TORTOISE_DB_PATH"] = uri_or_path
 
@@ -670,9 +684,16 @@ def _edge_endpoints(spec: dict, item: str, input_id: str) -> dict[str, set[str]]
     the opposite of what the item is about — a false PASS in the one number
     Step 3 reads as its acceptance delta (#9695 review P1). The gold already
     states the shape in prose (`"an ORG edge between Subjects"`); this reads it
-    as a declaration. A gold edge item that does NOT declare its endpoints is
-    refused rather than graded by name alone — refusing to answer beats
-    answering the wrong question, and the refusal names the field to add.
+    as a declaration. A gold edge item that declares NEITHER end, or only ONE
+    of them, is refused rather than graded by name alone — refusing to answer
+    beats answering the wrong question, and the refusal names the missing side.
+
+    ⛔ BOTH sides are required, not merely whichever sides are present (#9695
+    review P1). A one-sided declaration silently un-grades the other end: `owned
+    by` stated only `to: [Subject]`, so an `ownedBy` written Point -> Subject
+    scored `OK` — exactly the false PASS correction 29 was added to close.
+    Requiring both is what makes this class's claim ("graded on the ENDS") true
+    for every gold edge item instead of for most of them.
     """
     ends = spec.get("endpoints")
     known = {layer.lower() for layer in LAYERS}
@@ -691,8 +712,13 @@ def _edge_endpoints(spec: dict, item: str, input_id: str) -> dict[str, set[str]]
     stray = sorted(set(ends) - {"from", "to"}) if isinstance(ends, dict) else []
     if problem is None and stray:
         problem = f"unknown key(s) {stray} — only `from` / `to` are endpoint sides"
-    if problem is None and not wanted:
-        problem = "neither `from` nor `to` given"
+    missing = [side for side in ("from", "to") if not wanted.get(side)]
+    if problem is None and missing:
+        problem = (
+            "missing side(s) "
+            + ", ".join(f"`{side}`" for side in missing)
+            + " — an edge has two ends and BOTH are graded"
+        )
     if problem is not None:
         raise SystemExit(
             f"gold item {item!r} (input {input_id!r}) is an EDGE item with no usable "
@@ -884,7 +910,14 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
             continue
 
         allowed = [k.lower() for k in exp.get("kind", [])]
-        got_kind = (best["kind"] or "").lower()
+        # AS WRITTEN, never lowercased (#9695 review P2). The finding text, the
+        # `kind` field and the doc all quote the spelling the GRAPH carries
+        # (`customerCommitment`). Lowercasing here made one record state two
+        # spellings of one kind — `UNDECLARED kind 'customercommitment'` beside
+        # `kind_sources: {"customerCommitment": …}` — and contradicted
+        # `canonical_object_kinds`'s own docstring. Matching stays
+        # case-insensitive, inside `_kind_matches`.
+        got_kind = best["kind"] or ""
         own_prop = best.get("kind_prop") or KIND_PROP.get(best["layer"], "kind")
         foreign = best.get("foreign_kinds") or {}
         # A kind written to a DIFFERENT layer's property is its own finding. The
@@ -1244,6 +1277,12 @@ def score(record_doc: dict, gold: dict, input_id: str) -> dict:
         },
         "packs": _pack_vocab()["packs"],
         "severity_counts": {
+            # P2 is a RESERVED slot, not a dead rule (#9695 review round 8, P2).
+            # The instrument emits only P0/P1 today — the review skills' two
+            # severities that gate a merge — but every record carries the counter
+            # so a future P2 rule lands in a stable schema rather than forcing
+            # all ten committed artifacts to be rewritten. The doc says
+            # "P0/P1 findings" accordingly.
             sev: sum(1 for f in findings if f["severity"] == sev)
             for sev in ("P0", "P1", "P2")
         },

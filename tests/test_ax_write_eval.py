@@ -1336,7 +1336,10 @@ def test_an_edge_item_wired_between_the_wrong_layers_is_not_ok():
                     "item": "owned by",
                     "layer": "edge",
                     "kind": ["ownedBy"],
-                    "endpoints": {"to": ["Subject"]},
+                    "endpoints": {
+                        "from": ["Subject", "Object", "Source"],
+                        "to": ["Subject"],
+                    },
                     "why": "§3.5-3.6 — responsibility is an EDGE to a Subject",
                 }
             ],
@@ -1364,7 +1367,10 @@ def test_an_edge_item_with_the_endpoints_the_gold_names_is_ok():
                     "item": "owned by",
                     "layer": "edge",
                     "kind": ["ownedBy"],
-                    "endpoints": {"to": ["Subject"]},
+                    "endpoints": {
+                        "from": ["Subject", "Object", "Source"],
+                        "to": ["Subject"],
+                    },
                     "why": "§3.5-3.6 — responsibility is an EDGE to a Subject",
                 }
             ],
@@ -1376,6 +1382,130 @@ def test_an_edge_item_with_the_endpoints_the_gold_names_is_ok():
     # about the fixture's unkinded nodes and not about this edge.
     assert verdict["severity_counts"]["P0"] == 0
     assert not [f for f in verdict["findings"] if f["item"] == "owned by"]
+
+
+def test_an_edge_item_that_declares_only_one_end_is_refused():
+    """One declared end must not silently un-grade the other (#9695 review P1).
+
+    `owned by` stated only `to: [Subject]` for six rounds. Because `_edge_fits`
+    constrains exactly the sides the gold declares, the `from` end was never
+    checked, and an `ownedBy` written Point -> Subject — an Entity's accountability
+    attached to a Point, which §3.6 says is an Entity -> Subject relation — scored
+    `OK`. The class row in the doc claimed both ends were graded. Requiring BOTH
+    is what makes that claim true; a one-sided declaration is refused, not
+    half-graded.
+    """
+    record = _record(
+        nodes=[_node("Object", "plan v2", kind="plan"), _node("Subject", "platform team")],
+        edges=[_edge("ownedBy", "Object", "Subject")],
+    )
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {
+                    "item": "owned by",
+                    "layer": "edge",
+                    "kind": ["ownedBy"],
+                    "endpoints": {"to": ["Subject"]},
+                    "why": "§3.5-3.6 — responsibility is an EDGE to a Subject",
+                }
+            ],
+        }
+    )
+    with pytest.raises(SystemExit) as exc:
+        axe.score(record, gold, "x")
+    assert "`from`" in str(exc.value), str(exc.value)
+
+
+def test_an_ownedBy_written_FROM_a_Point_is_not_ok():
+    """The exact false PASS a one-sided `owned by` gold let through.
+
+    ONTOLOGY §3.6 (`docs/ONTOLOGY.md`) states `ownedBy | Entity → Subject`. The
+    committed runs wire `Object -> Subject`, so this fixes no number — it closes
+    the hole that would have accepted `Point -> Subject` in Step 3.
+    """
+    record = _record(
+        nodes=[_node("Point", "plan v2", kind="plan"), _node("Subject", "platform team")],
+        edges=[_edge("ownedBy", "Point", "Subject")],
+    )
+    gold = _gold(
+        {
+            "id": "x",
+            "expect": [
+                {
+                    "item": "owned by",
+                    "layer": "edge",
+                    "kind": ["ownedBy"],
+                    "endpoints": {
+                        "from": ["Subject", "Object", "Source"],
+                        "to": ["Subject"],
+                    },
+                    "why": "§3.5-3.6 — responsibility is an EDGE to a Subject",
+                }
+            ],
+        }
+    )
+    verdict = axe.score(record, gold, "x")
+    assert verdict["item_rows"][0]["verdict"] == "EDGE-LAYER", verdict["item_rows"]
+    (finding,) = [f for f in verdict["findings"] if f["item"] == "owned by"]
+    assert finding["severity"] == "P0"
+    assert "Point -> Subject" in finding["finding"]
+
+
+def test_an_undeclared_kind_is_quoted_as_the_graph_wrote_it():
+    """One record must not carry two spellings of one kind (#9695 review P2).
+
+    `kind_sources` and the census keep the as-written spelling; the finding text
+    lowercased it, so a `score.json` read `UNDECLARED kind 'customercommitment'`
+    beside `"customerCommitment": "UNDECLARED"`. The doc quotes the camelCase
+    form, and `canonical_object_kinds`'s docstring says the finding quotes the
+    kind as written.
+    """
+    record = _record(
+        nodes=[_node("Event", "renewal confirmed", kind="customerCommitment")],
+        edges=[],
+    )
+    gold = _gold(
+        {
+            "id": "x",
+            # The item is gold-mapped so the finding is the PER-ITEM one; an
+            # unmapped node is charged by the graph-wide census instead.
+            "expect": [
+                {
+                    "item": "renewal confirmed",
+                    "layer": "event",
+                    "kind": ["milestone"],
+                    "why": "an occurrence the gold names",
+                }
+            ],
+        }
+    )
+    verdict = axe.score(record, gold, "x")
+    texts = [f["finding"] for f in verdict["findings"]]
+    quoted = [t for t in texts if "UNDECLARED kind" in t]
+    assert quoted, texts
+    assert "'customerCommitment'" in quoted[0], quoted[0]
+    assert "customercommitment" not in quoted[0], quoted[0]
+
+
+def test_a_mistyped_db_path_is_refused_instead_of_scored_as_an_empty_graph(
+    tmp_path, monkeypatch
+):
+    """A typo must not fabricate a total-failure record (#9695 review P2).
+
+    The embedded lane CREATES a missing path and returns an empty graph, so
+    scoring a mistyped `--db` produced a record of exactly the committed shape
+    whose content is "everything absent" — indistinguishable from an agent that
+    wrote nothing. `setup.py` already refuses a target it cannot identify; the
+    read side is where fabricated evidence would enter.
+    """
+    monkeypatch.delenv("TORTOISE_DB_URI", raising=False)
+    missing = tmp_path / "typo.db"
+    with pytest.raises(SystemExit) as exc:
+        axe._open(str(missing))
+    assert "no graph at" in str(exc.value), str(exc.value)
+    assert not missing.exists(), "the refusal must not create the path it refused"
 
 
 def test_an_edge_item_that_does_not_declare_its_endpoints_is_refused():
@@ -1428,6 +1558,14 @@ def test_every_committed_edge_item_declares_the_endpoints_it_is_graded_on():
         assert isinstance(ends, dict) and ends, (
             f"{exp['item']!r}: an edge item must declare `endpoints` — a relation "
             f"name alone passes between the wrong layers"
+        )
+        # BOTH sides, not "whichever sides happen to be present" (#9695 review
+        # P1): iterating `ends.items()` accepted a one-sided declaration, which
+        # un-grades the other end silently. `owned by` shipped that way.
+        assert set(ends) == {"from", "to"}, (
+            f"{exp['item']!r}: an edge item must declare BOTH `from` and `to` — "
+            f"got {sorted(ends)}; a one-sided declaration leaves the other end "
+            f"ungraded while the class table says the ends are graded"
         )
         for side, wanted in ends.items():
             assert side in ("from", "to"), f"{exp['item']!r}: unknown endpoint side {side!r}"

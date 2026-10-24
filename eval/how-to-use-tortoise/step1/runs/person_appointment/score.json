@@ -91,8 +91,8 @@
       "severity": "P1",
       "item": "joined Northwind Logistics",
       "layer": "Event",
-      "kind": "employmentstart",
-      "finding": "UNDECLARED kind 'employmentstart' on a Event ('Marta Reyes joins Northwind Logistics as CFO') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
+      "kind": "employmentStart",
+      "finding": "UNDECLARED kind 'employmentStart' on a Event ('Marta Reyes joins Northwind Logistics as CFO') \u2014 not a core \u00a75 kind, not one the SDK registers, and not one any loaded pack declares; nothing routes to, finds or classifies it",
       "fix": "use a declared Event kind (\u00a75 core, or a pack kind spelled as the pack declares it)"
     },
     {
