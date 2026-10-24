@@ -804,8 +804,12 @@ def _run_probe(tmp_path: Path, mode: str) -> tuple[int, str]:
         "STUB_DIR": str(tmp_path),
         "PROBE_TMP": str(tmp_path),
     }
-    # `bash -e` mirrors GitHub Actions' default Linux shell — the exact condition
-    # under which the original bug reproduced.
+    # `bash -e` is the SHELL FLOOR these probes are written to survive, not the
+    # shell CI runs them in: GitHub Actions adds `-o pipefail`. Kept at `-e` here
+    # deliberately (#9680), because switching this shared helper would also submit
+    # every inherited step it drives to a pipefail audit nobody has done — the
+    # IndexNow steps, which this PR introduces, run under `-eo pipefail` in their
+    # own runners.
     r = subprocess.run(
         ["bash", "-e", str(_probe_script(tmp_path))],
         capture_output=True,
@@ -860,7 +864,7 @@ def test_the_probe_reports_the_503_error_code_verbatim(tmp_path) -> None:
 
 
 def test_the_probe_retries_a_transient_transport_failure(tmp_path) -> None:
-    """Proves the retry loop is REACHABLE under `bash -e`.
+    """Proves the retry loop is REACHABLE under `bash -e` (the floor, not CI's shell).
 
     Before the `|| curl_rc=$?` guard, the first failed substitution aborted the
     step: `rc7once` (two failures then a healthy 302) exited non-zero and the
@@ -1605,9 +1609,10 @@ def _run_deploy(
 ) -> tuple[int, str, Path, Path]:
     """Execute the shipped Deploy step with the shell exactly as CI runs it.
 
-    `bash -e` mirrors GitHub Actions' default Linux shell. The run block is the
-    comment-stripped shipped text — comments are inert, so executing without them
-    proves the CODE carries the behaviour, not the prose.
+    `bash -e` — the floor, not CI's shell: Actions adds `-o pipefail`, which is why
+    the #9680 steps have their own `-eo pipefail` runners. See `_run_probe`. The run
+    block is the comment-stripped shipped text — comments are inert, so executing
+    without them proves the CODE carries the behaviour, not the prose.
     """
     bin_dir = _stub_bin(tmp_path, "npx", STUB_NPX)
     site = _write_website_fixture(tmp_path, omit)
@@ -2248,7 +2253,7 @@ def _purge_script(tmp_path: Path) -> Path:
     """The shipped purge step, executed as written (comments stripped).
 
     No rewrites: the step has no retry bound, and its `exit 1` branches are the
-    behaviour under test. `bash -e` mirrors the Actions default shell.
+    behaviour under test. `bash -e` — the floor; CI adds `-o pipefail`.
     """
     p = tmp_path / "purge.sh"
     p.write_text(_step_code(PURGE), encoding="utf-8")
@@ -3188,7 +3193,7 @@ while [ $# -gt 0 ]; do
 done
 printf '%s\n' "$url" >> "$STUB_DIR/calls"
 n=$(wc -l < "$STUB_DIR/calls" | tr -d ' ')
-if [ "${STUB_FAIL_FIRST}" = "1" ] && [ "$n" = "1" ]; then
+if [ "${STUB_FAIL_FIRST:-0}" != "0" ] && [ "$n" -le "${STUB_FAIL_FIRST}" ]; then
   echo 'curl: (7) Failed to connect to host' >&2
   printf '000'
   exit 7
@@ -3213,6 +3218,9 @@ case "$path" in
         key) body="$key";;
         newline) body="$key
 ";;
+        # SAME LENGTH, WRONG KEY: a rotated key is also 32 lowercase hex, so this
+        # is the shape that a length-only comparison certifies.
+        other32) body="deadbeefdeadbeefdeadbeefdeadbeef";;
         other) body="not-the-key";;
       esac
       # A transient bad 200 on the FIRST attempt only: an HTML error document at
@@ -3226,6 +3234,7 @@ case "$path" in
         key) body="$key";;
         newline) body="$key
 ";;
+        other32) body="deadbeefdeadbeefdeadbeefdeadbeef";;
         other) body="not-the-key";;
       esac
     fi;;
@@ -3273,7 +3282,10 @@ def _run_indexnow_gate(
         "STUB_GATE_BODY": gate_body,
         "STUB_PROXY_CODE": "401",
         "STUB_PROXY_BODY": '{"error":"not_signed_in"}',
-        "STUB_FAIL_FIRST": "1" if fail_first else "0",
+        # a COUNT, not a flag: `99` fails EVERY attempt, which is the only arm
+        # that leaves the `-D` header file empty and so the only one that can see
+        # a header read that dies under `pipefail` (see the dead-origin test).
+        "STUB_FAIL_FIRST": "0" if fail_first is False else str(int(fail_first)),
         "STUB_CACHE": cache,
         "STUB_EDGE_CODE": edge_code,
         "STUB_EDGE_BODY_MODE": edge_body_mode,
@@ -3283,7 +3295,14 @@ def _run_indexnow_gate(
         tmp_path, _step_code(INDEXNOW_PROBE), module_text, write_module=cwd is None
     )
     r = subprocess.run(
-        ["bash", "-e", str(script)],
+        # `-eo pipefail`, NOT `-e`: GitHub Actions runs a `run:` body under
+        # `bash --noprofile --norc -eo pipefail`, and the difference is load-bearing
+        # here — a `grep|tail|tr` inside the step exits 1 on "no matching header",
+        # which under `-e` alone is harmless and under `pipefail` aborts the step
+        # before its retry can run (the review that found this ran both shells:
+        # `-e` → retried and passed, `-eo pipefail` → rc=1 after ONE request, no
+        # `::error::`). A harness that models the weaker shell cannot see that.
+        ["bash", "-eo", "pipefail", str(script)],
         cwd=cwd or tmp_path,
         capture_output=True,
         text=True,
@@ -3313,13 +3332,16 @@ def _run_indexnow_proxy(
         "STUB_GATE_BODY": '{"error":"unauthorized"}',
         "STUB_PROXY_CODE": proxy_code,
         "STUB_PROXY_BODY": proxy_body,
-        "STUB_FAIL_FIRST": "1" if fail_first else "0",
+        # a COUNT, not a flag: `99` fails EVERY attempt, which is the only arm
+        # that leaves the `-D` header file empty and so the only one that can see
+        # a header read that dies under `pipefail` (see the dead-origin test).
+        "STUB_FAIL_FIRST": "0" if fail_first is False else str(int(fail_first)),
     }
     script = _indexnow_fixture(
         tmp_path, _dashboard_step_code(INDEXNOW_PROXY_PROBE), _INDEXNOW_MODULE_OK
     )
     r = subprocess.run(
-        ["bash", "-e", str(script)],
+        ["bash", "-eo", "pipefail", str(script)],  # the shell Actions actually uses
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -3435,13 +3457,20 @@ def test_the_indexnow_gate_passes_when_the_surface_is_correct(tmp_path) -> None:
         ({"get_code": "404"}, "at ORIGIN"),
         ({"body_mode": "newline"}, "must contain the key and NOTHING else"),
         ({"body_mode": "other"}, "must contain the key and NOTHING else"),
+        # The BODY TEXT is pinned separately from the byte COUNT, on both legs: a
+        # rotated key is also 32 lowercase hex, so 'same length, wrong key' is the
+        # desync a length-only comparison would certify.
+        ({"body_mode": "other32"}, "must contain the key and NOTHING else"),
         ({"ctype": "text/html"}, "is not text/plain"),
         # #4050/#9680: an edge-cached answer certifies the PREVIOUS deployment, so
         # the origin leg must be able to notice it answered from cache.
         ({"cache": "HIT"}, "was answered from CACHE"),
-        # Leg 2 is what the endpoint actually fetches: origin-correct is not enough.
+        # Leg 2 is what the endpoint actually fetches: origin-correct is not enough,
+        # and BOTH of its halves are pinned (count and text).
         ({"edge_code": "404"}, "at the EDGE"),
         ({"edge_body_mode": "other"}, "at the EDGE"),
+        ({"edge_body_mode": "other32"}, "at the EDGE"),
+        ({"edge_body_mode": "newline"}, "at the EDGE"),
         ({"gate_code": "405"}, "did not refuse an anonymous caller"),
         ({"gate_body": '{"error":"not_signed_in"}'}, "did not refuse an anonymous caller"),
         # A provider blip is NOT "the route is gone" (#3485) — the message must
@@ -3467,9 +3496,13 @@ def test_the_indexnow_gate_fails_for_each_broken_surface(tmp_path, argv: dict, n
 @pytest.mark.parametrize(
     "argv,needle",
     [
-        # the route is gone: the call falls through to the app SPA shell (200 HTML)
-        ({"proxy_code": "200", "proxy_body": "<!doctype html>"}, "did not answer the proxy's session gate"),
+        # With the route deleted the POST is answered 405 with an EMPTY body
+        # (measured; a GET on this host is an honest 404, #3523) — so a status-only
+        # check would red there. These two are what the body assertion adds: a 401
+        # for the WRONG reason, and (hardening) a widened fallback answering 200
+        # with the SPA shell.
         ({"proxy_code": "405", "proxy_body": ""}, "did not answer the proxy's session gate"),
+        ({"proxy_code": "200", "proxy_body": "<!doctype html>"}, "did not answer the proxy's session gate"),
         # a 401 for the WRONG reason — the handler's own body, not the proxy's
         (
             {"proxy_body": '{"error":"unauthorized","message":"Session expired"}'},
@@ -3565,21 +3598,62 @@ def test_the_indexnow_proxy_gate_retries_a_transport_blip_instead_of_failing(tmp
 
 
 def test_the_indexnow_gate_reads_the_constant_not_an_example_above_it(tmp_path) -> None:
-    """An example of the constant in the module's header must not be what is read.
+    """An example of the constant quoted ABOVE it must not be what is read.
 
-    `_shared/indexnow.ts` documents the shape in its comment (`rotation = change
-    this constant AND rename the file`), so a comment quoting `INDEXNOW_KEY =
-    "…"` above the real declaration is a plausible future edit — and an unanchored
-    match would then verify the wrong file and PASS.
+    The fixture is a COMMENTED-OUT previous declaration — the shape a rotation
+    actually leaves behind, and the one that discriminates the `^export const`
+    anchor: an unanchored pattern still matches `// export const INDEXNOW_KEY =
+    "…"`, and a 32-hex example passes the length/hex validation, so the gate would
+    then verify `deadbeef….txt` and report the failure as a DEPLOY fault — exactly
+    what the `EXTRACTOR fault` arms exist to prevent.
+
+    (A block comment with the declaration at column 0 would defeat the anchor as
+    well, because `sed` has no comment awareness; that shape is not claimed, so it
+    is not asserted here.)
     """
     module = (
-        "// e.g. `INDEXNOW_KEY = \"deadbeefdeadbeefdeadbeefdeadbeef\"`\n"
+        '// export const INDEXNOW_KEY = "deadbeefdeadbeefdeadbeefdeadbeef";\n'
         f'export const INDEXNOW_KEY = "{_INDEXNOW_KEY}";\n'
     )
     rc, out, calls = _run_indexnow_gate(tmp_path, module_text=module)
     assert rc == 0, out
     requested = [c for c in calls if c.endswith(".txt")]
     assert requested == [f"https://tortoise.premiselabs.co/{_INDEXNOW_KEY}.txt"], requested
+
+
+def test_the_indexnow_gate_diagnoses_a_dead_origin_instead_of_aborting_silently(tmp_path) -> None:
+    """Every attempt blips: the step must SAY so, not die in a pipeline.
+
+    GitHub Actions runs `run:` under `bash -eo pipefail`. A `grep | head | tr` after
+    the loop exits 1 when the `-D` header file is empty — which is exactly what a
+    transport blip leaves behind — so under `pipefail` the step aborted on the first
+    line after the loop: no echo, no `::error::`, an empty log, and the operator
+    left with a red deploy and nothing to act on (measured by the review that found
+    it: `bash -e` → retried and passed, `bash -eo pipefail` → rc=1 after ONE request).
+    The header reads are single-process `awk` for this reason: awk exits 0 on no
+    match, so "no header" reaches the `exit 1` arms that name it.
+    """
+    rc, out, calls = _run_indexnow_gate(tmp_path, fail_first=99)
+    assert rc == 1, out
+    assert "::error::" in out, f"the step died without a diagnosis: {out!r}"
+    assert "curl-failed" in out or "000" in out, out
+    assert calls, "nothing was requested"
+
+
+def test_the_indexnow_gate_reports_an_extractor_fault_when_the_checkout_is_empty(tmp_path) -> None:
+    """No `website/` tree (a failed checkout under `if: always()`) is OUR fault.
+
+    This is the arm that makes the extractor's `|| true` load-bearing rather than
+    decorative: without it, `sed` on an absent file exits 2, `pipefail` propagates
+    that through `| head -1`, and `set -e` kills the step before the `EXTRACTOR
+    fault` message — the one message written for this case — can print.
+    """
+    empty = tmp_path / "empty-checkout"
+    empty.mkdir()
+    rc, out, calls = _run_indexnow_gate(tmp_path, cwd=empty)
+    assert rc == 1, out
+    assert "EXTRACTOR fault" in out, f"no diagnosis for an absent source file: {out!r}"
+    assert calls == [], f"an unreadable constant still made requests: {calls}"
 
 
 def test_the_indexnow_gate_reports_an_extractor_fault_without_touching_the_site(tmp_path) -> None:
