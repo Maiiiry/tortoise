@@ -932,7 +932,7 @@ class TestDocsPageAndSkillConfig:
             "Connect",                   # 3 — the OAuth grant is a SEPARATE act
             "Connect Tortoise",          # 3 — the consent dialog between Connect and Authorize
             "Authorize",                 # 3 — consent (key-less connect completes here)
-            "pick the Organization you are onboarding",  # 3 — the MULTI-org chooser (oauth.py)
+            "pick the organization you are onboarding",  # 3 — the MULTI-org chooser (oauth.py)
                                        #     hides the named-org line and keeps
                                        #     Authorize disabled until it is picked
             "chatgpt.com/skills",        # 4 — the Skills surface the archives install on
@@ -2047,10 +2047,11 @@ def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
         "The chatgpt card must come BEFORE the key-less one — chatgpt is key-less "
         "too, so ordering decides which copy it gets. Update this guard.")
     assert (terminator.group(1), terminator.group(2)) == ("wizardKeyless", "?"), (
-        "the first arm after the chatgpt card is not the key-less one "
-        f"({terminator.group(0).strip()!r}) — a SIBLING arm sits between them, and "
-        "every copy assertion below would be satisfied from it while the chatgpt "
-        "card lost the copy")
+        "the terminator this guard found is not the chatgpt arm's end: the next "
+        f"arm-shaped clause is {terminator.group(0).strip()!r}, not the key-less "
+        "branch. Either the arm was moved behind another harness branch (so every "
+        "copy assertion below would be satisfied from a SIBLING) or the key-less "
+        "branch was removed/re-spelled. Update this guard with the new shape.")
     end = terminator.start()
     assert "wizardConnectHarness ===" not in main[start:end], (
         "a second harness branch sits between the chatgpt card and the key-less "
@@ -2098,9 +2099,10 @@ def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
         "key-less branch or the nav-button use of the identifier")
     assert _inside(good, "<p>card</p>", start, end) == good.index("<p>card</p>")
 
-    # The regression the ordering claim names: the card MOVED AFTER the key-less
-    # branch. A bare-identifier anchor finds the nav-button label below and calls
-    # that the end, so the old helper stayed green here.
+    # The card MOVED AFTER the key-less branch and is now the LAST arm: no
+    # arm-shaped terminator follows it, so the guard reports the missing end
+    # anchor (it cannot see an ordering violation it has no end for). The
+    # sibling-shaped case below is what exercises the ordering assertion.
     moved = (
         "{wizardConnectHarness === 'codex' ? (\n"
         "  <p>other</p>\n"
@@ -2110,7 +2112,7 @@ def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
         "  <p>card</p>\n"
         "{busy ? 'Checking…' : (wizardKeyless\n"
     )
-    with pytest.raises(AssertionError, match="must come BEFORE the key-less one"):
+    with pytest.raises(AssertionError, match="end anchor is gone"):
         _chatgpt_arm_bounds(moved)
 
     # The key-less ternary deleted outright: the anchor names that, too.
@@ -2127,7 +2129,7 @@ def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
         "  <p>other</p>\n"
         ") : wizardKeyless ? (\n"
     )
-    with pytest.raises(AssertionError, match="SIBLING arm"):
+    with pytest.raises(AssertionError, match="not the chatgpt arm's end"):
         _chatgpt_arm_bounds(sibling)
 
     # …and the same guard under the TWO spellings a blacklist of
@@ -2143,7 +2145,7 @@ def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
             + spelling
             + ") : wizardKeyless ? (\n"
         )
-        with pytest.raises(AssertionError, match="SIBLING arm"):
+        with pytest.raises(AssertionError, match="not the chatgpt arm's end"):
             _chatgpt_arm_bounds(widened)
 
     # …and `after()` itself is bounded at the far end: a marker that only exists
@@ -2196,10 +2198,10 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     #    Everything else below is a COPY fact, asserted by presence INSIDE the
     #    chatgpt arm and nowhere else: `after()` is bounded at BOTH ends, since a
     #    marker that survives only in a sibling branch is not this card's copy.
-    #    That makes the arm's end a real dependency, so a reflow of the next
-    #    ternary branch reds this on purpose while a reformat that keeps it reds
-    #    nothing — the guard reads the SELECTOR as a ternary terminator, not a
-    #    spelling, and `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`
+    #    That makes the arm's end a real dependency, so the guard reds on a change
+    #    of STRUCTURE (a sibling arm inserted, the key-less branch removed or
+    #    re-spelled) and never on whitespace or line wrapping — `_ARM_TERMINATOR`
+    #    tolerates any spacing. `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`
     #    proves each wrong shape actually fails (#4880: a guard deciding from the
     #    SHAPE of the source is defeated by a source of a different shape).
     arm_start, arm_end = _chatgpt_arm_bounds(main)
@@ -2280,7 +2282,7 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
         "say the plan is paid")
 
 
-def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
+def test_9660_the_org_choice_precedes_authorize_on_every_recipe_carrier():
     """#9660: the connect recipes that drive the shared consent page, judged on ORDER
     across seven copy blocks in four files (dashboard `main.jsx` and
     `harnesses.js`, `website/docs.html`, `tortoise/onboarding/SKILL.md`).
@@ -2338,7 +2340,9 @@ def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
     # (docs/oauth-mcp.md). They shipped the same inversion, so they are judged
     # here too rather than left to a comment.
     blocks = [
-        ("Claude key-less card list", span(main, "Pick the Organization you&apos;re onboarding", "</ol>")),
+        ("Claude key-less card list",
+         main[main.rindex("<ol", 0, main.index("Pick the Organization you&apos;re onboarding")):
+              main.index("</ol>", main.index("Pick the Organization you&apos;re onboarding"))]),
         ("claude-web step", step_line(harnesses, "Claude opens the authorization page")),
         ("Claude Desktop snippet",
          span(harnesses, "'claude-desktop': () =>", "'claude-web': () =>")),
@@ -2357,8 +2361,11 @@ def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
         assert "asks you to choose" in flat, (
             f"the {label} describes the consent page's single-Organization shape "
             "only — a second-org user meets a chooser (tortoise/oauth.py)")
-        org = flat.find("Organization")
-        authorize = flat.find("Authorize")
+        # Case-insensitive: docs.html and the served document write
+        # "organization", the dashboard writes "Organization". The ORDER is the
+        # property; the house capitalisation belongs to each surface.
+        org = flat.lower().find("organization")
+        authorize = flat.lower().find("authorize")
         assert -1 not in (org, authorize), (
             f"the {label} no longer names both acts — Organization={org}, "
             f"Authorize={authorize}")
