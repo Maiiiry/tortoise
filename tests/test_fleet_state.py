@@ -2477,7 +2477,65 @@ def test_a_session_store_from_a_FAILED_command_is_named_and_refused(
     recs, source, err = fs.cmux_session_records()
     assert recs == [] and source == "", (
         "a store that arrived with a failed command is not the answer")
-    assert "exited 1" in err and "refusing to read a store" in err
+    assert "exited 1" in err and "is not read as a session store" in err
+
+
+def test_a_store_on_STDERR_is_a_cause_never_an_answer(monkeypatch) -> None:
+    """THE STREAMS ARE NOT INTERCHANGEABLE (review of #2401).
+
+    Reading the failure's words is what lets the refusal be named — but stderr must
+    never become an EVIDENCE source the pre-#2401 reader did not consult: a
+    `{"sessions": []}` written there (a warning, a debug echo) would otherwise be a
+    MEASURED "nothing is running" from a channel that carries diagnostics.
+    """
+
+    class _StderrStore:
+        returncode = 0
+        stdout = ""
+        stderr = json.dumps({"sessions": [
+            {"agent": "pi", "workspace_id": "ws-1", "pid": 1}]})
+
+    monkeypatch.setattr(fs.subprocess, "run", lambda cmd, **k: _StderrStore())
+    recs, source, err = fs.cmux_session_records()
+    assert recs == [] and source == "", (
+        "a store on stderr is not an answer, however well-formed")
+    assert "printed nothing on stdout" in err
+    assert "ws-1" not in source
+
+
+def test_the_gap_fits_the_bound_its_readers_apply(monkeypatch) -> None:
+    """THE MESSAGE IS READ THROUGH A BOUND (review of #2401).
+
+    `refresh-candidates.sh` cuts the first cause it records at 320 characters and
+    `orch-loop.sh` prints `why=` at 400. A per-pid clause made five refused pids a
+    977-character sentence — so the pids and the remedy fell outside the window, and
+    a message built for an unbounded reader is a message that is invisible where it
+    matters. The pids, one raw datum and the remedy must all survive 320.
+    """
+    refused = {
+        2510056 + i: f"/tmp/cell-wt-adv-runnerprov-land{i} (deleted)" for i in range(5)
+    }
+
+    class _Cwds(dict):
+        pass
+
+    cwds = _Cwds()
+    cwds.refused = refused
+    monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
+    monkeypatch.setattr(fs, "pi_processes", lambda: (
+        [{"pid": p, "ppid": 1} for p in refused], ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: (cwds, ""))
+    monkeypatch.setattr(fs, "pid_alive", lambda pid: True)
+    live = fs.live_sessions()
+    assert live.measured is False
+    head = live.error[:320]
+    for pid in refused:
+        assert str(pid) in head, f"pid {pid} fell outside the 320-char window"
+    assert "/tmp/cell-wt-adv-runnerprov-land0 (deleted)" in head, (
+        "the datum fell outside the window")
+    assert "orphan" in head, "and so did the remedy"
+    assert len(live.error) < 400, (
+        f"the whole sentence should fit one bound: {len(live.error)} chars")
 
 
 def test_the_plural_grammar_is_preferred_and_a_later_one_can_answer(monkeypatch) -> None:

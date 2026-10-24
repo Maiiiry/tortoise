@@ -1257,55 +1257,84 @@ def cmux_session_records() -> tuple[list[dict[str, Any]], str, str]:
         (LIVE_STORE_CMUX_SINGULAR, ["cmux", "session", "list", "--json"]),
     ):
         raw, rc, err = _capture(cmd)
-        # ⛔ THE GRAMMAR'S OWN ANSWER IS THE CAUSE, AND IT IS OFTEN ON STDERR.
-        # The guest CLI writes its refusal as JSON on STDERR and exits non-zero
-        # (`cmux sessions list --json --all` → rc 2, stderr
-        # `{"code":"usage.invalid","message":"--all needs a value"}`), so a
-        # reader that takes STDOUT and only when rc == 0 sees an EMPTY STRING here
-        # and reports "produced nothing" about a command that named its own
-        # problem — which is how a whole cell reported an undiagnosable refusal
-        # while the cause sat in a payload the reader had already discarded.
+        # ⛔ THE STREAMS ARE NOT INTERCHANGEABLE, AND THIS IS THE LINE THAT KEEPS THEM
+        # APART (review of #2401).
+        #
+        #   * an **ANSWER** may only come from STDOUT, and only from a command that
+        #     SUCCEEDED. A store read out of a diagnostics stream would make stderr
+        #     an evidence source the pre-#2401 reader never consulted — and a
+        #     `{"sessions": []}` on stderr would then be a MEASURED "nothing is
+        #     running" read from a channel that carries warnings. A non-zero exit is
+        #     refused on the same principle: it can mean a PARTIAL list, and a lane
+        #     missing from a partial store is the fail-open direction (#8999).
+        #   * the **CAUSE** may come from either stream, because the guest CLI writes
+        #     its refusal as JSON on STDERR and exits non-zero
+        #     (`cmux sessions list --json --all` → rc 2, stderr
+        #     `{"code":"usage.invalid","message":"--all needs a value"}`). A reader
+        #     that took stdout-only would see an EMPTY STRING here and report
+        #     "produced nothing" about a command that named its own problem — which
+        #     is how a whole cell reported an undiagnosable refusal while the cause
+        #     sat in a payload the reader had already discarded. On a FAILURE stderr
+        #     wins, because stdout may carry the command's chatter (a progress line,
+        #     a warning) and naming that would point an operator at the wrong thing.
         # `_run` is deliberately left as it is (`gh_json` depends on its
         # succeed-or-empty polarity); this store needs the failure's OWN words.
-        payload = raw if raw.strip() else err
-        if not payload.strip():
-            errors.append(f"`{' '.join(cmd)}` exited {rc} with no output")
+        said = (err if (rc != 0 and err.strip()) else raw) or err
+        detail = _cmux_said(said)
+        if rc != 0:
+            errors.append(
+                f"`{' '.join(cmd)}` exited {rc}: {detail} (a failed command's "
+                "output is not read as a session store)"
+            )
+            continue
+        if not raw.strip():
+            errors.append(
+                f"`{' '.join(cmd)}` exited 0 and printed nothing on stdout"
+                + (f" (stderr: {detail})" if err.strip() else "")
+            )
             continue
         try:
-            data = json.loads(payload)
+            data = json.loads(raw)
         except Exception:
-            first = payload.strip().splitlines()[0][:200]
             errors.append(
-                f"`{' '.join(cmd)}` exited {rc} and returned no parsable JSON: "
-                f"{first}"
+                f"`{' '.join(cmd)}` exited 0 and returned no parsable JSON: {detail}"
             )
             continue
         recs = data.get("sessions") if isinstance(data, dict) else None
         if not isinstance(recs, list):
-            if isinstance(data, dict):
-                detail = f"{data.get('code') or '?'}: {data.get('message') or ''}".strip()
-            else:
-                detail = type(data).__name__
             errors.append(
-                f"`{' '.join(cmd)}` exited {rc} and answered {detail!r}, "
-                "not a session store"
-            )
-            continue
-        if rc != 0:
-            # ⛔ A STORE FROM A FAILED COMMAND IS NOT A READING, and this is the ONE
-            # polarity the capture change must not move: a non-zero exit can mean a
-            # PARTIAL list, and a lane missing from it is the fail-open direction
-            # (the gate answering "nobody holds it" about a lane the store omitted).
-            # The payload is still what NAMES the refusal above — a refusal read
-            # from the failure's own words is the whole point of `_capture` — but
-            # it is never ACCEPTED as the answer (review of #2401).
-            errors.append(
-                f"`{' '.join(cmd)}` exited {rc} and returned a session store — "
-                "refusing to read a store from a failed command"
+                f"`{' '.join(cmd)}` exited 0 and answered {detail}, not a session store"
             )
             continue
         return [r for r in recs if isinstance(r, dict)], source, ""
     return [], "", "; ".join(errors)
+
+
+def _cmux_said(text: str) -> str:
+    """One short, quotable rendering of what a cmux grammar SAID, for a cause.
+
+    A JSON error object becomes ``'usage.invalid: --all needs a value'`` — the one
+    form an operator can act on — and anything else becomes its first non-empty
+    line (bounded). Never raises: this only ever runs on text that is already a
+    failure, and a formatter that threw here would lose the cause entirely.
+    """
+    body = (text or "").strip()
+    if not body:
+        return "no output"
+    try:
+        data = json.loads(body)
+    except Exception:
+        return repr(body.splitlines()[0][:200])
+    if isinstance(data, dict) and (data.get("code") or data.get("message")):
+        # ⛔ BOUNDED ON EVERY PATH, INCLUDING THIS ONE (review of #2401). The other
+        # arms slice to 200; this one rendered `code: message` whole, so a cmux that
+        # reported a very long `message` field put it — unbounded — into `liveness_error`
+        # and from there into the persisted board cache. Display readers cut at 320/400,
+        # so it was invisible; the memory cost was not.
+        return repr(
+            f"{data.get('code') or '?'}: {data.get('message') or ''}".strip()[:200]
+        )
+    return repr(body.splitlines()[0][:200])
 
 
 def pi_processes() -> tuple[list[dict[str, Any]], str]:
@@ -1739,21 +1768,27 @@ def live_sessions() -> LiveSessions:
                 # does not. The VERDICT is untouched: a live pid with no
                 # attributable cwd still leaves the store UNMEASURED.
                 refused = getattr(cwds, "refused", {}) or {}
-                named = []
-                for p in still_alive[:5]:
-                    raw = refused.get(p)
-                    named.append(
-                        f"{p} (cwd read as {raw!r}, which attributes to no "
-                        "worktree — a removed directory or a reader "
-                        "placeholder)" if raw else f"{p} (no cwd could be read)"
-                    )
+                # ⛔ THE PIDS COME FIRST AND THE DATUM IS SAID ONCE. The first draft
+                # repeated a 120-character clause per pid: five refused pids made a
+                # 977-character sentence, and the harness cuts the first cause at 320
+                # characters — so the pids that identify the orphans, and the remedy,
+                # fell off the end, i.e. the message was built for a reader with no
+                # bound. Measured against the real bound: this form keeps every pid,
+                # one raw path and the remedy inside 320.
+                pids_txt = ", ".join(str(p) for p in still_alive[:5])
+                sample = next(
+                    (refused[p] for p in still_alive if p in refused), None
+                )
+                more = "" if len(still_alive) <= 5 else f" (+{len(still_alive) - 5} more)"
                 proc_error = (
-                    "a live pi pid has no ATTRIBUTABLE cwd: "
-                    + ", ".join(named)
-                    + " — with no worktree to attribute, 'nobody holds it' is "
-                    "unprovable for the lanes they may be. If the path is a "
-                    "reaped worktree, the orphan process is the thing to fix, "
-                    "not the gate"
+                    f"live pi pid(s) {pids_txt}{more} have no ATTRIBUTABLE cwd"
+                    + (
+                        f" — e.g. {sample!r} (a removed directory or a reader "
+                        "placeholder)"
+                        if sample else ""
+                    )
+                    + " — an unattributable lane means 'nobody holds it' is "
+                    "unprovable; reaping the orphan is the fix, not the gate"
                 )
         for cwd, pids in by_cwd.items():
             pids.sort()
