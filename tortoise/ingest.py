@@ -191,6 +191,86 @@ def _run_ep_propagation(proj, api=None, *, label: str = "EP"):
             print(f"  {label}: propagation failed: {e}")
             raise
 
+def _document_is_pending(needs_extraction, doc_status, *,
+                         unmarked_is_pending: bool = True) -> bool:
+    """#5140 P1: is this document Source awaiting extraction? ONE definition.
+
+    ``_do_upgrade`` (one document the operator named) and ``_do_upgrade_all``
+    (a corpus sweep) answer the same question, so they read it here — the same
+    discipline the retrieval legs follow for ``documentKind`` (#5140 finding 1):
+    two paths that each spell the rule out drift apart.
+
+    D10 retired ``doc_status`` and left ``needs_extraction`` as the only stored
+    signal — but it also moved the DEFAULT. Pre-D10 ``_do_upgrade`` read
+    ``coalesce(d.doc_status, 'captured')`` (absent ⇒ CAPTURED ⇒ pending) and
+    ``_do_upgrade_all`` discovered ``doc_status='captured' OR needs_extraction
+    = true``; the D10 code half became ``coalesce(s.needs_extraction, false)``
+    / ``= true``, which reads absence as EXTRACTED and drops the retired marker
+    from discovery entirely. The pre-D10 metadata-only population — stamped
+    ``doc_status='captured'`` beside the old writer's boilerplate
+    ``needs_extraction=false`` — then vanished from both paths, and
+    ``--upgrade`` claimed *"already extracted"* about a document it had never
+    extracted.
+
+    So the rule is read off what the old signals SAID rather than invented. The
+    pre-D10 writer stamped BOTH: ``--capture-metadata`` set
+    ``doc_status='captured'`` **and** ``needs_extraction=false`` (its default),
+    so the stored ``false`` on a legacy node is boilerplate, not a claim — while
+    ``doc_status`` was the live authority at the time. The same code flipped
+    ``doc_status`` to ``'extracted'`` on completion, and D10 replaced that flip
+    with the ``needs_extraction`` clear (``_do_upgrade``'s final SET), so a
+    post-D10 node has no ``doc_status`` at all.
+
+    1. ``doc_status='captured'`` → PENDING, **even beside a stored
+       ``needs_extraction=false``** — that pair IS the legacy backlog. It means
+       "never PROVEN extracted", not "never extracted": the deleted
+       ``graph-scripts/backfill_doc_status.py`` stamped ``'captured'`` on every
+       ``:Document`` whose ``doc_status`` was NULL (``MATCH (d:Document) WHERE
+       d.doc_status IS NULL``), so a pre-``doc_status`` node that HAD been
+       extracted carries it too. Re-selecting such a node costs a
+       ``begin_ingest`` gate check, and the extraction runs only when the
+       content-hash/extractor-version key no longer matches — exact pre-D10
+       parity, which discovered on ``doc_status='captured' OR
+       needs_extraction=true``.
+    2. ``doc_status='extracted'`` → done. It is a completion record, and it
+       outranks a stale ``needs_extraction=true``; without that precedence a
+       sweep would re-discover a document the per-document path always skips.
+    3. otherwise the live signal decides: ``needs_extraction=true`` → pending,
+       ``false`` → done. The comparison is ``is True``, not ``bool(...)``: the
+       Cypher twin asks ``s.needs_extraction = true``, and a truthy non-boolean
+       (the string ``'false'``, the int ``1``) must not split the two readings.
+    4. any other retired value (``draft`` — the pre-D10 full-ingest default) is
+       not a pending claim.
+    5. with no signal at all, ``unmarked_is_pending`` decides. ``_do_upgrade``
+       keeps the pre-D10 default (pending — the operator named this document);
+       the corpus SWEEP passes ``False``, because BOTH writers that mint a
+       document Source without a signal are transcript writers
+       (``hosted_api._execute_commit_writes``, and ``_event_plain_merge``'s
+       ``objectType='Document'`` branch, which stamps
+       ``documentKind='transcript'``), and selecting those would queue every
+       captured session for LLM extraction. ``--include-unstamped`` is the
+       operator's explicit opt-in to that wider population — the discoverability
+       half of the deleted ``graph-scripts/backfill_doc_status.py``, as a read.
+
+    Completion must therefore clear BOTH when it can (see ``_do_upgrade``): an
+    upgrade that only cleared ``needs_extraction`` would leave
+    ``doc_status='captured'`` behind and the sweep would re-select the document
+    forever. A document the sweep CANNOT complete (unreadable path, file gone,
+    no ``##`` sections, content already claimed at this extractor version)
+    deliberately KEEPS its marker and is reported in its own bucket — clearing
+    it would silently record "extracted" for work that never ran.
+    """
+    if doc_status == "captured":
+        return True
+    if doc_status == "extracted":
+        return False
+    if needs_extraction is not None:
+        return needs_extraction is True
+    if doc_status is not None:
+        return False
+    return unmarked_is_pending
+
+
 def _do_upgrade(transcript, text, source_id, proj, api, args):
     """Upgrade a single Document: re-run extraction, clear needs_extraction.
 
@@ -199,24 +279,35 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
     stored extraction signal is ``needs_extraction``.
 
     Guards:
-    - Already-extracted (needs_extraction false) → no-op
+    - ``doc_status='extracted'``, or a stored ``needs_extraction`` false with no
+      legacy marker, → no-op (``_document_is_pending``)
+    - A legacy capture (``doc_status='captured'``, even with the pre-D10
+      boilerplate ``needs_extraction=false``) and a document with NO signal →
+      PENDING (#5140 P1, the pre-D10 default restored): ``--upgrade`` names one
+      document, so it is upgraded rather than reported as already done.
     - Non-Document transcript → graceful "not a Document" error
     - Uses begin_ingest for idempotency (content-hash + extractor version)
-    - needs_extraction cleared via raw Cypher SET after the extraction attempt
-      (``--upgrade-all`` discovers on this flag, so clearing it preserves the
-      discovery loop)
+    - On completion both signals are cleared: ``needs_extraction=false`` (the
+      live signal, which ``--upgrade-all`` discovers on) and the retired
+      ``doc_status`` is REMOVED. The pre-D10 code flipped that property to
+      ``'extracted'``; D10 retired it, so the same transition is recorded by
+      clearing it — writing a retired property back would re-enter it as a live
+      signal, which is exactly what the retirement forbids for our own writes.
     """
     # 1. Check the document Source exists + its extraction signal.
+    # RAW values, not coalesced: "absent" and "explicitly false" are different
+    # claims, and coalescing them is exactly what inverted the default (#5140).
     rows = proj.g.query(
         "MATCH (s:Source {url: $id}) "
         "WHERE s.documentKind IS NOT NULL "
-        "RETURN coalesce(s.needs_extraction, false) AS needs_extraction",
+        "RETURN s.needs_extraction, s.doc_status",
         params={"id": source_id},
     ).result_set
     if not rows:
         print(f"not a Document: {source_id} (no document Source with this url)")
         return
-    if not rows[0][0]:
+    needs_ext, doc_status = rows[0][0], rows[0][1]
+    if not _document_is_pending(needs_ext, doc_status):
         print(f"doc already extracted, skipped: {source_id}")
         return
 
@@ -228,7 +319,8 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
         print(f"upgrade skip: {result.reason} (run {result.run_id}); use --force to reprocess")
         return
 
-    print(f"upgrading {source_id} …")
+    print(f"upgrading {source_id} "
+          f"(needs_extraction={needs_ext}, doc_status={doc_status}) …")
 
     # 3. Re-run full extraction (the same path as normal full ingest)
     from .extractor import extract_from_document  # noqa: I001
@@ -282,11 +374,14 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
     else:
         print(f"  warning: {source_id} is not a Document (no ## headers) — extraction skipped")
 
-    # 4. Mark extracted: clear the needs_extraction signal (the D10
-    #    replacement for the retired doc_status flip). add_document reads the
-    #    flag freshly above, so a raw SET is correct here.
+    # 4. Mark extracted: clear the live signal AND retire the legacy marker.
+    #    The pre-D10 code flipped doc_status to 'extracted' here; D10 retired
+    #    that property, so the transition is recorded by clearing it. Leaving
+    #    doc_status='captured' behind would keep the sweep re-selecting this
+    #    document forever (#5140).
     proj.g.query(
-        "MATCH (s:Source {url: $id}) SET s.needs_extraction = false",
+        "MATCH (s:Source {url: $id}) "
+        "SET s.needs_extraction = false REMOVE s.doc_status",
         params={"id": source_id},
     )
     print("  needs_extraction: true → false")
@@ -307,16 +402,65 @@ def _resolve_ingest_base() -> str | None:
     return os.path.realpath(os.path.expanduser(raw))
 
 
-def _do_upgrade_all(proj, api, args):
-    """Discover needs_extraction document Sources and upgrade each.
+def _discover_pending_documents(proj, *, include_unstamped: bool = False) -> list:
+    """Document Sources awaiting extraction — the ONE discovery predicate.
 
-    D10 (ONTOLOGY v3.15 §4.4): ``doc_status`` is retired — the only stored
-    extraction signal is ``needs_extraction``, set true by the
-    ``--capture-metadata`` path and cleared here after a successful extraction.
+    Mirrors ``_document_is_pending`` in Cypher, term for term — the ``CASE``
+    branch order IS that function's precedence, so a change to one that is not
+    made to the other is a visible diff in the same commit:
+
+    * ``doc_status = 'captured'`` — the pre-D10 capture marker, pending EVEN
+      beside the boilerplate ``needs_extraction=false`` the old writer stamped.
+      A second source of this marker is the deleted
+      ``graph-scripts/backfill_doc_status.py``, which stamped it on every
+      ``:Document`` with a NULL ``doc_status`` — so it means "never PROVEN
+      extracted", and a node it stamps is re-selected even if it had been
+      extracted (the ``begin_ingest`` key still gates the actual work).
+    * ``doc_status = 'extracted'`` — a completion record, never pending;
+    * ``needs_extraction = true`` — the live pending claim;
+    * any other retired value (``draft``) — not a pending claim;
+    * no signal at all — only under ``include_unstamped``, because both writers
+      that mint a document Source without a signal are transcript writers
+      (``hosted_api._execute_commit_writes`` and ``_event_plain_merge``'s
+      ``objectType='Document'`` branch), and sweeping those up would queue every
+      captured session for LLM extraction.
+
+    Returns ``[(url, sourcePath, needs_extraction, doc_status), …]``.
+    """
+    return proj.g.query(
+        "MATCH (s:Source) "
+        "WHERE s.documentKind IS NOT NULL "
+        "AND CASE "
+        "      WHEN s.doc_status = 'captured' THEN true "
+        "      WHEN s.doc_status = 'extracted' THEN false "
+        "      WHEN s.needs_extraction IS NOT NULL THEN s.needs_extraction = true "
+        "      WHEN s.doc_status IS NOT NULL THEN false "
+        "      ELSE $unmarked "
+        "    END "
+        "RETURN s.url, coalesce(s.sourcePath, s.url) AS sourcePath, "
+        "s.needs_extraction, s.doc_status",
+        params={"unmarked": bool(include_unstamped)},
+    ).result_set
+
+
+def _do_upgrade_all(proj, api, args):
+    """Discover pending document Sources and upgrade each.
+
+    D10 (ONTOLOGY v3.15 §4.4): ``doc_status`` is retired — the extraction
+    signal is ``needs_extraction``, set true by the ``--capture-metadata`` path
+    and cleared here after a successful extraction. The retired
+    ``doc_status='captured'`` marker is still honoured as a PENDING claim so the
+    pre-D10 backlog stays discoverable (#5140 finding 3); the rule lives in
+    ``_discover_pending_documents`` / ``_document_is_pending``, never inline.
 
     Uses inline Cypher via proj.g.query (no SDK method needed — plan §Task 2).
-    Loop-safe: each attempt gated by begin_ingest key (content-hash + extractor
-    version) so identical content is a no-op on re-run.
+
+    Re-run safety, stated precisely: each attempt is gated by the begin_ingest
+    key (content-hash + extractor version), so identical content is a no-op. A
+    document this sweep CANNOT complete is left PENDING and counted in its own
+    bucket (see the summary line) — the marker is the operator's signal that
+    something is still outstanding, so it is not cleared on a failure path.
+    Only a completed extraction clears it.
 
     #329 containment: the file read path (s.sourcePath OR s.url — both are
     tenant-mutable graph state) is resolved strictly under TORTOISE_INGEST_BASE_DIR;
@@ -329,25 +473,34 @@ def _do_upgrade_all(proj, api, args):
               "documents are skipped unless their path resolves under a configured base. "
               "Set TORTOISE_INGEST_BASE_DIR to your corpus root to enable re-upgrade.")
 
-    # Discover document Sources awaiting extraction (D10: needs_extraction is
-    # the signal; documentKind IS NOT NULL restricts to documents).
-    rows = proj.g.query(
-        "MATCH (s:Source) "
-        "WHERE s.documentKind IS NOT NULL "
-        "AND coalesce(s.needs_extraction, false) = true "
-        "RETURN s.url, coalesce(s.sourcePath, s.url) AS sourcePath, "
-        "coalesce(s.needs_extraction, false) AS needs_extraction"
-    ).result_set
+    include_unstamped = bool(getattr(args, "include_unstamped", False))
+    rows = _discover_pending_documents(proj, include_unstamped=include_unstamped)
 
     if not rows:
-        print("upgrade-all: no document Sources found with needs_extraction=true")
+        print("upgrade-all: no document Sources are awaiting extraction "
+              "(needs_extraction=true, or the legacy doc_status='captured' marker"
+              + ("; --include-unstamped widened the search to documents with no "
+                 "signal at all" if include_unstamped else
+                 "; pass --include-unstamped to also select documents with no "
+                 "signal at all") + ")")
         return
 
-    print(f"upgrade-all: {len(rows)} document(s) to upgrade")
+    print(f"upgrade-all: {len(rows)} document(s) to upgrade"
+          + (" (--include-unstamped: documents with no extraction signal are "
+             "selected too)" if include_unstamped else ""))
 
     upgraded = 0
     skipped = 0
-    for doc_id, source_path, needs_ext in rows:
+    # Skip buckets, kept apart on purpose: "unresolved" means we never got to
+    # read the content (fail-closed on an unprovable path), "not a document"
+    # means the content has no sections to extract, and "already claimed" means
+    # this extractor version has processed this content before. All three leave
+    # the pending marker in place (see the docstring), so the summary has to say
+    # WHICH kind of outstanding work remains, or "0 upgraded" reads as "done".
+    unresolved = 0
+    not_document = 0
+    already_claimed = 0
+    for doc_id, source_path, needs_ext, doc_status in rows:
         # #329: resolve the candidate (sourcePath OR s.url — BOTH are
         # tenant-mutable) strictly under the configured base. Fail-closed:
         # anything not provably under base is skipped, never read.
@@ -357,10 +510,12 @@ def _do_upgrade_all(proj, api, args):
             print(f"  skip {doc_id}: path {candidate!r} not under TORTOISE_INGEST_BASE_DIR "
                   f"({ingest_base or '<unset>'}); refusing to read (fail-closed)")
             skipped += 1
+            unresolved += 1
             continue
         if not filepath.exists():
             print(f"  skip {doc_id}: file not found ({filepath})")
             skipped += 1
+            unresolved += 1
             continue
 
         text = filepath.read_text(encoding="utf-8")
@@ -374,9 +529,11 @@ def _do_upgrade_all(proj, api, args):
         if result and result.skip:
             print(f"  skip {doc_id}: {result.reason}")
             skipped += 1
+            already_claimed += 1
             continue
 
-        print(f"  upgrading {doc_id} (needs_extraction={needs_ext}) …")
+        print(f"  upgrading {doc_id} "
+              f"(needs_extraction={needs_ext}, doc_status={doc_status}) …")
 
         # Emit DocumentCreated for metadata (idempotent via MERGE)
         from .extractor import extract_from_document  # noqa: I001
@@ -428,12 +585,15 @@ def _do_upgrade_all(proj, api, args):
         else:
             print(f"    warning: not a Document (no ## headers) — extraction skipped")  # noqa: F541
             skipped += 1
+            not_document += 1
             continue
 
-        # Mark extracted: clear the needs_extraction signal (the D10
-        # replacement for the retired doc_status flip).
+        # Mark extracted: clear the live signal AND retire the legacy marker
+        # (the pre-D10 flip is recorded by clearing, not by writing a retired
+        # property — see `_do_upgrade`).
         proj.g.query(
-            "MATCH (s:Source {url: $id}) SET s.needs_extraction = false",
+            "MATCH (s:Source {url: $id}) "
+            "SET s.needs_extraction = false REMOVE s.doc_status",
             params={"id": source_id},
         )
         print("    needs_extraction: true → false")
@@ -445,6 +605,15 @@ def _do_upgrade_all(proj, api, args):
         _run_ep_propagation(proj, api)
 
     print(f"upgrade-all complete: {upgraded} upgraded, {skipped} skipped")
+    if skipped:
+        # Never let "0 upgraded" read as "nothing outstanding": the buckets name
+        # the work that is still pending, and each one keeps its marker.
+        print("  still pending: "
+              f"{unresolved} unreadable (path outside base or file gone; "
+              "fail-closed), "
+              f"{not_document} not a document (no ## sections), "
+              f"{already_claimed} already claimed at this extractor version "
+              "(re-run with --force to reprocess)")
 
 
 def build_model(spec: str, *, reasoning: bool = False):
@@ -549,7 +718,23 @@ def main(argv=None):
                          "Source (requires transcript positional arg)")
     ap.add_argument("--upgrade-all", action="store_true",
                     help="#133: discover needs_extraction document Sources and upgrade each")
+    ap.add_argument("--include-unstamped", action="store_true",
+                    help="#5140: with --upgrade-all, also select document Sources "
+                         "that carry NO extraction signal at all. The default sweep "
+                         "selects an explicit needs_extraction=true or the pre-D10 "
+                         "doc_status='captured' marker; the sanctioned session-capture "
+                         "writer mints transcripts with no signal, so widening the "
+                         "sweep to them is an explicit choice. This is the "
+                         "discoverability half of the deleted "
+                         "graph-scripts/backfill_doc_status.py, as a read (nothing is "
+                         "written by selecting).")
     args = ap.parse_args(argv)
+
+    # #5140: --include-unstamped is a discovery MODIFIER, not a mode — it can
+    # only change which documents --upgrade-all selects. Refuse rather than
+    # accept a flag that would silently do nothing.
+    if args.include_unstamped and not args.upgrade_all:
+        raise SystemExit("--include-unstamped requires --upgrade-all")
 
     # #133: --upgrade requires a transcript file
     if args.upgrade and not args.transcript:
