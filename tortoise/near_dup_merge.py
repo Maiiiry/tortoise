@@ -387,13 +387,25 @@ def apply_merge_union(proj: Any, record: dict, *, session_id: str,
             # MERGEs on {id:...} and would mint a DIFFERENT node). Same
             # fallback as capture's own attachment pass (#1727): keep the
             # edge, live-only, honestly unjournaled.
+            #
+            # ⚠️ COUNT the edge here too. A bare `MERGE` after a `MATCH` that
+            # resolves nothing is a silent no-op, so a blind `linked += 1`
+            # reports an attachment that does not exist — the same false-PASS
+            # shape the CONTAINS branch above exists to avoid, and the one
+            # place `linked` would stop being a measurement. Reachable: this
+            # function does NOT return early when `contained == 0` (the
+            # survivor or session is absent), and `linked` is documented as
+            # what actually LANDED. `unresolved` keeps its one meaning — *no
+            # node has this name* — so a resolved-but-unwritten edge is not
+            # reported there; the `contained` warning already names the
+            # absent-endpoint cause.
             try:
-                proj.g.query(
+                rows = proj.g.query(
                     "MATCH (p:Point {id:$pid}), (o:Object {name:$n}) "
                     "WHERE o.id IS NULL OR o.id = '' "
-                    "MERGE (p)-[:aboutObject]->(o)",
-                    params={"pid": point_id, "n": _n})
-                out["linked"] += 1
+                    "MERGE (p)-[:aboutObject]->(o) RETURN count(*)",
+                    params={"pid": point_id, "n": _n}).result_set
+                out["linked"] += int(rows[0][0]) if rows and rows[0] else 0
             except Exception as e:  # noqa: BLE001, RUF100
                 out["warnings"].append(
                     f"merge id-less attachment failed for {_n!r} "

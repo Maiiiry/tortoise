@@ -273,16 +273,52 @@ class TestTheVetVerdictReachesTheFusion:
 
     def test_a_merge_verdict_is_routed_by_normalised_content(self):
         surface = {"decisions": {
-            "points:0": {"outcome": "MERGE",
+            "points:0": {"section": "points", "outcome": "MERGE",
                          "text": "The Team meets weekly in main office"},
-            "points:1": {"outcome": "KEEP", "text": "something else"},
+            "points:1": {"section": "points", "outcome": "KEEP",
+                         "text": "something else"},
         }}
         flagged = v2._merge_flagged_contents(surface)
         assert flagged == frozenset({v2._norm(PRIOR_CONTENT)})
 
+    def test_a_verdict_on_another_SECTION_does_not_authorise_a_point_merge(
+            self):
+        """The verdict is per-CANDIDATE, and VET decides three sections.
+
+        `vet_gate.OUTCOMES` carries `MERGE` for entities/events/points alike and
+        `_item_text` is `name or content` for all three, so an EVENT whose text
+        equals a point's — or an ENTITY whose NAME does — would authorise a
+        fusion of a Point the arbiter never marked if the key were text-only.
+        That is a write authorised by a verdict recorded for a different
+        candidate object: D12's "the verdict is the arbiter's" satisfied by a
+        text collision.
+        """
+        for section in ("events", "entities"):
+            surface = {"decisions": {f"{section}:0": {
+                "section": section, "outcome": "MERGE",
+                "text": PRIOR_CONTENT}}}
+            assert v2._merge_flagged_contents(surface) == frozenset(), section
+        # …while the SAME text on the point section is the verdict it is
+        points = {"decisions": {"points:0": {
+            "section": "points", "outcome": "MERGE",
+            "text": PRIOR_CONTENT}}}
+        assert v2._merge_flagged_contents(points) == frozenset(
+            {v2._norm(PRIOR_CONTENT)})
+
+    def test_the_point_section_is_vets_own_token(self):
+        """The section key is VET's vocabulary, not a local invention.
+
+        A rename in `vet_gate.SECTIONS` would otherwise silently stop every
+        real verdict from routing (fail-closed, so the fusion would simply
+        never fire) — a green battery and a dead mechanism.
+        """
+        assert v2._POINT_SECTION in {s[0] for s in vet_gate.SECTIONS}
+
     def test_both_vet_passes_contribute(self):
-        s2 = {"decisions": {"a": {"outcome": "MERGE", "text": "alpha"}}}
-        union = {"decisions": {"b": {"outcome": "merge", "text": "beta"}}}
+        s2 = {"decisions": {"a": {"section": "points", "outcome": "MERGE",
+                                   "text": "alpha"}}}
+        union = {"decisions": {"b": {"section": "points",
+                                      "outcome": "merge", "text": "beta"}}}
         assert v2._merge_flagged_contents(s2, union) == frozenset(
             {v2._norm("alpha"), v2._norm("beta")})
 
@@ -290,7 +326,10 @@ class TestTheVetVerdictReachesTheFusion:
         """Fail-closed: no readable verdict ⇒ no fusion."""
         for bad in (None, {}, {"decisions": None}, {"decisions": []},
                     {"decisions": {"a": "MERGE"}},
-                    {"decisions": {"a": {"outcome": "MERGE"}}}):
+                    {"decisions": {"a": {"outcome": "MERGE"}}},
+                    # a MERGE with no readable SECTION is not a point verdict
+                    {"decisions": {"a": {"outcome": "MERGE",
+                                            "text": "alpha"}}}):
             assert v2._merge_flagged_contents(bad) == frozenset(), bad
 
 
@@ -520,6 +559,190 @@ class TestApplyMergeUnionWritesTheUnionAndTheLostProvenance:
         res = apply_merge_union(sdk._get_proj(), {}, session_id="s_x")
         assert res["point_id"] == ""
         assert res["warnings"]
+
+    def test_the_idless_stub_counts_only_an_edge_that_exists(self, sdk):
+        """`linked` is a MEASUREMENT, on every branch of this write.
+
+        The CONTAINS branch counts the edge (`RETURN count(*)`) precisely
+        because a bare `MERGE` after a `MATCH` that resolves nothing is a
+        silent no-op. The id-less `Object` stub branch is the same write shape
+        and must obey the same rule: against an ABSENT survivor the MATCH
+        resolves nothing, no edge exists, and reporting `linked == 1` is the
+        false-PASS the record would carry to every reader of the fusion.
+
+        `unresolved` stays empty here on purpose: the NAME resolved (the stub
+        exists) — what did not happen is the edge, and the `contained` warning
+        already names the absent endpoint. `linked`/`contained` are the two
+        flags that separate a written union from an attempted one.
+        """
+        from tortoise.near_dup_merge import apply_merge_union
+
+        proj = sdk._get_proj()
+        # the id-less stub shape hosted_api.py mints (`MERGE (o:Object {name})`)
+        proj.g.query("MERGE (o:Object {name:'Stubbed'})")
+        pt = sdk.create_point("statement", PRIOR_CONTENT)
+        proj.g.query("MERGE (s:Session {id:$sid})", params={"sid": "s_x"})
+
+        ok = apply_merge_union(
+            proj, {"point_id": pt["id"], "about_entities": ["Stubbed"]},
+            session_id="s_x", sdk=sdk)
+        assert ok["contained"] == 1, ok
+        assert ok["linked"] == 1, ok
+        rows = proj.g.query(
+            "MATCH (p:Point {id:$pid})-[:aboutObject]->(o:Object "
+            "{name:'Stubbed'}) RETURN count(*)",
+            params={"pid": pt["id"]}).result_set
+        assert rows[0][0] == 1, rows        # the edge this count claimed
+
+        absent = apply_merge_union(
+            proj, {"point_id": "pt_absent", "about_entities": ["Stubbed"]},
+            session_id="s_x", sdk=sdk)
+        assert absent["contained"] == 0, absent
+        assert absent["linked"] == 0, absent   # ← the false-PASS this pins
+        assert absent["unresolved"] == [], absent
+        assert absent["warnings"], absent
+        still = proj.g.query(
+            "MATCH (:Point)-[r:aboutObject]->(:Object {name:'Stubbed'}) "
+            "RETURN count(r)").result_set
+        assert still[0][0] == 1, still     # no edge was minted by the miss
+
+
+# ── 4. The SEAM: the ONE production invocation of the fusion ───────────────
+
+
+class TestTheCapturePathExecutesTheFusion:
+    """P1 (review): every other test here proves a PART; this drives the SEAM.
+
+    `tortoise/sdk.py`'s capture write path is the only place
+    `apply_merge_union` is ever called in production, and nothing reached it:
+    a mutation that deletes that block, moves it above the entity pass, or
+    reads the wrong key (`out["merge"]`) stayed green, so the fusion could stop
+    happening on real captures while `near_dup_merge` stayed `implemented` and
+    this whole file passed.
+
+    **Layer coverage, stated exactly.** This drives the REAL
+    `sdk.capture_session` → `_extract_session_v2` write path — the Session
+    write, the entity pass, the points loop, the merge block, the graph
+    writes — with only the S1–S5 extraction REPLACED by a crafted `out`
+    (`extractor_v2.extract_session_v2`, monkeypatched). The stub is necessary,
+    not a shortcut: `MERGE` can only come from an INJECTED vet arbiter and
+    `capture_session` exposes no arbiter seam, so the S5 hand-off is the
+    furthest point a test can control without widening the public signature.
+    What is therefore NOT covered: that the arbiter's verdict reaches
+    `merge_flagged` (pinned in `TestTheVetVerdictReachesTheFusion`) and that
+    `execute_embed` builds the record (pinned in
+    `TestTheWritePathEmitsOneEntityAndKeepsTheLosersEvidence`).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_provider(self, monkeypatch):
+        monkeypatch.setenv("TORTOISE_SESSION_LLM_MOCK", "1")
+        monkeypatch.delenv("TORTOISE_SESSION_EXTRACTOR", raising=False)
+
+    @pytest.fixture
+    def sdk(self, tmp_path):
+        from tortoise.sdk import TortoiseSDK
+        s = TortoiseSDK(str(tmp_path / "capture_merge.db"))
+        yield s
+        s.close()
+
+    def test_capture_writes_the_union_and_the_losing_session(self, sdk,
+                                                             monkeypatch):
+        import tortoise.extractor_v2 as ev2
+
+        # The prior (the survivor) and the Objects, seeded OUTSIDE the capture:
+        # a merge emits no payload point, so the survivor is pre-existing and
+        # `Office` is the candidate's exclusive attachment — the one piece of
+        # evidence the fusion exists to keep. `Team` is the prior's own.
+        sdk.create_object("Team", objectKind="core:team")
+        sdk.create_object("Office", objectKind="core:location")
+        prior = sdk.create_point("statement", PRIOR_CONTENT)
+
+        record = {"point_id": prior["id"], "content": PRIOR_CONTENT,
+                  "about_entities": ["Office", "Team"],
+                  "merged_content": CANDIDATE_CONTENT,
+                  "merged_quote": CANDIDATE_CONTENT,
+                  "session_ref": "s_second_document"}
+        out = {"payload": {"entities": [], "points": [], "events": [],
+                            "operators": [], "supersessions": [],
+                            "chain_notes": [], "link_before_create": []},
+               "errors": [], "warnings": [], "stats": {},
+               "merges": [record], "noops": [], "supersessions": [],
+               "chain_notes": [], "link_before_create": [],
+               "minted_kinds": [], "story_arc": "", "search": {},
+               "error_census": {}}
+        monkeypatch.setattr(ev2, "extract_session_v2",
+                            lambda *a, **k: out)
+
+        receipt = sdk.capture_session(
+            [{"role": "user", "content": "a session whose seam is fixed"},
+             {"role": "assistant", "content": "noted"}],
+            session_id="s_second_document")
+        assert receipt.get("ok") is True, receipt
+        proj = sdk._get_proj()
+
+        # (a) the survivor carries the candidate-only attachment — the union
+        #     reached the graph, through the capture path.
+        edges = {r[0] for r in proj.g.query(
+            "MATCH (p:Point {id:$pid})-[:aboutObject]->(o:Object) "
+            "RETURN o.name", params={"pid": prior["id"]}).result_set}
+        assert edges == {"Office", "Team"}, edges
+
+        # (b) the losing document's provenance: its session CONTAINS the claim
+        contains = proj.g.query(
+            "MATCH (s:Session {id:$sid})-[:CONTAINS]->(p:Point {id:$pid}) "
+            "RETURN count(*)",
+            params={"sid": "s_second_document",
+                    "pid": prior["id"]}).result_set
+        assert contains[0][0] == 1, contains
+
+        # (c) no second Point for the candidate: the claim was never duplicated
+        for content in (PRIOR_CONTENT, CANDIDATE_CONTENT):
+            n = proj.g.query(
+                "MATCH (p:Point) WHERE p.content = $c RETURN count(p)",
+                params={"c": content}).result_set[0][0]
+            assert n == 1, (content, n)
+
+        # (d) …and the capture does not report a half-done union: the receipt
+        #     names no unresolved attachment and no merge failure.
+        assert not [w for w in receipt.get("warnings") or []
+                    if "merge" in w.lower()], receipt.get("warnings")
+
+    def test_an_empty_merge_list_writes_nothing(self, sdk, monkeypatch):
+        """The default path stays inert — the block is data-driven.
+
+        Pins the other half of the mutation: a merge write that fires with no
+        record would fabricate a `CONTAINS` edge (and, on a real capture, a
+        provenance claim for a fusion nobody decided).
+        """
+        import tortoise.extractor_v2 as ev2
+
+        prior = sdk.create_point("statement", PRIOR_CONTENT)
+        out = {"payload": {"entities": [], "points": [], "events": [],
+                            "operators": [], "supersessions": [],
+                            "chain_notes": [], "link_before_create": []},
+               "errors": [], "warnings": [], "stats": {}, "merges": [],
+               "noops": [], "supersessions": [], "chain_notes": [],
+               "link_before_create": [], "minted_kinds": [],
+               "story_arc": "", "search": {}, "error_census": {}}
+        monkeypatch.setattr(ev2, "extract_session_v2",
+                            lambda *a, **k: out)
+
+        receipt = sdk.capture_session(
+            [{"role": "user", "content": "a session whose seam is fixed"},
+             {"role": "assistant", "content": "noted"}],
+            session_id="s_no_merge")
+        assert receipt.get("ok") is True, receipt
+        proj = sdk._get_proj()
+        assert proj.g.query(
+            "MATCH (s:Session {id:$sid})-[:CONTAINS]->(p:Point {id:$pid}) "
+            "RETURN count(*)",
+            params={"sid": "s_no_merge",
+                    "pid": prior["id"]}).result_set[0][0] == 0
+        assert proj.g.query(
+            "MATCH (p:Point {id:$pid})-[:aboutObject]->(:Object) "
+            "RETURN count(*)",
+            params={"pid": prior["id"]}).result_set[0][0] == 0
 
 
 if __name__ == "__main__":  # pragma: no cover - manual mutation aid

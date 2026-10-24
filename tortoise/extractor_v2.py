@@ -164,6 +164,13 @@ from .env_truthy import env_flag, is_truthy  # #4097: the declared truthy contra
 from .near_dup_merge import MERGE as _MERGE_DECISION
 from .near_dup_merge import near_dup_merge as _near_dup_merge
 
+#: The ONE VET section whose candidates are Points, and therefore the only
+#: section a point fusion may be authorised for (#5006 review F2). `MERGE` is a
+#: legal outcome for every section in `vet_gate.OUTCOMES`, so the section is
+#: part of the verdict's key; `test_the_point_section_is_vets_own_token` pins
+#: this literal against `vet_gate.SECTIONS` so it cannot drift silently.
+_POINT_SECTION = "points"
+
 # ── The v2 master list (design doc §3) ─────────────────────────────────────
 
 SUBJECTS = {
@@ -7897,6 +7904,18 @@ def _merge_flagged_contents(*surfaces: dict | None) -> frozenset[str]:
     Content, not the item id: VET's ids are index-shaped and ``apply_vet``
     removes DISCARDed items from the list between the two passes, so an
     index-keyed hand-off would flag the wrong candidate after any removal.
+
+    ⚠️ **And the SECTION is part of the key.** ``vet_candidates`` decides over
+    three sections (``points`` / ``events`` / ``entities``) with one shared
+    ``OUTCOMES`` set — ``MERGE`` is one of them for all three — and
+    ``_item_text`` is ``name or content`` for every section. A content-only key
+    therefore lets an EVENT whose text equals a point's, or an ENTITY whose
+    NAME does, authorise a fusion of a Point the arbiter never marked: the
+    verdict is per-CANDIDATE, and dropping the section widens it silently to a
+    different candidate object. Rows are kept only for the point section; a
+    row with no readable ``section`` is not a point verdict and contributes
+    nothing (fail-closed — no verdict ⇒ no merge).
+
     A missing/malformed surface contributes nothing (no verdict ⇒ no merge),
     which is the fail-closed direction for a write.
     """
@@ -7907,6 +7926,8 @@ def _merge_flagged_contents(*surfaces: dict | None) -> frozenset[str]:
             continue
         for d in decisions.values():
             if not isinstance(d, dict):
+                continue
+            if str(d.get("section") or "").strip().lower() != _POINT_SECTION:
                 continue
             outcome = str(d.get("outcome") or "").strip().upper()
             if outcome != _MERGE_DECISION:

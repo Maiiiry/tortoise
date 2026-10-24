@@ -908,3 +908,16 @@ mechanism is **inert** — the same injected-seam posture VET ships with — and
 the strength of `tests/test_near_dup_merge_5006.py` driving the real classifier, the real write path and a real
 graph, not on a flag flip. A false `contained` counter (counting the ATTEMPT rather than the edge) was found and
 fixed by that battery before landing.
+
+**Review round 2 — three residual gaps, all closed by measurement.** (1) The verdict key was content-only: `MERGE` is
+a legal outcome for `entities`/`events`/`points` alike and `_item_text` is `name or content` for all three, so an
+event's text — or an entity's name — that normalised to a point's could authorise a fusion of a Point the arbiter
+never marked. `_merge_flagged_contents` now keeps only the `points` section (a row with no readable section
+contributes nothing), and `test_a_verdict_on_another_SECTION_does_not_authorise_a_point_merge` pins it. (2) The
+id-less `Object`-stub branch of `apply_merge_union` counted the ATTEMPT (`linked += 1` with no read-back) while the
+`CONTAINS` branch beside it counted the EDGE — reachable whenever the survivor is absent, and the one place `linked`
+would stop being a measurement; it is now `MERGE … RETURN count(*)` like its sibling. (3) The ONE production
+invocation of the fusion (`capture_session`'s merge block) was reached by no test — a mutation deleting it stayed
+green. `TestTheCapturePathExecutesTheFusion` now drives the real capture write path (the S1–S5 extraction stubbed,
+since `MERGE` needs an injected arbiter `capture_session` has no seam for) and asserts on the graph: the survivor
+carries the candidate-only attachment, `(Session)-[:CONTAINS]->(Point)` exists, and no second Point was minted.
