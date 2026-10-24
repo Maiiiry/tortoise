@@ -248,6 +248,32 @@ def _rows(conn, tenant, table, *, columns="count(*)"):
         return cur.fetchone()
 
 
+def _tenant_parents(conn, tenant) -> tuple[int, int]:
+    """The two PARENT rows every recorded layer write foreign-keys to.
+
+    `(organizations, graphs)`, as counts for this exact pair. Without them a
+    zero-row assertion is **true by construction**, not evidence: `node_identity`
+    FK-references `public.graphs (org_id, id)`
+    (`20261012000001_record_event_stream.sql:70`) and `public.point`
+    FK-references `node_identity` (`20261012000003_record_epistemic.sql:119`), so
+    an unseeded tenant cannot hold a row no matter what the code under test does.
+    Measured on a throwaway `postgres:16`: inserting a `node_identity` row for an
+    UNSEEDED pair raises `ForeignKeyViolation` on `node_identity_org_id_fkey`;
+    the same insert after `_seed_tenant` succeeds. Asserting the parents exist is
+    what separates "the refusal held" from "nothing could have been written".
+    """
+    org_id, graph_id = tenant
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM public.organizations WHERE id=%s",
+                    (org_id,))
+        orgs = cur.fetchone()[0]
+        cur.execute(
+            "SELECT count(*) FROM public.graphs WHERE id=%s AND org_id=%s",
+            (graph_id, org_id))
+        graphs = cur.fetchone()[0]
+    return orgs, graphs
+
+
 # ── 1. the surface the client is CONSTRUCTED from ──────────────────────────
 
 
@@ -308,9 +334,31 @@ def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypa
     are on the three things that separate a refusal from a silent success: the
     status, a machine-readable body a client can surface, and the record
     itself — an unauthenticated call must not leave a row behind.
+
+    ⛔ THE RECORD HALF IS ONLY EVIDENCE IF A WRITE COULD HAVE LANDED, so the two
+    preconditions for that are asserted, not assumed (P2, PR #9852 review):
+
+    * the tenant is SEEDED. Without `public.organizations`/`public.graphs` the
+      layer tables FK-refuse every insert, so `count(*) == 0` would be true by
+      construction — it could not tell "the refusal held" from "nothing could
+      ever be written". `_tenant_parents` states that the parents are there;
+    * the seam is ARMED (`RecordWriter().armed`), the same precondition the
+      capstone leg asserts. An unarmed seam writes nothing, counts nothing and
+      warns about nothing, so it too makes a zero indistinguishable from a
+      correct refusal — see `_database`'s docstring.
+
+    All three layer tables the fold touches are then asserted empty, because
+    `point` alone would miss a partial write that stopped at the identity row.
     """
+    from tortoise import record_writer
+
     client, _api_key, tenant = connector
-    conn, _seed = _database(monkeypatch)
+    conn, seed_tenant = _database(monkeypatch)
+    seed_tenant(conn, tenant)
+    assert record_writer.RecordWriter().armed, (
+        "the record seam is NOT armed, so an empty table below would be about an "
+        "unarmed deployment rather than about the refusal: check "
+        f"{record_writer.RECORD_DSN_ENV}")
     try:
         response = client.post("/mcp", json={
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -332,8 +380,14 @@ def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypa
             "an unauthenticated client received a stack trace, not a refusal")
         assert "tortoise_create_point" not in response.text, (
             "the refusal leaked the tool inventory to an unauthenticated caller")
-        assert _rows(conn, tenant, "point")[0] == 0, (
-            "an unauthenticated call wrote a Point into the record")
+        parents = _tenant_parents(conn, tenant)
+        assert parents == (1, 1), (
+            "the tenant's parent rows are not in place, so the zero counts below "
+            "are TRUE BY CONSTRUCTION (the layer tables FK to "
+            f"organizations/graphs) rather than evidence: {parents!r}")
+        for table in ("point", "node_identity", "journal_event"):
+            assert _rows(conn, tenant, table)[0] == 0, (
+                f"an unauthenticated call wrote a {table} row into the record")
     finally:
         conn.close()
 
@@ -437,7 +491,11 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
         read_back = _tool_payload(body)
         assert "error" not in read_back, (
             f"the id the client was handed does not read back: {read_back!r}")
-        assert read_back.get("id", point_id) == point_id
+        assert read_back.get("id") == point_id, (
+            "the read-back payload does not carry the identifier the client was "
+            f"handed ({point_id!r}) — got {read_back.get('id')!r}. No `.get` "
+            "default here: with one, an absent `id` would satisfy the equality "
+            "by comparing the fallback to itself")
         assert read_back.get("content") == content, (
             f"reading {point_id!r} back returned {read_back.get('content')!r}, "
             f"not what was filed ({content!r})")
@@ -447,8 +505,23 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
 
 # ── the same rule, applied to the DESCRIPTIONS a model reads ───────────────
 
-#: Live (advertised) tools whose description recommends a RETIRED name.
-#: Measured at `a999be41e` — see `test_a_live_tool_description_never_recommends_a_retired_tool`.
+#: LIVE registry tools whose `description` recommends a RETIRED name.
+#:
+#: Measured at `a999be41e`: **2 tools, 4 names**. "Live" is `TOOL_REGISTRY`
+#: membership — NOT `http_policy`, and the two are not the same surface
+#: (P3, PR #9852 review). `tortoise_index_files` carries `http_policy=False`
+#: (`tortoise/tool_registry.py`, "EXCLUDED from tenant HTTP" in its own
+#: description), so it is absent from a connector's `tools/list` and the
+#: CONNECTOR-facing half of this defect is `tortoise_query` alone
+#: (`tortoise_get_point` is the exact read the journey's "read it back by id"
+#: step performs).
+#:
+#: The stdio-only half is still measured, because the rule is about the text a
+#: MODEL reads: a stdio client receives the same `description` and the retired
+#: names are absent from ITS `tools/list` too, so the property holds for both
+#: surfaces. What must never drift is the CLAIM — hence
+#: `test_the_stale_description_set_says_which_half_is_the_connectors`, which pins
+#: which side of `http_policy` each measured tool sits on.
 _RETIRED_NAMES_NAMED_BY_LIVE_DESCRIPTIONS = {
     "tortoise_query": ("tortoise_get", "tortoise_get_point"),
     "tortoise_index_files": ("tortoise_index_sessions", "tortoise_ingest_corpus"),
@@ -456,7 +529,13 @@ _RETIRED_NAMES_NAMED_BY_LIVE_DESCRIPTIONS = {
 
 
 def _retired_names_named_by_live_descriptions() -> dict[str, tuple[str, ...]]:
-    """Measured, not asserted from a date: which live descriptions are stale."""
+    """Measured, not asserted from a date: which LIVE descriptions are stale.
+
+    Every `TOOL_REGISTRY` entry — advertised on HTTP (`http_policy`) **or**
+    stdio-only. Deliberately not narrowed to the HTTP surface: the defect is a
+    description that names a tool its own reader cannot call, and a stdio
+    client's `tools/list` omits the retired name just as a connector's does.
+    """
     from tortoise import tool_registry as tr
 
     retired = {t.name for t in tr.RETIRED_TOOL_REGISTRY}
@@ -472,14 +551,18 @@ def _retired_names_named_by_live_descriptions() -> dict[str, tuple[str, ...]]:
     condition=_retired_names_named_by_live_descriptions() != {},
     strict=True,
     reason=(
-        "MEASURED defect: a live tool's `description` is part of the tools/list "
-        "payload the model reads, and four of them recommend RETIRED names that "
-        "are absent from that same payload — so a tool-grant client (the ChatGPT "
-        "connector) is told to call a tool it was never granted. "
-        "`tortoise_query` → `tortoise_get_point`, the exact read the journey's "
-        "'read it back by id' step performs. This marker DELETE-ITSELF when the "
-        "copy is fixed (the condition is the measured set, not a date); the "
-        "equality pin below is what stays loud in the meantime."
+        "MEASURED defect: a tool's `description` is part of the tools/list "
+        "payload the model reads, and TWO live tools name FOUR RETIRED tools "
+        "that are absent from that same payload. `tortoise_query` → "
+        "`tortoise_get_point` / `tortoise_get` is the CONNECTOR-facing half "
+        "(`tortoise_query` itself IS advertised) and is the exact read the "
+        "journey's 'read it back by id' step performs, so a tool-grant client is "
+        "told to call a tool it was never granted; `tortoise_index_files` → "
+        "`tortoise_index_sessions`/`tortoise_ingest_corpus` is stdio-only "
+        "(`http_policy=False`), so it mis-instructs a stdio client rather than a "
+        "connector. This marker DELETE-ITSELF when the copy is fixed (the "
+        "condition is the measured set, not a date); the equality pins below are "
+        "what stay loud in the meantime."
     ),
 )
 def test_a_live_tool_description_never_recommends_a_retired_tool():
@@ -505,12 +588,54 @@ def test_the_stale_description_set_is_exactly_what_was_measured():
     entry. Pinned by EQUALITY instead: the measured set may only change when this
     line changes, and fixing one entry reds it too — so neither a new defect nor a
     fix can land unnoticed. (The #9200 idiom, from `test_9078`.)
+
+    ⚠️ The pin spans `TOOL_REGISTRY`, not the HTTP surface, so an edit to a
+    stdio-only tool's `description` reds this too (deliberate: the pin's job is
+    to force a re-MEASURE of a stale description, and a description no model can
+    follow is a defect on either surface). What it must not do is overstate the
+    impact — see the surface-split pin below.
     """
     measured = _retired_names_named_by_live_descriptions()
     assert measured == _RETIRED_NAMES_NAMED_BY_LIVE_DESCRIPTIONS, (
         "the set of live descriptions naming RETIRED tools changed: "
         f"{measured!r} (pinned: {_RETIRED_NAMES_NAMED_BY_LIVE_DESCRIPTIONS!r}). "
         "Fix the description — do not widen this pin silently")
+
+
+def test_the_stale_description_set_says_which_half_is_the_connectors():
+    """The measured set is 2 tools / 4 names, and only ONE tool is advertised.
+
+    P3, PR #9852 review: the constant and the `xfail` reason above first read as
+    though four *advertised* descriptions were stale and a ChatGPT-style
+    tool-grant client was mis-instructed four times over. `tortoise_index_files`
+    carries `http_policy=False` (`tortoise/tool_registry.py`), and `HTTP_ALLOWED`
+    is derived from exactly that flag (`tortoise/mcp_auth.py::get_http_allowed`),
+    so by this file's OWN definition of advertised
+    (`test_the_connector_advertises_the_journey_tools_and_nothing_retired`:
+    `{t.name for t in TOOL_REGISTRY if t.http_policy}`) only `tortoise_query`
+    reaches the connector. The impact claim is therefore pinned mechanically
+    rather than left in prose that the next lane would read as measurement.
+
+    Both halves are asserted by equality, so a tool changing `http_policy` (or a
+    third stale description appearing on either side) forces a re-measure instead
+    of silently re-wording the claim.
+    """
+    from tortoise import tool_registry as tr
+
+    advertised = {t.name for t in tr.TOOL_REGISTRY if t.http_policy}
+    measured = _retired_names_named_by_live_descriptions()
+    http_facing = {name: names for name, names in measured.items()
+                   if name in advertised}
+    stdio_only = sorted(set(measured) - advertised)
+    assert http_facing == {"tortoise_query": ("tortoise_get", "tortoise_get_point")}, (
+        "the CONNECTOR-facing half of the stale-description defect changed — "
+        f"advertised stale tools: {http_facing!r}. Only an HTTP-advertised tool's "
+        "description can mis-instruct a tool-grant client; re-measure before "
+        "re-wording the xfail reason")
+    assert stdio_only == ["tortoise_index_files"], (
+        "which stale descriptions belong to stdio-only tools changed: "
+        f"{stdio_only!r}. Those are real defects for a stdio client, but they "
+        "cannot reach a connector — keep both facts in the claim")
 
 
 # ── the wiring: this file must RUN where the record is armed ───────────────
