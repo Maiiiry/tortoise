@@ -2345,7 +2345,12 @@ def test_a_reaped_worktree_is_named_in_the_gap_not_hidden(monkeypatch) -> None:
     raw = "/tmp/cell-wt-adv-reaping (deleted)"
 
     class _Cwds(dict):
-        refused = {2559943: raw}
+        pass
+
+    # Set after the class body: a class-level mutable literal is RUF012 (real
+    # for a module-level class, noise for a function-local test double), and a
+    # `_Cwds()` instance only ever reads `refused` off the class.
+    _Cwds.refused = {2559943: raw}
 
     monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
     monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 2559943, "ppid": 1}], ""))

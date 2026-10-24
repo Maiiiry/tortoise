@@ -70,6 +70,13 @@ ROUTED_NAMESPACES: dict[str, dict[str, str]] = {
     # resolves. Same class as test_quota/test_commit_endpoint.
     "test_cohort_cost_cap.py": {"registry": "prod-coupled"},
     "test_cross_tenant_read_isolation.py": {"registry": "prod-coupled"},  # #3663 — registry control-plane seeding for the cross-tenant read proof
+    # #9664's capstone constructs the registry SDK the HTTP app is handed
+    # (`TortoiseSDK(namespace="registry")` + `create_http_app(_registry_sdk=…)`)
+    # and asserts the connector→record path against it, so the literal is the
+    # canonical namespace PROD resolves — same `prod-coupled` class as
+    # test_cohort_cost_cap / test_graph_storage, and a `test_*` rename would
+    # point the capstone at a graph the code under test never reads.
+    "test_9664_capstone_connector_to_record.py": {"registry": "prod-coupled"},
     "test_graph_storage.py": {"registry": "prod-coupled"},  # #5331 — the byte-meter fixture seeds an org through the registry namespace (the literal is the namespace PROD resolves; same class as test_cross_tenant_read_isolation)
     # The `reg` fixture (the two T7 registry-lane cases; the rest of the file
     # is Supabase-lane) reads the graph handle `_reg_seed_org` / `_reg_seed_key`
