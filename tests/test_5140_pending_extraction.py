@@ -151,8 +151,11 @@ def _run(argv, *, capture: bool = False):
 # corpus sweep) answer the SAME question, so they share one definition. The
 # sweep additionally refuses to treat an entirely unmarked document as pending
 # unless the operator opts in (`--include-unstamped`) — see
-# `test_upgrade_all_ignores_a_document_with_no_signal` — because the sanctioned
-# session-capture writer mints transcript Sources that store no signal at all.
+# `test_upgrade_all_discovers_the_legacy_capture_marker` (the transcript-left-
+# alone assertion) and `test_upgrade_all_include_unstamped_is_the_backfill_replacement`
+# (the unmarked document is NOT selected by the default run) — because the
+# sanctioned session-capture writer mints transcript Sources that store no signal
+# at all.
 
 def test_pending_predicate_boundaries():
     """The rule, pinned at its boundaries.
@@ -177,9 +180,19 @@ def test_pending_predicate_boundaries():
     # re-discover a document the per-document path always skips).
     assert _document_is_pending(None, "extracted") is False
     assert _document_is_pending(True, "extracted") is False
-    # The pre-D10 full-ingest default is not a pending claim.
+    # `draft` (the pre-D10 full-ingest default) is NOT a pending claim for the
+    # SWEEP (pre-D10 discovery never selected it) …
     assert _document_is_pending(False, "draft") is False
     assert _document_is_pending(None, "draft") is False
+    # … but it IS for the explicit command: pre-D10 `--upgrade` skipped on
+    # `'extracted'` alone, so a document whose post-extraction flip never ran
+    # must still be upgradeable.
+    assert _document_is_pending(False, "draft", other_legacy_is_pending=True) is True
+    assert _document_is_pending(None, "draft", other_legacy_is_pending=True) is True
+    # A stored signal or a completion record still outranks that policy.
+    assert _document_is_pending(True, "draft", other_legacy_is_pending=True) is True
+    assert _document_is_pending(
+        False, "extracted", other_legacy_is_pending=True) is False
     # Unmarked: pending for the explicitly named document, not for the sweep.
     assert _document_is_pending(None, None) is True
     assert _document_is_pending(None, None, unmarked_is_pending=False) is False
@@ -480,3 +493,83 @@ def test_python_rule_and_cypher_twin_agree(include_unstamped):
         f"(include_unstamped={include_unstamped}).\n"
         f"  only in Cypher: {sorted(selected - expected)}\n"
         f"  only in Python: {sorted(expected - selected)}")
+
+
+@_live_db
+def test_upgrade_still_reaches_a_document_left_at_draft():
+    """Pre-D10 parity for the ``other_legacy_is_pending`` arm.
+
+    ``draft`` is the pre-D10 full-ingest DEFAULT, and only the post-extraction
+    flip moved it to ``'extracted'`` — so a document still at ``draft`` is one
+    whose flip never ran. Pre-D10 ``--upgrade`` skipped on ``'extracted'``
+    alone; a rule that treated ``draft`` as done would refuse to upgrade it.
+    The SWEEP deliberately does not select it (pre-D10 discovery never did).
+    """
+    if not _require_live_falkor():
+        return
+    uri = _live_uri(f"test_5140_draft_{os.urandom(4).hex()}")
+    _reset(uri)
+    t = _transcript(TEXT, "draft_doc.md")
+    doc_id = t.name
+    _seed_document(uri, doc_id, str(t),
+                   doc_status="draft", needs_extraction=False)
+
+    out = _run([str(t), "--db", uri,
+                "--log", _tmp("events.jsonl"), "--out", _tmp("graph.html"),
+                "--upgrade", "--point-model", "mock:cheap",
+                "--relation-model", "mock:reason"], capture=True)
+
+    assert "doc already extracted, skipped" not in out, (
+        f"`--upgrade` refused a document the pre-D10 command upgraded; "
+        f"output:\n{out}")
+    nx, _ds = _read(uri, doc_id)
+    assert nx is False, (
+        f"`--upgrade` did not reach the draft document (needs_extraction={nx!r}); "
+        f"output:\n{out}")
+
+
+@_live_db
+def test_upgrade_all_not_a_document_bucket_is_stable_across_runs(monkeypatch):
+    """The skip bucket must not depend on whether a PREVIOUS run saw the file.
+
+    `begin_ingest` MINTS a claim, so claiming before deciding "does this content
+    have sections to extract?" made the second run report *already processed*
+    (a different bucket) and let the claim supersede/retract a prior run's
+    points for work the sweep then declined to do. Review round 2 measured that;
+    this pins the fix: two runs report the SAME bucket, and no claim was minted.
+    """
+    if not _require_live_falkor():
+        return
+    uri = _live_uri(f"test_5140_bucket_{os.urandom(4).hex()}")
+    _reset(uri)
+    base = tempfile.mkdtemp(prefix="tortoise_5140_corpus_")
+    monkeypatch.setenv("TORTOISE_INGEST_BASE_DIR", base)
+    doc = Path(base) / "no_sections.md"
+    doc.write_text("prose with no headings\n", encoding="utf-8")
+    _seed_document(uri, doc.name, str(doc),
+                   doc_status="captured", needs_extraction=False)
+
+    argv = ["--db", uri, "--log", _tmp("events.jsonl"),
+            "--out", _tmp("graph.html"), "--upgrade-all",
+            "--point-model", "mock:cheap", "--relation-model", "mock:reason"]
+    first = _run(list(argv), capture=True)
+    second = _run(list(argv), capture=True)
+
+    assert "not a Document (no ## headers)" in first, first
+    assert "already processed" not in first, (
+        f"first run claimed the content before checking for sections:\n{first}")
+    assert "not a Document (no ## headers)" in second, (
+        "the second run reports a different bucket for the same content — the "
+        f"idempotency claim was minted before the section check:\n{second}")
+    assert "already processed" not in second, second
+    # The document is still pending (the sweep never completed it) …
+    assert _read(uri, doc.name) == (False, "captured")
+    # … and no IngestStarted claim was journaled for it.
+    proj = FalkorProjection.from_uri(uri)
+    try:
+        claims = proj.g.query(
+            "MATCH (n) WHERE n.content CONTAINS 'no_sections.md' RETURN count(n)"
+        ).result_set
+    finally:
+        proj.close()
+    assert claims[0][0] == 0, f"a claim was minted for a no-sections document: {claims}"
