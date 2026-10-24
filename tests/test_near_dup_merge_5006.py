@@ -175,6 +175,77 @@ class TestThePlanMergesANearIdenticalFlaggedPair:
 
 
 class TestTheClassifierProducesMerge:
+    #: The PRIOR's claim, and a PARAPHRASE of it: the same words in a different
+    #: order. Not an exact normalized match (so it cannot take step 1's
+    #: exact-content shortcut), `_boundary` reports no distinguishing difference,
+    #: and `_token_overlap` is 1.0 — so this is the shape the ~0.95 BAR exists
+    #: for. A *truncated* paraphrase is NOT usable as a fixture: removing a word
+    #: is a `scope` difference to `_boundary`, so it is refused for a different
+    #: (also correct) reason and would not exercise the band at all.
+    PARAPHRASE_PRIOR = "the team meets weekly in the main office"
+    PARAPHRASE_TEXT = "the team meets weekly in the office main"
+
+    def test_the_paraphrase_band_merges_a_near_identical_flagged_pair(self):
+        """The BAR's own arm, not the exact-content shortcut.
+
+        Every positive MERGE test in this file used IDENTICAL content, so only
+        step 1's exact normalized match was ever exercised end to end. Measured:
+        disabling the band's `return DecisionRecord("MERGE", …)` at
+        `best_merge is not None` left 95 tests green — i.e. the bar #5006 says
+        must sit at ~0.95 was unpinned, and a near-identical paraphrase whose
+        fold would drop an attachment would silently take ADD and mint the
+        second Point this whole mechanism exists to prevent.
+        """
+        prior = {"id": "pt_p", "content": self.PARAPHRASE_PRIOR,
+                 "about_entities": ["Team"]}
+        candidate = {"content": self.PARAPHRASE_TEXT,
+                     "about_entities": ["Team", "Office"]}
+        # the three premises, asserted so the fixture cannot rot into an
+        # accidental exact match (which would pass this test for the wrong arm)
+        assert v2._norm(candidate["content"]) != v2._norm(prior["content"])
+        assert v2._boundary(prior["content"],
+                            candidate["content"]) == (None, frozenset())
+        assert v2._token_overlap(prior["content"],
+                                 candidate["content"]) >= ndm.MERGE_MIN_OVERLAP
+
+        d = v2.classify_consolidation(
+            candidate, [prior], entity_mentions=["Team", "Office"],
+            merge_flagged=True)
+        assert d.decision == "MERGE", d.evidence
+        assert d.reason == "near_dup_merge"
+        assert d.prior_id == "pt_p"
+        assert set(d.union_entities) == {"Office", "Team"}
+
+        # …and the VERDICT is what admits it: the same pair, no verdict, keeps
+        # both claims (the pre-#5006 behaviour, deliberately unchanged)
+        unflagged = v2.classify_consolidation(
+            candidate, [prior], entity_mentions=["Team", "Office"])
+        assert unflagged.decision == "ADD", unflagged.evidence
+
+    def test_a_tie_between_a_fold_and_a_merge_goes_to_the_merge(self):
+        """The documented tie-break (`best_noop[0] > best_merge[0]`), pinned.
+
+        Two priors at the SAME overlap: one whose attachment set already covers
+        the candidate (a lossless fold — NOOP), one whose does not (a merge with
+        a union — MERGE). The comment at the comparison says ties go to MERGE,
+        because it preserves the union where NOOP preserves only the prior's set
+        and both are lossless. Unpinned, `>` could become `>=` and silently
+        prefer the narrower write.
+        """
+        covered = {"id": "pt_covered", "content": self.PARAPHRASE_PRIOR,
+                   "about_entities": ["Team", "Office"]}
+        lossy = {"id": "pt_lossy", "content": self.PARAPHRASE_PRIOR,
+                 "about_entities": ["Team"]}
+        candidate = {"content": self.PARAPHRASE_TEXT,
+                     "about_entities": ["Team", "Office"]}
+
+        d = v2.classify_consolidation(
+            candidate, [covered, lossy], entity_mentions=["Team", "Office"],
+            merge_flagged=True)
+        assert d.decision == "MERGE", d.evidence
+        assert d.prior_id == "pt_lossy"
+        assert set(d.union_entities) == {"Office", "Team"}
+
     def test_flagged_pair_merges_onto_the_prior_and_carries_the_union(self):
         d = _classify(_prior(), _candidate(), flagged=True)
         assert d.decision == "MERGE", d.evidence
@@ -386,6 +457,73 @@ class TestTheVetVerdictReachesTheFusion:
         }}
         flagged = v2._merge_flagged_contents(surface)
         assert flagged == frozenset({v2._norm(PRIOR_CONTENT)})
+
+    def test_the_arbiter_verdict_reaches_the_fusion_through_the_pipeline(
+            self, monkeypatch):
+        """THE JOIN: `extract_session_v2`'s hand-off into `execute_embed`.
+
+        `execute_embed(..., merge_flagged=_merge_flagged_contents(vet_s2_stats,
+        vet_union_stats))` is the ONE line that carries a S2.2b verdict to S3,
+        and every other test here covers one SIDE of it: the producer (unit),
+        the consumer (`execute_embed(merge_flagged=…)` called directly), and the
+        capture seam — which monkeypatches `extract_session_v2` OUT, so it
+        cannot see this line. Measured: replacing the argument with
+        `frozenset()` left 677 tests green across this file,
+        test_extractor_v2, test_vet_gate_5005, test_capture_session,
+        test_ingest_v2_consolidation and test_capture_phase_d_dedup. The
+        mechanism then reverts to exactly the defect #5006 closed — a verdict
+        with no consumer — while the registry still says `implemented`.
+
+        Layer coverage: the REAL `extract_session_v2` (its S2.2b VET included,
+        with an injected arbiter) and the REAL `execute_embed`. Only S3's graph
+        search is stubbed (`search_graph` → one prior): the embedded lane has no
+        search backend, and the prior is the input the classifier needs. That is
+        a stub of the GRAPH, not of the wiring under test.
+        """
+        import tortoise.extractor_v2 as ev2
+        from tortoise import vet_gate as vg
+
+        prior_text = "the team meets weekly in the main office"
+
+        class _Model:
+            last_finish_reason = "stop"
+
+            def complete(self, *, system, user, max_tokens=None):
+                if "STORY SUMMARIZER" in system:
+                    return "A narrative that states one thing."
+                if "GAP REVIEWER" in system:
+                    return ('{"entities": [], "events": [], "operators": [], '
+                            '"points": []}')
+                return ('{"entities": [{"name": "Team", "kind": "core:team"},'
+                        ' {"name": "Office", "kind": "core:location"}],'
+                        ' "points": [{"content": "' + prior_text + '",'
+                        ' "pointKind": "statement",'
+                        # the candidate names an entity the PRIOR does not, so a
+                        # fold would be LOSSY — that is what makes MERGE the
+                        # admissible action instead of NOOP (`#9424`)
+                        ' "about_entities": ["Team", "Office"]}],'
+                        ' "events": [], "operators": []}')
+
+        def _merge_the_point_points(cands, _story):
+            return {"verdicts": [{"id": c["id"], "outcome": vg.MERGE,
+                                  "rule_id": "test.merge", "reason": "test"}
+                                 for c in cands if c["section"] == "points"]}
+
+        monkeypatch.setenv("TORTOISE_VET", "1")
+        monkeypatch.setattr(ev2, "search_graph", lambda *a, **k: {
+            "mode": "embedded", "degraded": False, "reason": None,
+            "entities": [], "events": [], "queries_run": 0,
+            "points": [{"id": "pt_prior", "content": prior_text,
+                        "about_entities": ["Team"]}]})
+
+        out = ev2.extract_session_v2(
+            _Model(), [{"role": "user", "content": prior_text}],
+            vet_arbiter=_merge_the_point_points)
+
+        assert out["stats"]["merges"] == 1, out.get("warnings")
+        assert out["payload"]["points"] == [], out["payload"]["points"]
+        (record,) = out["merges"]
+        assert record["point_id"] == "pt_prior"
 
     def test_a_verdict_on_another_SECTION_does_not_authorise_a_point_merge(
             self):
