@@ -212,6 +212,13 @@ RECORD_MIGRATIONS: tuple[str, ...] = (
     # reader must see it or `_split_properties` would refuse every narrative
     # column and the projection would write nothing while reporting success.
     "20261023000001_record_session_narrative.sql",
+    # #9555/R7: the narrative CARRIER, recorded on the SCHEMA as COMMENT ON
+    # (append-only — the table's own creation file cannot be edited, #1095).
+    # Contributes no COLUMN, so it is listed for the registry reason above: the
+    # filename is the only total partition of "is this the record's schema", and
+    # an unlisted migration is invisible to the reverse direction of
+    # `tests/test_9231_record_migrations_trigger.py`.
+    "20261024000001_record_session_narrative_carrier.sql",
     # The tenancy boundary itself (#9554, epic #7879): the app role, its table
     # grants and the tenant GUC. It contributes NO column and no refusal — and
     # it is listed anyway, per the registry rule above. Leaving it out was the

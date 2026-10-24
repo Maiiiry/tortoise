@@ -121,7 +121,7 @@ narrowed PRIMARY exception — an author-set prior is a non-reconstructible inpu
 per journal record type, totality as a registry property, idempotence by statement shape
 (`INSERT … ON CONFLICT (org_id, graph_id, node_key) DO UPDATE`), and the property→column decision
 **read from the migrations on disk** rather than restated (`RECORD_MIGRATIONS`,
-`tortoise/record_projection.py:170`; `table_columns()`, `refused_props_names()`).
+`tortoise/record_projection.py:172`; `table_columns()`, `refused_props_names()`).
 
 `PointsMerged` and `EntityMutated op=rename` are **declared refusals**, and `ConfidenceChanged` is a
 **`NoRecordEffect`** — the EP carve-out in executable form (`04-projection.md` §1).
@@ -156,7 +156,7 @@ raised) and §17.1-correct (record after the append, before the cache fold).
 
 ### A5. Embeddings — **durable today, not searchable, and that is not a defect**
 
-`embedding jsonb` on `source` (`…01:175`), `event` (`…01:233`), `point` (`…03:66`). **No migration and no module uses `pgvector`** — `grep -riE 'pgvector|vector\('` over all 71
+`embedding jsonb` on `source` (`…01:175`), `event` (`…01:233`), `point` (`…03:66`). **No migration and no module uses `pgvector`** — `grep -riE 'pgvector|vector\('` over all 72
 migrations returns **0**, and `git grep -il pgvector -- 'tortoise/*'` is **0**. The word itself
 appears in prose only — e.g. this document, §12.1c's open question, this epic's
 `03-schema.md`, and the competitor notes. So the record is a **durability carrier** for vectors, not a retrieval index — which is
@@ -243,7 +243,7 @@ first. `TORTOISE_RECORD_SINGLE_TENANT` is deliberately staged nowhere and a test
 `push` trigger on `supabase/**` runs the drift checks, not the apply — so the record tables will
 land on the next dispatch
 whether or not R1 has happened. Two couplings to respect: the record reader is **name-gated** on
-`RECORD_MIGRATIONS` (`record_projection.py:170`, no glob) so a **new** `.sql` is invisible to the
+`RECORD_MIGRATIONS` (`record_projection.py:172`, no glob) so a **new** `.sql` is invisible to the
 image until its name is added there; and `deploy-hosted.yml` deliberately does **not** trigger on
 `supabase/migrations/**` for that reason.
 **What it blocks:** any write at all; and a schema change that silently no-ops in the image.
@@ -560,8 +560,9 @@ exactly this question and the tree cannot answer it today.
 `8767b1c8b` measurement **there was no dedicated table for it** — the text was carried as data, in the
 `point.content` column and in the layer-1 `journal_event.payload` mirror of the record that wrote it
 (see below) — `grep -riE 'narrative|raw_turn|raw_text|transcript'` over all
-65 migrations returned **0** (at this head, 71 migrations, the same command matches it on 48 lines — 7 in `20261025000001_record_tenancy_role_and_guc.sql` (R6's grants and
-tenant policy for that very table) and 36 in `20261023000001_record_session_narrative.sql` — the table this
+65 migrations returned **0** (at this head, 72 migrations, the same command matches it on 62 lines — 7 in `20261025000001_record_tenancy_role_and_guc.sql` (R6's grants and
+tenant policy for that very table), 36 in `20261023000001_record_session_narrative.sql` and 19 in
+`20261024000001_record_session_narrative_carrier.sql` — the table this
 item's DECIDED block adds);
 `public.session` carries `turn_count` and **no turns**. §9.1 is explicit
 that *"the narrative is not something we're suggesting to store in the graph (same as raw) but store
@@ -978,7 +979,7 @@ both `rebuild_from_record` and backup-module lines still return the stated count
 
 ⚠️ **Re-measured 2026-10-22 (#9555): the third command is no longer 0.** The block above stands as
 what was run at `8767b1c8b`; at this head the same `narrative|raw_turn|raw_text|transcript` grep
-returns **48 lines, all in `20261025000001_record_tenancy_role_and_guc.sql` (7) and `20261023000001_record_session_narrative.sql` (41)** — R7's table, the tenth
+returns **62 lines, all in** `20261025000001_record_tenancy_role_and_guc.sql` (7), `20261023000001_record_session_narrative.sql` (36) and `20261024000001_record_session_narrative_carrier.sql` (19) — R7's table, the tenth
 record table (§A1). The other commands were re-run at this head and still return the counts the
 block states, with the one exception below (`app.current_org_id`).
 
@@ -987,11 +988,16 @@ The block's `grep -rn 'app.current_org_id' --include=*.py tortoise/ tools/ → 0
 pre-R6 reading. R6's tenancy boundary now ships the GUC, so the same grep returns
 **2 lines at `ff6379eb2`** — `tortoise/record_projection.py:227` (`TENANT_GUC =
 "app.current_org_id"`) and its docstring at `:3269`, the offsets `c5cbcbb4f` (R6's tenancy boundary)
-introduced — and **5 lines at this head**: `54a3e7abe` (R9's backup role must BYPASS RLS) added three
-`tortoise/record_backup.py` mentions *and* moved the projection's two to `:228` and `:3296`. The
+introduced — and **8 lines at this head**: `54a3e7abe` (R9's backup role must BYPASS RLS) added three
+`tortoise/record_backup.py` mentions, and #9555 (R7's narrative fetch) added three more —
+`tortoise/record_text.py` ×2 and `tortoise/__main__.py` ×1. ⛔ The sites are named by CONTENT and
+NOT by offset: the projection's two have moved on every change that touched that file (this note
+listed `:227`/`:3269`, then `:228`/`:3296`, then `:230`/`:3359`, and #9555's own registry entry moved
+them again) — a third offset in a note whose next sentence says the offsets are unusable is how a
+census note starts certifying a line nobody can find. The
 setter is `TENANT_GUC_SQL`, `set_config('app.current_org_id', $1, true)`, installed by
 `record_projection.scope_connection()` before the first plan statement of both record doors. The
-sites are named by CONTENT rather than by offset because the offset has already moved twice, and the
+sites are named by CONTENT rather than by offset because the offsets move on every edit, and the
 count carries its tree because a bare count re-stales on the next main-side edit — that is the
 failure this note exists to close. That is why the row above reads *"RLS as the tenancy boundary —
 SHIPPED"* while this census line still says zero; the census measured `8767b1c8b`, and

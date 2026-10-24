@@ -47,11 +47,12 @@
 --     arrive separately, so a whole-column-set write would erase whichever
 --     landed first, and the replay would then depend on arrival order.
 --   * `narrative`  <- the commit's `story_arc`, and `summary` <- the same
---     records' `summary`: **PRIMARY**, carried by `SessionNarrated` — the
---     record §9555's follow-up added to the layer-1 commit path (see the
---     ✅ CARRIER block below; when THIS migration landed the class was
---     PRIMARY-WITHOUT-CARRIER and the journal had to be extended, which is
---     exactly what that block records).
+--     records' `summary`: **PRIMARY-WITHOUT-CARRIER today.** §9.1 places this
+--     text here, so the COLUMN is right — but no producer journals it (see the
+--     ⚠️ CARRIER GAP block below: the layer-1 commit writes it to the graph by
+--     raw Cypher, which is not a journal record). Under the four-class rule
+--     that means “the journal must be extended”, and extending it is R7's
+--     remainder (#9555), not a claim that the carriage already exists.
 --
 -- TENANCY. Same posture as the other record tables (`#7968`): RLS enabled, an
 -- `authenticated` read policy on `app.current_org_id`, a `service_role` policy
@@ -98,46 +99,24 @@
 --     for a session the graph no longer has, and a same-id re-capture would
 --     attach the deleted incarnation's narrative to the new one.
 --
--- ✅ THE CARRIER — LANDED with #9555 (this block replaces the CARRIER GAP that
--- this migration shipped with, and the replacement is the point: a stale gap
--- note is how the next lane rebuilds work that already exists).
--- `hosted_api._execute_commit_writes` now journals `SessionNarrated`
--- (`record_projection.NARRATIVE_RECORD_TYPE`) immediately after the raw Cypher
--- MERGE it describes, carrying `sessionId` + `story_arc` + `summary`, and that
--- record lands here through the SHAPE-KEYED projection (`_narrative_statements`)
--- with no node materialised (`NoRecordEffect`; §9.1: "not in the graph, not a
--- `Document` node, not a `Point"`). So on a live capture this row lands with
--- BOTH its counts and its text, and a record-sourced rebuild reproduces them:
--- `tests/test_9555_narrative_carrier.py` (the carrier, the projection, §9.4's
--- verbatim fetch) and `tests/test_9555_narrative_cache_rebuild.py` (the cache
--- destroyed and rebuilt from the record alone).
--- ⚠️ THE PRODUCER'S PRECONDITION, stated so this is not over-read: the record is
--- reached through `sdk._emit_event` → the live door, which writes only from a
--- record that reached a CONFIGURED JOURNAL (`write_live_record(durable=…)`) and
--- only when `TORTOISE_RECORD_DSN` is armed. An unarmed deployment is
--- byte-identical to the pre-record one (§2.0), and the narrative is then
--- live-only exactly as before — not silently claimed.
--- HISTORY, kept because it is what makes the two statements above checkable.
--- Before the carrier, `story_arc` (the `narrative`) and its `summary` were
--- written to the GRAPH by the layer-1 commit's raw Cypher (`hosted_api.py`:
--- `SET s.story_arc=$arc, s.sessionId=$sid …`), and raw Cypher is **not** a
--- journal record (§17.1's unjournalled-writer ledger):
+-- ⚠️ THE CARRIER GAP, STATED SO THIS TABLE IS NOT OVER-READ. `story_arc` (the
+-- `narrative`) and its `summary` are written to the GRAPH by the layer-1 commit's
+-- raw Cypher (`hosted_api.py`: `SET s.story_arc=$arc, s.sessionId=$sid …`), and
+-- raw Cypher is **not** a journal record (§17.1's unjournalled-writer ledger):
 -- `grep -rn story_arc tortoise/` finds commit *payloads* and those raw writes,
--- and no producer journalled either — so on a live capture the row landed
+-- and no producer journals either. So on a live capture today this row lands
 -- with its two COUNTS filled and its two TEXT columns NULL: `turn_count` and
 -- `capture_redactions` each ride a `SessionRecorded` the capture emits, and
 -- `capture_redactions` reaches this table as an integer because
 -- `20261022000001` narrowed `public.session.capture_redactions` off `jsonb`
--- (#9264/R4, settled) — the projection was correct and total, and its narrative
--- carrier did not exist. ⛔ It was NOT faked with a NULL-looking value or by
--- scraping the graph (which would make the record's text depend on the cache it
--- is supposed to survive); it was built, in the producer described above.
--- ⚠️ The read path was the second half of #9555 and is now wired too:
--- `tortoise/record_text.py` composes `record_read` for §9.4's fetch and
--- `python -m tortoise record-text` is its operator verb (exit 0 served /
--- 3 readable-and-absent / 2 no verdict). ⛔ The hosted ask/answer path's own
--- verbatim fetch is still NOT wired, deliberately: it is an MCP/SDK SURFACE
--- change and `AGENTS.md` puts that behind Daniel's approval.
+-- (#9264/R4, settled) — the projection is correct and total, but the narrative
+-- carrier does not exist yet. That is exactly why the header above classes the
+-- two text columns as PRIMARY-WITHOUT-CARRIER rather than PRIMARY. The producer
+-- (journal the derived `:Source`/`:Event` write with `summary`/`story_arc`/
+-- `sessionId`) and the wiring of the read arm into R8's restore verb / the ask
+-- path are the remainder of #9555 — recorded on the issue, deliberately not
+-- faked here by writing a NULL-looking value or by scraping the graph (which
+-- would make the record's text depend on the cache it is supposed to survive).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS public.session_narrative (

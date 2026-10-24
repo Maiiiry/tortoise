@@ -1284,9 +1284,8 @@ def _cmd_record_text(args):
     import json as _json
 
     from tortoise.record_text import (
-        EXIT_ABSENT,
-        EXIT_SERVED,
         EXIT_UNAVAILABLE,
+        exit_code_for,
         log_result,
         scoped,
         serve_from_record,
@@ -1448,7 +1447,10 @@ def _cmd_record_text(args):
         print(_json.dumps(outcome.as_dict(), indent=2, sort_keys=True))
     else:
         print(outcome.render())
-    return EXIT_SERVED if outcome.served else EXIT_ABSENT
+    # The mapping is the COMPOSITION's, not a second copy here: `exit_code_for`
+    # is what the exit-code pin exercises, so the shipped path and the pin
+    # cannot disagree (PR #9862 review round 3).
+    return exit_code_for(outcome)
 
 
 def _cmd_init(args):

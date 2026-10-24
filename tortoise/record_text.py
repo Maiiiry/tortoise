@@ -80,7 +80,11 @@ LOG_NAME = "tortoise.record_text"
 #: The text was read from the record and is being served.
 EXIT_SERVED = 0
 #: No verdict was produced: no/invalid DSN, ``psycopg2`` absent, an unreadable
-#: record, or a scope this role cannot see. Never reported as an absence.
+#: record — or a connection the TENANT PROLOGUE refuses (a role that bypasses
+#: RLS; a tenant GUC that did not stick). Never reported as an absence.
+#: ⚠️ A scope that does not EXIST is not this case: it scopes fine and reads
+#: back fine, so its zero rows are an honest absence (:data:`EXIT_ABSENT`). The
+#: distinction is the whole 3-versus-2 split.
 EXIT_UNAVAILABLE = 2
 #: The record was READABLE for this scope and holds no §9.1 text for the key.
 #: An honest absence — the distinction from :data:`EXIT_UNAVAILABLE` is the
@@ -254,7 +258,16 @@ def serve_from_record(
 
 
 def exit_code_for(outcome: TextOutcome) -> int:
-    """``0`` served · ``3`` readable-and-absent · ``2`` no verdict produced."""
+    """``0`` served · ``3`` scoped-and-read-but-absent.
+
+    ⛔ ``2`` is deliberately NOT reachable here, and that is why the verb calls
+    this function rather than re-deriving the mapping inline: a
+    :class:`TextOutcome` only exists once a read happened, so "no verdict" is a
+    fact of the DOOR (no DSN, an unscopable connection, an unreadable record),
+    never of an outcome. A mapping that could return ``2`` would be a second
+    declaration of the exit contract living next to the first — the drift this
+    project already paid for once (PR #9862 review round 3).
+    """
     return EXIT_SERVED if outcome.served else EXIT_ABSENT
 
 

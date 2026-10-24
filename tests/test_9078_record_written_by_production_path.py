@@ -3246,59 +3246,84 @@ def yaml_jobs():
 # fixture junit XML, so what is asserted is the exit code and the named problem
 # — the effect — rather than a word appearing somewhere in a YAML string.
 
-#: A green armed run: both legs ran, nothing skipped, nothing failed.
-_JUNIT_GREEN = """<testsuites><testsuite name="pytest" tests="2" failures="0" \
+#: A green armed run: legs from BOTH files this job runs, nothing skipped,
+#: nothing failed. ⛔ The classnames are the real MODULES (not `tests.test_9078`),
+#: because the gate attributes an armed leg to its FILE and requires one from each
+#: — a fixture whose classnames collapse to one module would certify a run the
+#: gate exists to refuse (PR #9862 review round 3).
+_JUNIT_GREEN = """<testsuites><testsuite name="pytest" tests="3" failures="0" \
  errors="0" skipped="0">
-  <testcase classname="tests.test_9078" 
+  <testcase classname="tests.test_9078_record_written_by_production_path" \
             name="test_the_public_capture_path_writes_the_record"/>
-  <testcase classname="tests.test_9078"
+  <testcase classname="tests.test_9078_record_written_by_production_path" \
             name="test_the_public_capture_path_writes_the_epistemic_layer"/>
+  <testcase classname="tests.test_9555_narrative_carrier" \
+            name="test_the_public_capture_path_lands_the_narrative_in_the_record"/>
 </testsuite></testsuites>"""
 
-#: The defect #9551 exists for: the DSN (or the driver) did not arm, so BOTH
-#: legs skipped and pytest exited 0 — a run that certified nothing.
-_JUNIT_REAL_SKIP = """<testsuites><testsuite name="pytest" tests="2" failures="0" \
+#: ⛔ THE HOLE a flat leg count cannot see: three armed legs, ALL from one file.
+#: `armed = 3 >= 2` certified this; one-armed-leg-per-file does not. This is the
+#: shape PR #9862 produced by adding a second file to the job.
+_JUNIT_ONE_FILE = """<testsuites><testsuite name="pytest" tests="3" failures="0" \
+ errors="0" skipped="0">
+  <testcase classname="tests.test_9555_narrative_carrier" \
+            name="test_the_public_capture_path_lands_the_narrative_in_the_record"/>
+  <testcase classname="tests.test_9555_narrative_carrier" \
+            name="test_the_public_capture_path_serves_S9_4_text_by_SOURCE_URL"/>
+  <testcase classname="tests.test_9555_narrative_carrier" \
+            name="test_the_public_capture_path_serves_S9_4_text_through_the_VERB"/>
+</testsuite></testsuites>"""
+
+#: The defect #9551 exists for: the DSN (or the driver) did not arm, so the arms
+#: SKIPPED and pytest exited 0 — a run that certified nothing. One green leg from
+#: the OTHER file keeps the per-file rule satisfied, so the ONLY problem this
+#: fixture can produce is the skip itself.
+_JUNIT_REAL_SKIP = """<testsuites><testsuite name="pytest" tests="3" failures="0" \
  errors="0" skipped="2">
-  <testcase classname="tests.test_9078"
+  <testcase classname="tests.test_9078_record_written_by_production_path"
             name="test_the_public_capture_path_writes_the_record">
     <skipped type="pytest.skip" message="no record DSN">test_x.py:1711: skip</skipped>
   </testcase>
-  <testcase classname="tests.test_9078"
+  <testcase classname="tests.test_9078_record_written_by_production_path"
             name="test_the_public_capture_path_writes_the_epistemic_layer">
     <skipped type="pytest.skip" message="no record DSN">test_x.py:1711: skip</skipped>
   </testcase>
+  <testcase classname="tests.test_9555_narrative_carrier"
+            name="test_the_public_capture_path_lands_the_narrative_in_the_record"/>
 </testsuite></testsuites>"""
 
 #: A strict xfail of one armed leg (the engine-dependency pin). It is recorded
 #: as `type="pytest.xfail"` AND counted in the suite's `skipped` attribute, so a
 #: gate that read the attribute would red this required job for a database that
 #: armed perfectly.
-_JUNIT_XFAIL = """<testsuites><testsuite name="pytest" tests="2" failures="0" \
+_JUNIT_XFAIL = """<testsuites><testsuite name="pytest" tests="3" failures="0" \
  errors="0" skipped="1">
-  <testcase classname="tests.test_9078"
+  <testcase classname="tests.test_9078_record_written_by_production_path"
             name="test_the_public_capture_path_writes_the_record"/>
-  <testcase classname="tests.test_9078"
+  <testcase classname="tests.test_9078_record_written_by_production_path"
             name="test_the_public_capture_path_writes_the_epistemic_layer">
     <skipped type="pytest.xfail" message="the fold refuses captured Points"/>
   </testcase>
+  <testcase classname="tests.test_9555_narrative_carrier"
+            name="test_the_public_capture_path_lands_the_narrative_in_the_record"/>
 </testsuite></testsuites>"""
 
 #: One leg deselected out of the run — the Postgres proof never happened.
 _JUNIT_DESELECTED = """<testsuites><testsuite name="pytest" tests="1" \
  failures="0" errors="0" skipped="0">
-  <testcase classname="tests.test_9078"
+  <testcase classname="tests.test_9078_record_written_by_production_path"
             name="test_the_public_capture_path_writes_the_record"/>
 </testsuite></testsuites>"""
 
 #: A red leg (the ordinary failing case).
-_JUNIT_FAILED = """<testsuites><testsuite name="pytest" tests="2" failures="1" \
+_JUNIT_FAILED = """<testsuites><testsuite name="pytest" tests="3" failures="1" \
  errors="0" skipped="0">
-  <testcase classname="tests.test_9078"
+  <testcase classname="tests.test_9078_record_written_by_production_path"
             name="test_the_public_capture_path_writes_the_record">
     <failure message="AssertionError">boom</failure>
   </testcase>
-  <testcase classname="tests.test_9078"
-            name="test_the_public_capture_path_writes_the_epistemic_layer"/>
+  <testcase classname="tests.test_9555_narrative_carrier"
+            name="test_the_public_capture_path_lands_the_narrative_in_the_record"/>
 </testsuite></testsuites>"""
 
 #: pytest collected nothing (a bad `-k`, a broken module): nothing certified.
@@ -3336,8 +3361,26 @@ def test_the_arm_gate_reds_on_a_real_skip_and_names_it(tmp_path):
     assert _gate_errors(result) == [
         "::error::2 leg(s) SKIPPED — the record database did not arm, or the "
         "driver is missing (#9551)"], _gate_errors(result)
-    assert "skipped=2" in result.stdout and "armed_capture_legs=2" in result.stdout, (
+    assert "skipped=2" in result.stdout and "armed_capture_legs=3" in result.stdout, (
         "the gate must report the counts it decided on, not just its verdict")
+
+
+def test_the_arm_gate_reds_when_only_ONE_FILE_contributed_legs(tmp_path):
+    """⛔ The hole a flat leg count cannot see (PR #9862 review round 3).
+
+    The job now runs two files. `MIN_ARMED_LEGS = 2` was satisfied by three legs
+    from ONE file, so both of the four-layer proof's legs could be deselected and
+    the gate would still certify the run — a silent reopening of #9551's exact
+    defect, reachable by editing only the pytest argument list. The fixtures use
+    the real module classnames, so `from_files` is the discriminating number.
+    """
+    result = _run_leg_gate(tmp_path, _JUNIT_ONE_FILE)
+    assert result.returncode == 1, (
+        "the gate certified a run in which a whole FILE's armed legs never ran:\n"
+        f"{result.stdout}")
+    errors = _gate_errors(result)
+    assert any("from only 1 file" in line for line in errors), errors
+    assert "from_files=1" in result.stdout, result.stdout
 
 
 def test_the_arm_gate_passes_a_green_armed_run(tmp_path):
@@ -3424,7 +3467,7 @@ def test_deleting_the_skip_clause_reds_the_arm_gate(tmp_path):
     """
     source = RECORD_LEG_GATE.read_text(encoding="utf-8")
     start = source.find("    if skipped:")
-    end = source.find("    if len(armed) < MIN_ARMED_LEGS:")
+    end = source.find("    if len(armed_files) < MIN_ARMED_LEG_FILES:")
     assert start != -1 and end > start, (
         "the skip clause moved — re-point this mutation test at it instead of "
         "deleting the proof that the pin discriminates")
@@ -3459,10 +3502,14 @@ def test_the_arm_gate_is_a_file_the_job_calls_never_an_inline_heredoc():
         "the gate script exposes no `decide`/`main` — a module whose logic is "
         "unreachable cannot be tested against a fixture, which is the whole "
         "point of moving it out of the YAML")
-    assert module.MIN_ARMED_LEGS == 2, (
-        "the armed leg count moved — the job exists for exactly two legs, so "
-        "a third (or a second) needs the fixture set re-derived, not a number "
-        "retyped")
+    # ⛔ PER FILE, not per leg: a flat leg count was satisfiable with a whole
+    # file's legs deselected once this job ran two files (PR #9862 review round
+    # 3). The number is a property of the JOB's pytest argument list, so adding a
+    # third file there means re-deriving this, not retyping it.
+    assert module.MIN_ARMED_LEG_FILES == 2, (
+        "the armed FILE count moved — the job arms two files (the four-layer "
+        "proof and R7's narrative carrier), so a third needs the fixtures "
+        "re-derived, not a number retyped")
     _name, job = _record_ci_job()
     called = [str(step.get("run", "")) for step in (job.get("steps") or [])]
     assert any(RECORD_LEG_GATE.name in run for run in called), (

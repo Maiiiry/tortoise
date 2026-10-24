@@ -58,12 +58,21 @@ from tortoise import record_read as rr
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATIONS = REPO_ROOT / "supabase" / "migrations"
 MIGRATION_NAME = "20261023000001_record_session_narrative.sql"
+#: The CARRIER's own migration (#9555). The table's creation file is APPEND-ONLY
+#: (#1095), so the follow-up that closed the carrier gap records the correction
+#: on the SCHEMA with `COMMENT ON` instead — a real catalog object, no column or
+#: policy change, and CI's `check-migration-append-only` accepts it.
+CARRIER_MIGRATION = "20261024000001_record_session_narrative_carrier.sql"
 ORG = "org_9555"
 GRAPH = "graph_9555"
 
 
 def _migration_sql() -> str:
     return (MIGRATIONS / MIGRATION_NAME).read_text(encoding="utf-8")
+
+
+def _carrier_migration_sql() -> str:
+    return (MIGRATIONS / CARRIER_MIGRATION).read_text(encoding="utf-8")
 
 
 # ── 1. The home exists, is registered, and ships in the wheel ────────────────
@@ -73,6 +82,11 @@ def test_the_migration_is_registered_and_exists():
     """A table the reader cannot see is a table the projection cannot write."""
     assert MIGRATION_NAME in rp.RECORD_MIGRATIONS
     assert (MIGRATIONS / MIGRATION_NAME).exists()
+    # Both halves: the table's creation file AND the carrier's later, append-only
+    # correcting migration (a `COMMENT ON`, which is how a merged migration's
+    # story is corrected — #1095 forbids editing it).
+    assert CARRIER_MIGRATION in rp.RECORD_MIGRATIONS
+    assert (MIGRATIONS / CARRIER_MIGRATION).exists()
 
 
 def test_the_migration_ships_in_the_wheel():
@@ -108,39 +122,37 @@ def test_the_foreign_key_cascades_so_erasure_reaches_it():
 
 
 def test_the_carrier_block_states_the_carrier_THAT_LANDED():
-    """The migration's carrier block must state the PRESENT, and keep the past.
+    """The SCHEMA must state the PRESENT carrier — and keep the past.
 
-    This pin has now been re-derived twice, and both times for the same reason:
-    a migration comment is where the next lane reads what is true. It first
-    guarded against the block inventing a `capture_redactions` gap that the
-    #9264/R4 narrowing had already closed. #9555 has since landed the OTHER half
-    — the journal carrier for `story_arc`/`summary` — so the block that used to
-    disclose a GAP (`⚠️ THE CARRIER GAP`) now discloses the CARRIER
-    (`✅ THE CARRIER`), and a pin still indexing the old heading would fail
-    without saying anything about the truth.
+    This pin has been re-derived twice, and both times for the same reason: a
+    migration is where the next reader learns what is true. It first guarded
+    against the table's creation block inventing a `capture_redactions` gap that
+    the #9264/R4 narrowing had already closed. #9555 has since landed the OTHER
+    half — the journal carrier for `story_arc`/`summary` — and ⛔ that correction
+    could NOT be an edit to `20261023000001`: a merged migration is append-only
+    (#1095) and CI's `check-migration-append-only` refuses a modified one. The
+    correction therefore lives in `CARRIER_MIGRATION` as `COMMENT ON`, which
+    the psql `d+` output shows.
 
     Two halves, because a comment can fail in either direction:
 
     * the CLOSED claims must be gone (no `DatatypeMismatch` refusal, no
-      "`capture_redactions` NULL" as the live outcome) — those are false in this
-      tree;
+      "`capture_redactions` NULL" as the live outcome);
     * the CARRIER must be named (`SessionNarrated`, the shape-keyed projection,
-      `NoRecordEffect`) AND its HISTORY kept (`raw Cypher`,
-      `story_arc`/`summary`), because the history is what makes the claim
-      checkable — deleting it would leave an assertion nobody can audit.
+      `NoRecordEffect`) AND its history kept (`raw Cypher`, `story_arc`,
+      `summary`), because the history is what makes the claim checkable.
 
     Derived from the tree, not re-typed: the narrowing migration and the
     registry constant are both read.
     """
-    sql = _migration_sql()
-    assert "✅ THE CARRIER" in sql, (
-        "the migration's carrier block is gone — if the heading moved again, "
-        "re-derive this pin rather than deleting it")
-    start = sql.index("✅ THE CARRIER")
-    block = sql[start:sql.index("\n-- ====", start)]
+    carrier_sql = _carrier_migration_sql()
+    assert "COMMENT ON TABLE public.session_narrative" in carrier_sql, (
+        "the carrier's correction must be a real catalog object (COMMENT ON), "
+        "not just a prose paragraph — a merged migration cannot be edited")
+    assert "COMMENT ON COLUMN public.session_narrative" in carrier_sql
 
     # The #9264/R4 settling migration is in THIS tree, and it narrows the
-    # column the old block said would refuse the carrier.
+    # column the table's creation block said would refuse the carrier.
     narrowing = (MIGRATIONS
                  / "20261022000001_record_session_capture_redactions_integer.sql")
     assert narrowing.exists(), (
@@ -155,30 +167,29 @@ def test_the_carrier_block_states_the_carrier_THAT_LANDED():
         "re-derived rather than loosened")
     for claim in ("DatatypeMismatch", "`capture_redactions` NULL",
                   "`capture_redactions` is NULL"):
-        assert claim not in block, (
+        assert claim not in carrier_sql, (
             f"the carrier block still states the CLOSED gap {claim!r} — the "
             "column is `integer` since 20261022000001 (#9264/R4 settled) and "
-            "the count LANDS"
-        )
+            "the count LANDS")
 
     # The CARRIER that landed is named, and named the way the code names it —
     # read off the registry so the comment cannot drift from the constant.
     from tortoise import record_projection as rp
-    assert rp.NARRATIVE_RECORD_TYPE in block, (
+    assert rp.NARRATIVE_RECORD_TYPE in carrier_sql, (
         f"the block does not name {rp.NARRATIVE_RECORD_TYPE!r} — a reader would "
         "conclude the narrative still has no journal carrier and rebuild it")
-    assert "_narrative_statements" in block, (
+    assert "_narrative_statements" in carrier_sql, (
         "the block does not say WHICH projection lands the narrative "
         "(the shape-keyed `_narrative_statements`), so its 'record effect' "
         "claim is unfalsifiable")
-    assert "NoRecordEffect" in block, (
+    assert "NoRecordEffect" in carrier_sql, (
         "the block does not say the carrier materialises NO node — which is "
         "the whole §9.1 reason it is a carrier and not a node record")
 
     # History kept: the gap's CAUSE stays stated, because that is what a
     # reader checks the claim against.
     for kept in ("story_arc", "summary", "raw Cypher"):
-        assert kept in block, (
+        assert kept in carrier_sql, (
             f"the carrier block dropped {kept!r} — the history is what makes the "
             "claim auditable, and deleting it is not a correction")
 
