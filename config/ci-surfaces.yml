@@ -1450,6 +1450,23 @@ surfaces:
   # breaks them. `core` remains load-bearing for the other input,
   # `tortoise/record_writer.py`, which matches no SOURCE_PATTERN.
   - test_9192_tenant_armed_by_request.py
+  # #9664: DUAL-REGISTERED with `core` (below), for the same #2969/#9192 reason.
+  # `tortoise/mcp_auth.py` is an EXACT `SOURCE_PATTERNS["api"]` entry — the
+  # per-request tenant install the capstone drives, AND the module that produces
+  # the refusal text its unauthenticated leg asserts (`ERR_UNAUTHORIZED`, the
+  # `"Unauthorized: … Bearer …"` body) — so a middleware-only diff selects
+  # `api` and REPLACES the `core` fallback (`select()` adds `core` only in its
+  # `if not found:` branch; `CORE_ALSO` lists neither). `tortoise/supabase_control.py`
+  # (the control plane the fixture stubs) is the other `api` match.
+  # Measured on this entry's absence: `--changed-files tortoise/mcp_auth.py`
+  # yielded surfaces=['api'] with this file ABSENT — i.e. the one end-to-end pin
+  # of "an authenticated connector request reaches the record under the request's
+  # OWN tenant" would not run on the diff class that can break it, the
+  # #1349/#2938/#3154/#4367 silent-drop class. Keep BOTH arms: `core` is
+  # load-bearing for `record_writer.py` (no SOURCE_PATTERN), this one for the
+  # middleware diff. Pinned by
+  # `tests/test_ci_selection.py::test_9664_capstone_runs_on_the_middleware_diff_that_can_break_it`.
+  - test_9664_capstone_connector_to_record.py
   battery:
   - test_battery_arms.py
   # (removed a duplicate test_battery_derive_truth_leg.py entry here on the
@@ -1626,6 +1643,32 @@ surfaces:
   # FastMCP app over an embedded registry with planted credentials and spies on
   # `record_writer.write_records`, so it needs no graph and no URI.
   - test_9192_tenant_armed_by_request.py
+  # #9664 (the capstone): an authenticated CONNECTOR request (`POST /mcp`,
+  # `tools/call`) puts a Point in the Postgres RECORD, under the request's own
+  # tenant, and the identifier the client is handed reads it back. Registered
+  # `core` because `tortoise/record_writer.py` — the seam whose rows are asserted
+  # — matches no `SOURCE_PATTERN`, so a diff to it selects the `core` fallback and
+  # this file must be in that pool or the row-count assertion runs nowhere; its
+  # other subjects (`tortoise/mcp_server.py`, `tortoise/tool_registry.py`) are
+  # `SHARED_MODULES` and run the FULL matrix regardless (the `#6211` idiom — do
+  # not read this entry as covering those diffs). `.github/workflows/*.yml` is
+  # unclassified → FULL, so the workflow half also runs on its own diffs.
+  # DB-free for EIGHT of its ten legs (the surface, the verify-envelope check, the
+  # two description-matcher assertions, both description pins and the CI-wiring
+  # pin, plus the strict xfail). The other TWO need `TEST_RECORD_DB_URI`: the
+  # capstone's rows,
+  # and the unauthenticated refusal — which skips rather than guesses because it
+  # asserts that NO row was written, and without a database that assertion would
+  # be about nothing. Both are ARMED in the dedicated `test-record-postgres` job,
+  # which this file is wired into (pinned by its own
+  # `test_ci_runs_this_file_in_the_armed_record_job`, so deleting it from that
+  # job's `run:` cannot leave a green job). Same shape as the `#9551` entry above:
+  # the fast matrix keeps the surface/description/wiring legs, the armed job keeps
+  # the record. The `api` arm above covers the `tortoise/mcp_auth.py` /
+  # `tortoise/supabase_control.py` diff, which selects `api` and replaces this
+  # fallback; a `tortoise/mcp_server.py`/`tortoise/tool_registry.py` diff arrives
+  # as `SHARED_MODULES` (FULL matrix) and a `record_writer.py` diff lands here.
+  - test_9664_capstone_connector_to_record.py
   # #9190: `EventLog.append()` returns the record's journal position (the `seq`
   # `record_projection.replay_plan` keys `journal_event` on) and
   # `EventLog.position()` exposes the count. Same anchor as the #5612 entry
@@ -7813,6 +7856,23 @@ durations:
   # Entered LOW per the #2517/#4883 precedent for a newly-added file, so the
   # duration-coverage floor is not spent; the first post-merge push re-measures.
   test_9192_tenant_armed_by_request.py: 3.8  # ci-timing top-15 2026-10-20 (run 39467226356); was 2.0
+  # #9664 capstone connector→record. TEN tests: SEVEN DB-free (the surface, the
+  # two description-matcher assertions, both description pins, the verify-envelope
+  # check and the CI-wiring pin), ONE strict xfail (DB-free), and TWO that SKIP by
+  # name without `TEST_RECORD_DB_URI` (the capstone's rows and the unauthenticated
+  # refusal, which asserts no row was written). Measured 2026-10-24 on this host,
+  # DB-free — the lane whose wall clock this row's weight is for: "7 passed, 2
+  # skipped, 1 xfailed in 1.63s" (`TORTOISE_TEST_CARVE_OUT=1`, `TORTOISE_DB_URI`
+  # unset) and "7 passed, 2 skipped, 1 xfailed in 2.06s" (docker FalkorDB), so the
+  # 2.0 entry still holds. Armed against a throwaway `postgres:16`: "9 passed,
+  # 1 xfailed, 0 skipped" — its WALL CLOCK is deliberately not quoted as this
+  # row's weight: a dev venv carries `[embeddings]`, which the
+  # `test-record-postgres` job omits on purpose (`pip install -e
+  # '.[test,postgres]'`, measured there as "71s against 204s with the embedder
+  # installed"), and the embedder load dominates the capstone leg on a dev box.
+  # Entered LOW per the #2517/#4883 precedent for a newly-added file so the
+  # duration-coverage floor is not spent; the first post-merge push re-measures it.
+  test_9664_capstone_connector_to_record.py: 2.0
   test_5917_torn_tail_seal.py: 2.0
   test_longmem_costing.py: 0.2
   test_longmem_errors.py: 0.1
