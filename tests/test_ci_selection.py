@@ -157,8 +157,9 @@ def test_docs_scanning_gates_stay_in_tier1():
         "reads docs/runbook/b7-activation-scorecard.md — `docs/` is in "
         "NON_PYTHON_PREFIXES and the runbook matches no SOURCE_PATTERNS "
         "entry, so a runbook-only diff runs tier1 only; without this "
-        "registration the pre-#8135 sentence (or a dropped #9084 plain-dict "
-        "clause) merges green (#4309 class, same as #8614)"
+        "registration the pre-#8135 sentence (or a dropped #9084 CLOSED "
+        "claim, or a re-asserted plain-dict producer) merges green (#4309 "
+        "class, same as #8614)"
     )
     assert "test_definite_description_backfill_5059.py" in tier1, (
         "#5333 review (P1): the *G5's destructive half* doc guards in this file "
@@ -264,6 +265,44 @@ def test_fly_secret_drift_gate_runs_on_a_runbook_only_diff():
     )
 
 
+def test_the_record_arming_runbook_pins_run_on_a_runbook_only_diff():
+    """#9548 review (P1): the arming section's pins must run on the runbook.
+
+    `tests/test_deploy_workflow.py` binds `docs/infra-runbook.md` prose for the
+    first time in #9548 (§"Arming the Postgres record"):
+    `_record_arming_section()`, `_matrix_rows()` and
+    `test_the_record_arming_verify_recipe_reads_a_surface_that_exists`. `docs/`
+    is in NON_PYTHON_PREFIXES and the runbook matches no SOURCE_PATTERNS entry,
+    so a runbook-only diff filters to `changed == []` and takes the docs-only
+    early return — tier1 ONLY. Registered in `core` but not in `tier1`, those
+    pins were therefore asleep on the only realistic diff that can re-break
+    them: a docs-only PR re-introducing
+    `curl -s localhost:9090/metrics | grep record_write_failures` — which the
+    hosted app does not serve, so it prints nothing in EVERY state and the
+    empty grep reads as "0 failures" — or restoring the absolute
+    `record_write_failures == 0` bar, would merge green and only red `main`
+    post-merge (#4309 silent-drop class; the #8614 shape one runbook section
+    over). Dropping the tier1 entry re-opens that hole.
+    """
+    r = _sel(["docs/infra-runbook.md"])
+    assert r["full"] is False
+    assert r["surfaces"] == []
+    assert "test_deploy_workflow.py" in r["test_files"], (
+        "a docs/infra-runbook.md-only diff must select the pins that bind its "
+        "arming-section prose (`test_deploy_workflow.py`) — otherwise a "
+        "docs-only edit that restores the 9090/metrics recipe or the absolute "
+        "`record_write_failures == 0` bar merges green (#9548 review, #4309 "
+        "class)"
+    )
+    # ... and the pre-existing runbook owner must stay selected alongside it:
+    # the two files pin DIFFERENT halves of the same doc (Secrets Matrix +
+    # rotation recipes vs. the arming section), so neither substitutes.
+    assert "test_fly_secret_drift.py" in r["test_files"], (
+        "the #8614 runbook owner must stay in tier1 — #9548 adds a second "
+        "runbook reader, it does not replace the first"
+    )
+
+
 def test_b7_runbook_ok_semantics_gate_runs_on_a_runbook_only_diff():
     """#8135 review (P1, two reviews): the runbook's `ok` pin must run on the runbook.
 
@@ -277,7 +316,8 @@ def test_b7_runbook_ok_semantics_gate_runs_on_a_runbook_only_diff():
     The pin used to live in `tests/test_activation_scorecard.py`, registered on
     `api` and `core` but NOT in `tier1`, so it was asleep on the one change that
     can break it: re-introducing "means only that the tool did not raise", or
-    deleting the #9084 plain-dict clause, in a docs-only PR merged green.
+    dropping the #9084 CLOSED claim (and the two residuals it names), in a
+    docs-only PR merged green.
     Dropping the tier1 entry moves the pin back into that hole (#4309 silent-drop
     class; the #8614 shape one runbook over).
     """
@@ -288,7 +328,7 @@ def test_b7_runbook_ok_semantics_gate_runs_on_a_runbook_only_diff():
         "a docs/runbook/b7-activation-scorecard.md-only diff must select the "
         "pin that binds its prose (test_b7_runbook_ok_semantics_8135.py) — "
         "otherwise a docs-only edit that re-teaches the pre-#8135 meaning of "
-        "`ok`, or drops the #9084 boundary, merges green (#8135 review P1, "
+        "`ok`, or drops the #9084 CLOSED claim, merges green (#8135 review P1, "
         "#4309 class)"
     )
 
@@ -2443,6 +2483,28 @@ def test_record_schema_pin_runs_on_migration_or_doc_change():
         assert "test_record_projection.py" in r["test_files"], (changed, r)
 
 
+def test_the_tenancy_migration_selects_the_posture_pins():
+    # #9554, PR #9600 review cycle 1 (P2): the TENANCY POSTURE migration defines
+    # the record's entire boundary — the role, its grants (including the
+    # IDENTITY sequence's USAGE) and the `*_app_tenant` policies (one per record
+    # table, ten since #9555's `session_narrative`). It sorts
+    # outside the `2026101200000` CORE_ALSO prefix and `supabase/` is in
+    # NON_PYTHON_PREFIXES, so without its own entry a migration-only edit
+    # (dropping a `WITH CHECK`, flipping `is_local`, re-adding `BYPASSRLS`,
+    # deleting the sequence grant) selected NO PYTHON surface: the PGlite posture
+    # suite already ran (the workflow selects it from its own `supabase/migrations/`
+    # prefix output), but `tests/test_record_tenancy_guc.py` — the suite that pins
+    # this migration's text — did not. Mutation check: removing the CORE_ALSO entry makes
+    # this assertion fail with `surfaces == []`.
+    changed = "supabase/migrations/20261025000001_record_tenancy_role_and_guc.sql"
+
+    r = _sel([changed])
+
+    assert r["full"] is False, r
+    assert r["surfaces"] == ["core"], r
+    assert "test_record_tenancy_guc.py" in r["test_files"], r
+
+
 def test_postgres_storage_guard_runs_on_migration_or_doc_change():
     # PR #8744 review P2: `tests/test_postgres_storage.py` pins the SQL↔Python
     # contract — the two RPC names and the `p_since`/`p_until` parameter names
@@ -2779,6 +2841,25 @@ def test_capstone_probe_change_selects_core_not_tier1():
         assert r["full"] is False, (path, r)
 
 
+def test_the_capstone_gate_change_selects_core_not_tier1():
+    # #9089 review P2: the GATE itself (tools/capstone_verdict_check.py) owns
+    # tests/test_7949_capstone_verdict_check.py, which is registered `core` —
+    # and `config/ci-surfaces.yml` names `core` as its home. Before the
+    # CORE_ALSO row a gate-only diff came back with NO surface at all and the
+    # pin ran only because it also sits in the `tier1` curated list, so `core`
+    # was nominal and one `tier1` edit would have dropped the pin silently
+    # (the #1349/#3332/#3616 class, reached through the docs-only early return
+    # rather than through `_selection_relevant`).
+    #
+    # MEASURED before the row (2026-10-20, `select()` in-process):
+    # `_sel(["tools/capstone_verdict_check.py"])` -> surfaces=[], full=False.
+    # Mutation check: removing the CORE_ALSO row fails assert 1 below.
+    r = _sel(["tools/capstone_verdict_check.py"])
+    assert "core" in r["surfaces"], r
+    assert "test_7949_capstone_verdict_check.py" in r["test_files"], r
+    assert r["full"] is False, r
+
+
 def test_the_capstone_evidence_bundle_selects_core_not_tier1():
     # PR #9196 review P1: the S2 verdict's deciding artifacts are committed TEXT
     # — `s2-wiring-census.log` (the census output), `e2e-chain-probe.log` (the
@@ -2832,6 +2913,51 @@ def test_the_capstone_census_pin_runs_on_a_main_py_change():
     assert "api" in r["surfaces"], r
     assert "test_7950_capstone_probe.py" in r["test_files"], r
     assert r["full"] is False, r
+
+
+def test_7949_capstone_probe_change_selects_core_not_tier1():
+    # #9080: docs/evidence/7949-capstone/probes/capstone_run.py owns
+    # tests/test_7949_capstone_verdict_check.py (`core`), the DB-free pin on the
+    # run's refusal chain and the pure observers every row is derived from.
+    #
+    # ⛔ The entry that keeps this `core` is the BUNDLE prefix
+    # (`docs/evidence/7949-capstone/`, added by #9076), NOT a `probes/` row.
+    # This PR added the narrower `docs/evidence/7949-capstone/probes/` and its
+    # claim was wrong on both halves (#9089 review P1): the broader row was
+    # already in place and `path.startswith()` makes a narrower prefix inside
+    # it dead, so (a) the entry changed no selection, and (b) the mutation
+    # claim this comment used to carry ("removing the entry fails assert 1")
+    # was falsified — the test passed with the entry deleted. MEASURED
+    # (2026-10-20, `select()` in-process, narrow row deleted):
+    # `_sel(["docs/evidence/7949-capstone/probes/capstone_run.py"])` ->
+    # surfaces=['core'], full=False, the pin present. The narrow row was
+    # removed; the mutation check below now names the row that does the work.
+    for path in (
+        "docs/evidence/7949-capstone/probes/capstone_run.py",
+        "docs/evidence/7949-capstone/probes/README.md",
+    ):
+        r = _sel([path])
+        assert "core" in r["surfaces"], (path, r)
+        assert "test_7949_capstone_verdict_check.py" in r["test_files"], (path, r)
+        assert r["full"] is False, (path, r)
+
+
+def test_no_core_also_entry_is_shadowed_by_a_parent_prefix():
+    # #9089 review P1: `CORE_ALSO` matching is `path.startswith(entry)`, so an
+    # entry that is a DESCENDANT of another entry can never admit a path its
+    # parent does not — it is dead config that reads as the reason a path is
+    # covered. This bundle added exactly one such row
+    # (`docs/evidence/7949-capstone/probes/` under the bundle prefix) and its
+    # pin passed with the row deleted, so nothing else could notice.
+    #
+    # Non-vacuity: with that row restored this test fails (it is the only
+    # shadowed pair in the tuple, measured 2026-10-20: 63 entries, 1 pair).
+    entries = list(cs.CORE_ALSO)
+    shadowed = sorted((a, b) for a in entries for b in entries
+                      if a != b and a.startswith(b))
+    assert shadowed == [], (
+        "CORE_ALSO rows shadowed by a parent prefix (dead config — delete the "
+        f"narrow row, keep the broad one): {shadowed}")
 
 
 def test_the_capture_receipt_key_registry_pin_runs_for_every_surface_that_owns_it():
@@ -2956,7 +3082,7 @@ def test_install_ci_runner_x64_tool_change_selects_core_not_tier1():
     # and that `core` is selected, not that it rides in the diff selection.
     #
     # Mutation check: removing the CORE_ALSO entry makes the first assert fail (surfaces == []).
-    from tools.ci_selection import carve_out_files  # noqa: I001
+    from tools.ci_selection import carve_out_files
 
     r = _sel(["tools/install-ci-runner-x64.sh"])
     assert r["surfaces"] == ["core"], r
@@ -3105,6 +3231,41 @@ def test_9192_guard_runs_on_the_diff_that_can_break_it():
     assert api_sel["full"] is False, api_sel
     assert api_sel["surfaces"] == ["api"], api_sel
     assert "test_9192_tenant_armed_by_request.py" in api_sel["test_files"], api_sel
+
+
+def test_9664_capstone_runs_on_the_middleware_diff_that_can_break_it():
+    # #9664 review P2: `tests/test_9664_capstone_connector_to_record.py` is the
+    # end-to-end pin of "an authenticated CONNECTOR request reaches the record
+    # under the request's OWN tenant". It was registered `core`-only, and
+    # `tortoise/mcp_auth.py` — the per-request tenant install it drives, AND the
+    # module that produces the 401 body its refusal leg asserts — is an EXACT
+    # `SOURCE_PATTERNS["api"]` entry, so a middleware-only diff selects `api` and
+    # REPLACES the `core` fallback (`core` is added only in the `if not found:`
+    # branch; `CORE_ALSO` lists neither path). Registration alone is not a
+    # selection pin: a guard registered and never selected on the diff that can
+    # break it certifies nothing (#9196/#9231, the same reasoning as the #9192 pin
+    # above).
+    #
+    # Measured before this entry's `api` arm was added:
+    # `select(["tortoise/mcp_auth.py"])` -> surfaces=['api'] with the file ABSENT.
+    #
+    # Mutation check: deleting the `api` arm fails the second pair of asserts,
+    # deleting the `core` arm fails the first — neither can be dropped believing
+    # the other covers it.
+    core_sel = _sel(["tortoise/record_writer.py"])
+    assert core_sel["full"] is False, core_sel
+    assert "core" in core_sel["surfaces"], core_sel
+    assert "test_9664_capstone_connector_to_record.py" in core_sel["test_files"], core_sel
+
+    for middleware_diff in ("tortoise/mcp_auth.py", "tortoise/supabase_control.py"):
+        api_sel = _sel([middleware_diff])
+        assert api_sel["full"] is False, api_sel
+        assert api_sel["surfaces"] == ["api"], (middleware_diff, api_sel)
+        assert "test_9664_capstone_connector_to_record.py" in api_sel["test_files"], (
+            middleware_diff,
+            "the capstone would not run on the diff class that can break its "
+            "tenant install or its refusal text",
+            api_sel)
 
 
 def test_source_currency_tool_change_selects_core_not_tier1():

@@ -76,6 +76,10 @@ from .vector_write import (  # #4520: the ONE clear-then-set vector seam
 )
 # #4282 phase 2: retired public names fail with their replacement named (#3836 (c)).
 from .sdk_retired import retirement_hint
+from .validity import (  # #2350: the ONE home for the precision PROP NAMES
+    FROM_PRECISION_PROP,
+    TO_PRECISION_PROP,
+)
 from .live import TERMINAL_EXCLUDED_STATUSES  # EP terminal vocabulary (shared)
 from .live import _live_only  # #6597 dream coverage closure mirrors EP liveness
 from .live import decay_clause, _terminal_excluded  # #2490 vacuity decay + terminal predicate
@@ -4929,6 +4933,39 @@ _ISO_DATE10_RE = re.compile(r"^(\d{4})[-/](\d{2})[-/](\d{2})")
 #: fabricated date in front of a temporal question.
 _UNDATED_SENTINEL = "1970-01-01T00:00:00Z"
 
+#: "the caller did not pass this field" — the ONE sentinel for a partial
+#: update (#4282 phase 2.3). A plain ``None`` default cannot carry this
+#: meaning: for ``update_memory_graph``'s ``recording``, ``None`` is a
+#: MEANINGFUL value ("clear the override → inherit the org default"), so
+#: conflating it with "unspecified" would clear an override on every call
+#: that only meant to rename the graph.
+class _Unset:
+    """The type of :data:`_UNSET` — so the parameter's contract stays narrow.
+
+    Annotating the parameter ``bool | None | object`` would collapse to ``object``
+    (a union with ``object`` IS ``object``), which silently drops the contract: a
+    caller could pass ``recording="false"`` and the registry would store a STRING
+    that reads back truthy, leaving recording ON.
+
+    ⛔ The ANNOTATION is not the enforcement — ``sdk.py`` is
+    ``from __future__ import annotations``, so at runtime every annotation is a
+    string, and the only static consumer (``mypy tortoise/``) disables
+    ``arg-type``. ``update_memory_graph`` therefore REFUSES a non-``bool``
+    ``recording`` with a ``TypeError`` before any write, so the accepted set really
+    is ``{True, False, None, _UNSET}``. Same rule, same wording as the REST twin
+    (``hosted_api.GraphRecordingPatch._strict_bool``: *"reject anything that is not
+    an actual bool"*), because ``_apply_graph_recording_override`` resolves the
+    stored value with ``bool(override)`` — a stored ``"false"`` reads back ON.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<unset>"
+
+
+_UNSET: _Unset = _Unset()
+
 
 def _iso_date10(value: object) -> str:
     """``value``'s ``YYYY-MM-DD`` calendar date, else ``""`` (unknown).
@@ -6305,6 +6342,50 @@ class UnapprovedKindNamespace(ValueError):
         self.installed = installed
 
 
+#: #7819 — the props REFUSED on a TERMINAL claim: ONTOLOGY §4.7's four
+#: caller-temporal properties — the valid-time window (both bounds and their
+#: precision markers, which describe the bounds), ``expiredAt``, the
+#: transaction-time termination stamp, and ``when``, the occurrence-time anchor.
+#: An end written after death is the window the temporal read surfaces answer
+#: from (`_covers` / `get_historical_knowledge`), so writing it here changes what
+#: the dead claim asserts about WHEN it held, with no CORRECTS and no lifecycle
+#: record. ``when`` carries the same harm on the occurrence axis, and it is not
+#: inert metadata: ``extractor_v2`` dates a supersession decision off
+#: ``existing["when"]``, so re-stamping it re-dates the dead claim for the
+#: extractor as well as for the temporal reads.
+#:
+#: (``createdAt``/``updatedAt`` complete §4.7's temporal set but are write
+#: stamps, not claims about when the assertion held: ``update_point`` stamps
+#: ``updatedAt`` itself on every call and ``createdAt`` is a create-time stamp,
+#: so neither belongs to the temporal record this guard protects.)
+#:
+#: Scoped, not blanket, because a content/metadata revision of a terminal claim
+#: is a recorded capability: a ``PointRevised`` later than a terminalization is
+#: the newer same-id writer and the replay fold handles it (``skip_updated_at``
+#: via ``max_inline_seq``, #3305), pinned by
+#: ``test_pointinvalidated_rebuild.py::test_revise_after_invalidate_skip_
+#: updated_at`` and ``test_pointsuperseded_rebuild.py::test_supersede_then_
+#: revision_does_not_end_at_the_supersede_ts``.
+#:
+#: ``outdated`` is absent because ``_sanitize_props`` already refuses it as a
+#: server-managed lifecycle flag.
+#:
+#: #9649 covers the separate door ``update_entity`` opens onto the same window
+#: (its Point arms write caller props and ``status`` with a vocabulary check and
+#: no lifecycle guard, so they can also flip a ``retracted`` Point to ``live``).
+#:
+#: The two precision names are the CANONICAL constants from ``validity``, never
+#: re-spelled here: a hand-written copy of a canonical declaration is how
+#: ``outdated`` silently dropped out of three readers (#2901/#4058), and a
+#: rename in ``validity`` would be followed by the #2350 precision refusal while
+#: this set kept the stale spelling — the guard would then fail OPEN on the
+#: markers every other reader still gates.
+_TEMPORAL_RESTAMP_PROPS = frozenset({
+    "validFrom", "validTo", FROM_PRECISION_PROP, TO_PRECISION_PROP,
+    "expiredAt", "when",
+})
+
+
 def _refuse_inverted_point_window(g, props: dict, *,
                                   point_id: str | None = None) -> None:
     """#5359: refuse an INVERTED validity window at a Point write boundary.
@@ -7430,6 +7511,24 @@ class TortoiseSDK:
             # `_projection_for(target)` assignments in `__main__.py` hand the
             # SDK a projection that was never bound either.
             self._proj._bind_journal(self._event_log_path)
+            # #9553 class 4 (R5): the structural-edge mints (`create_edge` and its
+            # three typed wrappers, `create_about_edge`) wrote bare edges that
+            # NOTHING journaled, so `rebuild_all` reported `edges: 0` for
+            # `ownedBy`/`hasPart`/`dependsOn`/`wasDerivedFrom`/`references` and the
+            # record's `relation` table never saw them. The engine already carries
+            # them (`DirectEdgeCreated` + pass-2b) — what was missing was the
+            # EMISSION, and this is it: the projection hands each edge it writes
+            # back to this SDK, which journals the record. Bound HERE, beside
+            # `_bind_journal`, because that is the same fact — this projection is a
+            # live cache with a journal behind it.
+            #
+            # ⛔ CONDITIONAL ON THE JOURNAL, exactly as the record's own door is
+            # (`record_writer.write_live_record`: a record appended to a SCRATCH
+            # buffer must not become a row, because nothing could ever replay it).
+            # With no journal the recorder is None, so the mint writes exactly what
+            # it wrote before #9553 — no record, no half-carried edge.
+            self._proj._bind_structural_edge_recorder(
+                self._record_structural_edge if self._event_log_path else None)
             # (B) #2952: explicit embedder warm-up at ENGINE INIT —
             # best-effort, non-fatal, and non-blocking (daemon thread) so a
             # load failure surfaces ONCE here instead of masquerading as a
@@ -7793,6 +7892,74 @@ class TortoiseSDK:
             purge_overflow(proj, max_events=cap)
         except Exception:  # noqa: BLE001, RUF100
             _logger.warning("event retention purge failed — continuing", exc_info=True)
+
+    def _record_structural_edge(self, descriptor: dict) -> None:
+        """Journal ONE structural edge as §4.4's flat `DirectEdgeCreated` (#9553).
+
+        Bound on the projection by :meth:`_get_proj`; called by the structural
+        edge lane's two mints AFTER their MERGE (`projection/edges.py`,
+        `_record_structural_edges`), once per resolved endpoint pair.
+
+        THE SHAPE IS `create_direct_edge`'s, deliberately: `{src, tgt,
+        edge_type}` flat, plus `source_label`/`target_label`. The labels are what
+        `record_projection` needs — `relation.src_label`/`tgt_label` are bound as
+        VALUES and `relation` carries composite FKs into `node_identity`, so the
+        record must know WHICH table to resolve the endpoint in (a `Point` keys
+        `node_key = id`, a `Subject` keys `name`) — while the journal fold
+        IGNORES them and resolves labels itself by an id-anchored sweep
+        (`rebuild_all` pass-2b). Adding them therefore changes nothing for the
+        journal route and is what makes the record route agree with it.
+
+        ⚠️ NO `direction`/`confidence`/`weight`/`label`/`batch_id`: these edges
+        carry no relationship properties (§9.6 — the verbs take no value
+        parameter). Emitting `direction` here would be an invention the fold
+        would then SET on the rebuilt edge.
+
+        Emission is on EVERY successful write, not created-only, exactly as
+        `create_direct_edge` does: the replay MERGE is idempotent, and a
+        created-only gate would lose the edge from the log forever if the process
+        died between the graph write and this call.
+
+        Never raises: `_emit_event` is best-effort by contract (a journal append
+        failure is counted and logged there) and the record write's own door
+        (`record_writer.write_live_record`) heals by replay.
+        """
+        rel = descriptor.get("edge_type")
+        src, tgt = descriptor.get("src"), descriptor.get("tgt")
+        # A malformed descriptor is journaled as NOTHING (a record that cannot be
+        # addressed is worse than an absent one). A SELF-EDGE is skipped for the
+        # reason the replay fold skips it — `E2E-11.6`'s no-self contract — so
+        # journaling one would give the RECORD an edge the journal-sourced rebuild
+        # never re-creates: the two routes would disagree about topology, which is
+        # the defect this producer exists to end. ⛔ AND THE SKIP IS DISCLOSED once
+        # per relation, like the endpoint decline: the mint DID write a live
+        # self-loop, so silence here would be a live ≠ rebuild divergence with no
+        # diagnostic anywhere (measured: `create_edge("related", p, p)` leaves one
+        # live edge, no record, no log line).
+        if not isinstance(rel, str) or not isinstance(src, str) \
+                or not isinstance(tgt, str):
+            return
+        if src == tgt:
+            from .projection.edges import _RECORD_GAP_WARNED
+
+            if rel not in _RECORD_GAP_WARNED:
+                _RECORD_GAP_WARNED.add(rel)
+                _logger.warning(
+                    "structural edge %r: a SELF-EDGE (%s -> %s) is written to the "
+                    "graph and NOT journaled — the replay fold skips `src == tgt` "
+                    "(E2E-11.6), so a rebuild cannot re-create it. Declared at "
+                    "`04-projection.md` §3 rather than dropped in silence (#9553).",
+                    rel, src, tgt)
+            return
+        self._emit_event(
+            "DirectEdgeCreated",
+            id=f"{src}->{tgt}:{rel}",
+            src=src,
+            tgt=tgt,
+            edge_type=rel,
+            source_label=descriptor.get("src_label"),
+            target_label=descriptor.get("tgt_label"),
+        )
 
     def _emit_event(self, type_: str, payload: dict | None = None, *,
                     point: dict | None = None,
@@ -8964,6 +9131,58 @@ class TortoiseSDK:
                     len(_key_hits), _supplied_key, kind, _key_hits, _key_hits[0])
             if existing_id:
                 pid = existing_id
+                # ── #7819: a dedup hit must not RE-STAMP a dead claim ───────
+                # The check sits at the TOP of this branch because the fold has
+                # two write legs and only one of them is `update_point`: the
+                # authored-word leg (`set_point_baseline` +
+                # `_stamp_authored_word`) writes server-owned baseline props
+                # directly.
+                #
+                # It is scoped to `_TEMPORAL_RESTAMP_PROPS` — the reason is
+                # stated ONCE on that constant — so a fold that carries no
+                # temporal prop keeps applying, exactly like any other revision
+                # of a dead claim (#3305). What must not happen is a fold that
+                # writes the window: it is all-or-nothing, so the WHOLE fold is
+                # dropped rather than applied-minus-the-window.
+                #
+                # Why not "just let the guard raise": the hosted commit path
+                # re-keys a successor onto an already-dead node when the
+                # successor's content address exists as one, and a committed
+                # `when` puts a window on that fold —
+                # `hosted_api._execute_commit_writes` sets `validFrom` from
+                # `pr.point.when` (cited by symbol: this branch's own census file
+                # forbids `file:line` pointers, which drift) — so a raise
+                # there is the deterministic fail-closed 500 #3366 exists to
+                # prevent.
+                #
+                # A dropped fold WARNS **and ADVISES** (#5365's posture, never
+                # a silent skip): the caller keeps the honest outcome — the
+                # dedup HIT is still reported and the point is still terminal —
+                # and is told the window was not written, in the RESULT (the
+                # `temporal_not_applied` advisory, which the hosted commit
+                # receipt folds into `warnings`) as well as the log. The
+                # operation for "replace what this
+                # claim said, from a different time" is the retroactive
+                # correction, which is DESIGN ONLY and not shipped in this tree
+                # (`supersede_retroactively` has no SDK method and no registry
+                # row; #5362 waits on surface approval).
+                _temporal = _TEMPORAL_RESTAMP_PROPS & set(props)
+                if _temporal:
+                    _terminal = self._lifecycle_terminal_marker(pid)
+                    if _terminal is not None:
+                        _logger.warning(
+                            "create_point: dedup resolved to point %s, which "
+                            "is already terminal (%s) — the fold would "
+                            "re-stamp its temporal record (%s), so NOTHING "
+                            "was applied (#7819).",
+                            pid, _terminal, sorted(_temporal))
+                        # ...and SAY it in the RESULT, not only in the log: a
+                        # warning is not observable to a hosted commit caller
+                        # or to an SDK caller reading the return value. The
+                        # advisory is transient (#8171) — it rides a COPY, so
+                        # neither `get_point` nor the journal ever holds it.
+                        return {**self.get_point(pid),
+                                **self._temporal_not_applied_advisory(pid)}
                 if _has_key:
                     # One read serves BOTH #6110 audits below.
                     _existing = self.get_point(pid)
@@ -9922,6 +10141,15 @@ class TortoiseSDK:
             model, _redact_turn_contents(conversation)[0],
             sdk=self, session_id=session_id, chunk_size=chunk_size,
             session_date=session_date)
+        # ⚠️ A `MERGE` verdict decided HERE has no applier on this path: only
+        # ``_extract_session_v2`` reads ``out["merges"]`` (the ``merges = out.get("merges")``
+        # line below its extraction call) and executes ``apply_merge_union``. This
+        # entry passes no ``vet_arbiter``, and #5006's
+        # verdicts come from one, so any ``MERGE`` it could see today would suppress a
+        # payload point with no union written — no Point, no edges, no warning. If an
+        # arbiter is ever wired here, this call needs its own merge relay (or an
+        # ``allow_merge=False`` switch on ``extract_session_v2``), because the payload
+        # point is already gone by the time the record exists (#9872).
         payload = out.get("payload")
         errors = list(out.get("errors", []) or [])
         if payload is None and not errors:
@@ -12220,6 +12448,56 @@ class TortoiseSDK:
                     "(non-capture canonical / paraphrase fold / missing "
                     "node — deferred surface)")
 
+        # #5006 (D12/O4): execute the near-duplicate FUSIONs the extractor's S3
+        # decided. Unlike the noop surface above this is NOT a display path —
+        # the merge has already happened at decision time (ONE survivor, no new
+        # payload point); what remains is to write the UNION of both sides'
+        # attachments onto that survivor and the losing document's provenance
+        # (its session) onto the claim. `apply_merge_union` is the one
+        # implementation of that write, invoked from HERE; it never raises — a
+        # failed attachment is a warning, never a lost capture.
+        #
+        # ⚠️ The eval lane does NOT come through this path, and it is not a
+        # missing wire — it injects no `vet_arbiter`
+        # (`tools/longmem_eval/ingest_v2.py:1017`) and consumes only `noops`,
+        # so `merges` is always empty there. Giving eval merge coverage would
+        # need its own `_apply_merges`, in that lane.
+        #
+        # It is data-driven, not flag-driven: with no arbiter and
+        # `TORTOISE_VET` unset there are no `MERGE` verdicts, so `merges` is
+        # empty and this block is a no-op on every default capture.
+        merges = out.get("merges") or []
+        if merges:
+            from tortoise.near_dup_merge import apply_merge_union
+
+            for _m in merges:
+                _m_res = apply_merge_union(proj, _m, session_id=session_id,
+                                           sdk=self,
+                                           subject_names=subject_entity_names)
+                for _w in (_m_res.get("warnings") or []):
+                    warnings.append(f"merge {_m_res.get('point_id')}: {_w}")
+                if _m_res.get("unresolved"):
+                    # An attachment the graph could not resolve is NOT a silent
+                    # drop: it is named, and the merge record still carries the
+                    # entity so a later backfill can link it.
+                    warnings.append(
+                        "merge " + str(_m_res.get("point_id")) +
+                        ": unresolved attachment(s) " +
+                        ", ".join(_m_res["unresolved"][:5]))
+                if _m_res.get("skipped_subject"):
+                    # #5006 review (F2): a subject-kind name must NOT get the
+                    # un-gated `aboutObject` edge — the same skip this method's
+                    # own attachment pass makes above (`_n in
+                    # subject_entity_names`). It is a DROP, not a resolution
+                    # failure, so it is named separately from `unresolved`: a
+                    # merge emits no payload point, so `bind_point_subjects`
+                    # never runs for the candidate and that binding is lost.
+                    warnings.append(
+                        "merge " + str(_m_res.get("point_id")) +
+                        ": subject-kind attachment(s) skipped (the binder owns "
+                        "the gated aboutSubject edge): " +
+                        ", ".join(_m_res["skipped_subject"][:5]))
+
         # ── events ──
         # #2552: payload events are created under their CONTENT-ADDRESSED
         # ``ev_<sha>`` ids (the ``_server_id`` channel — the same id
@@ -13112,6 +13390,44 @@ class TortoiseSDK:
                 # already-satisfied status and let the non-status write path
                 # below apply them (never silently discard caller data).
                 props.pop('status')
+
+        # ── #7819: a TERMINAL claim's temporal record is refused here ───────────
+        # Measured on the pre-change tree: `retract_point(p)` followed by
+        # `update_point(p, validTo="2026-06-10")` was accepted and stored the
+        # window, as it was on a point carrying the legacy `outdated=true` flag.
+        # `supersede_point` / `invalidate_point` / `retract_point` consult the
+        # shared guard for their lifecycle writes; this verb did not, and it
+        # writes the same window the temporal read surfaces answer from.
+        #
+        # THE GATE IS SCOPED to `_TEMPORAL_RESTAMP_PROPS` (see that constant for
+        # why a blanket refusal is wrong here: #3305's post-terminalization
+        # revisions are a recorded capability). A call with no temporal prop in
+        # it does not reach this guard at all, so:
+        #   * a status-carrying call keeps the promote path unchanged —
+        #     `update_point(terminal, status='live')` still raises the #432
+        #     "Illegal status transition", and an already-LIVE node is still the
+        #     #1088 idempotent no-op;
+        #   * `missing_ok=True` keeps the absent-id contract: this verb returns
+        #     `{}` for a missing id (measured on both trees);
+        #   * `allow_operator=True` keeps operator points writable: this verb is
+        #     what `annotate_operator` delegates to, and a caller may pass a
+        #     window for an operator. A TERMINAL operator is still refused, pinned
+        #     by `test_update_point_refuses_a_terminal_operator_record` (without
+        #     the flag the operator verdict would mask the terminal one).
+        # It runs after the inverted-window and validity-precision refusals (so
+        # those are reported as themselves, not as terminal), and before the
+        # journal append and every write, so a refused call journals nothing and
+        # writes nothing.
+        #
+        # Residual, unchanged by this fix: the promote arm's
+        # `WHERE (n.status IS NULL OR n.status = 'draft')` does not read the
+        # legacy `outdated=true` flag, so a flag-dead point with a NULL status
+        # can still be given `status='live'` (the flag keeps it terminal for
+        # readers, and the status then contradicts it). That predates this
+        # change; the promote contract and its message are #432's.
+        if _TEMPORAL_RESTAMP_PROPS & set(props):
+            self._assert_lifecycle_guard(id, method="update", missing_ok=True,
+                                         allow_operator=True)
 
         # Check if node carries :Object label (entity node with version tracking)
         has_object = proj.g.query(
@@ -14094,7 +14410,8 @@ class TortoiseSDK:
 
     def _assert_lifecycle_guard(self, point_id: str, *, method: str,
                                 role: str = "point",
-                                missing_ok: bool = False) -> dict | None:
+                                missing_ok: bool = False,
+                                allow_operator: bool = False) -> dict | None:
         """Single authoritative terminal/operator guard for point lifecycle
         transitions (#2498).
 
@@ -14118,6 +14435,15 @@ class TortoiseSDK:
         ``invalidate_point``'s retry-friendly contract — then returns
         ``None``), an operator node, or an already-terminal claim.
 
+        ``allow_operator`` (#7819) is passed by ``update_point``, which writes
+        operator points (``annotate_operator`` re-enters it, and a caller may
+        supply a window for one): on that door an operator verdict is not a
+        refusal by itself, while a TERMINAL one still is. The classifier
+        checks the operator verdict before terminal
+        (``live.classify_lifecycle_fanout``), so on that branch ``status`` /
+        ``outdated`` describe the operator node and not terminality; the same
+        fan-out rows are then scanned for a terminal node.
+
         #7822: the verdict is over EVERY node carrying the id, not ``row[0]``.
         The writer's stamp MATCHes and writes EVERY node with that id (point
         ids are not unique), so a first-row-only read made the terminal /
@@ -14136,18 +14462,71 @@ class TortoiseSDK:
             if missing_ok:
                 return None
             raise ValueError(f"No point {point_id!r}")
-        if kind == "operator":
+        if kind == "operator" and not allow_operator:
             raise ValueError(
                 f"Point {point_id!r} is an operator — {method} is for "
                 f"statement points")
-        if kind == "terminal":
-            marker = ("outdated" if outdated
-                      and status not in TERMINAL_EXCLUDED_STATUSES
-                      else (status or "live"))
+        # #7819: operator-ness is writable on the doors that pass
+        # `allow_operator` (`update_point`, whose body `annotate_operator`
+        # re-enters); TERMINALITY is not. The marker is read off the same rows,
+        # once — the operator branch of the classifier outranks terminal, so
+        # its `status`/`outdated` are not the terminality answer.
+        marker = self._lifecycle_terminal_marker(point_id, rows)
+        if marker is not None:
+            # Neither verb of the two families (#7819): ``update_point``
+            # re-stamps a prop/window without terminalizing, while
+            # ``retract_point`` / ``supersede_point`` / ``invalidate_point``
+            # terminalize, so the refusal names what the dead claim FORBIDS
+            # instead of assuming the caller's shape.
             raise ValueError(
                 f"Point {point_id!r} is already terminal ({marker}) — "
-                f"{method} cannot terminalize a dead {role}")
+                f"{method} cannot re-stamp or terminalize a dead {role} "
+                f"(#2498: terminalization is one-way)")
         return {"id": point_id, "status": status, "outdated": outdated}
+
+    def _lifecycle_terminal_marker(self, point_id: str, rows=None) -> str | None:
+        """The terminal marker for an id's whole fan-out, or ``None``.
+
+        Shared by the two callers that need the verdict (#7819):
+        ``_assert_lifecycle_guard`` (which raises on a marker) and
+        ``create_point``'s dedup fold (which drops a fold that would write the
+        window onto a dead claim). The fold writes through more than one route
+        — ``update_point`` and the server-owned baseline writers — which is why
+        the check is not placed beside any single write.
+
+        Covers BOTH shapes the shared classifier can report a terminal node
+        under: ``kind == "terminal"``, and ``kind == "operator"`` — the
+        classifier ranks the operator verdict ABOVE terminal, so on that branch
+        its ``status``/``outdated`` describe the operator node and say nothing
+        about terminality. The rows are scanned with the same shared predicate
+        rather than re-queried (#7822).
+
+        ``rows`` lets a caller that already ran ``LIFECYCLE_FANOUT_QUERY`` pass
+        its result in, so the guard's verdict is over the SAME read it just
+        classified.
+        """
+        if rows is None:
+            rows = self._get_proj().g.query(
+                LIFECYCLE_FANOUT_QUERY, params={"id": point_id},
+            ).result_set
+        kind, status, outdated = classify_lifecycle_fanout(rows)
+        if kind == "operator":
+            # Picked by the classifier's OWN stable key, never by position:
+            # `classify_lifecycle_fanout` sorts a copy, so the rows here are
+            # still in server order, and this value reaches both the refusal
+            # message and the dedup WARNING.
+            hit = min(((st, od) for _op, st, od in rows
+                       if is_terminal_status(st, od)),
+                      key=lambda r: (str(r[0] or ""), bool(r[1])),
+                      default=None)
+            if hit is None:
+                return None
+            status, outdated = hit
+        elif kind != "terminal":
+            return None
+        return ("outdated" if outdated
+                and status not in TERMINAL_EXCLUDED_STATUSES
+                else (status or "live"))
 
     def _assert_window_start_not_inverted(self, point_id: str, now: str) -> None:
         """#5358: refuse an INVERTED predecessor window BEFORE any mutation.
@@ -17704,6 +18083,30 @@ class TortoiseSDK:
                                f"server-managed and cannot be set on bundle items",
                 })
         if section == "points":
+            # #8400 review P2 (the refusal message used to offer it): `dedup` is
+            # NOT a bundle item field. Step 2 writes every points item as
+            # `create_point(kind, content, dedup=True, **write_item)`, so a
+            # top-level `dedup` on the item binds the same keyword twice and
+            # raises a RAW TypeError INSIDE the write loop — after step 1 (and
+            # any earlier point item) committed, which is exactly the
+            # partial-mutation class this gate exists to replace with a
+            # zero-mutation Phase-1 refusal. Refused at shape time, beside
+            # `is_episodic`/`_server_id`/`batch_id`, where the splat-bind hazard
+            # is already the stated reason. Nested is a different story and not
+            # a hole: `_coerce_props` gives the explicit top-level `dedup=True`
+            # PRESENCE precedence, so `props: {"dedup": …}` is shadowed and then
+            # popped (measured); a double-wrapped spelling is left nested and
+            # is never consulted for the fold decision.
+            if "dedup" in item:
+                violations.append({
+                    "section": section, "index": index,
+                    "message": f"ingest: {section}[{index}] dedup is not a "
+                               f"bundle item field — ingest writes every point "
+                               f"with dedup=True, so a top-level dedup would "
+                               f"raise mid-write; mint a second point with "
+                               f"create_point(..., dedup=False) OUTSIDE the "
+                               f"bundle (#8400)",
+                })
             # kind is OPTIONAL (CYCLE-25: kind-absent defaults to
             # 'statement'); content is required.
             if item.get("content") is None or not isinstance(item.get("content"), str):
@@ -18279,6 +18682,95 @@ class TortoiseSDK:
                 out[event_id] = entry
         return out
 
+    def _terminal_holder_among(self, ids: list[str] | None) -> str | None:
+        """The first TERMINAL point in ``ids``, or ``None``.
+
+        ONE query, shared by both key legs — :meth:`_key_holder_state` (the
+        unconditional ingest guard) and :meth:`_find_terminal_dedup_hit` (the
+        route-scoped bundle-local-ref leg). The two carried byte-identical
+        copies of this statement, which is the fork class
+        ``_dedup_match_clauses``' docstring was extracted to eliminate: two
+        copies of one guard query is how the three sites disagreed before
+        (#2062/#2971/#2422). The predicate is the shared
+        ``_terminal_expression`` builder, never a re-listing.
+        """
+        if not ids:
+            return None
+        rows = self._get_proj().g.query(
+            "MATCH (n:Point) WHERE n.id IN $ids AND "
+            f"{_terminal_expression('n')} RETURN n.id LIMIT 1",
+            params={"ids": ids},
+        ).result_set
+        return rows[0][0] if rows else None
+
+    def _key_holder_state(self, kind: str, key: str | None,
+                          ) -> tuple[list[str], str | None]:
+        """``(holders, terminal_holder)`` for one ``key`` within ``kind`` — the
+        KEY-identity half of :meth:`_find_terminal_dedup_hit`, alone.
+
+        Both halves are returned from ONE resolution because they answer
+        different questions and a caller needs both: PRESENCE decides whether
+        the writer's key-first resolution stops here (a key HIT is the dedup
+        resolution whatever the content, #8400, so no content leg may run), and
+        TERMINALITY decides whether that fold would MUTATE a terminal node.
+
+        #8400/#9173: a ``points`` item carrying a ``key`` that a TERMINAL point
+        holds is NOT a direct-edge question. ``create_point``'s key-first dedup
+        resolves that point whatever the content, so the write path FOLDS onto
+        it — measured on the #9173 tree: a retracted point came back with
+        ``batch_id`` stamped and ``updatedAt`` moved (status still
+        ``retracted``). The bundle therefore MUTATES a terminal node, which is
+        the hazard #8400 P1 exists to stop.
+
+        This is why the leg must not inherit #9173's route scoping. #9173 was
+        right that every ``create_direct_edge``-predicting leg belongs to the
+        EFFECTIVE route (a Point-bearing pair is promoted to the operator route
+        and never reaches that primitive). This leg predicts a POINT WRITE, and
+        every route reaches one — scoping it by ``route == "direct"`` left it
+        dead for exactly the bundles it protects, because a ``points`` ref makes
+        the pair Point-bearing by construction.
+
+        The CONTENT-dedup legs stay route-scoped in :meth:`_find_terminal_dedup_hit`
+        — #9173 deliberately made wiring an operator to a terminal point legal,
+        and that is the class its scoping governs. Only the key IDENTITY is
+        unconditional here: the key holder is the SAME node, so there is no edge
+        question to ask.
+
+        ⚠️ RESIDUAL, stated so this helper is not read as closing more than it
+        does: a CONTENT (or hash) fold onto a terminal point is still reachable
+        from an ingest and still mutates it — ``create_point(dedup=True)``
+        resolves content unconditionally, so a fresh key (or none) with the
+        SAME content as a retracted point folds onto it and stamps
+        ``batch_id`` — and moves ``updatedAt`` when the item carries props —
+        exactly as the key case did (measured on this tree; an intra-bundle pair
+        can fold onto a terminal point it minted one statement earlier). That
+        half is NOT closed by this change
+        and not claimed to be; it is #9173's accepted trade and needs its own
+        decision rather than a silent widening of this guard.
+
+        ⛔ What this helper CANNOT answer, and does not pretend to: it reads the
+        COMMITTED graph, so a point minted terminal by an EARLIER item of the
+        same bundle is invisible to it. That half of the key identity is
+        answered by bundle-order simulation in ``_check_endpoints`` (the caller),
+        not here — see the ``minted_terminal`` map there.
+
+        Composition is the writer's own (``_find_points_by_key`` key-first, the
+        shared ``_terminal_expression`` predicate) about the NODE SET; it is
+        deliberately conservative about WHICH node: a graph written before
+        #6110 can already hold several points under one key and the writer's
+        pick among them carries no ORDER BY, so ANY terminal holder refuses
+        rather than a bet on which one the fold lands on. The refusal therefore
+        names *a* terminal holder, which need not be the node the writer would
+        have folded onto — the safe direction, and the same posture
+        :meth:`_find_terminal_dedup_hit` documents for its content fallback.
+
+        An absent or blank key is ``([], None)``: no key identity to resolve.
+        """
+        if not (isinstance(key, str) and key.strip()):
+            return [], None
+        holders = self._find_points_by_key(key, pointKind=kind)
+        return holders, self._terminal_holder_among(holders)
+
     def _find_terminal_dedup_hit(self, content: str, kind: str,
                                  key: str | None = None) -> str | None:
         """Read-only NFC-keyed dedup MATCH (mirrors create_point's dedup key)
@@ -18360,14 +18852,14 @@ class TortoiseSDK:
             # the dedup resolution (whatever the content), so return from here
             # — a fall-through to the content path could reject a bundle whose
             # writer would legally fold onto a LIVE key holder.
-            key_hits = self._find_points_by_key(key, pointKind=kind)
+            # Delegates to the ONE query+predicate home (#8400 review: the two
+            # key legs carried byte-identical copies of this statement). The
+            # presence test stays here because it is the FALL-THROUGH decision:
+            # a key HIT is the writer's resolution, so a LIVE holder returns
+            # None from here rather than falling through to the content legs.
+            key_hits, terminal = self._key_holder_state(kind, key)
             if key_hits:
-                rows = proj.g.query(
-                    "MATCH (n:Point) WHERE n.id IN $ids AND "
-                    f"{_terminal_expression('n')} RETURN n.id LIMIT 1",
-                    params={"ids": key_hits},
-                ).result_set
-                return rows[0][0] if rows else None
+                return terminal
         base_clauses, base_params = self._dedup_match_clauses(point_kind=kind)
         status_clauses = (_terminal_expression("n"),)
         rows = proj.g.query(
@@ -18564,13 +19056,22 @@ class TortoiseSDK:
         (#8623's residual class, #9173).
 
         ⛔ CONSEQUENCE, stated so a future reader is not misled: after #9173 the
-        **bundle-local dedup-hit guard** (the ``content_hash``/``content+kind``
-        leg at the bottom of this check, which resolves a ``points`` item ref)
-        is unreachable BY CONSTRUCTION — a `points` ref makes the pair
-        Point-bearing, so its effective route is always ``operator``. It is
-        retained, not deleted: it is a prediction about
+        **bundle-local CONTENT-dedup-hit guard** (the ``content_hash``/
+        ``content+kind`` leg at the bottom of this check, which resolves a
+        ``points`` item ref) is unreachable BY CONSTRUCTION — a `points` ref
+        makes the pair Point-bearing, so its effective route is always
+        ``operator``. It is retained, not deleted: it is a prediction about
         ``create_direct_edge``, and narrowing the endpoint-kind gate (#8499) is
         the only change that would make it live again.
+
+        ⛔ That scoping does NOT cover the KEY-identity arm (#8400), and the two
+        must not be read as one rule: the content legs predict a
+        ``create_direct_edge`` raise, while the key leg predicts a POINT WRITE —
+        ``create_point``'s key-first dedup folds onto the key holder on EVERY
+        route, connection or not — so the key leg runs unconditionally, at the
+        bottom of this method, over every ``points`` item. Scoping it by
+        ``route == "direct"`` is what left #8400's guard inert for exactly the
+        bundles it protects.
 
         The by-name / declared-status arms in the item loop are NOT that: they
         are the ENTITY legs (``section == "entities"``), an Object/Subject/Event
@@ -18607,6 +19108,13 @@ class TortoiseSDK:
         - the direct-route terminal legs: a terminal name holder and a terminal
           ``status`` on the FIRST item naming the name (``status`` applies at
           mint only);
+        - the UNCONDITIONAL key-identity terminal leg (#8400): a ``points`` item
+          whose ``key`` is held by a terminal point, or whose ``key`` an EARLIER
+          item of the same bundle mints terminal — the writer's key-first dedup
+          folds onto that node whatever the content and whatever the route, so
+          the bundle would MUTATE a terminal point. Read off the graph for
+          committed holders and off ``minted_terminal`` (bundle-order
+          simulation) for holders this same bundle creates;
         - an invalid ``:Subject`` ``status`` (outside ``SUBJECT_STATUS_VALUES``,
           non-string, or an explicit ``None``) on ANY entity item —
           referenced or not, on EITHER route, because the ``:Subject`` writer
@@ -18630,7 +19138,8 @@ class TortoiseSDK:
         depth, so neither a single- nor a double-wrapped spelling slips past.
 
         ``_bundle_entity_name_outcomes`` is the simulated bundle state those
-        by-name legs resolve against; see its docstring for why the answer is a
+        by-name legs resolve against, and ``minted_terminal`` is the same shape
+        for the key-identity leg; see their docstrings for why the answer is a
         property of the ordered items plus the graph, never of one item.
         """
         # (#7925 review P1) The `outdated` flag is refused by `_sanitize_props`
@@ -19342,6 +19851,98 @@ class TortoiseSDK:
                                    f"{hit!r} (dedup hit) — new direct edges to "
                                    f"terminal points are rejected",
                     })
+
+        # #8400 (RESTORED after #9173): the KEY-identity terminal guard is a
+        # prediction about a POINT WRITE, not about `create_direct_edge`, so it
+        # runs on EVERY route and over EVERY `points` item — connection or not.
+        #
+        # The leg above is dead by construction (#9173's own note says so): a
+        # `points` ref makes the pair Point-bearing, so the effective route is
+        # always `operator` and the `route != "direct"` gate skips it. That is
+        # correct for the CONTENT-dedup prediction it carries. It was NOT
+        # correct for the key IDENTITY, which `create_point` folds onto
+        # unconditionally — measured on this tree: a bundle whose `points` item
+        # carried a retracted point's key left that point with `batch_id`
+        # stamped and `updatedAt` moved (status still `retracted`). Scoping the
+        # key leg by route is what let a terminal point be mutated by an
+        # ingest that Phase 1 had certified.
+        #
+        # A points item is checked here whether or not a connection references
+        # it: step 3 writes every point item, so the fold (and the mutation)
+        # happens either way.
+        #
+        # #8400 review P2: the graph read alone is not the whole rule. Phase 1
+        # runs before ANY item is written, so a terminal point MINTED by an
+        # earlier item of the same bundle is invisible to the query above — and
+        # `_stamp_batch_id` has no terminal exclusion. `{"points": [{"key": K,
+        # "status": "retracted", …}, {"key": K, …}]}` under
+        # `promotion_policy="auto"` therefore folded the second item onto the
+        # first and stamped `batch_id` on a node born terminal: the same
+        # measured mutation, one statement inside the bundle. `minted_terminal`
+        # is the bundle-order simulation that closes it — the shape
+        # `_bundle_entity_name_outcomes` already uses for name-merged entities
+        # (a record of what the ORDERED items will have written, not a graph
+        # read).
+        _points_depth = _POINT_ITEM_FLATTEN_DEPTH
+        minted_terminal: dict[tuple[str, str], tuple[int, object]] = {}
+        for j, pitem in enumerate(bundle.get("points") or []):
+            if not isinstance(pitem, dict):
+                continue
+            pkey = _item_dedup_key(pitem)
+            if not (isinstance(pkey, str) and pkey.strip()):
+                continue
+            pkind = pitem.get("kind") or "statement"
+            holders, holder = self._key_holder_state(pkind, pkey)
+            if holder:
+                violations.append({
+                    "section": "points", "index": j,
+                    "message": f"ingest: points[{j}] (ref {pitem.get('ref')!r}) "
+                               f"key {pkey!r} is held by terminal point "
+                               f"{holder!r} (dedup hit) — create_point resolves "
+                               f"a key BEFORE content, so this write would "
+                               f"fold onto a terminal point and MUTATE it; a "
+                               f"bundle cannot turn that fold off (its "
+                               f"points are written with dedup=True, and a "
+                               f"nested 'dedup' spelling is shadowed and "
+                               f"dropped). Supersede-transfer the key first, "
+                               f"or mint the second point OUTSIDE the bundle "
+                               f"with create_point(..., key=<a FRESH key>, "
+                               f"dedup=False) — the same key with dedup=False "
+                               f"would create a second CARRIER of one key "
+                               f"(#6110) (#8400)",
+                })
+                continue
+            earlier = minted_terminal.get((pkind, pkey))
+            if earlier is not None:
+                violations.append({
+                    "section": "points", "index": j,
+                    "message": f"ingest: points[{j}] (ref {pitem.get('ref')!r}) "
+                               f"reuses key {pkey!r}, which points[{earlier[0]}] "
+                               f"in THIS bundle mints with status "
+                               f"{earlier[1]!r} — the key-first fold would land "
+                               f"on a point this same bundle creates terminal "
+                               f"and stamp it, so the bundle is rejected at "
+                               f"validation (bundle-order, not a graph read): "
+                               f"mint the second point under a FRESH key "
+                               f"(#8400)",
+                })
+                continue
+            if holders:
+                # A key HIT means the writer folds onto an existing point and
+                # the declared status is popped before the dedup branch is
+                # taken — so this item does not MINT anything terminal, and
+                # later items under the key land on that live holder.
+                continue
+            declared = _item_effective_status(pitem, _points_depth)
+            # Conservative in the FAIL-CLOSED direction, stated so it is not
+            # read as precision: this records a declared terminal status without
+            # predicting a CONTENT fold onto an existing live point (which would
+            # pop the declaration and mint nothing terminal). Over-rejecting that
+            # pathological combination — a bundle that declares `retracted` on a
+            # key which content-folds onto a live point and then reuses the key —
+            # is preferred to letting a fold land on a terminal mint.
+            if isinstance(declared, str) and declared in TERMINAL_EXCLUDED_STATUSES:
+                minted_terminal[(pkind, pkey)] = (j, declared)
 
     def _check_endpoint_race(self, index: int, conn: dict,
                              refs: dict[str, str], violations: list[dict],
@@ -31781,7 +32382,7 @@ class TortoiseSDK:
         SOR is the ``graphs`` table (20260901000001) — but the INSERT path
         into it is C2/C3 (provisioning service, out of C1 scope), so this
         method still returns the deterministic id WITHOUT persisting; the
-        registry-shaped list seam (graph_metadata/graph_list) derives the
+        registry-shaped list seam (graph_metadata/list_memory_graphs) derives the
         default graph from organizations.graph_name and reads custom rows once they
         exist. Selfhost (registry mode) keeps the registry Graph node. The
         zero-registry-writes cutover contract (registry node count == 0)
@@ -31814,8 +32415,11 @@ class TortoiseSDK:
         )
         return {"graph_id": gid, "name": name, "kind": kind, "namespace": ns}
 
-    def graph_list(self, org_id: str) -> list[dict]:
-        """List Graph nodes for an org (default graph first).
+    def list_memory_graphs(self, org_id: str) -> list[dict]:
+        """List this account's memory graphs (default graph first).
+
+        The #4282 phase 2.3 rename of ``graph_list``: the owner-approved name
+        (`docs/product/beta-sdk-surface.md` row 31). Behaviour is unchanged.
 
         #765 (plan Task 8 reader inventory): in Supabase control-plane mode
         the default graph is derived from ``teams.graph_name`` via the seam
@@ -31921,8 +32525,14 @@ class TortoiseSDK:
         )
         return True
 
-    def graph_restore(self, org_id: str, graph_id: str) -> bool:
-        """#2304 trash restore: flip a tombstoned custom node back to active
+    def restore_memory_graph(self, org_id: str, graph_id: str) -> bool:
+        """Undo a recoverable delete; refuse a purged graph.
+
+        The #4282 phase 2.3 rename of ``graph_restore`` (approved target:
+        `docs/product/beta-sdk-surface.md` row 33 — "Undo a recoverable delete.
+        **Refuses on a purged graph**"). Behaviour is unchanged.
+
+        #2304 trash restore: flip a tombstoned custom node back to active
         and clear the deletion stamp. Returns False when nothing matched
         (unknown / active / default / ALREADY PURGED — callers 404/403/410).
         Keys stay dead (revoked at delete; restore never resurrects them) —
@@ -31962,17 +32572,70 @@ class TortoiseSDK:
             for r in rows
         ]
 
-    def graph_set_recording(self, org_id: str, graph_id: str,
-                            value: bool | None) -> bool:
-        """C6 #2115: set the session_recording override on a Graph node.
+    def update_memory_graph(self, org_id: str, graph_id: str, *,
+                            name: str | None = None,
+                            recording: bool | None | _Unset = _UNSET) -> bool:
+        """The ONE partial update a memory graph has — rename it, and/or
+        set/clear its session-recording override.
 
-        ``value`` True/False = explicit override; None = remove the override
-        (FalkorDB SET null removes the prop → inherit org default, #1927
-        default-ON preserved). Resolves the literal ``default`` id to the
-        org's kind='default' node (the default graph IS graph 0 — settable
-        per epic §6.3); real gids match directly. Returns True when the node
-        was found (override written/cleared), False on unknown graph —
-        callers map to 404."""
+        The #4282 phase 2.3 target (`docs/product/beta-sdk-surface.md` row 30):
+        *"The one partial update a memory graph has — rename it, or set/clear
+        its session-recording override. A graph is created with its fields; this
+        is the single place they change."* It merges ``graph_set_name``
+        (#2701) and ``graph_set_recording`` (C6 #2115) into one call, so a
+        field is never settable through a second, per-field verb.
+
+        ``name`` — the graph's DISPLAY name. Display-only: the node's
+        id/kind/namespace (the data-plane storage key) are untouched, so a
+        rename never orphans points/keys (the default graph is renameable
+        too — graph 0's node carries ``name`` as a label distinct from
+        ``namespace``).
+
+        ``recording`` — True/False sets the per-graph session-recording
+        override; ``None`` removes it (FalkorDB SET null removes the prop →
+        inherit the org default, #1927 default-ON preserved). **Omit the
+        parameter entirely to leave the override untouched** — that is why
+        the default is a sentinel rather than ``None``: ``None`` is a
+        meaningful VALUE (clear the override), not "unspecified".
+
+        Resolves the literal ``default`` id to the org's kind='default' node
+        (mode-agnostic callers use either); any other id must match a real
+        node exactly. Soft-deleted nodes (status='deleted') are NOT patchable
+        — treated as unknown, exactly as both setters it replaces did. (The
+        tombstone FILTER lives on the readers: ``hosted_api.list_graphs`` skips
+        ``status='deleted'`` rows, while ``list_memory_graphs`` returns them in
+        the selfhost registry lane — which is why ``graph_count`` was not folded
+        into it. In the Supabase lane that reader filters to active already.)
+
+        Returns True when the node was found (the requested fields written),
+        False on an unknown graph — callers map that to 404. At least one of
+        ``name``/``recording`` must be given; a call that asks for nothing is
+        a programming error, not a no-op (it would otherwise report success
+        having written nothing). ``recording`` must be a REAL ``bool`` or
+        ``None`` — anything else (``"false"``, ``1``, …) raises ``TypeError``
+        rather than being stored, the same strict-bool rule the REST PATCH
+        applies.
+        """
+        if name is None and recording is _UNSET:
+            raise ValueError(
+                "update_memory_graph needs at least one field to change — "
+                "pass name=... and/or recording=... (recording=None CLEARS "
+                "the override; omitting it leaves the field untouched)")
+        # The `_Unset` annotation narrows the TYPE; this is the runtime half, and the
+        # half that matters: `sdk.py` defers annotations (`from __future__ import
+        # annotations`), so the annotation is a STRING to the interpreter and mypy's
+        # `arg-type` is disabled repo-wide — nothing would reject a truthy string.
+        # Refusing it here (before any read or write) is what stops a caller's
+        # `recording="false"` becoming a stored STRING that `bool(override)` in
+        # `hosted_api._apply_graph_recording_override` reads back as recording ON.
+        if (recording is not _UNSET and recording is not None
+                and not isinstance(recording, bool)):
+            raise TypeError(
+                "update_memory_graph's `recording` is a STRICT bool or None — got "
+                f"{type(recording).__name__} ({recording!r}). `None` CLEARS the "
+                "override and omitting the parameter leaves it untouched; a truthy "
+                "string (e.g. \"false\") would be stored verbatim and read back as "
+                "recording ON, so it is refused rather than coerced.")
         reg = self._get_registry()
         rows = reg.query(
             "MATCH (g:Graph {org_id:$tid}) RETURN g.id, g.kind, "
@@ -31981,8 +32644,7 @@ class TortoiseSDK:
         ).result_set
         # The literal ``default`` id maps to the org's kind='default' node
         # (mode-agnostic callers use either); any other id must match a real
-        # node exactly. Soft-deleted nodes (status='deleted') are NOT
-        # patchable — treat as unknown (mirror list_graphs' tombstone skip).
+        # node exactly.
         if graph_id == "default":
             node = next((r[0] for r in rows
                          if r[1] == "default" and r[2] != "deleted"), None)
@@ -31992,10 +32654,16 @@ class TortoiseSDK:
             node = None
         if node is None:
             return False
-        reg.query(
-            "MATCH (g:Graph {id:$gid, org_id:$tid}) SET g.recording = $v",
-            params={"gid": node, "tid": org_id, "v": value},
-        )
+        if name is not None:
+            reg.query(
+                "MATCH (g:Graph {id:$gid, org_id:$tid}) SET g.name = $name",
+                params={"gid": node, "tid": org_id, "name": name},
+            )
+        if recording is not _UNSET:
+            reg.query(
+                "MATCH (g:Graph {id:$gid, org_id:$tid}) SET g.recording = $v",
+                params={"gid": node, "tid": org_id, "v": recording},
+            )
         return True
 
     def graph_key_ids(self, org_id: str, graph_id: str) -> list[str]:
@@ -32032,41 +32700,6 @@ class TortoiseSDK:
             params={"tid": org_id, "gid": graph_id},
         ).result_set
         return int(rows[0][0]) if rows else 0
-
-    def graph_set_name(self, org_id: str, graph_id: str,
-                       name: str) -> bool:
-        """#2701 — rename a graph's DISPLAY name on its registry Graph node.
-
-        Display-name-only: the node's id/kind/namespace (the data-plane
-        storage key) are untouched, so a rename never orphans points/keys
-        (the default graph is renameable too — graph 0's node carries
-        ``name`` as a label distinct from ``namespace``). Resolves the
-        literal ``default`` id to the org's kind='default' node (mode-
-        agnostic callers use either); real gids match directly. Returns
-        True when the node was found (name written), False on unknown
-        graph — callers map to 404. Soft-deleted nodes (status='deleted')
-        are NOT renameable — treat as unknown (mirror list_graphs'
-        tombstone skip + graph_set_recording)."""
-        reg = self._get_registry()
-        rows = reg.query(
-            "MATCH (g:Graph {org_id:$tid}) RETURN g.id, g.kind, "
-            "coalesce(g.status, 'active')",
-            params={"tid": org_id},
-        ).result_set
-        if graph_id == "default":
-            node = next((r[0] for r in rows
-                         if r[1] == "default" and r[2] != "deleted"), None)
-        elif any(r[0] == graph_id and r[2] != "deleted" for r in rows):
-            node = graph_id
-        else:
-            node = None
-        if node is None:
-            return False
-        reg.query(
-            "MATCH (g:Graph {id:$gid, org_id:$tid}) SET g.name = $name",
-            params={"gid": node, "tid": org_id, "name": name},
-        )
-        return True
 
     def org_get(self, org_id: str) -> dict | None:
         """Get an org by ID. Returns None if not found."""
@@ -35028,6 +35661,43 @@ class TortoiseSDK:
         "sourceKind=agentSession) — an unsourced assertion carries whatever "
         "credibility its wording implies."
     )
+
+    #: #7819 — the DROPPED dedup fold's transient advisory. `create_point`'s
+    #: dedup branch discards the WHOLE fold when the target is a terminal claim
+    #: and the fold carries a temporal prop, and a `_logger.warning` is not a
+    #: return value: the hosted commit path
+    #: (`hosted_api._execute_commit_writes`) and any SDK caller would otherwise
+    #: get a SUCCESS with the window silently not applied. The #8171 advisory
+    #: channel is the seam for this — transient, rides a COPY of the write
+    #: result, never becomes a node property or a journal row.
+    #:
+    #: It names NO remedy on purpose: the fold's window is refused by the shared
+    #: lifecycle guard, the alternative is the retroactive correction (#5362,
+    #: design only — `supersede_retroactively` has no SDK method), and "re-create
+    #: under a NEW id" is wrong on an idempotent replay (the supplied window
+    #: equal to the stored one is a no-op the caller should not be told to
+    #: duplicate).
+    _TEMPORAL_NOT_APPLIED_MESSAGE: ClassVar[str] = (
+        "The dedup fold carried a temporal prop, and the point this content "
+        "addresses is a terminal claim, whose window cannot be re-stamped "
+        "(#7819) — NOTHING was applied and the stored point is returned "
+        "unchanged."
+    )
+
+    def _temporal_not_applied_advisory(self, node_id: str | None) -> dict:
+        """The `temporal_not_applied` advisory payload (#7819).
+
+        ADVISORY ONLY — a dropped fold has already written nothing; this only
+        makes the drop OBSERVABLE to the caller (`create_point` returns it on a
+        COPY of the dedup snapshot, and the hosted commit receipt folds it into
+        `warnings`). Never raises, never blocks.
+        """
+        return {"advisories": [{
+            "code": "temporal_not_applied",
+            "node_id": node_id,
+            "message": self._TEMPORAL_NOT_APPLIED_MESSAGE,
+            "advisory": True,
+        }]}
 
     def _no_source_advisory(self, node_id: str | None, *, hint: str = "") -> dict:
         """The `no_source` advisory payload, with an optional door-specific hint.
@@ -38970,6 +39640,30 @@ class TortoiseSDK:
         before re-routing this method through the anchor.
         """
         proj = self._get_proj()
+
+        # R5 class 4 (#9553): the RECORD carrier for an edge minted here is
+        # emitted at the MINT — `projection.edges._EdgeHandlers.create_edge` /
+        # `create_about_edge` → `_record_structural_edges` — not at this door.
+        #
+        # ⛔ ONE PRODUCER, ON PURPOSE, AND THIS DOOR IS NOT IT. `#9827` shipped
+        # this door's OWN emission (resolve both endpoints, `_emit_event`); this
+        # change puts the emission one level down, at the mint, because the door
+        # cannot reach the writers that matter: `create_owned_by`/
+        # `create_managed_by`/`create_authored_by` are `return self.create_edge(…)`
+        # on the PROJECTION (so `sdk.create_object(…, ownedBy=…)` — the commonest
+        # `ownedBy` producer — never runs a door), the ingest bundle-connection
+        # writer and the `wasDerivedFrom` writer call `proj.create_edge`
+        # directly, and `create_about_edge` is a different door entirely. With
+        # BOTH emissions in place one edge journals TWO `DirectEdgeCreated`
+        # records, so the door-level one was removed when the two changes met.
+        #
+        # What the mint-level producer inherits from this door's review rounds and
+        # keeps: the descriptor names the endpoints `_resolve_entity` returned
+        # (never the caller's spelling), it carries NO `direction`/attrs (§9.6 —
+        # the fold would SET what live never had), and it is emitted on every
+        # successful write rather than created-only (`_EdgeHandlers.create_edge`
+        # returns `MERGE … RETURN count(*) > 0`, truthy on a dedup hit, which is
+        # what closes the crash window between the write and its record).
         created = proj.create_edge(from_id, to_id, relation)  # validates relation
         return {
             "edge": {"relation": relation, "from": from_id, "to": to_id},

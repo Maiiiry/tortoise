@@ -15880,10 +15880,22 @@ def _commit_response(
     """§6.1 200 response body — commit_id = client_commit_id (stable per
     logical commit); duplicate:true ⇒ zero writes, zero write-ops billed
     (PL4); held non-empty ⇒ overflow (PL3), client-side, re-commit checks
-    the 50-ceiling only. warnings[] (#405): additive, warn-first domain
-    integrity violations — the commit WRITES anyway; present (possibly
-    empty) on every 200, deterministic per payload (idempotent re-commits
-    return the same warnings)."""
+    the 50-ceiling only.
+
+    ``warnings[]`` (#405): additive, warn-first — the commit WRITES anyway;
+    present (possibly empty) on every 200. TWO kinds ride the one key, and the
+    difference is why the field is not uniform per payload:
+
+    * the payload's DOMAIN integrity warnings, derived from the payload alone
+      — deterministic per payload, so an idempotent re-commit returns the
+      same ones;
+    * WRITE-TIME advisories (``temporal_not_applied``, #7819) — observed while
+      the writes ran (a dedup fold dropped on an already-terminal claim wrote
+      NOTHING). These are present only on the response to the call that
+      PERFORMED the write; a ``duplicate:true`` replay writes nothing, so
+      nothing can be dropped, and its ``warnings[]`` is exactly the payload's
+      domain warnings (see the inline note in ``commit_session``'s write
+      phase)."""
     return {
         "session_id": payload.session_id,
         "commit_id": payload.client_commit_id,
@@ -16049,6 +16061,18 @@ def _prevalidate_supersede_window(sdk, pr, *, now: str) -> None:
     - a freshly-minted successor's payload ``when`` (``create_point`` writes
       ``validFrom`` only for a truthy ``when``).
 
+    ⚠️ The first bullet holds for a NON-TERMINAL dedup target only. When the
+    target is a terminal claim, ``create_point`` DROPS the fold whole (#7819):
+    a payload carrying any ``_TEMPORAL_RESTAMP_PROPS`` member writes nothing, so
+    the re-keyed node's stored start is NOT overwritten. ``payload_when`` is
+    still this mirror's input in that case, which makes the check CONSERVATIVE —
+    it can compare an end against a start the writer will never write. Because
+    ``_succ_state``'s terminal pre-check then skips ``supersede_point`` anyway,
+    no inverted window can result (nothing is written, so nothing is refused
+    late); the residual is an over-refusal — a ``supersede_window_inverted`` 422
+    for an inversion that exists only in the mirror's model — and it is
+    deterministic, so it must be repaired in the payload, not retried.
+
     When the resolution would instead fall through to a clock this check cannot
     read before the write (a fresh node's future ``createdAt``, or
     ``supersede_point``'s own ``now``), NOTHING is refused here and the ``[5]``
@@ -16074,9 +16098,13 @@ def _prevalidate_supersede_window(sdk, pr, *, now: str) -> None:
     # sibling loops + the MCP preview's identical read).
     old_vfs = [r[0] for r in old_rows]
     # Mirror `create_point(dedup=True)`'s successor resolution AT THIS POINT in
-    # the write sequence. A match re-keys the write onto that node (and, with a
-    # truthy payload `when`, `update_point` overwrites its stored start); no
-    # match mints the content-addressed `supersede_id` with the payload `when`.
+    # the write sequence. A match re-keys the write onto that node and — for a
+    # NON-TERMINAL target — a truthy payload `when` overwrites its stored start
+    # through the dedup fold's `update_point` (#7819 DROPS that fold whole when
+    # the target is a terminal claim, so `payload_when` is then the mirror's
+    # model of a write that will not happen: conservative, never fail-open —
+    # `_succ_state` skips the supersede itself). No match mints the
+    # content-addressed `supersede_id` with the payload `when`.
     existing_id = sdk._find_point_by_content(
         pr.point.content, pointKind=pr.point.pointKind)
     payload_when = pr.point.when or None
@@ -16136,6 +16164,14 @@ def _execute_commit_writes(sdk: TortoiseSDK, payload: CommitPayload, plan):  # n
     now = datetime.now(UTC).isoformat()
     session_id = payload.session_id
     reconcile = plan.reconcile
+    # #7819: TRANSIENT write-time advisories this phase has to REPORT but that
+    # are not payload domain warnings — today the only one is
+    # `temporal_not_applied`, raised when `create_point`'s dedup branch DROPS a
+    # fold carrying a validity window because the content address resolves to a
+    # terminal claim. A dropped fold writes nothing, so without this the client
+    # gets a 200 whose `when` was silently not applied. The handler folds these
+    # into the response's `warnings[]` (#405's additive channel).
+    _write_advisories: list[dict] = []
     # #5363 (B): each supersede window is validated inside the points loop
     # below, PER ACTION and immediately BEFORE that action's successor is
     # minted — see `_prevalidate_supersede_window` for why the position in the
@@ -16505,6 +16541,9 @@ def _execute_commit_writes(sdk: TortoiseSDK, payload: CommitPayload, plan):  # n
                 # a new point property.
                 session_id=session_id, **point_props,
             )
+            # #7819: a fold dropped because the target is terminal writes
+            # NOTHING — carry the advisory out so the receipt reports it.
+            _write_advisories.extend(_written.get("advisories") or [])
             # #1370: record the id the write RESOLVED to (the map the binder
             # reads). #4970: the SUCCESSOR may itself re-key (its content
             # already exists under another id) — supersede the prior with the
@@ -16647,6 +16686,8 @@ def _execute_commit_writes(sdk: TortoiseSDK, payload: CommitPayload, plan):  # n
                 # the same source-session attribution surface.
                 session_id=session_id, **point_props,
             )
+            # #7819: same drop, the plain-create leg.
+            _write_advisories.extend(_written.get("advisories") or [])
             # #1370: the id the write RESOLVED to. #4970: the graph id §5
             # CONTAINS and the supersede below must use — the pre-existing
             # node on a dedup re-key, the payload id otherwise.
@@ -16883,6 +16924,7 @@ def _execute_commit_writes(sdk: TortoiseSDK, payload: CommitPayload, plan):  # n
         point_content_by_id=lambda pid: _point_content_by_id(
             payload, _commit_reverse_id_map.get(pid, pid)),
     )
+    return _write_advisories
 
 
 @app.post("/v1/sessions/commit")
@@ -16893,8 +16935,9 @@ async def commit_session(request: Request, org: dict = Depends(get_current_org_g
     422 field reasons incl. commit_id_mismatch + calibration_mismatch;
     retry-once semantics documented) → [2] L1 replay via :CommitRecord
     (fully_written → 200 duplicate:true, zero writes, zero write-ops) →
-    [3] L2 reconciliation IN MEMORY → [4] sessions presence contract +
-    budget adjudication on the reconciled net-new delta (soft 15 → WARN
+    [3] L2 reconciliation IN MEMORY → [4] sessions presence contract,
+    org points ceiling, per-org ingest budget (#4051: 429 + Retry-After)
+    and budget adjudication on the reconciled net-new delta (soft 15 → WARN
     telemetry; >25 first-adjudication → held[], NOT written; >50 → 402) →
     [5] the four-node chain + entities + operators + supersede_point +
     Session counters → [6] metering (write_ops +1 non-duplicate;
@@ -16906,8 +16949,12 @@ async def commit_session(request: Request, org: dict = Depends(get_current_org_g
     401 bad/missing key (get_current_org) · 402 budget ceiling · 422 Layer-1
     (retry once; code calibration_mismatch / commit_id_mismatch) OR an
     inverted supersede window (code supersede_window_inverted — #5363, a
-    deterministic payload refusal, NOT retryable) · 429
-    dedicated 300/min/key bucket (R-13) · 500 fail-closed, redacted.
+    deterministic payload refusal, NOT retryable) · 429 in TWO shapes, told
+    apart by `detail.code`: the dedicated 300/min/key bucket (R-13), and the
+    per-org ingest budget (#4051) with `detail.code = "ingest_rate_limited"`,
+    `detail.scope`, and a `Retry-After` the client MUST honour and then retry —
+    that one is a throttle, not a refusal of the data · 500 fail-closed,
+    redacted.
     """
     # #1927: commit_session is a session-content write surface that needs NO
     # consent gate — session_recording is default-ON (ToS-covered) with an
@@ -17012,7 +17059,9 @@ async def commit_session(request: Request, org: dict = Depends(get_current_org_g
     # write proceeds). Phase B (wired-but-inactive in prod — no production
     # chain is 'block'): a block-severity warning rejects the commit.
     from tortoise.commit_schema import domain_block_warnings
-    warnings = result.warnings or []
+    # COPY: `_execute_commit_writes` appends the #7819 write-time advisories
+    # below, and the plan's own warning list must not be mutated by a write.
+    warnings = list(result.warnings or [])
     blocking = domain_block_warnings(warnings)
     if blocking:
         raise HTTPException(
@@ -17137,6 +17186,116 @@ async def commit_session(request: Request, org: dict = Depends(get_current_org_g
         # never gated.
         _check_org_limit(org, "points")
 
+        # [4c] #4051 §3.1 — the per-ORG ingest budget. The gates above bound the
+        # REQUEST (payload shape, #9425) and the org's ALREADY-COUNTED nodes
+        # (#5637). Neither bounds the growth this lane leaves behind: a
+        # `points: []` commit mints :Session + transcript :Source +
+        # AgentSession :Event, and `_count_resource("points")` matches none of
+        # those labels, so that count never moves and its gate can never trip.
+        # #4010 made sessions unlimited for every tier, which removed this
+        # lane's only TOTAL bound; the total bound itself is #4051 §4 and needs
+        # an owner ruling (#4495/#5331 decided the UNIT is MB/GB, not nodes) —
+        # this is the slice of #4051 that needs no ruling: a per-org, 60s
+        # BYTE allowance on what a tenant may ingest, refused with 429 +
+        # Retry-After. It is a throttle (rate), not a cap (total): a legitimate
+        # commit at any rate below the allowance is unaffected, and a plan that
+        # wants more speaks to us (#5425's posture — rate limit, not refusal of
+        # the customer's data).
+        #
+        # WHY HERE — the SAME site as the sessions/points gates above, i.e. after
+        # every replay return and BEFORE the budget adjudication. Before the
+        # adjudication is load-bearing, not cosmetic: the `held` outcome WRITES
+        # (it MERGEs the :Session node with its `value_nodes_held` counter, and
+        # for a fresh `session_id` that MERGE CREATES it) and the `fail`
+        # outcome still leaves the :CommitRecord merged above — so every request
+        # that gets past the replay returns writes at least one node, and a gate
+        # below the adjudication (i.e. below the `held` return, not below the
+        # replay returns) would leave the held band's :Session mint
+        # (one uncounted node per request, the very class this issue is about)
+        # completely uncharged. ⛔ Moving the gate ABOVE the replay returns is the
+        # opposite error and is forbidden: a replay writes no nodes and must
+        # never 402 (#1727, pinned by
+        # `test_replay_does_not_consume_the_budget`).
+        #
+        # SCOPE, stated precisely because overstating a gate is worse than the
+        # gap it leaves: the refusal is not COMPLETELY write-free, but it no
+        # longer changes anything the client can observe. `store.acquire(...)`
+        # above merges this attempt's `:CommitRecord` BEFORE any gate in this
+        # handler, and a leftover `status='partial'` record is not neutral —
+        # `plan_commit`/`is_first_adjudication` read ANY existing record as a
+        # previous attempt, so it would make the documented
+        # backoff-and-retry a RE-adjudication without the first-adjudication
+        # hard-25 band (measured: a 26-net-new payload holds 26 on a clean
+        # graph but WRITES all 26 after a 429 left the record). The refusal
+        # therefore discards the record it just created
+        # (`store.discard_attempt`, only while its status is `partial`,
+        # `write_ops_billed` is 0 and no value nodes were declared), so a 429
+        # leaves the graph exactly as it was and the retry is a genuine first
+        # attempt. What remains is bounded and uncharged either way: the
+        # refused charge is not appended to the window, and the per-key rate
+        # limit bounds the request itself.
+        #
+        # CHARGE = max(payload bytes, nodes it will mint × 1024). The payload
+        # term stops a `summary`/`story_arc` (uncapped by Layer-1) from adding
+        # megabytes for a few hundred bytes of node charge; the node floor
+        # stops the `points: []` loop from being cheap. Both are stated in
+        # `commit_schema.commit_ingest_charge_bytes`; the reason it is NOT
+        # `plan.reconcile.net_new` (the PL4 metered figure) is there too — that
+        # counts points+entities+operators only, so an events-only payload
+        # would meter 0 while minting a node per entry.
+        from tortoise.commit_schema import commit_ingest_charge_bytes
+        from tortoise.quota import commit_ingest_admit
+
+        admission = commit_ingest_admit(org.get("org_id"),
+                                       commit_ingest_charge_bytes(payload))
+        if not admission.allowed:
+            retry_after = max(1, math.ceil(admission.retry_after))
+            # #4051 — the refusal must not change the RETRY's adjudication.
+            # `store.acquire` above merged this attempt's `:CommitRecord`, and
+            # `plan_commit`/`is_first_adjudication` read ANY existing record as
+            # a previous attempt — so leaving it would make the client's
+            # documented backoff-and-retry a RE-adjudication, dropping the
+            # first-adjudication hard-25 band: measured, a 26-net-new payload
+            # holds 26 on a clean graph but WRITES all 26 after a 429 left the
+            # record. Delete only what THIS attempt created (`created`) and
+            # only while it is still write-free, so the retry is a genuine
+            # first attempt and a real mid-write `partial` is untouched.
+            if created:
+                store.discard_attempt(payload.client_commit_id)
+            # #5425's seam, not a hand-appended sentence: it terminates the
+            # prose and appends the ONE contact path. A throttle is not a
+            # ceiling to buy out of — it names its own next step ("retry
+            # shortly") and the header says how long. The SENTENCE follows
+            # `scope`: in the shared-overflow regime the caller's own `used`
+            # can be 0 (the instance's shared capacity is what is spent), so
+            # saying "by this team" would blame a tenant that wrote nothing.
+            message = (
+                "The shared ingest allowance for this instance is saturated "
+                "— retry shortly"
+                if admission.scope == "process" else
+                "Too much data is being written by this team right now — "
+                "retry shortly")
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "ingest_rate_limited",
+                    "message": with_limit_contact(message),
+                    # "org" = the caller's own allowance; "process" = the ONE
+                    # shared overflow bucket an instance falls back to when its
+                    # owned store is full of active orgs (bounded flood
+                    # regime). `used` is the caller's own spend in either case,
+                    # so `used: 0` with `scope: "process"` is a refusal about
+                    # the instance, never about the caller's traffic.
+                    "scope": admission.scope,
+                    "resource": "commit_ingest_bytes",
+                    "used": admission.used,
+                    "limit": admission.limit,
+                    "unit": "bytes/60s",
+                    "retry_after": retry_after,
+                },
+                headers={"Retry-After": str(retry_after)},
+            )
+
         # [4b] Budget — the authoritative §6.1 semantics live in adjudicate_budget.
         if plan.budget.outcome == "fail":
             # Ceiling exceeded (>50): nothing written; the record stays partial
@@ -17168,7 +17327,13 @@ async def commit_session(request: Request, org: dict = Depends(get_current_org_g
         # client retries with the same client_commit_id — safe by L1; the record
         # stays partial).
         try:
-            _execute_commit_writes(sdk, payload, plan)
+            # #7819: the phase returns its write-time advisories (a dedup fold
+            # dropped on a terminal claim wrote nothing) — they ride the same
+            # additive `warnings[]` channel as the payload's domain warnings, so
+            # a client sees that its `when` was not applied instead of a silent
+            # 200. They are NOT on the duplicate:true replay path (nothing is
+            # written there, so nothing is dropped).
+            warnings.extend(_execute_commit_writes(sdk, payload, plan) or [])
         except HTTPException:
             raise
         except InvertedSupersedeWindow as exc:
@@ -19037,7 +19202,7 @@ async def _membership_org(user_id: str, org_id: str) -> dict | None:
 def _graph_list_for(org_id: str) -> list[dict]:
     """One org's graph listing (#3718: blocking registry/PostgREST read).
 
-    The MODE BRANCH is here, not left to ``graph_list``'s own short-circuit:
+    The MODE BRANCH is here, not left to ``list_memory_graphs``'s own short-circuit:
     in Supabase mode ``_registry_anchor()`` would build (and eagerly attach)
     a FalkorDB handle BEFORE the callee ever consulted the mode, so the
     switcher — the first read every client makes — would need a live graph
@@ -19059,7 +19224,7 @@ def _graph_list_for(org_id: str) -> list[dict]:
     )
     if is_supabase_enabled():
         return graph_metadata(get_control_plane(), org_id)
-    return _registry_anchor().graph_list(org_id)
+    return _registry_anchor().list_memory_graphs(org_id)
 
 
 #: Orgs per off-loop submission when the switcher lists graphs, PER LANE
@@ -19170,13 +19335,13 @@ async def list_my_orgs(user: dict = Depends(get_current_user)):  # noqa: B008
     When EVERY membership is suspended there is nothing healthy to list →
     403 SUSPENDED with the appeal detail (#1853 lockdown preserved).
 
-    #765 (plan Task 8 reader inventory): graph_list resolves via the
+    #765 (plan Task 8 reader inventory): list_memory_graphs resolves via the
     mode-aware SDK (Supabase → teams.graph_name derivation via the seam;
     registry → Graph nodes). The mode branch that keeps this endpoint off the
     registry in Supabase mode is NOT the callee's short-circuit — it is the
     call-site branch in ``_graph_list_for`` (#3718), together with the
     lane-and-chunk choice made on the loop below, because ``_registry_anchor()``
-    binds eagerly and would be built before ``graph_list`` could consult the
+    binds eagerly and would be built before ``list_memory_graphs`` could consult the
     mode."""
     memberships = await _user_memberships(user["user_id"])
     resolved = []
@@ -19187,7 +19352,7 @@ async def list_my_orgs(user: dict = Depends(get_current_user)):  # noqa: B008
         resolved.append((m, org))
 
     # Suspended rows are excluded from graph resolution — they cannot be
-    # selected anyway, and graph_list must not observe the suspension stamp.
+    # selected anyway, and list_memory_graphs must not observe the suspension stamp.
     # #3718: the listing is a blocking registry/PostgREST read, and it used to
     # run per membership ON the loop. It now costs one OFF-LOOP submission per
     # chunk — ceil(N / the lane's chunk) submissions for N healthy orgs. (The
@@ -19242,6 +19407,12 @@ async def list_my_orgs(user: dict = Depends(get_current_user)):  # noqa: B008
         graphs_by_org.update(await offload(
             lambda chunk=chunk: {
                 org_id: _graph_list_for(org_id) for org_id in chunk},
+            # `op` is an OBSERVABILITY label naming the operation, not the SDK
+            # method it calls (its siblings are `data_sdk`, `org_sdk`, `query`):
+            # `tests/test_read_routes_loop_responsiveness.py` counts this exact
+            # label to prove the org-switcher fan-out stays chunked (#3718), so
+            # renaming it with the method it happens to call silently reds a pin
+            # that is about submission COUNT — and breaks metric continuity.
             op="graph_list"))
 
     out = []
@@ -20257,7 +20428,7 @@ async def create_org_graph(org_id: str, body: dict,
     async with _provision_lock(org_id):
         # Duplicate-active check INSIDE the lock (registry has no unique
         # index — P2 from review: the app check is the registry guard).
-        existing = _make_sdk(namespace="registry").graph_list(org_id)
+        existing = _make_sdk(namespace="registry").list_memory_graphs(org_id)
         if any(g["name"] == name and g.get("status") != "deleted"
                for g in existing):
             raise HTTPException(status_code=409, detail="Graph name already exists")
@@ -20327,7 +20498,7 @@ async def create_graph(body: dict, request: Request,
         raise HTTPException(status_code=404, detail="Unknown organization")
     await _provision_preflight(org)
     async with _provision_lock(org_id):
-        existing = _make_sdk(namespace="registry").graph_list(org_id)
+        existing = _make_sdk(namespace="registry").list_memory_graphs(org_id)
         if any(g["name"] == name and g.get("status") != "deleted"
                for g in existing):
             raise HTTPException(status_code=409, detail="Graph name already exists")
@@ -20525,7 +20696,7 @@ async def _apply_graph_recording_override(
             found = any(r[0] == graph_id and r[2] != "deleted" for r in rows)
         if not found:
             raise HTTPException(status_code=404, detail="Unknown graph")
-        written = sdk.graph_set_recording(org_id, graph_id, body.recording)
+        written = sdk.update_memory_graph(org_id, graph_id, recording=body.recording)
     if not written:
         raise HTTPException(status_code=404, detail="Unknown graph")
     return {"graph_id": graph_id, "recording": body.recording}
@@ -20665,17 +20836,17 @@ def _pack_entries_from_body(raw: object) -> list[dict] | None:
 
 
 def _registry_graph_list(org_id: str) -> list[dict]:
-    """Registry-lane ``graph_list`` in ONE worker hop — SDK construction
+    """Registry-lane ``list_memory_graphs`` in ONE worker hop — SDK construction
     included (#8648 review P1).
 
     ``_make_sdk`` is NOT free: in embedded mode it runs the keepalive anchor's
     probe query and, on a miss, an eager connect that holds the socket
     (#4660). Building the SDK on the loop and off-loading only the callee
-    (``to_thread(sdk.graph_list, …)``) left that blocking I/O on the event
+    (``to_thread(sdk.list_memory_graphs, …)``) left that blocking I/O on the event
     loop — the exact defect ``tests/test_read_routes_loop_responsiveness.py``
     pins.
     """
-    return _make_sdk(namespace="registry").graph_list(org_id)
+    return _make_sdk(namespace="registry").list_memory_graphs(org_id)
 
 
 async def _resolve_graph_data_namespace(org_id: str, graph_id: str) -> str | None:
@@ -20684,7 +20855,7 @@ async def _resolve_graph_data_namespace(org_id: str, graph_id: str) -> str | Non
     ``None`` = unknown / deleted / another team's graph (fail closed). The
     literal ``"default"`` resolves by KIND, not by id: in registry mode the
     default node carries a real gid as its id, while in Supabase mode the
-    derived default row's id IS the literal — reading the ``graph_list`` seam
+    derived default row's id IS the literal — reading the ``list_memory_graphs`` seam
     makes both lanes agree without a second resolution path.
     """
     try:
@@ -21159,7 +21330,7 @@ async def _apply_graph_rename(
     # name_active as the cross-worker DB backstop, whose violation is mapped
     # to the same 409 below (create-key parity: "HTTP 409" → 409, never 500).
     async with _provision_lock(org_id):
-        for row in sdk.graph_list(org_id):
+        for row in sdk.list_memory_graphs(org_id):
             if row.get("status") == "deleted":
                 continue
             if row.get("name") == name and row.get("graph_id") != target:
@@ -21172,7 +21343,7 @@ async def _apply_graph_rename(
                                         graph_id, name),
                     op="set_graph_name")
             else:
-                written = sdk.graph_set_name(org_id, graph_id, name)
+                written = sdk.update_memory_graph(org_id, graph_id, name=name)
         except Exception as _exc:
             if is_supabase_enabled() and "HTTP 409" in str(_exc):
                 raise HTTPException(
@@ -21622,7 +21793,7 @@ async def _restore_trash_graph_locked(request: Request, user: dict,
             restored = await asyncio.to_thread(
                 sb_restore, get_control_plane(), org_id, graph_id)
         else:
-            restored = await asyncio.to_thread(sdk.graph_restore, org_id,
+            restored = await asyncio.to_thread(sdk.restore_memory_graph, org_id,
                                                graph_id)
     except RuntimeError as e:
         # #2468: a concurrent create landing the freed name between the
@@ -21797,7 +21968,7 @@ async def list_graphs(org_id: str, user: dict = Depends(get_current_user)):  # n
         raise HTTPException(status_code=404, detail="Unknown organization")
     _ensure_not_suspended(org)
     sdk = _make_sdk(namespace="registry")
-    graphs = sdk.graph_list(org_id)
+    graphs = sdk.list_memory_graphs(org_id)
     from tortoise.supabase_control import (
         count_graph_keys,
         get_control_plane,
