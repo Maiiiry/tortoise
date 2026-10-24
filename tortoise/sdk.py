@@ -10008,6 +10008,15 @@ class TortoiseSDK:
             model, _redact_turn_contents(conversation)[0],
             sdk=self, session_id=session_id, chunk_size=chunk_size,
             session_date=session_date)
+        # ⚠️ A `MERGE` verdict decided HERE has no applier on this path: only
+        # ``_extract_session_v2`` reads ``out["merges"]`` (the ``merges = out.get("merges")``
+        # line below its extraction call) and executes ``apply_merge_union``. This
+        # entry passes no ``vet_arbiter``, and #5006's
+        # verdicts come from one, so any ``MERGE`` it could see today would suppress a
+        # payload point with no union written — no Point, no edges, no warning. If an
+        # arbiter is ever wired here, this call needs its own merge relay (or an
+        # ``allow_merge=False`` switch on ``extract_session_v2``), because the payload
+        # point is already gone by the time the record exists (#9872).
         payload = out.get("payload")
         errors = list(out.get("errors", []) or [])
         if payload is None and not errors:

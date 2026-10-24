@@ -895,8 +895,12 @@ never fused), the **union** of both sides' attachments written onto it, and the 
 a `(Session)-[:CONTAINS]->(Point)` edge with its own quote on the merge record. `extract_session_v2` routes the VET
 `MERGE` verdicts (`_merge_flagged_contents`, matched by normalised content, not by VET's index-shaped item ids) into
 `execute_embed`'s consolidation pass; `classify_consolidation` gained the fifth `MERGE` outcome the design always had.
-The fusion runs in `capture_session` through `apply_merge_union`, which routes each edge through the journaled
-`link_entity` writer so it replays (`#3664`).
+The fusion runs in `capture_session` through `apply_merge_union`: the `aboutObject` union edges go through the
+journaled `link_entity` writer, so they replay (`#3664`). The losing document's provenance edge
+(`(Session)-[:CONTAINS]->(Point)`) is the same raw, unjournaled write the `#2104` fold uses — durable through the
+`:Session` snapshot rather than the journal (`#3947`, `#3722` scope) — and an id-less `Object` stub stays a
+live-only `MERGE` (`#1727`). What is guaranteed is that no edge is *lost*; what is not is that every one of them
+replays.
 
 **Why the bar is 0.95 and not the NOOP band's 0.45.** §16.4's evidence (*"practical thresholds cluster at ~0.95"*;
 *"a false merge costs MORE than keeping near-duplicates"*) plus `#9424`'s split: a mid-band paraphrase pair is still
