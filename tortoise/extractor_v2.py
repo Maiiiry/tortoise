@@ -158,6 +158,12 @@ from . import vet_gate as _vet_gate  # #5005: S2.2 VET (stdlib-only module)
 from ._gate_memo import GateMemo
 from .env_truthy import env_flag, is_truthy  # #4097: the declared truthy contract
 
+# #5006: D12/O4's FUSION half — the union of both sides' attachments, executed
+# at S3 after the S2.2b verdict. Stdlib-only, so importing it costs nothing on
+# the capture path.
+from .near_dup_merge import MERGE as _MERGE_DECISION
+from .near_dup_merge import near_dup_merge as _near_dup_merge
+
 # ── The v2 master list (design doc §3) ─────────────────────────────────────
 
 SUBJECTS = {
@@ -3864,25 +3870,39 @@ NOOP_MIN_OVERLAP = 0.45        # Q2: paraphrase-NOOP band floor
 
 
 class DecisionRecord:
-    """One 4-way consolidation decision (D1).
+    """One consolidation decision (D1, plus D12/O4's MERGE).
 
-    decision ∈ {"ADD", "UPDATE", "NOOP", "DELETE"}; prior_id = the matched
-    existing point ("" for ADD); overlap = the length-guarded token overlap
-    vs the chosen prior; reason ∈ {"", "identical", "paraphrase",
-    "value_change"}; evidence = human-readable why (rides the result-level
-    records + link_before_create notes).
+    decision ∈ {"ADD", "UPDATE", "NOOP", "DELETE", "MERGE"}; prior_id = the
+    matched existing point ("" for ADD); overlap = the length-guarded token
+    overlap vs the chosen prior; reason ∈ {"", "identical", "paraphrase",
+    "value_change", "near_dup_merge"}; evidence = human-readable why (rides
+    the result-level records + link_before_create notes).
+
+    ``MERGE`` (#5006, D12/O4) is the fifth outcome the design has always had
+    and the code did not: the FUSION the design places at S3, after the S2.2b
+    verdict. It is distinct from ``NOOP`` in exactly one way — it writes.
+    ``NOOP`` folds a candidate into a prior and emits nothing, so it may only
+    be taken when the prior already carries every entity the candidate names
+    (the #9424 guard); ``MERGE`` is the authorised path for the pair that
+    guard refuses, because it UNIONS the two attachment sets onto the
+    survivor instead of dropping one side's. ``union_entities`` is that union
+    — the whole set the survivor must carry after the fusion, empty on every
+    other decision.
     """
 
-    __slots__ = ("decision", "evidence", "overlap", "prior_id", "reason")
+    __slots__ = ("decision", "evidence", "overlap", "prior_id", "reason",
+                 "union_entities")
 
     def __init__(self, decision: str, prior_id: str = "",
                  overlap: float = 0.0, reason: str = "",
-                 evidence: str = "") -> None:
+                 evidence: str = "",
+                 union_entities: tuple[str, ...] = ()) -> None:
         self.decision = decision
         self.prior_id = prior_id
         self.overlap = overlap
         self.reason = reason
         self.evidence = evidence
+        self.union_entities = tuple(union_entities)
 
 
 _NUMBER_WORDS = {
@@ -5793,10 +5813,13 @@ def supersede_allowed(a: str, b: str) -> bool:
 # paraphrase band below AND the exact-content arm (step 1), which returns
 # before the per-prior loop.
 #
-# ⚠️ This is the evidence-preservation half of #5006, NOT the union-merge. The
-# Jev-arbitrated fusion that keeps ONE point and writes the union onto it is
-# still unimplemented (`config/v4-mechanisms.yml` keeps `near_dup_merge` at
-# `not-implemented`), and this guard deliberately does not pretend otherwise.
+# ⚠️ That was the REFUSAL half of #5006 (#9424). The other half — the
+# authorised FUSION that keeps ONE point and writes the union of both sides'
+# attachments onto it — is `tortoise/near_dup_merge.py`, and it is what makes
+# this refusal the SAFE branch rather than a dead end: a pair this guard
+# refuses is `ADD` by default, and `MERGE` when S2.2b VET recorded the verdict
+# (D12/O4). The two halves are complementary by construction — the guard's
+# refusal is precisely the case the fusion exists to make lossless.
 
 
 def _attachment_ids(value: object) -> frozenset[str] | None:
@@ -5836,18 +5859,22 @@ def _attachments_preserved(prior: dict, candidate: dict) -> bool:
 
 def classify_consolidation(point: dict, priors: list[dict], *,
                            entity_mentions: list[str] | None = None,
-                           current_date: str | None = None) -> DecisionRecord:
-    """D1: the pure 4-way consolidation classifier (no LLM, no graph I/O).
+                           current_date: str | None = None,
+                           merge_flagged: bool = False) -> DecisionRecord:
+    """D1: the consolidation classifier (no LLM, no graph I/O).
 
     Maps (candidate point + S3-retrieved priors + entity/attribute context)
-    to one of ADD / UPDATE / NOOP / DELETE in priority order:
+    to one of ADD / UPDATE / NOOP / DELETE in priority order, plus the MERGE
+    (D12/O4) the `merge_flagged` operand admits:
 
       1. NOOP (identical)   — normalized content equals a prior (the
                               existing exact/content-hash dedup).  A fold is
                               admissible only when it loses nothing here too:
                               the prior must already carry every entity the
                               candidate names (#5006), else that prior is
-                              skipped and the claim falls through to ADD;
+                              skipped and the claim falls through to ADD —
+                              or to MERGE when the pair is flagged and near-
+                              identical (see `merge_flagged` below);
       2. UPDATE             — same entity + same attribute, VALUE differs
                               (value-signature inequality when both sides
                               carry a signature, else the E5 frame-token
@@ -5865,8 +5892,26 @@ def classify_consolidation(point: dict, priors: list[dict], *,
                               already carry every entity the candidate names
                               (#5006 — a fold stamps no link, so an entity
                               only the candidate names would be dropped);
-                              otherwise the claim falls through to ADD.
-      4. ADD                — no prior match.
+                              otherwise the claim falls through to ADD;
+      4. MERGE (D12/O4)     — ⚠️ NOT a sixth way to fold: it is the authorised
+                              alternative for the pair step 1/step 3 must
+                              REFUSE. When such a pair is `merge_flagged`
+                              and near-identical, `tortoise.near_dup_merge`
+                              unions the two attachment sets onto the
+                              survivor instead of dropping one side's, which
+                              is exactly what makes the fold lossless. A
+                              `MERGE` carries `union_entities` — the whole
+                              set the survivor must carry afterwards;
+      5. ADD                — no prior match.
+
+    ``merge_flagged`` is the S2.2b VET verdict for THIS candidate (D12: the
+    arbiter answers *"are these the same claim?"*, the mechanical guard only
+    answers *"is anything distinguishing lost?"*). Default False — no
+    verdict, no fusion — so the classifier's pre-#5006 behaviour is byte-
+    identical for every caller that does not thread a verdict through. A
+    flagged pair still has to clear the mechanical ladder (never-across
+    guard, value differences, the 0.95 bar, a readable union): the flag is
+    necessary, never sufficient.
 
     DELETE is NEVER produced from content alone (D5 — only explicit
     retractions). Ambiguous entity/attribute → NOOP only on high text
@@ -5895,6 +5940,20 @@ def classify_consolidation(point: dict, priors: list[dict], *,
         # carry every entity the candidate names may not absorb it — skip that
         # prior (not the candidate) and let the pair fall through to ADD.
         if not _attachments_preserved(p, point):
+            # D12/O4 (#5006): unless S2.2b recorded the MERGE verdict, in which
+            # case this is exactly the pair the FUSION exists for — identical
+            # content, a wider attachment set, nothing distinguishing lost.
+            if merge_flagged and str(p.get("id") or ""):
+                _diff, _ident = _boundary(str(p.get("content") or ""), content)
+                plan = _near_dup_merge(point, p, overlap=1.0,
+                                       difference=_diff, identity=_ident,
+                                       flagged=True)
+                if plan.merge:
+                    return DecisionRecord(
+                        "MERGE", prior_id=str(p.get("id") or ""),
+                        overlap=1.0, reason="near_dup_merge",
+                        evidence=plan.evidence,
+                        union_entities=plan.union_entities)
             continue
         return DecisionRecord("NOOP", prior_id=str(p.get("id") or ""),
                               overlap=1.0, reason="identical",
@@ -5902,6 +5961,7 @@ def classify_consolidation(point: dict, priors: list[dict], *,
 
     best_update: tuple[float, dict] | None = None
     best_noop: tuple[float, dict, str] | None = None   # (overlap, prior, mode)
+    best_merge: tuple[float, dict, Any] | None = None  # (overlap, prior, plan)
     for p in priors:
         if not str(p.get("id") or ""):
             continue
@@ -5938,8 +5998,18 @@ def classify_consolidation(point: dict, priors: list[dict], *,
             continue
         # #5006: the attachments half of the same ruling.  A fold emits no
         # payload point, so it would drop any entity only the candidate names;
-        # refuse it and let the claim fall through to ADD instead.
+        # refuse it — UNLESS S2.2b recorded the MERGE verdict (D12/O4), in which
+        # case the fold becomes lossless by UNIONING the two attachment sets
+        # onto the survivor instead. The mechanical ladder is re-checked inside
+        # `near_dup_merge` (never-across, the 0.95 bar, a readable union): the
+        # verdict is necessary and never sufficient.
         if not _attachments_preserved(p, point):
+            if merge_flagged:
+                plan = _near_dup_merge(point, p, overlap=ov,
+                                       difference=difference, identity=identity,
+                                       flagged=True)
+                if plan.merge and (best_merge is None or ov > best_merge[0]):
+                    best_merge = (ov, p, plan)
             continue
         if sig_equal and (tier_a or bool(mentions)) and gate:
             # value identity — short-circuits both bands
@@ -5959,12 +6029,22 @@ def classify_consolidation(point: dict, priors: list[dict], *,
             reason="value_change",
             evidence="same entity+attribute, value differs, length-guarded "
                      "overlap or fact-value contradiction, later date")
-    if best_noop is not None:
+    if best_noop is not None and (best_merge is None
+                                  or best_noop[0] > best_merge[0]):
         ov, p, mode = best_noop
         return DecisionRecord(
             "NOOP", prior_id=str(p.get("id") or ""), overlap=round(ov, 3),
             reason="paraphrase",
             evidence=f"{mode} (overlap {ov:.2f})")
+    if best_merge is not None:
+        # Ties go to MERGE: it preserves the union where NOOP preserves only
+        # the prior's set, and both are lossless, so the union is the strictly
+        # safer winner on an otherwise equal pair.
+        ov, p, plan = best_merge
+        return DecisionRecord(
+            "MERGE", prior_id=str(p.get("id") or ""), overlap=round(ov, 3),
+            reason="near_dup_merge", evidence=plan.evidence,
+            union_entities=plan.union_entities)
     return DecisionRecord("ADD", evidence="no prior match")
 
 
@@ -6683,7 +6763,8 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
                   extractor_version: str = "value@0.5.0+v2",
                   master: dict | None = None,
                   session_date: str | None = None,
-                  edus: list[dict] | None = None) -> dict:
+                  edus: list[dict] | None = None,
+                  merge_flagged: frozenset[str] | set[str] = frozenset()) -> dict:
     """S5: deterministic embed EXECUTION (not a flash prompt).
 
     Maps the complete embed list to the Layer-1 commit payload in dependency
@@ -6926,6 +7007,12 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
     point_ids: dict[str, str] = {}   # norm content → point id
     tier_a_points = 0                # E2 (#1534): Tier-A state-value count
     noops: list[dict] = []           # E7 (D4): folded duplicates — result-level
+    # #5006 (D12/O4): the FUSIONS — near-duplicate pairs merged onto ONE
+    # survivor with the union of both sides' attachments. Result-level like
+    # ``noops`` (never inside the payload: the payload describes NEW nodes, and
+    # a merge creates none). This list is the merge's whole evidence trail: the
+    # survivor, the union it must carry, and the losing candidate's provenance.
+    merges: list[dict] = []
     # #2552 (op_04, F2): point-level supersede refs collected from the
     # embed points (a NEW point whose ``supersedes`` names an EARLIER-session
     # claim surfaced by the S3 search) — resolved after the loop against the
@@ -6973,15 +7060,23 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
         quote = str(p.get("quote") or "").strip()[:200]
         search_keys = _clean_search_keys(p.get("search_keys"), warnings,
                                          f"point '{content[:60]}'")
-        # E7 (D1): the 4-way decision vs the S3-retrieved priors — pure and
-        # deterministic. NOOP folds into the existing point (a `duplicates`
+        # E7 (D1): the consolidation decision vs the S3-retrieved priors — pure
+        # and deterministic. NOOP folds into the existing point (a `duplicates`
         # stamp at the write path, D4 — physically ONE point, no new edge),
         # never a new payload point.
+        #
+        # #5006 (D12/O4): a MERGE verdict recorded by S2.2b VET for THIS
+        # candidate is what admits the FUSION at S3 — `merge_flagged` reaches
+        # the classifier as the verdict, never as the decision. Matching is by
+        # normalised content (`_norm`), not by list index: VET's item ids are
+        # index-shaped and `apply_vet` removes DISCARDed items from the list,
+        # so an index-based read would silently flag the WRONG candidate.
         decision = classify_consolidation(
             {"content": content, "about_entities": about_list,
              "search_keys": search_keys, "when": when_valid,
              "tier": str(p.get("tier") or "")},
             idx["points"], entity_mentions=about_list,
+            merge_flagged=n in merge_flagged,
             current_date=when_valid or session_date)
         pid = _content_id("pt", content)
         if decision.decision == "NOOP":
@@ -7001,6 +7096,33 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
                 "searched_for": f"point '{content[:60]}'", "found": True,
                 "note": f"duplicate of existing {pid} ({decision.reason}) — "
                         "folded (duplicates stamp, no new point)"})
+            continue
+        if decision.decision == "MERGE":
+            # #5006 (D12/O4) — the FUSION, executed at S3 after the gate.
+            # ONE node survives (the prior); no payload point is emitted, and
+            # the prior's CLAIM is never rewritten ("union the attachments,
+            # never fuse the claim"). The surviving point's attachment set
+            # becomes `union_entities`, which the write path applies; the
+            # losing document's provenance rides this record as the session
+            # membership + quote it contributed, so it is not silently dropped.
+            pid = decision.prior_id or pid
+            merges.append({
+                "point_id": pid, "session_ref": session_id,
+                "overlap": decision.overlap,
+                "evidence": decision.evidence,
+                # the SURVIVING claim, unchanged — read from the prior row
+                "content": _prior_row_content(idx["points"], pid, content),
+                # the whole union the survivor must carry after the fusion
+                "about_entities": list(decision.union_entities),
+                # where the LOSING side's evidence goes
+                "merged_content": content,
+                "merged_quote": quote,
+                "reason": "near_dup_merge"})
+            point_ids[n] = pid
+            link_before_create.append({
+                "searched_for": f"point '{content[:60]}'", "found": True,
+                "note": f"near-duplicate merge into existing {pid} "
+                        "(attachments unioned, no new point)"})
             continue
         if decision.decision == "UPDATE":
             reason = "REVISES"  # supersession: new content corrects the old
@@ -7540,6 +7662,7 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
     return {
         "payload": payload,
         "noops": noops,                # E7 (D4): result-level, NOT in the payload
+        "merges": merges,              # #5006: result-level, NOT in the payload
         "deletions": deletions,        # E7 (D5): result-level, NOT in the payload
         "supersessions": supersessions,
         "chain_notes": llm_chain_notes + chain_notes,
@@ -7552,6 +7675,7 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
             "operator_endpoints_minted": len(minted_endpoints),
             "tier_a_points": tier_a_points,
             "noops": len(noops),
+            "merges": len(merges),
             "deletions": len(deletions),
             "search_queries": (search or {}).get("queries_run", 0),
             "search_degraded": bool((search or {}).get("degraded")),
@@ -7759,6 +7883,38 @@ def _edus_from_conversation(conversation: list[dict]) -> list[dict]:
     return [{"index": i, "role": str(t.get("role", "unknown")),
              "text": str(t.get("content", ""))}
             for i, t in enumerate(conversation) if t.get("content")]
+
+
+def _merge_flagged_contents(*surfaces: dict | None) -> frozenset[str]:
+    """The normalised candidate contents S2.2b VET recorded a ``MERGE`` verdict
+    for (#5006 — the verdict's consumer).
+
+    D12/O4 splits the near-duplicate concern across three sites (§4.2): VET
+    records the VERDICT, S3 executes the FUSION. This is the routing between
+    them — until #5006 the verdict had **no consumer at all**, which is what
+    made the absence of the action invisible.
+
+    Content, not the item id: VET's ids are index-shaped and ``apply_vet``
+    removes DISCARDed items from the list between the two passes, so an
+    index-keyed hand-off would flag the wrong candidate after any removal.
+    A missing/malformed surface contributes nothing (no verdict ⇒ no merge),
+    which is the fail-closed direction for a write.
+    """
+    flagged: set[str] = set()
+    for surface in surfaces:
+        decisions = (surface or {}).get("decisions")
+        if not isinstance(decisions, dict):
+            continue
+        for d in decisions.values():
+            if not isinstance(d, dict):
+                continue
+            outcome = str(d.get("outcome") or "").strip().upper()
+            if outcome != _MERGE_DECISION:
+                continue
+            text = str(d.get("text") or "").strip()
+            if text:
+                flagged.add(_norm(text))
+    return frozenset(flagged)
 
 
 def _run_vet_pass(embed_list: dict, narrative: str, *, arbiter=None,
@@ -8252,7 +8408,9 @@ def extract_session_v2(model, conversation: list[dict], *, sdk=None,
     try:
         result = execute_embed(complete_list, search, session_id=session_id,
                                story_arc=story_arc, master=master,
-                               session_date=session_date, edus=edus)
+                               session_date=session_date, edus=edus,
+                               merge_flagged=_merge_flagged_contents(
+                                   vet_s2_stats, vet_union_stats))
     except Exception as e:  # S5 must NEVER block the pipeline (design §7.4)
         errors.append(f"S5 failed: {type(e).__name__}: {e}")
         # D1 (#1746): deterministic class for the previously-uncensused S5
@@ -8260,6 +8418,7 @@ def extract_session_v2(model, conversation: list[dict], *, sdk=None,
         _bump_census_class(error_census, "s5_failed")
         result = {"payload": None, "chain_notes": [], "link_before_create": [],
                   "supersessions": [], "noops": [], "deletions": [],
+                  "merges": [],
                   "warnings": [f"S5 embed execution failed: {e}"],
                   "minted_kinds": [], "stats": {}}
     result["chain_enforcer"] = {      # #1695 Task 1 evidence surface

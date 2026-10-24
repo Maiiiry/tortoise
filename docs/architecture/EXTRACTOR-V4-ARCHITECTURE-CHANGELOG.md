@@ -881,3 +881,31 @@ is the part that is still absent. The passage now states the design in the prese
 measurement history lives here rather than in the design document (#8542's rule). `config/v4-mechanisms.yml` carries
 `source_dedup` as `implemented` and its declaration marker sits on this passage, so a stale
 verdict there would be a row saying "shipped" anchored to a document saying "absent".
+
+## 2026-10-24 — D12/O4's FUSION landed: the flagged verdict finally has a consumer (#5006)
+
+`config/v4-mechanisms.yml` recorded `near_dup_merge` as `state: not-implemented, tracking_issue: 5006` while
+`EXTRACTOR-V4-ARCHITECTURE.md` §4.2 named **three** sites for the near-duplicate concern — DETECT the pair
+(`_boundary`, S2.2a-β), record the VERDICT (`vet_gate.OUTCOMES`' `MERGE`, S2.2b), execute the FUSION (S3) — and the
+third had no implementation. `vet_gate.py`'s own docstring was the honest record of it: *"nothing consumes it yet: no
+code routes a `MERGE` verdict to S3"*. #9424 had already landed the REFUSAL half (a fold that would drop an
+attachment is not taken); what was missing is the authorised alternative for exactly that pair.
+
+**What landed.** `tortoise/near_dup_merge.py` is the fusion: ONE survivor (the prior, its claim **byte-identical** —
+never fused), the **union** of both sides' attachments written onto it, and the losing document's provenance kept as
+a `(Session)-[:CONTAINS]->(Point)` edge with its own quote on the merge record. `extract_session_v2` routes the VET
+`MERGE` verdicts (`_merge_flagged_contents`, matched by normalised content, not by VET's index-shaped item ids) into
+`execute_embed`'s consolidation pass; `classify_consolidation` gained the fifth `MERGE` outcome the design always had.
+The fusion runs in `capture_session` through `apply_merge_union`, which routes each edge through the journaled
+`link_entity` writer so it replays (`#3664`).
+
+**Why the bar is 0.95 and not the NOOP band's 0.45.** §16.4's evidence (*"practical thresholds cluster at ~0.95"*;
+*"a false merge costs MORE than keeping near-duplicates"*) plus `#9424`'s split: a mid-band paraphrase pair is still
+REFUSED and still goes to `ADD` — both claims survive. The fusion only makes the near-IDENTICAL pair admissible.
+
+**The verdict is necessary and never sufficient.** The mechanical ladder (§16.4's never-across guard, the bar, a
+readable union) is re-checked inside the mechanism. With no arbiter injected there are no `MERGE` verdicts, so the
+mechanism is **inert** — the same injected-seam posture VET ships with — and the registry row says `implemented` on
+the strength of `tests/test_near_dup_merge_5006.py` driving the real classifier, the real write path and a real
+graph, not on a flag flip. A false `contained` counter (counting the ATTEMPT rather than the edge) was found and
+fixed by that battery before landing.

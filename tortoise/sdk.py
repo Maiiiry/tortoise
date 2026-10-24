@@ -12306,6 +12306,36 @@ class TortoiseSDK:
                     "(non-capture canonical / paraphrase fold / missing "
                     "node — deferred surface)")
 
+        # #5006 (D12/O4): execute the near-duplicate FUSIONs the extractor's S3
+        # decided. Unlike the noop surface above this is NOT a display path —
+        # the merge has already happened at decision time (ONE survivor, no new
+        # payload point); what remains is to write the UNION of both sides'
+        # attachments onto that survivor and the losing document's provenance
+        # (its session) onto the claim. `apply_merge_union` is the one
+        # implementation of that write, shared with the eval lane, and it never
+        # raises — a failed attachment is a warning, never a lost capture.
+        #
+        # It is data-driven, not flag-driven: with no arbiter and
+        # `TORTOISE_VET` unset there are no `MERGE` verdicts, so `merges` is
+        # empty and this block is a no-op on every default capture.
+        merges = out.get("merges") or []
+        if merges:
+            from tortoise.near_dup_merge import apply_merge_union
+
+            for _m in merges:
+                _m_res = apply_merge_union(proj, _m, session_id=session_id,
+                                           sdk=self)
+                for _w in (_m_res.get("warnings") or []):
+                    warnings.append(f"merge {_m_res.get('point_id')}: {_w}")
+                if _m_res.get("unresolved"):
+                    # An attachment the graph could not resolve is NOT a silent
+                    # drop: it is named, and the merge record still carries the
+                    # entity so a later backfill can link it.
+                    warnings.append(
+                        "merge " + str(_m_res.get("point_id")) +
+                        ": unresolved attachment(s) " +
+                        ", ".join(_m_res["unresolved"][:5]))
+
         # ── events ──
         # #2552: payload events are created under their CONTENT-ADDRESSED
         # ``ev_<sha>`` ids (the ``_server_id`` channel — the same id

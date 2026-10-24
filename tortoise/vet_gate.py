@@ -95,6 +95,15 @@ fusion. A merge candidate is flagged ``MERGE`` and
 code routes a ``MERGE`` verdict to S3, and the merge *itself* is #5006's (it
 needs the union-of-attachments machinery and the high bar).
 
+✅ **Updated (#5006) — the verdict HAS a consumer now.** A ``MERGE`` outcome in
+``stats["decisions"]`` is read by ``extractor_v2._merge_flagged_contents`` and
+routed into S3's consolidation pass, where ``tortoise.near_dup_merge`` executes
+the fusion (union of both attachment sets onto ONE survivor). This module still
+performs no fusion itself and must not: the split is §4.2's, and moving the
+write here would put the fusion BEFORE the gate — the one thing that section
+forbids. With ``arbiter=None`` there are no ``MERGE`` verdicts, so the routing
+is inert on every arbiter-less run.
+
 Failure policy (§4.2): FAIL-OPEN
 --------------------------------
 A wrong keep is noise; a wrong drop is memory loss. Unknown ⇒ ``KEEP``. An
