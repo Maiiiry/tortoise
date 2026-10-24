@@ -111,6 +111,14 @@ class TextOutcome:
     session: SessionText | None = None
     shown: int = 0
     limit: int | None = None
+    #: For the ``source-url`` door: did the LINK resolve to a session id?
+    #: ``None`` on the ``session`` door (there is no link to resolve) and on any
+    #: outcome built before the link was probed — deliberately NOT ``True``, so
+    #: the default can never narrate a resolution that did not happen.
+    source_linked: bool | None = None
+    #: The session id the link resolved to, when it did — the second signal
+    #: ``--json`` needs, since ``session_id`` is ``None`` for every miss.
+    linked_session_id: str | None = None
 
     @property
     def served(self) -> bool:
@@ -126,6 +134,12 @@ class TextOutcome:
             "key": self.key,
             "resolved_by": self.resolved_by,
             "served": self.served,
+            # ⚠️ `session_id` below is None for EVERY miss, so a miss is only
+            # diagnosable if the link's own state travels with it (PR #9862
+            # review, P2: "there is no second signal — `--json` cannot tell them
+            # apart either").
+            "source_linked": self.source_linked,
+            "linked_session_id": self.linked_session_id,
             "session_id": sess.session_id if sess is not None else None,
             "narrative": sess.narrative if sess is not None else None,
             "summary": sess.summary if sess is not None else None,
@@ -152,9 +166,29 @@ class TextOutcome:
             # source-url 'session:abc' (session 'session:abc')` — the same value
             # twice, labelled a session it is not (PR #9862 review, P3).
             if self.resolved_by == BY_SOURCE:
+                # ⛔ THE TWO MISSES ARE NOT THE SAME MISS. `source_narrative`
+                # returns None both when the LINK did not resolve (no source row
+                # for this url in this tenant, or its session link is unset) and
+                # when it resolved to a session that holds no text. Printing
+                # "the source's session was resolved" unconditionally narrated a
+                # proof step that had not happened for the first case — the
+                # wrong-pointer defect an earlier P3 fix set out to remove, one
+                # layer down (PR #9862 review, P2). `source_linked is not True`
+                # is the fail-closed read of the field: an outcome that never
+                # probed the link must not claim it resolved.
+                if self.source_linked is not True:
+                    return (f"no §9.1 text in the record behind {self.resolved_by} "
+                            f"{self.key!r} (no source row with this url in this "
+                            f"tenant, or its session link is unset — nothing "
+                            f"was resolved, so nothing was proven about a "
+                            f"session's text)")
+                # The link RESOLVED: name the session it resolved to, so the
+                # operator can go and look at the thing that holds no text.
+                resolved = (f" resolved to session {self.linked_session_id!r}"
+                            if self.linked_session_id else " resolved")
                 return (f"no §9.1 text in the record behind {self.resolved_by} "
-                        f"{self.key!r} (the source's session was resolved, and "
-                        f"the record holds no text for it)")
+                        f"{self.key!r} (the source's link{resolved}, and the "
+                        f"record holds no text for that session)")
             return (f"no §9.1 text in the record for {self.resolved_by} "
                     f"{self.key!r} (the tenant was scoped and read)")
         sess = self.session
@@ -230,7 +264,13 @@ def serve_from_record(
     Exactly one of ``session_id`` / ``source_url`` is the key. ``source_url``
     is §9.4's own shape — *"show me the verbatim text behind this claim"* — and
     resolves through ``public.source.session_id``, a COLUMN, so the link
-    survives the graph being destroyed (`record_read.source_narrative`).
+    survives the graph being destroyed (`record_read.source_session`).
+
+    A ``source_url`` miss carries WHICH miss it was in
+    :attr:`TextOutcome.source_linked` (and the resolved id in
+    :attr:`TextOutcome.linked_session_id`), because "no such source in this
+    tenant" and "that session holds no text" send an operator in opposite
+    directions and `session_id` is ``None`` for both.
 
     Raises :class:`tortoise.record_read.RecordReadError` for a structurally
     broken record (a turn key that cannot be ordered, a malformed turn row):
@@ -242,19 +282,32 @@ def serve_from_record(
             "two keys make the answer's meaning ambiguous and neither makes it "
             "unanswerable"
         )
+    # For the `source-url` door: whether the LINK resolved, and to what. Both
+    # travel on the outcome so a miss is worded as what actually happened.
+    linked: bool | None = None
+    linked_session: str | None = None
     if session_id:
         session = record_read.session_text(
             conn, org_id=org_id, graph_id=graph_id, session_id=session_id)
         key, resolved_by = session_id, BY_SESSION
     else:
-        session = record_read.source_narrative(
-            conn, org_id=org_id, graph_id=graph_id, url=str(source_url))
+        # ⛔ THE LINK IS PROBED SEPARATELY FROM THE TEXT, and not via
+        # `source_narrative`: that returns None for BOTH an unresolved link and
+        # an empty session, so a caller that reports on the miss cannot tell
+        # them apart (see `record_read.source_session`). Same two statements on
+        # the same connection, so this costs no extra round trip.
         key, resolved_by = str(source_url), BY_SOURCE
+        linked_session = record_read.source_session(
+            conn, org_id=org_id, graph_id=graph_id, url=key)
+        linked = linked_session is not None
+        session = None if linked_session is None else record_read.session_text(
+            conn, org_id=org_id, graph_id=graph_id, session_id=linked_session)
     shown = len(session.turns) if session is not None else 0
     if limit is not None and session is not None:
         shown = min(shown, limit)
     return TextOutcome(key=key, resolved_by=resolved_by, session=session,
-                       shown=shown, limit=limit)
+                       shown=shown, limit=limit, source_linked=linked,
+                       linked_session_id=linked_session)
 
 
 def exit_code_for(outcome: TextOutcome) -> int:

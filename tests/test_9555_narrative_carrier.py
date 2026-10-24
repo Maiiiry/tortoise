@@ -559,6 +559,86 @@ def test_the_absent_line_names_the_key_the_door_actually_used():
     assert "no §9.1 text" in by_source, by_source
 
 
+def test_a_source_url_miss_reports_WHICH_miss_it_was():
+    """An unresolved LINK and an empty SESSION are not the same absence.
+
+    PR #9862 review (P2): `record_read.source_narrative` returns ``None`` in
+    three situations — no source row for the url, a row whose `session_id` is
+    NULL, and a link that resolves to a session holding no text — and the verb
+    printed *"the source's session was resolved, and the record holds no text
+    for it"* for ALL of them. For the first two the resolution step never
+    happened, so the one string an operator debugging "why is there no text?"
+    reads first named a proof that was not performed (and `--json` reported
+    `session_id: null` for every case, so it could not tell them apart either).
+
+    Pre-fix this fails on the WORDING (the message said "the source's session was
+    resolved" for an unresolved link), not merely on a missing field: the defect
+    is the sentence an operator reads.
+    """
+    # (1) NO SOURCE ROW: the link cannot resolve, and nothing may claim it did.
+    no_link = record_text.serve_from_record(
+        _Conn([]), org_id="o", graph_id="g", source_url=f"session:{SESSION}")
+    # ⛔ THE WORDING IS CHECKED FIRST, so this leg fails on the PRE-FIX message
+    # ("the source's session was resolved, and the record holds no text for it")
+    # rather than merely on a field that did not exist yet: the defect is the
+    # sentence an operator reads, not the absent attribute.
+    rendered = no_link.render()
+    assert "no §9.1 text" in rendered, rendered
+    assert "nothing was resolved" in rendered, (
+        f"a url with no `:Source` row reports a resolution that never "
+        f"happened: {rendered}")
+    assert "session was resolved" not in rendered, (
+        f"the miss claims the resolution step ran when no link was found: "
+        f"{rendered}")
+    assert "no source row" in rendered, rendered
+    assert not no_link.served
+    assert no_link.source_linked is False, (
+        "an unresolved link reported itself as resolved (source_linked is not "
+        f"False): {no_link.source_linked!r}")
+    assert no_link.linked_session_id is None
+    assert no_link.as_dict()["source_linked"] is False, (
+        "`--json` cannot distinguish the two misses, so it re-reports the "
+        "absence without its cause")
+
+    # (2) THE ROW EXISTS BUT ITS session_id IS EMPTY: still an unresolved link.
+    blank = record_text.serve_from_record(
+        _Conn([("public.source", [("",)])]),
+        org_id="o", graph_id="g", source_url=f"session:{SESSION}")
+    blank_render = blank.render()
+    assert "nothing was resolved" in blank_render, (
+        "a source row with no session link is reported as a resolution, so "
+        f"the message again narrates a proof that never happened: {blank_render}")
+    assert blank.source_linked is False, (
+        "a source row with a blank session_id counts as resolved")
+
+    # (3) THE LINK RESOLVES, the session holds nothing: now the resolution IS
+    #     proven, and the miss may say so — naming the session it resolved to.
+    linked = record_text.serve_from_record(
+        _Conn([("public.source", [(SESSION,)]), ("session_narrative", []),
+               ("public.point", [])]),
+        org_id="o", graph_id="g", source_url=f"session:{SESSION}")
+    linked_render = linked.render()
+    assert f"resolved to session {SESSION!r}" in linked_render, (
+        f"a resolved link does not name the session it resolved to, so the "
+        f"operator cannot go and look at it: {linked_render}")
+    assert "no source row" not in linked_render, linked_render
+    assert not linked.served
+    assert linked.source_linked is True, linked.source_linked
+    assert linked.linked_session_id == SESSION
+    assert record_text.exit_code_for(linked) == record_text.EXIT_ABSENT
+    assert linked.as_dict()["linked_session_id"] == SESSION
+    # The two misses are distinguishable from `--json` ALONE — the second
+    # signal the review measured as missing.
+    assert linked.as_dict()["source_linked"] != no_link.as_dict()["source_linked"]
+
+    # An outcome that never probed the link (the default) must not assert a
+    # resolution either: the fail-closed read of an unmeasured field.
+    unprobed = record_text.TextOutcome(
+        key=f"session:{SESSION}", resolved_by=record_text.BY_SOURCE).render()
+    assert "session was resolved" not in unprobed, unprobed
+    assert "nothing was resolved" in unprobed, unprobed
+
+
 def test_the_exit_code_for_a_served_and_an_absent_answer():
     served = record_text.TextOutcome(
         key=SESSION, resolved_by=record_text.BY_SESSION,
@@ -743,6 +823,48 @@ def test_the_public_capture_path_lands_the_narrative_in_the_record():
         assert [t.body for t in outcome.session.turns] == [
             "what does a source hold?", "the narrative, plus its raw turns."]
         assert outcome.session.transcript.startswith("user: what does a source hold?")
+    finally:
+        conn.close()
+
+
+def test_the_public_capture_path_reports_an_UNLINKED_source_url_honestly():
+    """A `--source-url` the tenant has no `:Source` for: absence, not a guess.
+
+    PR #9862 review (P2) measured that this branch was never exercised end to
+    end: the only live `--source-url` leg seeds the row first, so nothing proved
+    what an operator is told when the URL is wrong/uncaptured — and the message
+    asserted *"the source's session was resolved"* regardless. This is the leg
+    that seeds NO source row, so the wording has to match what actually
+    happened: the LINK did not resolve (and the record was still provably read,
+    which is what makes `3` an answer rather than a guess).
+    """
+    conn = _record_db()
+    try:
+        _ensure_schema(conn)
+        org_id, graph_id = _tenant()
+        _seed(conn, org_id=org_id, graph_id=graph_id)
+        url = f"session:{SESSION}-never-captured"
+
+        outcome = record_text.serve_from_record(
+            conn, org_id=org_id, graph_id=graph_id, source_url=url)
+        assert not outcome.served, (
+            "a source url with no :Source row served text — the fixture is "
+            "wrong or the reader resolves the wrong key")
+        # The SENTENCE first: the defect is what the operator reads, so this leg
+        # fails on the pre-fix wording rather than only on a new field.
+        rendered = outcome.render()
+        assert "nothing was resolved" in rendered, (
+            f"no :Source row exists for {url!r}, so nothing could resolve, yet "
+            f"the verb's miss narrates a resolution: {rendered}")
+        assert "session was resolved" not in rendered, rendered
+        assert outcome.source_linked is False, (
+            f"no :Source row exists for {url!r}, so nothing could resolve, "
+            f"yet the outcome reports link={outcome.source_linked!r}")
+        assert outcome.linked_session_id is None
+        # `3`, i.e. an honest absence: the tenant WAS scoped and read (the
+        # verb installs the prologue before any read), so nothing here is a
+        # no-verdict.
+        assert record_text.exit_code_for(outcome) == record_text.EXIT_ABSENT
     finally:
         conn.close()
 

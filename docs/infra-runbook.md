@@ -3016,6 +3016,18 @@ python -m tortoise record-text --org … --graph … --source-url 'session:<sess
 python -m tortoise record-text … --session <id> --limit 20 --json
 ```
 
+**A `--source-url` miss says WHICH miss it was.** "No such source in this
+tenant" and "the link resolved, the session holds no text" send you in opposite
+directions, so the verb prints the distinction rather than a generic absence
+(`--json` carries it too, as `source_linked` / `linked_session_id`, because
+`session_id` is `null` for both):
+
+- `… nothing was resolved, so nothing was proven about a session's text` — no
+  `public.source` row for that url in this tenant, or its `session_id` is unset.
+  The url is wrong, the capture never landed, or you are in the wrong tenant;
+- `… the source's link resolved to session '<id>', and the record holds no text
+  for that session` — the link IS good, so look at that session's capture.
+
 **Exit codes — and the 3-versus-2 split is the reason the verb exists:**
 
 | code | meaning | next step |
@@ -3032,8 +3044,8 @@ that has one. So the verb installs the record's **own tenant prologue**
 `app.current_org_id` transaction-locally, **reads it back**, and refuses a
 connection whose role can bypass RLS — every refusal is `2`. Once it returns, the
 connection is provably scoped to one tenant, so a zero-row answer is a true
-statement about that tenant and `3` is an answer rather than a guess. This is
-#9555's G1 note and #9600's app role, not a hypothetical.
+statement about that tenant and `3` is an answer rather than a guess. That is the
+G1 note on #9555 and the app role from #9600, not a hypothetical.
 
 ⛔ **The DSN must therefore be the app role** (`tortoise_record_app`), exactly as
 `record-restore` requires: a `postgres`/superuser DSN exits `2` with the role

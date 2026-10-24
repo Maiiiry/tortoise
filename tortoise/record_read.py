@@ -82,6 +82,7 @@ __all__ = [
     "Turn",
     "session_text",
     "source_narrative",
+    "source_session",
 ]
 
 #: The narrative home (#9555).
@@ -324,6 +325,48 @@ def session_text(conn: Any, *, org_id: str, graph_id: str,
     )
 
 
+def source_session(conn: Any, *, org_id: str, graph_id: str,
+                   url: str) -> str | None:
+    """THE LINK: the session id behind a `:Source`'s url, or ``None``.
+
+    §9.4 makes the claim→source link load-bearing, and this is that link read
+    as its OWN fact rather than folded into the text lookup. It matters because
+    ``None`` here is a **different statement** from "the link resolved and the
+    session holds no text" (:func:`session_text` returning ``None``):
+
+    * ``None`` — **no link was resolved**: no `public.source` row with this url
+      in this tenant (a mistyped ``--source-url``, a url never captured, a url
+      outside the tenant), or the row's ``session_id`` is NULL/blank;
+    * a session id — the link resolved, so “this session holds no §9.1 text” is
+      then a true statement about that session.
+
+    ⛔ Collapsing the two is a claim-level fail-open, measured in review (PR
+    #9862, P2): the verb printed *"the source's session was resolved, and the
+    record holds no text for it"* for BOTH, i.e. it narrated a proof step it had
+    not performed — in the one string an operator debugging "why is there no
+    text?" reads first, and with no second signal in ``--json`` either.
+
+    ⚠️ The lookup probes `node_key`, NOT `url`. For a `:Source` the canonical key
+    IS the url (`(label, key)` = `Source -> url`, and `_upsert_statement` writes
+    `node_key = <that key>`), so both columns hold the same string while only
+    `node_key` is indexed (`PRIMARY KEY (org_id, graph_id, node_key)`; there is
+    no index on `url`). `url = %s` would resolve against the tenant prefix and
+    filter the tenant's whole source set on §9.4's answer-time path.
+    """
+    if not url:
+        raise RecordReadError("source_session needs a source url")
+    cursor = _cursor(conn)
+    cursor.execute(
+        "SELECT session_id FROM public.source "
+        "WHERE org_id = %s AND graph_id = %s AND node_key = %s",
+        (org_id, graph_id, url),
+    )
+    rows = _rows(cursor)
+    if not rows or not isinstance(rows[0][0], str) or not rows[0][0].strip():
+        return None
+    return rows[0][0]
+
+
 def source_narrative(conn: Any, *, org_id: str, graph_id: str,
                      url: str) -> SessionText | None:
     """§9.4's verbatim fetch: the session text behind a `:Source`'s url.
@@ -334,23 +377,13 @@ def source_narrative(conn: Any, *, org_id: str, graph_id: str,
     with the graph destroyed the *link* still resolves, because it is a column
     on the record's own `source` row rather than an edge in the cache.
 
-    ⚠️ The lookup probes `node_key`, NOT `url`. For a `:Source` the canonical key
-    IS the url (`(label, key)` = `Source -> url`, and `_upsert_statement` writes
-    `node_key = <that key>`), so both columns hold the same string while only
-    `node_key` is indexed (`PRIMARY KEY (org_id, graph_id, node_key)`; there is
-    no index on `url`). `url = %s` would resolve against the tenant prefix and
-    filter the tenant's whole source set on §9.4's answer-time path.
+    ⚠️ ``None`` here is AMBIGUOUS BY CONSTRUCTION (an unresolved link and an
+    empty session both answer ``None``), so a caller that REPORTS on the miss
+    must call :func:`source_session` and :func:`session_text` itself rather
+    than infer the cause from this return value — see that function's note.
     """
-    if not url:
-        raise RecordReadError("source_narrative needs a source url")
-    cursor = _cursor(conn)
-    cursor.execute(
-        "SELECT session_id FROM public.source "
-        "WHERE org_id = %s AND graph_id = %s AND node_key = %s",
-        (org_id, graph_id, url),
-    )
-    rows = _rows(cursor)
-    if not rows or not isinstance(rows[0][0], str) or not rows[0][0].strip():
+    session_id = source_session(conn, org_id=org_id, graph_id=graph_id, url=url)
+    if session_id is None:
         return None
     return session_text(conn, org_id=org_id, graph_id=graph_id,
-                        session_id=rows[0][0])
+                        session_id=session_id)
