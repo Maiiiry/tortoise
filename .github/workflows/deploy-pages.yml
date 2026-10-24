@@ -711,38 +711,70 @@ jobs:
             exit 1
           fi
           url="https://tortoise.premiselabs.co/$KEY.txt"
+          # #4050/#9680: the ORIGIN leg needs a per-run nonce. This host is the shared
+          # Pages project and its static assets are edge-cached (`s-maxage: 7d` — the
+          # leak probe above measures it), so a plain GET can be answered by the
+          # PREVIOUS deployment's copy: 200, text/plain, the exact 32 bytes, from a
+          # deploy that no longer contains the file. Every assertion below would then
+          # pass on attempt 1 and certify nothing, and the break would surface only
+          # when the cache expires — the weeks-latency shape this step exists to
+          # prevent. `$RANDOM` alone can repeat across runs, so the run id + epoch pin
+          # uniqueness per run. NEVER drop `?cb=`.
+          nonce="${GITHUB_RUN_ID:-local}-$(date +%s)-$RANDOM"
+          origin_url="$url?cb=$nonce"
           : > /tmp/indexnow-key.body
           : > /tmp/indexnow-key.hdr
-          code=000
+          : > /tmp/indexnow-edge.body
+          code=000 edge=000 cache=""
           for attempt in $(seq 1 10); do
-            code=000
+            code=000 edge=000 cache=""
             curl_rc=0
-            # `-D` so content-type is read from the RESPONSE rather than assumed;
-            # `|| curl_rc=$?` because bash -e would otherwise abort the step on the
-            # first transport blip and skip the retries (the trap the sign-in probe
-            # above documents).
+            # `-D` so content-type and the cache status are read from the RESPONSE
+            # rather than assumed; `|| curl_rc=$?` because bash -e would otherwise
+            # abort the step on the first transport blip and skip the retries (the
+            # trap the sign-in probe above documents).
             code=$(curl -sS -o /tmp/indexnow-key.body -D /tmp/indexnow-key.hdr \
-                        -w '%{http_code}' -m 20 "$url" 2>/tmp/indexnow-key.err) || curl_rc=$?
+                        -w '%{http_code}' -m 20 "$origin_url" 2>/tmp/indexnow-key.err) || curl_rc=$?
             [ "$curl_rc" -ne 0 ] && code="curl-failed(rc=$curl_rc)"
-            # The WHOLE predicate decides the break, not just the status: Pages can
-            # briefly serve the PREVIOUS deployment, and that one answers 200 with a
-            # CORRECT body — so "the first 200 wins" would PASS a deploy that stopped
-            # serving the file and notice it only on the following deploy (weeks, for
-            # this site). The final attempt's artifacts are what the checks below
-            # judge, exactly as the leak probe above does.
-            if [ "$code" = "200" ] \
+            cache=$(grep -i '^cf-cache-status:' /tmp/indexnow-key.hdr 2>/dev/null \
+                      | tail -1 | tr -d '\r' | awk '{print $2}' | tr 'A-Z' 'a-z')
+            # Leg 2 — the EXACT URL the IndexNow endpoint is handed (canonical, no
+            # nonce). The origin leg proves the deployment contains the file; this
+            # one proves the edge does not hand the endpoint something else.
+            edge_rc=0
+            edge=$(curl -sS -o /tmp/indexnow-edge.body -w '%{http_code}' -m 20 "$url" 2>/dev/null) || edge_rc=$?
+            [ "$edge_rc" -ne 0 ] && edge="curl-failed(rc=$edge_rc)"
+            # The WHOLE predicate decides the break, not just the status. Two
+            # DIRECTIONALLY OPPOSITE false verdicts are avoided this way, and they
+            # are worth naming because neither is the obvious one:
+            #   * breaking only on `code = 200` does NOT notice a stopped deploy —
+            #     the previous deployment also answers 200 with the correct body, so
+            #     the nonce (leg 1) is what defeats that, not this predicate;
+            #   * what THIS buys is the other direction: a transient bad 200 (an
+            #     error document at 200, a cache rule pinning an HTML copy) is not
+            #     accepted on the first attempt, it is retried — so a propagation
+            #     blip does not red the deploy falsely.
+            if [ "$code" = "200" ] && [ "$cache" != "hit" ] \
                && grep -qi '^content-type:[[:space:]]*text/plain' /tmp/indexnow-key.hdr \
                && [ "$(wc -c < /tmp/indexnow-key.body | tr -d ' ')" = "${#KEY}" ] \
-               && [ "$(cat /tmp/indexnow-key.body)" = "$KEY" ]; then
+               && [ "$(cat /tmp/indexnow-key.body)" = "$KEY" ] \
+               && [ "$edge" = "200" ] \
+               && [ "$(wc -c < /tmp/indexnow-edge.body | tr -d ' ')" = "${#KEY}" ] \
+               && [ "$(cat /tmp/indexnow-edge.body)" = "$KEY" ]; then
               break
             fi
             [ "$attempt" -lt 10 ] && sleep 10
           done
           ctype=$(grep -i '^content-type:' /tmp/indexnow-key.hdr 2>/dev/null | head -1 | tr -d '\r')
           body_len=$(wc -c < /tmp/indexnow-key.body | tr -d ' ')
-          echo "$url -> $code | ${ctype:-no content-type} | $body_len bytes (the key is ${#KEY} bytes)"
+          edge_len=$(wc -c < /tmp/indexnow-edge.body 2>/dev/null | tr -d ' ')
+          echo "$url -> origin $code (cache ${cache:-unknown}) | ${ctype:-no content-type} | $body_len bytes (the key is ${#KEY} bytes) | edge $edge / $edge_len bytes"
           if [ "$code" != "200" ]; then
-            echo "::error::$url answered $code — the IndexNow key file is not served, so the endpoint cannot fetch the proof of host ownership and answers 403 to every submission (#9680)."
+            echo "::error::$url answered $code at ORIGIN — the IndexNow key file is not served by the deployment ($nonce), so the endpoint cannot fetch the proof of host ownership and answers 403 to every submission (#9680)."
+            exit 1
+          fi
+          if [ "$cache" = "hit" ]; then
+            echo "::error::$url was answered from CACHE (cf-cache-status: HIT) even with the per-run nonce — the deployment was never read, so nothing about it was verified. Check the zone's cache rule for query strings (#4050/#9680)."
             exit 1
           fi
           case "$ctype" in
@@ -752,6 +784,15 @@ jobs:
           if [ "$body_len" != "${#KEY}" ] || [ "$(cat /tmp/indexnow-key.body)" != "$KEY" ]; then
             echo "::error::$url must contain the key and NOTHING else: $body_len bytes, want ${#KEY}. Body follows — a trailing newline, a BOM or an error page all break ownership:"
             od -c /tmp/indexnow-key.body | head -3
+            exit 1
+          fi
+          if [ "$edge" != "200" ]; then
+            echo "::error::$url answered $edge at the EDGE — the substrate the endpoint fetches is not serving the key file, even though origin has it."
+            exit 1
+          fi
+          if [ "$edge_len" != "${#KEY}" ] || [ "$(cat /tmp/indexnow-edge.body)" != "$KEY" ]; then
+            echo "::error::$url serves ${edge_len} bytes at the EDGE, want ${#KEY} — origin is correct, so a cache rule is serving a different copy:"
+            od -c /tmp/indexnow-edge.body | head -3
             exit 1
           fi
 

@@ -3138,7 +3138,9 @@ def _dashboard_step_code(name: str) -> str:
     return _strip_bash_comments(step["run"])
 
 
-def _indexnow_fixture(tmp_path: Path, code: str, module_text: str) -> Path:
+def _indexnow_fixture(
+    tmp_path: Path, code: str, module_text: str, write_module: bool = True
+) -> Path:
     """Write `code` (with only the benign retry rewrites) and the module fixture.
 
     Rewrites, both benign: 10/5 attempts -> 2 and `sleep 10` -> `sleep 0`, so the
@@ -3154,17 +3156,21 @@ def _indexnow_fixture(tmp_path: Path, code: str, module_text: str) -> Path:
     )
     assert "seq 1 2" in rewritten, "the retry bounds were not rewritten"
     assert "sleep 10" not in rewritten, "a sleep was left in the executed copy"
-    module = tmp_path / _INDEXNOW_MODULE_REL
-    module.parent.mkdir(parents=True, exist_ok=True)
-    module.write_text(module_text, encoding="utf-8")
+    if write_module:
+        module = tmp_path / _INDEXNOW_MODULE_REL
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text(module_text, encoding="utf-8")
     script = tmp_path / "indexnow.sh"
     script.write_text(rewritten, encoding="utf-8")
     return script
 
 
-#: A key-file GET, one POST per hop (the marketing origin's Function, the app
-#: origin's BFF proxy), and the edge's own answer for an unmatched path. Every
-#: answer is an env var so a test can break exactly one of them.
+#: A key-file GET on two legs (origin with a per-run `?cb=` nonce, then the
+#: canonical URL the endpoint is handed), one POST per hop (the marketing origin's
+#: Function, the app origin's BFF proxy), and the edge's own answer for an
+#: unmatched path. Every answer is an env var so a test can break exactly one of
+#: them — including ONE leg of the key file, which is what makes the two-leg
+#: probe falsifiable.
 STUB_INDEXNOW_CURL = r"""#!/bin/bash
 out= hdr= fmt= url=
 while [ $# -gt 0 ]; do
@@ -3189,25 +3195,46 @@ if [ "${STUB_FAIL_FIRST}" = "1" ] && [ "$n" = "1" ]; then
 fi
 code=200
 ctype="${STUB_CTYPE}"
+cache="${STUB_CACHE:-DYNAMIC}"
 body=""
-key="${url##*/}"; key="${key%.txt}"
-case "$url" in
+path="${url%%\?*}"          # the origin leg carries ?cb=<nonce>
+query=""
+[ "$path" != "$url" ] && query="nonce"
+key="${path##*/}"; key="${key%.txt}"
+case "$path" in
   *app.premiselabs.co*notify-publish)
     code="${STUB_PROXY_CODE}"; body="${STUB_PROXY_BODY}";;
   *tortoise.premiselabs.co*notify-publish)
     code="${STUB_GATE_CODE}"; body="${STUB_GATE_BODY}";;
   *.txt)
-    code="${STUB_GET_CODE}"
-    case "${STUB_BODY_MODE}" in
-      key) body="$key";;
-      newline) body="$key
+    if [ "$query" = "nonce" ]; then
+      code="${STUB_GET_CODE}"
+      case "${STUB_BODY_MODE}" in
+        key) body="$key";;
+        newline) body="$key
 ";;
-      other) body="not-the-key";;
-    esac;;
+        other) body="not-the-key";;
+      esac
+      # A transient bad 200 on the FIRST attempt only: an HTML error document at
+      # 200. The shipped loop must retry it, not accept it (and not break on it).
+      if [ "${STUB_BAD_FIRST}" = "1" ] && [ "$n" = "1" ]; then
+        ctype="text/html; charset=utf-8"; body='<!doctype html><title>oops</title>'
+      fi
+    else
+      code="${STUB_EDGE_CODE:-${STUB_GET_CODE}}"
+      case "${STUB_EDGE_BODY_MODE:-${STUB_BODY_MODE}}" in
+        key) body="$key";;
+        newline) body="$key
+";;
+        other) body="not-the-key";;
+      esac
+    fi;;
   *) code=405;;
 esac
 [ -n "$out" ] && printf '%s' "$body" > "$out"
-[ -n "$hdr" ] && printf 'HTTP/2 %s\r\ncontent-type: %s\r\n\r\n' "$code" "$ctype" > "$hdr"
+if [ -n "$hdr" ]; then
+  printf 'HTTP/2 %s\r\ncontent-type: %s\r\ncf-cache-status: %s\r\n\r\n' "$code" "$ctype" "$cache" > "$hdr"
+fi
 case "$fmt" in *http_code*) printf '%s' "$code";; esac
 exit 0
 """
@@ -3222,8 +3249,18 @@ def _run_indexnow_gate(
     gate_body: str = '{"error":"unauthorized","message":"Session expired or not an admin"}',
     fail_first: bool = False,
     module_text: str = _INDEXNOW_MODULE_OK,
+    cache: str = "DYNAMIC",
+    edge_code: str = "",
+    edge_body_mode: str = "",
+    bad_first: bool = False,
+    cwd: Path | None = None,
 ) -> tuple[int, str, list[str]]:
-    """Run the shipped marketing-origin gate; return (rc, output, urls requested)."""
+    """Run the shipped marketing-origin gate; return (rc, output, urls requested).
+
+    `cwd=REPO` runs it against the SHIPPED module instead of the fixture — the one
+    mode in which the real `sed` extractor and the real constant are exercised
+    together (`test_the_shipped_extractor_reads_the_shipped_constant`).
+    """
     bin_dir = _stub_bin(tmp_path, "curl", STUB_INDEXNOW_CURL)
     env = {
         **os.environ,
@@ -3237,11 +3274,17 @@ def _run_indexnow_gate(
         "STUB_PROXY_CODE": "401",
         "STUB_PROXY_BODY": '{"error":"not_signed_in"}',
         "STUB_FAIL_FIRST": "1" if fail_first else "0",
+        "STUB_CACHE": cache,
+        "STUB_EDGE_CODE": edge_code,
+        "STUB_EDGE_BODY_MODE": edge_body_mode,
+        "STUB_BAD_FIRST": "1" if bad_first else "0",
     }
-    script = _indexnow_fixture(tmp_path, _step_code(INDEXNOW_PROBE), module_text)
+    script = _indexnow_fixture(
+        tmp_path, _step_code(INDEXNOW_PROBE), module_text, write_module=cwd is None
+    )
     r = subprocess.run(
         ["bash", "-e", str(script)],
-        cwd=tmp_path,
+        cwd=cwd or tmp_path,
         capture_output=True,
         text=True,
         env=env,
@@ -3373,8 +3416,12 @@ def test_the_indexnow_gates_are_named_by_every_artifact_that_quotes_them() -> No
 def test_the_indexnow_gate_passes_when_the_surface_is_correct(tmp_path) -> None:
     rc, out, calls = _run_indexnow_gate(tmp_path)
     assert rc == 0, out
-    # Non-vacuity: it must have actually read the key file and the marketing hop.
-    assert [c for c in calls if c.endswith(f"{_INDEXNOW_KEY}.txt")], calls
+    # Non-vacuity: it must have read BOTH key-file legs and the marketing hop.
+    origin = [c for c in calls if c.startswith(f"https://tortoise.premiselabs.co/{_INDEXNOW_KEY}.txt?cb=")]
+    assert origin, f"the cache-bypassing ORIGIN leg was never requested: {calls}"
+    assert f"https://tortoise.premiselabs.co/{_INDEXNOW_KEY}.txt" in calls, (
+        f"the canonical URL the IndexNow endpoint is handed was never requested: {calls}"
+    )
     assert any("tortoise.premiselabs.co" in c and c.endswith("notify-publish") for c in calls), calls
     # #2691, executably: the marketing gate must not touch the dashboard's origin
     # at all — that surface is asserted by `deploy-dashboard`.
@@ -3385,10 +3432,16 @@ def test_the_indexnow_gate_passes_when_the_surface_is_correct(tmp_path) -> None:
 @pytest.mark.parametrize(
     "argv,needle",
     [
-        ({"get_code": "404"}, "is not served"),
+        ({"get_code": "404"}, "at ORIGIN"),
         ({"body_mode": "newline"}, "must contain the key and NOTHING else"),
         ({"body_mode": "other"}, "must contain the key and NOTHING else"),
         ({"ctype": "text/html"}, "is not text/plain"),
+        # #4050/#9680: an edge-cached answer certifies the PREVIOUS deployment, so
+        # the origin leg must be able to notice it answered from cache.
+        ({"cache": "HIT"}, "was answered from CACHE"),
+        # Leg 2 is what the endpoint actually fetches: origin-correct is not enough.
+        ({"edge_code": "404"}, "at the EDGE"),
+        ({"edge_body_mode": "other"}, "at the EDGE"),
         ({"gate_code": "405"}, "did not refuse an anonymous caller"),
         ({"gate_body": '{"error":"not_signed_in"}'}, "did not refuse an anonymous caller"),
         # A provider blip is NOT "the route is gone" (#3485) — the message must
@@ -3458,8 +3511,50 @@ def test_the_indexnow_gate_retries_a_transport_blip_instead_of_failing(tmp_path)
     """
     rc, out, calls = _run_indexnow_gate(tmp_path, fail_first=True)
     assert rc == 0, out
-    key_calls = [c for c in calls if c.endswith(f"{_INDEXNOW_KEY}.txt")]
-    assert len(key_calls) == 2, f"the transport blip did not retry: {calls}"
+    origin = [
+        c for c in calls if f"/{_INDEXNOW_KEY}.txt?cb=" in c
+    ]
+    assert len(origin) == 2, f"the transport blip did not retry: {calls}"
+
+
+def test_the_indexnow_gate_retries_a_bad_200_instead_of_accepting_it(tmp_path) -> None:
+    """The per-attempt predicate is what makes a transient bad 200 retryable.
+
+    Pins the ONE property the whole-predicate break has that a `code = 200` break
+    lacks — and it is the opposite direction from the obvious guess: a stopped
+    deploy is defeated by the nonce, not by this predicate (the previous
+    deployment answers 200 with a CORRECT body too). What this buys is that a
+    200 whose type/body is wrong — an error document served at 200, a cache rule
+    pinning an HTML copy — is not accepted on the first attempt. With
+    `if [ "$code" = "200" ]; then break; fi` the loop stops on that attempt and
+    the ctype arm then reds the deploy for a propagation blip.
+    """
+    rc, out, calls = _run_indexnow_gate(tmp_path, bad_first=True)
+    assert rc == 0, out
+    origin = [c for c in calls if f"/{_INDEXNOW_KEY}.txt?cb=" in c]
+    assert len(origin) == 2, f"a bad 200 was accepted on the first attempt: {calls}"
+
+
+def test_the_shipped_extractor_reads_the_shipped_constant(tmp_path) -> None:
+    """The real `sed` must read the real constant — not just a fixture.
+
+    Every other executed case writes `_shared/indexnow.ts` into a temp tree, so
+    the extractor is only ever exercised against a shape this suite controls. An
+    edit to the SHIPPED file that the regex cannot read (a type annotation, a
+    `as const`, a reflow) would then keep the whole local suite green and red
+    main's next deploy post-merge with `EXTRACTOR fault`. The independent oracle
+    is the key file the deploy uploads (`website/<key>.txt`), which is what the
+    served bytes must equal — so a wrong extraction cannot agree with it.
+    """
+    served = sorted(p for p in (REPO / "website").glob("*.txt") if p.stem != "robots")
+    assert len(served) == 1, f"expected exactly one served IndexNow key file, got {served}"
+    served_key = served[0].stem
+    rc, out, calls = _run_indexnow_gate(tmp_path, cwd=REPO)
+    assert rc == 0, out
+    assert f"https://tortoise.premiselabs.co/{served_key}.txt" in calls, (
+        "the shipped extractor did not resolve the constant the deploy serves — "
+        f"expected {served_key}.txt, requested {[c for c in calls if c.endswith('.txt')]}"
+    )
 
 
 def test_the_indexnow_proxy_gate_retries_a_transport_blip_instead_of_failing(tmp_path) -> None:
