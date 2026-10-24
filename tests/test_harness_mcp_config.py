@@ -2011,20 +2011,6 @@ _CHATGPT_ARM_MARKER = "wizardConnectHarness === 'chatgpt'"
 _ARM_TERMINATOR = re.compile(r"\)\s*:\s*([A-Za-z_$][\w$.]*)\s*(\?|&&|\|\||===|!==)")
 
 
-def _anchor(text: str, needle: str, what: str) -> int:
-    """`text.find(needle)`, asserted — never a bare `ValueError` from `.index()`.
-
-    Every offset this file derives from a source literal routes through here, so a
-    moved heading reports *which* anchor went missing instead of dying as
-    `ValueError: substring not found` naming nothing (#9660 review, P3).
-    """
-    position = text.find(needle)
-    assert position != -1, (
-        f"{what}: the anchor {needle!r} no longer appears — the copy this pin "
-        "reads is gone, or it moved behind different text. Update the anchor.")
-    return position
-
-
 def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
     """(start, end) of the ChatGPT connect card inside `main.jsx` source.
 
@@ -2295,19 +2281,30 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
 
 
 def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
-    """#9660: the ChatGPT recipe renders on four surfaces, and the CARD is pinned
-    by `test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end`. This
-    covers the other three — the docs row, the wizard step, and the served
-    document an agent reads aloud — because the same journey shipped wrong on all
-    four at once, and each rendering is edited by a different hand.
+    """#9660: the connect recipes that drive the shared consent page, judged on ORDER
+    across seven copy blocks in four files (dashboard `main.jsx` and
+    `harnesses.js`, `website/docs.html`, `tortoise/onboarding/SKILL.md`).
 
     WHY ORDER, NOT PRESENCE. `tortoise/oauth.py` reveals the consent page's two
-    shapes: with one Organization it names it and Authorize is live, and with
-    several it hides that line, shows a "Choose an org…" chooser and calls
+    shapes: with one selectable Organization it names it and Authorize is live;
+    with several it hides that line, shows a "Choose an org…" chooser and calls
     `disableAuthorize()`, re-enabling the button only from the chooser's onchange.
     So "click Authorize, and check the Organization … if it offers a chooser, pick
-    one" tells a multi-Organization user to click a disabled control. A presence
-    assertion cannot see that; two offsets can.
+    one" tells such a user to click a disabled control. A presence assertion cannot
+    see that; two offsets can.
+
+    The chooser is a property of the PAGE, not of ChatGPT (`docs/oauth-mcp.md`), so
+    the Claude key-less carriers are judged here too — same three acts, same page,
+    and they shipped the same inversion.
+
+    Each block is bounded to the recipe it belongs to — one list row, one copy
+    string or template, one intro/note paragraph — and not to the whole file. The
+    bound is what makes the offsets mean anything: measured over a file or a whole
+    list, an unrelated mention of either act satisfies the order while the step
+    that matters is inverted (#9660 review).
+
+    The ChatGPT card is NOT here — it is pinned by
+    `test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end`.
     """
     root = Path(__file__).resolve().parent.parent
     main = (root / "website/apps/dashboard/src/main.jsx").read_text(encoding="utf-8")
@@ -2345,6 +2342,8 @@ def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
         ("claude-web step", step_line(harnesses, "Claude opens the authorization page")),
         ("Claude Desktop snippet",
          span(harnesses, "'claude-desktop': () =>", "'claude-web': () =>")),
+        ("Claude Desktop intro",
+         span(harnesses, "'claude-desktop': 'Open Claude Desktop", "'claude-web':")),
         ("wizard step", step_line(harnesses, "confirm Connect Tortoise in the dialog")),
         ("docs row", span(docs, "chatgpt.com/settings/plugins-settings", "</li>")),
         ("served document",
