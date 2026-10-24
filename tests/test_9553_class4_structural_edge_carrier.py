@@ -28,11 +28,18 @@ verb's resolver accepts an OR-set (`id` | `eventId` | `url`). Today `:Source`
 `id == url` and `:Event` `id == eventId`, so the two spellings coincide — the
 emission resolves the node `id` anyway so the record cannot silently become
 unresolvable if that widens. The parts that do NOT coincide are pinned as
-MEASURED BOUNDS at the bottom of this file (`test_bound_*`: the typed-wrapper /
-node-property lane, an id-bearing `:Source` endpoint, a URL-only `:Source` stub
-that carries no `id` at all, a self-edge, and an edge at an endpoint that is
-later superseded), because a bound asserted in prose is a bound nobody
-re-checks.
+MEASURED BOUNDS at the bottom of this file (`test_bound_*`: a `:Source` endpoint,
+both id-bearing and a url-only stub, and a self-edge), because a bound asserted
+in prose is a bound nobody re-checks.
+
+⚠️ THIS FILE WAS WRITTEN AGAINST `#9827`'s DOOR-LEVEL PRODUCER, which emitted
+from `TortoiseSDK.create_edge`. That producer is GONE: the emission moved one
+level down, to the mint itself (`projection/edges.py::_record_structural_edges`),
+because the door could not reach the writers that matter — so the two legs that
+pinned the door's reach as a BOUND (`test_bound_the_node_property_lane_emits_
+nothing`, `test_bound_an_edge_at_a_superseded_endpoint_is_not_restored`) now pin
+that the MINT carries them, and would red on `#9827`'s tree. Both emissions
+together would journal TWO records for ONE edge, which is why only one survives.
 
 Offline: an embedded store (explicit `db_path`) plus a JSONL journal — no
 network, no provider spend.
@@ -189,13 +196,13 @@ def test_a_dedup_hit_still_emits(env):
     from the log forever if the process died in that window.
 
     ⛔ The premise has to be OBSERVABLE, or this test passes for a contract it
-    does not measure (#9553 review P2). `if created:` is the gate in `sdk.py`,
-    and for THIS verb `created` is not a creation flag: `_EdgeHandlers.
-    create_edge` returns `MERGE … RETURN count(*) > 0`, truthy on a dedup hit
-    too. So the second call must be shown to be a DEDUP — the edge count is
-    still 1 while its `created` flag is `True` — and both observations are
-    asserted here. Without the count, a regression that minted a PARALLEL edge
-    on the second call would leave this green too.
+    does not measure (#9553 review P2). `if created:` is the gate at the MINT
+    (`projection/edges.py`), and for THIS verb `created` is not a creation flag:
+    `_EdgeHandlers.create_edge` returns `MERGE … RETURN count(*) > 0`, truthy on
+    a dedup hit too. So the second call must be shown to be a DEDUP — the edge
+    count is still 1 while its `created` flag is `True` — and both observations
+    are asserted here. Without the count, a regression that minted a PARALLEL
+    edge on the second call would leave this green too.
     """
     sdk, events = env
     team = sdk.create_subject("Team Atlas")
@@ -218,63 +225,78 @@ def test_a_dedup_hit_still_emits(env):
         f"closed (got {len(carriers)} of 2): {carriers!r}")
 
 
-# ── MEASURED BOUNDS — the lanes this emission does NOT reach ──────────────
+# ── MEASURED BOUNDS, AND THE TWO LANES THIS CHANGE FIXED ──────────────────
 #
-# These FIVE assert the CURRENT behaviour, not a requirement. Each one is a
-# live-only edge that a rebuild drops. They are tests (not prose) so that the
-# day the missing half lands, this file reds and the claim above it has to be
-# re-derived with the change rather than discovered later.
+# Two families live here, and they are NOT the same kind of test:
+#
+#   * `test_bound_*` — a live-only edge that a rebuild still drops, asserted as
+#     the CURRENT behaviour, not a requirement. They are tests (not prose) so
+#     that the day the missing half lands, this file reds and the claim above it
+#     has to be re-derived with the change rather than discovered later.
+#   * `test_the_mint_carries_*` — the two lanes `#9827`'s DOOR-LEVEL producer
+#     could not reach and that the MINT-LEVEL one does (the node-property lane
+#     and an edge whose endpoint is later superseded). They were bounds in
+#     `#9827`'s revision of this file; they are now the fix. Each would red on
+#     that tree, which is what keeps them from being assertions about nothing.
 
 
-def test_bound_an_id_bearing_source_endpoint_is_not_restored(env):
-    """BOUND (1 of 2 for `:Source`): the record IS emitted, but the fold's id
-    sweep covers `EPISTEMIC_LABELS` only, so a `:Source` endpoint is skipped at
-    replay.
+def test_bound_a_source_endpoint_is_declined_not_restored(env):
+    """BOUND: a `:Source` endpoint is DECLINED at the mint — no record at all.
 
-    `aboutSource`/`aboutDocument` targets are `:Source` by definition, so those
-    two relations can never be restored by this record without widening the
-    fold's sweep.
+    The fold addresses an endpoint by sweeping `EPISTEMIC_LABELS` on `p.id`, and
+    a `:Source` is url-keyed and outside that sweep. `#9827`'s door emitted the
+    record anyway and let the fold skip it; the mint DECLINES to write a record
+    the journal route cannot consume (a record richer than the graph is the one
+    direction Interface A forbids), and reports the decline through the
+    package's one skip reporter.
 
-    ⛔ The record's PRESENCE is asserted, not just its failure to restore: this
-    test's own docstring says the carrier is written, and a claim stated in
-    prose and unchecked in the test that states it is exactly the shape the
-    `url`-only stub below was missed through (#9553 review P2).
+    `aboutSource`/`aboutDocument` targets are `:Source` by definition, so their
+    CANONICAL shape can never be restored without widening the fold's sweep
+    (`#9834`), while the PREDICATES themselves are carried between epistemic
+    endpoints (pinned in `test_9553_class4_structural_edge_records.py`).
     """
+    from tortoise.projection.nonfolded import collect_identity_skips
+
     sdk, events = env
     team = sdk.create_subject("Team Atlas")
     sdk.create_source("https://docs9553.example/page", "document")
 
-    assert sdk.create_edge(
-        "references", team["id"], "https://docs9553.example/page")["created"] is True
+    with collect_identity_skips() as skips:
+        assert sdk.create_edge(
+            "references", team["id"],
+            "https://docs9553.example/page")["created"] is True
 
     proj = sdk._get_proj()
     live = proj.g.query(
         "MATCH (s:Subject)-[r:references]->(t:Source) RETURN count(r)").result_set[0][0]
-    assert live == 1
-    carriers = [
+    assert live == 1, "the live write did not land — vacuous otherwise"
+    assert not [
         e for e in _journal(events)
         if e.get("type") == "DirectEdgeCreated" and e.get("edge_type") == "references"
-    ]
-    assert carriers, (
-        "no `DirectEdgeCreated` was emitted for a `references` edge to an "
-        "ID-BEARING `:Source` (`create_source` writes `id = coalesce($id, "
-        "$url)`, so the emission has an id to name and MUST write a record) — "
-        "the failure mode this bound describes is 'the fold skips it', not "
-        "'nothing is journaled'")
+    ], (
+        "a `DirectEdgeCreated` was emitted for a `:Source` endpoint — the fold "
+        "cannot address one, so that record is dropped at replay and the two "
+        "rebuild routes disagree")
+    reported = [s for s in skips if "structural edge" in s.what]
+    assert reported, (
+        "the mint declined a `:Source` endpoint in SILENCE — a live-only edge "
+        "with no carrier and no signal is indistinguishable at runtime from a "
+        "deliberate skip")
+    assert all(s.drops_record for s in reported)
+
     proj.rebuild_all(str(events), confirm_destructive=True)
     rebuilt = proj.g.query(
         "MATCH (s:Subject)-[r:references]->(t:Source) RETURN count(r)").result_set[0][0]
     assert rebuilt == 0, (
-        "the fold now restores a `:Source` endpoint — the emission's bound has "
-        "been closed, so the claim in projection/edges.py and record_projection.py "
+        "the fold now restores a `:Source` endpoint — the decline's premise is "
+        "gone, so the claim in projection/edges.py and record_projection.py "
         "must be widened (and this bound test updated with it)")
 
 
 def test_bound_a_url_only_source_stub_emits_no_record_and_reports_it(env):
-    """BOUND (2 of 2 for `:Source`): a stub `:Source` minted by
-    `_mint_source_stub` carries NO `id` property, so the emission has no
-    identity to name and writes nothing — a DIFFERENT mechanism from the bound
-    above (record emitted, fold skips it) and from the self-edge (deliberate).
+    """BOUND: a stub `:Source` minted by `_mint_source_stub` carries NO `id`
+    property, so no record is written — a DIFFERENT mechanism from the bound
+    above (a label the fold does not sweep) and from the self-edge (deliberate).
 
     ⛔ The edge IS minted live: the source OR-set carries `by_url=True`
     precisely so a url-only stub resolves. An edge minted live with nothing
@@ -311,12 +333,12 @@ def test_bound_a_url_only_source_stub_emits_no_record_and_reports_it(env):
         if e.get("type") == "DirectEdgeCreated"
         and e.get("tgt") == widget["id"] and e.get("edge_type") == "references"
     ], "a record was emitted for a stub with no `id` — re-derive this bound"
-    reported = [s for s in skips if "direct edge (SDK door)" in s.what]
+    reported = [s for s in skips if "structural edge" in s.what]
     assert reported, (
         "the emission skipped an endpoint with no writable `id` in SILENCE — a "
         "live-only edge with no carrier and no signal is indistinguishable at "
         "runtime from the two DECLARED skips, and an operator cannot tell a "
-        "deliberate degrade from data loss")
+        "deliberate degradation from data loss")
     assert all(s.drops_record for s in reported), (
         "a skipped endpoint means NO record for an edge that IS in the live "
         "graph, so the skip must be counted as a dropped RECORD, not as a "
@@ -330,10 +352,18 @@ def test_bound_a_url_only_source_stub_emits_no_record_and_reports_it(env):
         "projection/edges.py and record_projection.py must be closed with it")
 
 
-def test_bound_the_node_property_lane_emits_nothing(env):
-    """BOUND: `sdk.create_object(..., ownedBy=…)` calls `proj.create_owned_by`
-    DIRECTLY, so it never reaches the SDK door's emission — the commonest
-    `ownedBy` producer is still live-only."""
+def test_the_mint_carries_the_node_property_lane(env):
+    """FIXED (was `#9827`'s bound 1): `sdk.create_object(..., ownedBy=…)` calls
+    `proj.create_owned_by` DIRECTLY — it never passes the SDK's `create_edge`
+    door, which is why a door-level emission left the COMMONEST `ownedBy`
+    producer live-only.
+
+    The emission lives at the mint, so the three typed wrappers
+    (`create_owned_by`/`create_managed_by`/`create_authored_by` — all
+    `return self.create_edge(...)` on the projection) are carried by the SAME
+    producer. ⛔ On `#9827`'s tree this reds at `rebuilt == 0`: the leg is the
+    fix, not a description of it.
+    """
     sdk, events = env
     team = sdk.create_subject("Team Atlas")
     widget = sdk.create_object("Widget Owned", "product", ownedBy=team["id"])
@@ -341,13 +371,18 @@ def test_bound_the_node_property_lane_emits_nothing(env):
     proj = sdk._get_proj()
     live = _edge_count(proj, "ownedBy", widget["id"], team["id"])
     assert live == 1, "the node-property write did not land — vacuous otherwise"
+    assert [
+        e for e in _journal(events)
+        if e.get("type") == "DirectEdgeCreated"
+        and e.get("src") == widget["id"] and e.get("tgt") == team["id"]
+        and e.get("edge_type") == "ownedBy"
+    ], "the node-property lane emitted no carrier — a wrapper's mint is not wired"
 
     proj.rebuild_all(str(events), confirm_destructive=True)
     rebuilt = _edge_count(proj, "ownedBy", widget["id"], team["id"])
-    assert rebuilt == 0, (
-        "the node-property lane now carries its edge — route the claim in "
-        "projection/edges.py to it (the wrappers are `proj.create_owned_by` "
-        "calls, not the SDK door) and update this bound")
+    assert rebuilt == 1, (
+        "`sdk.create_object(name, 'product', ownedBy=team)` lost its edge on a "
+        "journal rebuild — the commonest `ownedBy` producer is live-only again")
 
 
 def test_bound_a_self_edge_is_minted_live_and_never_replayed(env):
@@ -371,11 +406,16 @@ def test_bound_a_self_edge_is_minted_live_and_never_replayed(env):
         "changed, so this bound (and the emission's skip) must be re-derived")
 
 
-def test_bound_an_edge_at_a_superseded_endpoint_is_not_restored(env):
-    """BOUND: the structural predicates are not in `SUPERSEDE_STRUCTURAL_RELS`,
-    so `supersede_point` journals no `DirectEdgeRepoint`; the fold then drops the
-    creation (the endpoint is in `succ`). Live keeps the edge at the dead
-    endpoint, replay loses it."""
+def test_the_mint_carries_an_edge_at_a_later_superseded_endpoint(env):
+    """FIXED (was `#9827`'s bound 5): `dependsOn` is not in
+    `SUPERSEDE_STRUCTURAL_RELS`, so a supersede MOVES nothing here — live keeps
+    the edge at the old point. The `DirectEdgeCreated` fold used to skip every
+    creation touching a superseded endpoint anyway, dropping an edge live still
+    held; `_supersede_took_this_edge` now asks what the supersede DID to that
+    edge instead of keying on the rel type.
+
+    ⛔ On `#9827`'s tree this reds at `rebuilt == 0`.
+    """
     sdk, events = env
     p1 = sdk.create_point("statement", "edge at a doomed endpoint A")
     p2 = sdk.create_point("statement", "endpoint B")
@@ -385,10 +425,11 @@ def test_bound_an_edge_at_a_superseded_endpoint_is_not_restored(env):
     proj = sdk._get_proj()
     sdk.supersede_point(p1["id"], p3["id"])
     assert _edge_count(proj, "dependsOn", p1["id"], p2["id"]) == 1, (
-        "the live supersede moved the edge — this bound no longer describes "
-        "the behaviour")
+        "the live supersede moved the edge — this leg no longer describes the "
+        "behaviour it was written for")
 
     proj.rebuild_all(str(events), confirm_destructive=True)
-    assert _edge_count(proj, "dependsOn", p1["id"], p2["id"]) == 0, (
-        "an edge at a superseded endpoint now survives a rebuild — the bound in "
-        "projection/edges.py and record_projection.py must be closed with it")
+    assert _edge_count(proj, "dependsOn", p1["id"], p2["id"]) == 1, (
+        "an edge at a superseded endpoint was dropped by the rebuild while the "
+        "live graph still holds it — a supersede that never moved this rel must "
+        "not license the fold to skip its creation")

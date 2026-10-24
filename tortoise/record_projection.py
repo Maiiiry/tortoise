@@ -1818,34 +1818,44 @@ def _nested_node_carrier(record: Mapping[str, Any],
 #: edges are carried by their OWN declarations, not this one:
 #: `_POINT_PROPERTY_RELATIONS` (class 1, `extractedFrom`) and
 #: `_OPERATOR_RELATION_RECORDS` (class 3 — the operator's `IMPL`/`NAND`/`hasPart`,
-#: its reverse `INPUT`, and the canonical `mitigated_by` mirror). What is STILL
-#: missing is the rest of the point-property set (`about*`, `TAGGED`) — those
-#: ride their own doors and have no record carrier yet — plus, on the STRUCTURAL
-#: side, the internal writers that call `proj.create_edge` directly (the derived-
-#: edge apply, the approver/event `performs`/`uses`/`produces` writes and the
-#: `wasDerivedFrom` writer).
+#: its reverse `INPUT`, and the canonical `mitigated_by` mirror).
 #:
-#: ✅ The epistemic-endpoint half of the structural predicates is no longer in
-#: the gap: `#9553` (R5 class 4) made the PUBLIC SDK door (`sdk.create_edge` —
-#: the MCP tool `tortoise_create_edge` and the onboarding seed) emit the SAME
-#: flat `DirectEdgeCreated` descriptor `create_direct_edge` emits, carrying the
-#: RESOLVED node ids, so a predicate minted through that door survives a
-#: journal-sourced `rebuild_all` — pinned by
-#: `tests/test_9553_class4_structural_edge_carrier.py`.
-#:
-#: ⛔ What is STILL uncarried, measured and not inferred: the typed wrappers /
-#: node-property lane (`sdk.create_object(..., ownedBy=…)` calls
-#: `proj.create_owned_by` directly, so the door's emission never runs); any edge
-#: with a `:Source` endpoint — TWO sub-cases, not one: an ID-BEARING `:Source`
-#: emits a record the fold's `EPISTEMIC_LABELS`-only sweep then skips, while a
-#: URL-ONLY STUB (`_mint_source_stub` writes no `id`) emits NO record and is
-#: reported through `projection._log_identity_skip` instead of being dropped in
-#: silence; self-edges (the fold refuses to re-create them); an edge at an
-#: endpoint that is LATER SUPERSEDED (no `DirectEdgeRepoint`: the structural
-#: predicates are not in `SUPERSEDE_STRUCTURAL_RELS`, so the fold drops the
-#: creation against `succ`); and the other direct `proj.create_edge` callers.
-#: `projection/edges.py`'s declaration block carries the same list at the point
-#: of enforcement.
+#: The STRUCTURAL predicates (`ownedBy`/`hasPart`/`dependsOn`/`wasDerivedFrom`,
+#: `references`, the bare `about*` mints) are class 4, and they are carried by the
+#: `DirectEdgeCreated` descriptor this module already handles below — the missing
+#: half was the PRODUCER, not this fold. Since `#9553` the structural-edge lane's
+#: two mints journal that record (`projection/edges.py::_record_structural_edges`
+#: ← `TortoiseSDK._record_structural_edge`), so those edges land a `relation` row
+#: with `source_label`/`target_label` naming the endpoints' tables. What stays
+#: missing is NAMED, not implied:
+#:   * `tags` → `TAGGED`: the target is a `:Tag` node and `NODE_TABLES` has no
+#:     `tag` table, so the record holds no `(Tag, key)` identity for
+#:     `relation.tgt_key`'s composite FK to point at — a schema decision, not a
+#:     projection one;
+#:   * a `:Source`-anchored `references` (`link_source_to_entity`): the replay
+#:     fold addresses endpoints by sweeping `EPISTEMIC_LABELS` on `p.id`, and a
+#:     `:Source` is url-keyed and outside it. The lane therefore DECLINES to
+#:     journal such a write and WARNs once, with the reason, rather than filing a
+#:     record the journal route cannot replay (`projection/edges.py`,
+#:     `RECORD_ADDRESSABLE_EDGE_LABELS`).
+#:   * `about*` when no `EntityLinked` record exists is now carried by the bare
+#:     `create_about_edge` mint, on the same `DirectEdgeCreated` route.
+#:   * ⚠️ **THE `idx` RESIDUAL (#9844), measured, not inferred.** A
+#:     `DirectEdgeCreated` descriptor carries no `idx`, so
+#:     `_relation_coordinates` defaults it to `0` — while `relation`'s conflict key
+#:     INCLUDES `idx` and an operator's own `hasPart`/`IMPL`/`NAND` rows carry
+#:     `idx = enumerate(inputs)`. Mint the edge the operator's record already
+#:     carries at `idx >= 1` and the record gains a SECOND row for ONE graph edge
+#:     (measured: `create_operator("composedOf", a, [b])` then
+#:     `create_edge("hasPart", op, b)` leaves the LIVE graph unchanged at two rows
+#:     — the `MERGE` is property-agnostic and dedups onto the `idx=1` edge — while
+#:     the record route computes `(op, b, hasPart, 0)` beside `(op, b, hasPart, 1)`).
+#:     The PRODUCER cannot fix it (the mint takes no property parameter, §9.6, and
+#:     cannot read the `idx` the existing edge carries), so the fix belongs to this
+#:     layer and needs its own test: insert only when no row already exists for the
+#:     `(org, graph, rel_type, src, tgt)` triple, for the `DirectEdgeCreated` family
+#:     only, so `DirectEdgeRepoint` and the re-linking families are untouched.
+#:     Filed as **#9844**.
 _ENVELOPE_RELATIONS: tuple[tuple[str, str, str, str, str], ...] = (
     ("PointAdded", "contains_session", "CONTAINS", "Session", "Point"),
     ("OperatorAdded", "contains_session", "CONTAINS", "Session", "Point"),

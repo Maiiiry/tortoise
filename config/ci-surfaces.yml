@@ -1985,6 +1985,18 @@ surfaces:
   # full matrix, and `sdk`/`core` are what keep it from going silently green
   # on the narrower selections.
   - test_9553_class4_structural_edge_carrier.py
+  # #9553 (R5 class 4), the MINT-side half: the same lane's emission, its
+  # fold-parity endpoint gate and the supersede-ordering narrowing, plus the
+  # journal/record round trip. Registered on the same two surfaces as the
+  # carrier suite above for the same reason -- it observes `tortoise/sdk.py`
+  # (the recorder binding, `_record_structural_edge`) and
+  # `tortoise/projection/edges.py` (the mints), and `projection/__init__.py`
+  # (the `DirectEdgeCreated` fold, `_supersede_took_this_edge`) is a
+  # SHARED_MODULE that forces the full matrix anyway. Its absence here was the
+  # first #9553 review round's BLOCKING finding: `ci_selection.py --integrity`
+  # rglobs every `tests/test_*.py` and redded `manifest-integrity`, while
+  # `select()` never chose the file -- so its legs ran in NO CI leg at all.
+  - test_9553_class4_structural_edge_records.py
   - test_7951_create_point_outbox.py
   # #9124 (the THIRD door): the projection's WRITE HANDLE (`proj.g`,
   # `_GuardedGraph`) refuses a mutating statement outside a declared scope, on
@@ -5302,6 +5314,18 @@ surfaces:
   # full matrix, and `sdk`/`core` are what keep it from going silently green
   # on the narrower selections.
   - test_9553_class4_structural_edge_carrier.py
+  # #9553 (R5 class 4), the MINT-side half: the same lane's emission, its
+  # fold-parity endpoint gate and the supersede-ordering narrowing, plus the
+  # journal/record round trip. Registered on the same two surfaces as the
+  # carrier suite above for the same reason -- it observes `tortoise/sdk.py`
+  # (the recorder binding, `_record_structural_edge`) and
+  # `tortoise/projection/edges.py` (the mints), and `projection/__init__.py`
+  # (the `DirectEdgeCreated` fold, `_supersede_took_this_edge`) is a
+  # SHARED_MODULE that forces the full matrix anyway. Its absence here was the
+  # first #9553 review round's BLOCKING finding: `ci_selection.py --integrity`
+  # rglobs every `tests/test_*.py` and redded `manifest-integrity`, while
+  # `select()` never chose the file -- so its legs ran in NO CI leg at all.
+  - test_9553_class4_structural_edge_records.py
   - test_7951_create_point_outbox.py
   # #7951 (increment 2, the revision door): `update_point` appends its
   # `PointRevised` record BEFORE the cache write. Same subjects as the
@@ -6993,6 +7017,7 @@ durations:
   test_7951_enforce_atomic_write.py: 7.4  # #7951: 19 tests, 7.39s wall (measured at the rebase head; refresh from the first post-merge run)
   test_9079_onboarding_declared_lane.py: 6.2  # #9079: **15 tests**, 6.12 s wall at the #9256 review-fix head (embedded carve-out lane, `--junitxml` sum of `testcase/@time` 5.85 s; warm re-reads 6.25 / 6.63 s wall, max single test 2.44 s) — the count is 14 when the row was written and this PR's `test_a_peer_projection_opening_mid_walk_is_not_attributed_to_this_lane` is the +1, a second embedded SDK the fixture now builds. WEIGHT raised 3.6 -> 6.2 to that coldest reading, never corrected downward (same convention as the rows above: an under-weight starves a loaded shard leg). Refresh from the first post-merge run that includes it.
   test_9553_class4_structural_edge_carrier.py: 12.0  # unmeasured -- a file ADDED BY A PR has no CI junit measurement (`tools/ci_timing.py --refresh-durations` samples push-to-main runs only), and WITHOUT this row `duration_coverage_issues()` reds on `ci_selection.py --integrity`. Count RE-DERIVED at the #9827 review head (`--collect-only` is the authority): 9 test functions / 11 collected cases -- an earlier revision of this note said "9 tests", and the third #9553 review round (P3) measured that drift. The 12.0 weight is unchanged and is NOT the reading: this file's local pytest session is dominated by the once-per-session embedded-fixture cost, which `#3400` attributes to no file (measured in the carve-out lane, 11 passed in 140.92 s of which 130.13 s is the FIRST test's `call` -- the session's first-graph setup -- leaving ~4.4 s across the other ten). Re-derive both from the first post-merge CI run that includes it.
+  test_9553_class4_structural_edge_records.py: 14.0  # unmeasured -- a file ADDED BY A PR has no CI junit measurement (`tools/ci_timing.py --refresh-durations` samples push-to-main runs only), and WITHOUT this row `duration_coverage_issues()` reds on `ci_selection.py --integrity`. Count RE-DERIVED at the #9835 fix head (`--collect-only` is the authority): 21 test functions / 21 collected cases (no parametrized legs). The 14.0 weight is a PLACEHOLDER, not a reading: like its carrier sibling above, this file's local session is dominated by the once-per-session embedded-fixture cost (`#3400` attributes that to no file), so the wall clock here is not this file's work. Re-derive both from the first post-merge CI run that includes it.
   test_9079_edge_lane_declared.py: 18.0  # unmeasured — #9195 (#3400 trap): a file ADDED BY A PR has no CI junit measurement (the refresher samples push-to-main runs only), and WITHOUT this row `duration_coverage_issues()` reds on `ci_selection.py --integrity`. Local embedded-lane wall readings at this head: 15.3 s, 22.4 s, 12.2 s and 6.7 s over four runs (12 test functions / 13 collected when this row was written — `test_a_read_on_this_path_is_not_declared` is parametrized over BOTH declared mints; fleet load varies). ⚠️ COUNT re-derived at the #9256 review-fix head: **13 test functions / 14 collected**, the +1 being this PR's `test_a_peer_projection_opening_mid_walk_is_not_attributed_to_this_lane`, which builds a SECOND embedded SDK. The 18.0 WEIGHT predates that added test and is deliberately NOT re-derived from this box: a re-read here gave 82.99 / 90.19 s of testcase/@time with ONE test, `test_every_edge_mint_declares_its_lane`, at 76.32-86.13 s — ~5x the 18 s this row records for the same walk — which is the lazy embedding-model fetch/load the note below already names (the run logs an unauthenticated HF Hub request), i.e. sandbox network variance rather than test weight, so adopting it would bake a dev-box artefact into the shard packer (record it, do not adopt it — the #3429 rule). Re-derive BOTH the count and the weight from the first post-merge CI run that includes it. ⚠️ The testcase/@time sum is ~18 s on a host with a warm model cache, NOT the wall clock — the first `create_point` in a process pays the one-time lazy embedding load (the same weight the #9123 row documents), and the fixture is per-test. Refresh from the first post-merge run that includes it.
   test_write_op_reachability.py: 3.3  # #8135: 43 tests + 1 xfail, 3.25s wall (same convention)
   test_capture_loop_responsiveness.py: 15.1  # ci-timing top-15 2026-10-20 (run 39467226356); was 10.2
