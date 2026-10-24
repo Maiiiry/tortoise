@@ -944,6 +944,23 @@ test("#3515: hermetic test deps SEAL the sweep — a test can never spawn the re
         + "`tortoise store-sync`, which reads the developer's sessions, rewrites their real "
         + "cursor store and can upload their transcripts",
     );
+
+    // THE SECOND SEAL (#3515 review, ISSUE 3). `sessionStartLines` builds its
+    // deps BY HAND rather than from `hermeticDeps`, so it states the seal again
+    // — and only the site above was guarded. Removing the `sweepImpl: () => {}`
+    // at `sessionStartLines` left this whole file green while making **10 real
+    // `tortoise store-sync` spawns** per run, so the second seal was load-bearing
+    // with nothing holding it. Exercising the helper is the guard: it is the
+    // exact function whose deps drifted.
+    const viaHelper = await sessionStartLines(tmpSpool(), fetchImpl);
+    assert.ok(viaHelper.lines.length >= 0);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(
+      existsSync(marker),
+      false,
+      "sessionStartLines must ALSO inject `sweepImpl` — its deps are hand-written, so the "
+        + "hermeticDeps seal does not cover it and a dropped seal is invisible everywhere else",
+    );
   } finally {
     process.env.PATH = originalPath;
     rmSync(dir, { recursive: true, force: true });

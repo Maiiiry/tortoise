@@ -412,7 +412,7 @@ test("the worker ships a session file, stamps lane=store_sync, and advances on 2
   const path = sessionFixture(root, "s.jsonl", [
     HEADER("sid-e2e"),
     entry("a", null, "user", "hello"),
-    entry("b", "a", "assistant", "world"),
+    entry("b", "a", "assistant", "world", { timestamp: "2026-10-23T10:05:00.000Z" }),
   ]);
   const fetchImpl = stubFetch([200]);
   const receipt = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl, ...FAST });
@@ -425,7 +425,22 @@ test("the worker ships a session file, stamps lane=store_sync, and advances on 2
   assert.equal(body.harness, "pi");
   assert.equal(body.capture_lane, LANE, "piece 8: the lane is the discriminator");
   assert.deepEqual(body.conversation.map((t) => t.content), ["hello", "world"]);
-  assert.equal(typeof body.client_captured_at, "number", "piece 12: the log's own clock");
+  // ISSUE 4 (#3515 review): pin the WIRING of the log's own clock, not just its
+  // type. A regression that swaps `windowCapturedAt(window)` for `Date.now()`
+  // keeps the `entry_timestamp` label while carrying the observation instant —
+  // a false provenance claim, and the timestamp floor's falsifiability rests on
+  // that label being true. `world` carries a DISTINCT timestamp on purpose.
+  assert.equal(
+    body.client_captured_at,
+    Math.floor(Date.parse("2026-10-23T10:05:00.000Z") / 1000),
+    "piece 12: the store-sync clock is the log's NEWEST entry timestamp, not now()",
+  );
+  assert.equal(body.client_captured_at_source, "entry_timestamp");
+  assert.notEqual(
+    body.client_captured_at,
+    Math.floor(Date.now() / 1000),
+    "the fixture timestamp is old on purpose: now() cannot satisfy this row",
+  );
 
   const state = loadCursor(cursorDir).state;
   assert.equal(state.files[path].offset, statSync(path).size, "cursor advanced to the file size");
@@ -518,6 +533,56 @@ test("a half-written tail neither ships garbage nor blocks the next run", async 
     ["first", "second"],
     "the completed turn is present and whole",
   );
+});
+
+// ISSUE 1 (#3515 review): the SIGKILL artifact is a tail that NEVER completes.
+// The row above completes the line before the second pass, so it passes even
+// with the torn-tail guard absent. This row holds the tail torn across THREE
+// passes — exactly what a killed `pi` leaves on disk — and asserts that the
+// same window is not re-POSTed forever.
+test("a torn trailing line does NOT re-ship the same window on every sweep", async () => {
+  const root = tmp("sessions-torn-");
+  const cursorDir = tmp("cursor-torn-");
+  const path = join(root, "s.jsonl");
+  writeFileSync(
+    path,
+    `${HEADER("sid-torn")}\n${entry("a", null, "user", "first")}\n${entry("b", "a", "assistant", "second")}\n{"type":"message","id":"c","parentId":"b","mess`,
+  );
+
+  const first = stubFetch([200]);
+  const r1 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: first, ...FAST });
+  assert.equal(first.calls.length, 1, "the complete part ships once");
+  const after1 = loadCursor(cursorDir).state.files[path];
+  assert.equal(after1.delivered, 2, "two turns delivered");
+
+  // Two further sweeps with the tail STILL torn (the process is dead; nothing
+  // will ever complete it). The window must not be re-POSTed.
+  const second = stubFetch([200]);
+  const r2 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: second, ...FAST });
+  const third = stubFetch([200]);
+  const r3 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: third, ...FAST });
+
+  assert.equal(second.calls.length, 0, "pass 2 must POST nothing while the tail is torn");
+  assert.equal(third.calls.length, 0, "pass 3 must POST nothing while the tail is torn");
+  assert.equal(r2.shipped, 0);
+  assert.equal(r3.shipped, 0);
+  assert.equal(loadCursor(cursorDir).state.files[path].delivered, 2, "`delivered` must not inflate");
+  assert.ok(
+    loadCursor(cursorDir).state.files[path].offset < statSync(path).size,
+    "the cursor still sits behind the torn tail — it is never crossed",
+  );
+
+  // DISCRIMINATION: completing the tail must still ship the whole line. The
+  // guard suppresses a REPEAT, it does not suppress the real work.
+  appendFileSync(path, 'age":{"role":"assistant","content":[{"type":"text","text":"third"}]}}\n');
+  const done = stubFetch([200]);
+  const r4 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: done, ...FAST });
+  assert.equal(done.calls.length, 1, "the completed tail ships on the next pass");
+  assert.deepEqual(
+    done.calls[0].body.conversation.map((t) => t.content),
+    ["first", "second", "third"],
+  );
+  assert.equal(r4.shipped, 1);
 });
 
 test("a TRUNCATED file is re-read from the header, not skipped forever", async () => {
@@ -775,6 +840,145 @@ test("a /compact SHRINK is refused, never shipped (it would delete filed turns)"
     beforeDry,
     "the dry run must not rewrite the cursor store",
   );
+});
+
+// ISSUE 2 (#3515 review): the guard above needs a PRIOR cursor to fire, which is
+// the one case production does NOT give it. The ordinary upgrade path is a long
+// session that was compacted before generation 8 ever ran here, and a live
+// session is excluded from every sweep it starts — so the backstop's FIRST sweep
+// of a file is already post-compaction. Shipping that short window would let the
+// turn store's shorter-re-capture rule hard-delete the pre-compaction turns the
+// HOOK filed. It MUST refuse instead, with no prior to compare against.
+test("a FIRST ship of an already-compacted file is refused (no cursor to compare)", async () => {
+  const root = tmp("sessions-compact-first-");
+  const cursorDir = tmp("cursor-compact-first-");
+  const compaction = (parentId, kept) => JSON.stringify({
+    type: "compaction", id: "z", parentId, timestamp: "2026-10-23T11:00:00.000Z",
+    summary: "S", firstKeptEntryId: kept,
+  });
+  // The file itself carries the WHOLE conversation: two old turns, then Pi
+  // compacts, then the two kept turns. The active window is only the kept pair.
+  const path = sessionFixture(root, "s.jsonl", [
+    HEADER("sid-compact-first"),
+    entry("a", null, "user", "old question"),
+    entry("b", "a", "assistant", "old answer"),
+    entry("k", "b", "user", "kept question"),
+    compaction("k", "k"),
+    entry("m", "z", "assistant", "kept answer"),
+  ]);
+  assert.equal(existsSync(cursorPath(cursorDir)), false, "the premise: NO cursor at all");
+
+
+  const fetchImpl = stubFetch([200]);
+  const receipt = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl, ...FAST });
+
+  assert.equal(fetchImpl.calls.length, 0, "a compacted first ship must NOT be posted");
+  assert.equal(receipt.shipped, 0);
+  assert.equal(receipt.shrunk, 1, "the refusal is COUNTED, never silent");
+  assert.equal(receipt.files[0].reason, "window_shrunk");
+  const state = loadCursor(cursorDir).state.files[path];
+  // NOT `state === undefined || state.offset === 0`: a persisted row at offset 0
+  // is exactly the state that disarms the NEXT sweep, so accepting it would
+  // accept the deletion one run later. No row at all is the invariant.
+  assert.equal(
+    state,
+    undefined,
+    "the refusal must leave NO cursor row — a row would make the next sweep look proven",
+  );
+
+  // And the SECOND real sweep must refuse again (stickiness, asserted rather
+  // than inferred from the dry run's ordering).
+  const again = stubFetch([200]);
+  const second = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: again, ...FAST });
+  assert.equal(again.calls.length, 0, "a sticky refusal must not lapse on the next sweep");
+  assert.equal(second.shrunk, 1);
+
+  // DISCRIMINATION: the plan for this file is `ship` (no cursor, file non-empty),
+  // so with the first-ship arm of the guard removed this row posts. The only
+  // reason it does not is the guard.
+  assert.equal(fetchImpl.calls.length, 0);
+
+  // And a DRY run reports the same refusal without creating a cursor store.
+  const dry = stubFetch([200]);
+  const dryReceipt = await runStoreSync({
+    sessionDir: root, cursorDir, fetchImpl: dry, dryRun: true, ...FAST,
+  });
+  assert.equal(dry.calls.length, 0);
+  assert.equal(dryReceipt.shrunk, 1);
+});
+
+test("a cursor row that PROVES NOTHING cannot disarm the first-ship refusal", async () => {
+  // #3515 review ISSUE 1: `prior === undefined` was the wrong test for "this
+  // lane has never delivered anything". Two ordinary paths write a cursor row
+  // with `delivered: 0` and no window — the `noTurns` advance and a first POST
+  // that is RETAINED (402 quota, offline). Either one made the guard believe it
+  // had a prior, so a quota block that lifts AFTER the user compacts would ship
+  // the short window and hard-delete the hook's turns.
+  const compaction = (parentId, kept) => JSON.stringify({
+    type: "compaction", id: "z", parentId, timestamp: "2026-10-23T11:00:00.000Z",
+    summary: "S", firstKeptEntryId: kept,
+  });
+  const fullLog = [
+    HEADER("sid-unproven"),
+    entry("a", null, "user", "old question"),
+    entry("b", "a", "assistant", "old answer"),
+    entry("k", "b", "user", "kept question"),
+    compaction("k", "k"),
+    entry("m", "z", "assistant", "kept answer"),
+  ];
+
+  // (a) a `no_turns` row: header + a label only, then the real history appears.
+  {
+    const root = tmp("sessions-unproven-nt-");
+    const cursorDir = tmp("cursor-unproven-nt-");
+    const path = join(root, "s.jsonl");
+    writeFileSync(path, `${HEADER("sid-unproven")}\n${NOTE("x", null)}\n`);
+    const warm = stubFetch([200]);
+    const r1 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: warm, ...FAST });
+    assert.equal(r1.noTurns, 1, "the premise: a no_turns row was written");
+    assert.equal(loadCursor(cursorDir).state.files[path].delivered, 0, "and it delivered nothing");
+
+    writeFileSync(path, `${fullLog.join("\n")}\n`);
+    const ship = stubFetch([200]);
+    const r2 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: ship, ...FAST });
+    assert.equal(ship.calls.length, 0, "a no_turns row must not disarm the refusal");
+    assert.equal(r2.shrunk, 1);
+  }
+
+  // (b) a RETAINED first POST (402 quota) that later succeeds.
+  {
+    const root = tmp("sessions-unproven-402-");
+    const cursorDir = tmp("cursor-unproven-402-");
+    const path = join(root, "s.jsonl");
+    writeFileSync(path, `${HEADER("sid-unproven")}\n${entry("q", null, "user", "hi")}\n`);
+    const quota = stubFetch([402]);
+    const r1 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: quota, ...FAST });
+    assert.equal(r1.shipped, 0);
+    assert.equal(loadCursor(cursorDir).state.files[path].delivered, 0);
+
+    writeFileSync(path, `${fullLog.join("\n")}\n`);
+    const ship = stubFetch([200]);
+    const r2 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: ship, ...FAST });
+    assert.equal(ship.calls.length, 0, "a retained first POST must not disarm the refusal");
+    assert.equal(r2.shrunk, 1);
+  }
+});
+
+test("the maxWindow high-water mark SURVIVES a reload so the guard cannot drift off", async () => {
+  const root = tmp("sessions-hw-");
+  const cursorDir = tmp("cursor-hw-");
+  const path = sessionFixture(root, "s.jsonl", [
+    HEADER("sid-hw"),
+    entry("a", null, "user", "one"),
+    entry("b", "a", "assistant", "two"),
+  ]);
+  await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: stubFetch([200]), ...FAST });
+  const recorded = loadCursor(cursorDir).state.files[path];
+  assert.equal(recorded.lastWindow, 2);
+  // `maxWindow` must be PERSISTED, not derived: validCursor() drops unlisted
+  // numeric fields on reload, so an unlisted `maxWindow` would silently reset
+  // the guard's basis every run — a fail-open with no failing test.
+  assert.equal(recorded.maxWindow, 2, "maxWindow must round-trip through the cursor store");
 });
 
 test("a no-turns window is COUNTED as examined-but-awaiting, never as shipped", async () => {

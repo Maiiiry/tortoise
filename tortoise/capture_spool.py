@@ -213,8 +213,10 @@ class Snapshot:
     # and the clock it came from. The floor compares THIS against the install
     # time — never the server's ``capturedAt``, which is the ingest transaction
     # time and so can only ever pass. ``..._source`` values: 'cli_observed'
-    # (stamped at hook fire), 'file_mtime' (the store-sync fallback) or
-    # 'unknown' (an admitted backfill gap, which can never count as a pass).
+    # (stamped at hook fire), 'entry_timestamp' (the store-sync lane's clock —
+    # the session log entry's own timestamp) or 'unknown' (an admitted backfill
+    # gap, which can never count as a pass). 'file_mtime' is a retained legacy
+    # member that no producer sends any more.
     client_captured_at: float | None = None
     client_captured_at_source: str | None = None
 

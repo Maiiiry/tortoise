@@ -7,15 +7,20 @@
  * it — SIGKILL, a crashed process, a closed terminal. Nothing in-process is
  * durable against those.
  *
- * Pi's session `.jsonl` IS durable against them (measured: a `pi -p` SIGKILLed
- * mid-turn left 10 complete, parseable entries on disk, ending with a
- * newline — see `docs/architecture/PI-CAPTURE-ARCHITECTURE.md` §Lifecycle).
- * This module reads that file with a per-file cursor
- * (`cursor-store.ts`) and ships it as an ordinary capture — `harness: "pi"`,
- * `capture_lane: "store_sync"` — through the SAME payload builder and POST
- * the hook uses. There is deliberately NO second capture implementation here:
- * `buildCapturePayload` / `extractTurns` / `postCapture` are imported, so the
- * two lanes cannot drift into two contracts.
+ * For those sessions the artifact this module reads is Pi's own session
+ * `.jsonl`. This module reads that file with a per-file cursor
+ * (`cursor-store.ts`) and ships
+ * it as an ordinary capture — `harness: "pi"`, `capture_lane: "store_sync"` —
+ * through the SAME payload builder and POST the hook uses. There is
+ * deliberately NO second capture implementation here: `buildCapturePayload` /
+ * `extractTurns` / `postCapture` are imported, so the two lanes cannot drift
+ * into two contracts.
+ *
+ * DURABILITY POSTURE IS NOT STATED HERE. What this substrate does and does not
+ * give you — the measured SIGKILL behaviour, the absent `fsync`, the
+ * memory-only prefix before the first assistant message — belongs to
+ * `docs/durability-posture.md`, which is the authority for every such claim in
+ * this tree. It is linked, not restated, so the two cannot drift.
  *
  * WHAT IT IS NOT. It is not a scheduler and not a daemon. It runs when it is
  * invoked — at `session_start` (the recovery sweep, bounded), and from
@@ -60,9 +65,12 @@
  *    is strictly shorter; the turn store's shorter-re-capture rule then
  *    hard-DELETES the turns beyond the new window. So a shrinking window is
  *    REFUSED (cursor retained, counted) rather than shipped.
- *  - **Bounded per run** (piece 10): files, requests, and attempts. An
- *    up-to-date file is skipped from its `stat` + header line, so a sweep does
- *    not read the whole session tree.
+ *  - **Bounded per run** (piece 10): files SHIPPED, requests, and attempts. An
+ *    up-to-date file is skipped from its `stat`, its header line and at most a
+ *    64 KiB tail read (`completeThroughCheap`), so a sweep does not read whole
+ *    session files to discover there is nothing to do. The file COUNT is
+ *    deliberately not capped: examination is O(1) per file, and a cap there
+ *    would starve later files behind an alphabetically-early backlog.
  */
 import { createHash } from "node:crypto";
 import {
@@ -337,6 +345,37 @@ export interface HeaderScan {
  * small positional read answers the identity question; the full scan is paid
  * for only when the plan says ship or re-anchor.
  */
+/**
+ * The byte offset just past the LAST COMPLETE line, read from the file's TAIL.
+ *
+ * A sweep must not read a whole session tree to discover that a file is up to
+ * date — and a torn trailing line is the ORDINARY state of a session whose
+ * process was killed, so the cheap path has to know where the last newline is
+ * without a full scan. A file ending in a newline is complete through its size;
+ * otherwise the position comes from the last 64 KiB.
+ *
+ * `undefined` means the window held no newline at all (a single entry larger
+ * than the window). That falls back to the full scan rather than guessing —
+ * guessing high would cross a complete line, which is silent loss.
+ */
+export function completeThroughCheap(path: string, size: number): number | undefined {
+  const WINDOW = 64 * 1024;
+  const start = Math.max(0, size - WINDOW);
+  const len = size - start;
+  if (len <= 0) return 0;
+  const buf = Buffer.alloc(len);
+  const fd = openSync(path, "r");
+  let read = 0;
+  try {
+    read = readSync(fd, buf, 0, len, start);
+  } finally {
+    closeSync(fd);
+  }
+  const nl = buf.subarray(0, Math.max(0, read)).lastIndexOf(0x0a);
+  if (nl === -1) return start === 0 ? 0 : undefined;
+  return start + nl + 1;
+}
+
 export function scanHeaderLine(path: string): HeaderScan {
   const fd = openSync(path, "r");
   let read = 0;
@@ -379,7 +418,7 @@ export interface FilePlan {
 export function planFile(
   cursor: FileCursor | undefined,
   identity: { size: number; dev: number; ino: number },
-  observed: { headerId?: string; headerSha?: string },
+  observed: { headerId?: string; headerSha?: string; completeThrough?: number },
 ): FilePlan {
   if (!cursor) return { action: "ship", offset: 0, reason: "no cursor" };
   if (
@@ -406,6 +445,17 @@ export function planFile(
   if (cursor.offset > identity.size) {
     // Truncated / rotated / rewritten in place. NEVER a silent skip.
     return { action: "reanchor", offset: 0, reason: "cursor_past_eof" };
+  }
+  // A torn trailing line makes `offset === size` UNREACHABLE — and that is the
+  // ordinary artifact of the SIGKILL this backstop exists for. `size` is not
+  // the position a cursor can occupy; the end of the last COMPLETE line is.
+  // Comparing against `size` alone therefore re-ships the identical window on
+  // EVERY sweep, forever, for a dead session: its file never grows, so its tail
+  // never completes. Nothing new is ahead of the cursor, so nothing ships; the
+  // fragment ships whole once it completes (the file grows, and `completeThrough`
+  // advances past it).
+  if (observed.completeThrough !== undefined && cursor.offset >= observed.completeThrough) {
+    return { action: "skip", offset: cursor.offset };
   }
   if (cursor.offset === identity.size) return { action: "skip", offset: cursor.offset };
   return { action: "ship", offset: cursor.offset };
@@ -599,6 +649,10 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     const headPlan = planFile(prior, identity, {
       headerId: head.headerId,
       headerSha: head.headerSha,
+      // Cheap, and load-bearing for COST rather than correctness: without it a
+      // file whose tail is torn can never satisfy `offset === size`, so every
+      // sweep would full-read it to conclude there is nothing to do.
+      completeThrough: completeThroughCheap(path, identity.size),
     });
     if (headPlan.action === "skip" && head.headerSha !== undefined) {
       // The cheap path: `stat` identity + the header sha already agree and the
@@ -623,10 +677,13 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
       continue;
     }
     // The FULL scan is authoritative for the plan: it can find a session header
-    // that is not the first line, which the header-only read cannot.
+    // that is not the first line, which the header-only read cannot — and it is
+    // the only place that knows where the last COMPLETE line ends, which is the
+    // position a cursor can actually occupy (see planFile's torn-tail note).
     const plan = planFile(prior, identity, {
       headerId: scan.headerId,
       headerSha: scan.headerSha,
+      completeThrough: scan.nextOffset,
     });
     if (plan.reason && plan.reason !== "no cursor") log(`store-sync: ${path}: ${plan.reason}`);
     if (plan.action === "skip") {
@@ -698,6 +755,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         headerSha: scan.headerSha,
         delivered: priorDelivered,
         lastWindow: prior?.lastWindow,
+        maxWindow: prior?.maxWindow ?? prior?.lastWindow,
         updatedAt: now(),
       };
       state.files[path] = advance;
@@ -723,24 +781,61 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     // hook lane never shrinks its window (Pi's entry array keeps the
     // pre-compaction entries), so this refusal costs nothing it would ship.
     const compacted = window.some((w) => w.type === "compaction");
-    const priorWindow = prior?.lastWindow ?? 0;
-    if (compacted && priorWindow > 0 && turns.length < priorWindow) {
+    // THE HIGH-WATER MARK, not `lastWindow`. `lastWindow` only says how big the
+    // PREVIOUS window was, so on a FIRST ship (`prior` undefined) it is 0 and the
+    // guard could not fire — which is precisely how production invokes the
+    // backstop: a session that was compacted before generation 8 ever ran on
+    // this machine has no cursor, and a live session is excluded from every
+    // sweep it starts, so its first sweep is after compaction. Shipping that
+    // short window would let the turn store's shorter-re-capture rule
+    // hard-delete the turns the HOOK already filed.
+    //
+    // So: a window carrying a `compaction` entry that this lane cannot PROVE it
+    // has delivered something for is refused outright — the hook owns the
+    // pre-compaction turns. The refusal is counted (`shrunk`) and logged, never
+    // silent. A `maxWindow` high-water mark then keeps the guard honest across
+    // refusals and rewinds, where `lastWindow` resets.
+    //
+    // "Proven" is NOT "a cursor row exists". Two ordinary paths write a row that
+    // proves nothing — the `noTurns` advance and a first POST that is RETAINED
+    // (402 quota, offline) — both at `delivered: 0` with no window recorded. A
+    // `prior === undefined` test therefore stops guarding the moment either
+    // happens, and a quota block that lifts after the user compacts would ship
+    // the short window and hard-delete the hook's turns. The high-water mark and
+    // the delivered count are the only two fields a real ship always sets
+    // (`lastWindow = turns.length >= 1`), so they are what unproven means.
+    const priorWindow = Math.max(prior?.maxWindow ?? 0, prior?.lastWindow ?? 0);
+    const unproven = compacted && priorWindow === 0 && (prior?.delivered ?? 0) === 0;
+    if (compacted && (unproven || turns.length < priorWindow)) {
       // A dry run reports the refusal WITHOUT persisting it (see the dry-run
       // contract above): the report is the whole product of that mode.
       if (!dryRun) {
-        state.files[path] = {
-          offset: plan.offset,
-          sessionId,
-          dev: identity.dev,
-          ino: identity.ino,
-          headerSha: scan.headerSha,
-          delivered: priorDelivered,
-          lastWindow: priorWindow,
-          updatedAt: prior?.updatedAt ?? 0,
-          attemptedAt: now(),
-          failures: (prior?.failures ?? 0) + 1,
-        };
-        checkpoint();
+        if (unproven) {
+          // STICKY BY CONSTRUCTION, and this is load-bearing. A compacted file
+          // this lane has never shipped stays UNPROVEN, so the guard must keep
+          // firing on every sweep. Writing a cursor record here would make the
+          // NEXT run look like it had a prior, `priorWindow` would read 0, and
+          // the short window would ship — the exact deletion this guard exists
+          // to prevent, one run later. The row that would have caught it is the
+          // DRY RUN below (it re-reads the same state).
+          delete state.files[path];
+          checkpoint();
+        } else {
+          state.files[path] = {
+            offset: plan.offset,
+            sessionId,
+            dev: identity.dev,
+            ino: identity.ino,
+            headerSha: scan.headerSha,
+            delivered: priorDelivered,
+            lastWindow: priorWindow,
+            maxWindow: priorWindow,
+            updatedAt: prior?.updatedAt ?? 0,
+            attemptedAt: now(),
+            failures: (prior?.failures ?? 0) + 1,
+          };
+          checkpoint();
+        }
       }
       receipt.shrunk += 1;
       receipt.files.push({
@@ -754,7 +849,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
       });
       log(
         `store-sync: REFUSED a shrunk window for ${sessionId} ` +
-          `(${turns.length} turns vs ${priorWindow} already delivered — a ` +
+          `(${turns.length} turns vs ${priorWindow || "an unknown"} already held — a ` +
           "/compact cut; shipping it would delete the turns past the new window)",
       );
       continue;
@@ -855,6 +950,9 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         // What THIS window delivered: the shrink guard compares the next window
         // against it, so a `/compact` cut is detectable without a re-read.
         lastWindow: turns.length,
+        // Monotone: the most this file has EVER delivered, which is the most the
+        // server may already hold. Never lowered by a rewind or a refusal.
+        maxWindow: Math.max(prior?.maxWindow ?? 0, prior?.lastWindow ?? 0, turns.length),
         updatedAt: now(),
         attemptedAt: now(),
         failures: 0,
@@ -894,6 +992,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
         headerSha: scan.headerSha,
         delivered: prior?.delivered ?? 0,
         lastWindow: prior?.lastWindow,
+        maxWindow: prior?.maxWindow ?? prior?.lastWindow,
         updatedAt: now(),
         attemptedAt: now(),
         failures: (prior?.failures ?? 0) + 1,
@@ -927,6 +1026,7 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
       headerSha: scan.headerSha,
       delivered: prior?.delivered ?? 0,
       lastWindow: prior?.lastWindow,
+      maxWindow: prior?.maxWindow ?? prior?.lastWindow,
       updatedAt: prior?.updatedAt ?? 0,
       attemptedAt: now(),
       failures: (prior?.failures ?? 0) + 1,

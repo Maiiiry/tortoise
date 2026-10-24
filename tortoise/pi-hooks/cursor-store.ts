@@ -63,6 +63,13 @@ export interface FileCursor {
    *  turn store's shorter-re-capture rule would hard-delete the turns past the
    *  new window, so the shrink is detectable for free and must not be shipped. */
   lastWindow?: number;
+  /** MONOTONE high-water mark: the largest window this file has ever shipped.
+   *  `lastWindow` answers "how big was the last window"; this answers "how much
+   *  may the SERVER already hold". They differ after a refusal (which keeps
+   *  `lastWindow` and `offset` put) and after a rewind, and the difference is
+   *  what makes the shrink guard hold on the FIRST ship of a file that was
+   *  compacted before this lane ever ran — the ordinary upgrade path. */
+  maxWindow?: number;
   /** Unix ms of the last successful advance. */
   updatedAt?: number;
   /** Unix ms of the last attempt (2xx or not) — drives the backoff floor. */
@@ -109,7 +116,11 @@ function validCursor(raw: unknown): FileCursor | undefined {
   const out: FileCursor = { offset: Math.floor(offset) };
   if (typeof rec.sessionId === "string" && rec.sessionId) out.sessionId = rec.sessionId;
   for (const key of [
+    // `maxWindow` MUST be listed: an unlisted numeric field is silently DROPPED
+    // on reload, which would reset the shrink guard's high-water mark every run
+    // and turn the guard off without failing anything.
     "dev", "ino", "updatedAt", "attemptedAt", "failures", "delivered", "lastWindow",
+    "maxWindow",
   ] as const) {
     const v = rec[key];
     if (typeof v === "number" && Number.isFinite(v)) out[key] = v;

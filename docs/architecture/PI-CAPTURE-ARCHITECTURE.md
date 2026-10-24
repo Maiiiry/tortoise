@@ -111,17 +111,25 @@ shorter-re-capture rule **DELETES the turns beyond the new window** (`sdk.py`; t
 remove turns the hook filed.
 
 The worker therefore **REFUSES to ship a shrinking window**: when the active branch
-carries a `compaction` entry and the window is shorter than `lastWindow` (the size of
-what this file already delivered), the cursor is RETAINED, nothing is posted, and the
-refusal is counted (`receipt.shrunk`) and logged. That makes the deletion path
-unreachable without deciding the open design question — posting the *union* of
-shipped + kept, or a server-side monotone window — which stays on #3515 and is named
-in §9. Recovery for anything already filed is still the journal, not the Session.
+carries a `compaction` entry and the window is shorter than the high-water mark of
+what this file may already have delivered, the cursor is RETAINED, nothing is posted,
+and the refusal is counted (`receipt.shrunk`) and logged. A compacted window with **no
+cursor at all** is refused too: this lane cannot prove the server holds nothing older,
+and refusing is the only direction that cannot destroy turns the hook filed. That
+narrows the deletion path to the residual below without deciding the open design
+question — posting the *union* of shipped + kept, or a server-side monotone window —
+which stays on #3515 and is named in §9. Recovery for anything already filed is still
+the journal, not the Session.
 
 **One deliberate cost, stated so it cannot read as an oversight.** The refusal is per
 FILE and STICKY: a compacted session whose window cannot grow back past what was
 delivered stays refused on every later run. That is the intended trade — a refused
-session is visible (`shrunk`) while a deleting ship is not.
+session is visible (`shrunk`) while a deleting ship is not. **Measured magnitude**
+(one box, 2026-10-24): **55 of 292** real session files carry a `compaction` entry,
+so about **19%** of a machine's history is refused on its first ship and left to the
+hook lane and the journal. That is the size of the gap the union/`turn_offset` work in
+§9 has to close — it is not a rounding error, and it is the reason the refusal is
+counted rather than silent.
 
 **The one field that distinguishes them** is the persisted `capture_lane`
 (`hook` | `store_sync`). Without it the two lanes POST byte-identical payloads and a
@@ -328,9 +336,12 @@ are unbuilt would read as done.
 - **Startup resolution assert** on the user's machine — §7.
 - **Part (ii)'s falsifiers (a)/(b)/(c)** — §6.
 - **A monotone window across a `/compact`** — §4's recorded consequence. The
-  deletion path is now unreachable (the worker refuses a shrinking window), so what
-  remains is the design choice between posting the union and a server-side monotone
-  window, plus the sticky-refusal cost recorded in §4.
+  deletion path is **narrowed, not closed**: the worker refuses a shrinking window
+  AND refuses a compacted window it has never shipped, so the reachable residual is
+  a file whose window grows back (a `compaction` entry that is no longer present in
+  the active branch) over turns the server already holds. What remains is the design
+  choice between posting the union and a server-side monotone window (a non-zero
+  `turn_offset` append), plus the sticky-refusal cost recorded in §4.
 - **Two operators over one cursor directory** — the sweep is spawned per
   `session_start` with no singleton or lock. Two workers cannot corrupt the cursor
   (one `rename`) and both may POST the same window (the server MERGE absorbs it), but

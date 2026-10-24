@@ -329,8 +329,7 @@ def test_part_ii_a_real_pi_session_file_is_captured_and_attributed(server, tmp_p
     """
     real_root = Path.home() / ".pi" / "agent" / "sessions"
     real_files = sorted(real_root.rglob("*.jsonl")) if real_root.is_dir() else []
-    header = None
-    source = None
+    candidates: list[tuple[dict, Path]] = []
     for candidate in real_files:
         try:
             with candidate.open(encoding="utf-8") as fh:
@@ -339,25 +338,61 @@ def test_part_ii_a_real_pi_session_file_is_captured_and_attributed(server, tmp_p
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if isinstance(parsed, dict) and parsed.get("type") == "session" and parsed.get("id"):
-            header, source = parsed, candidate
-            break  # a REAL header is enough: the shape is what is being proved
-    if header is None:
+            candidates.append((parsed, candidate))
+            if len(candidates) >= 40:
+                break
+    if not candidates:
         pytest.skip(f"no usable real Pi session file under {real_root}")
 
-    (tmp_path / "sessions").mkdir(parents=True, exist_ok=True)
-    target = tmp_path / "sessions" / "copied.jsonl"
-    target.write_bytes(source.read_bytes())
+    def _compacted(path: Path) -> bool:
+        try:
+            return '"type":"compaction"' in path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
 
-    _proc, receipt = _run_sync(tmp_path, "--file", str(target), server=server)
-    log = receipt["log"]
-    assert log["errors"] == [], log["errors"]
-    if not server.sessions:
-        # The copied session may simply hold no shippable turn (the live one was
-        # mid-answer): that is not a store-sync defect, so it is reported rather
-        # than asserted — the row's claim is about the HEADER/lane, and a file
-        # with nothing to ship cannot carry it.
-        pytest.skip(f"the copied real session has no shippable turn yet: {log}")
-    body = server.sessions[-1]
+    # NON-COMPACTED FIRST. A compacted file is legitimately REFUSED on its first
+    # ship (the shrink guard: its window starts at `firstKeptEntryId`, which is a
+    # DIFFERENT turn-index space from the hook's, so shipping it would overwrite
+    # the hook's turn 0 and delete the rest). Measured on one box: 55 of 292 real
+    # session files carry a compaction entry, while `sorted()` happens to put a
+    # compacted cluster first — so an unfiltered pick spends the whole row on
+    # refusals and reports a skip. Preferring a non-compacted candidate makes the
+    # real-bytes half actually run; the refusal branch below still covers the
+    # case where none is available.
+    candidates.sort(key=lambda item: _compacted(item[1]))
+
+    (tmp_path / "sessions").mkdir(parents=True, exist_ok=True)
+    header: dict | None = None
+    body: dict | None = None
+    refused = 0
+    log: dict = {}
+    for index, (candidate_header, source) in enumerate(candidates[:8]):
+        target = tmp_path / "sessions" / f"copied-{index}.jsonl"
+        target.write_bytes(source.read_bytes())
+        _proc, receipt = _run_sync(tmp_path, "--file", str(target), server=server)
+        log = receipt["log"]
+        assert log["errors"] == [], log["errors"]
+        if server.sessions:
+            header, body = candidate_header, server.sessions[-1]
+            break
+        if log.get("shrunk"):
+            # A COMPACTED real session is REFUSED by the shrink guard on purpose:
+            # shipping its short post-/compact window would delete the turns the
+            # hook already filed. That is the guard WORKING, not a defect — so the
+            # row advances to the next real file instead of turning a refusal
+            # into a silent "pass". Before this branch existed, one compacted
+            # candidate disabled the whole real-bytes half of the verification.
+            refused += 1
+            continue
+        # Nothing shippable and no refusal (the live session was mid-answer): the
+        # row's claim is about the HEADER and the lane, which a file carrying no
+        # turn cannot make. Keep looking, then skip honestly.
+    if body is None:
+        pytest.skip(
+            f"no shippable real Pi session among {len(candidates)} candidate(s) "
+            f"({refused} refused by the shrink guard as compacted; last log={log})"
+        )
+    assert header is not None
     assert body["session_id"] == header["id"], (
         "piece 6: session_id must come from the on-disk header id, never a "
         "generated one"

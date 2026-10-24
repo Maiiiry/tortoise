@@ -246,9 +246,16 @@ are **co-sourced** (mirroring `tortoise/__main__.py::_resolve_config_path`, issu
 `#2369` D1.1): an env key may use the env URL, but a **file**-sourced key
 always resolves its URL from the same file or the built-in default — a
 poisoned `TORTOISE_API_URL` can never redirect a stored credential (and the
-captured conversations) to another host. No local `tortoise` CLI or Python
-install is required, and there is **no `agent-infra` dependency** —
+captured conversations) to another host. The **hook lane** requires no local
+`tortoise` CLI or Python install, and there is **no `agent-infra` dependency** —
 `agent-infra` is not shipped to users.
+
+The **store-sync backstop** is different: it is run by `tortoise store-sync`, so it
+needs the `tortoise` CLI on `PATH`. On a machine with the Pi extension but no Python
+install the hook lane works and the backstop is **inert** — the SIGKILL/crash recovery
+in this document does not happen there, and the only signal is one warning per process
+(`store-sync sweep: no … CLI on PATH` — see `tortoise-capture.ts`). Install the CLI if
+you want the backstop.
 
 ## Relation to the other capture surfaces
 
