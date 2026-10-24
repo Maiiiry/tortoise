@@ -63,11 +63,15 @@ import pytest
 #: `test-record-postgres` job exports (`.github/actions/postgres-provision`).
 RECORD_DB_ENV = "TEST_RECORD_DB_URI"
 
-#: The tools the served ChatGPT first job tells the model to call, in order:
-#: verify, then file the first memory, then read it back by id. `tortoise_health`
-#: is deliberately NOT here — it is retired (#3883), so it is absent from
-#: `tools/list` and a connector's tool grant cannot contain it. The served skill
-#: already says so (`tortoise/onboarding/SKILL.md`, the ADVERTISED-form sentence).
+#: The tools this file drives, in order: verify, file the first memory, then read
+#: it back by id — plus the two listing tools the capstone's step 3 exercises.
+#: The served ChatGPT first job names only the first two (verify, then file), so
+#: this tuple is a SUPERSET of that job rather than a transcription of it; the
+#: read-back and the listing pair come from the capstone's own journey.
+#: `tortoise_health` is deliberately NOT here — it is retired (#3883), so it is
+#: absent from `tools/list` and a connector's tool grant cannot contain it. The
+#: served skill already says so (`tortoise/onboarding/SKILL.md`, the
+#: ADVERTISED-form sentence).
 JOURNEY_TOOLS = ("tortoise_overview", "tortoise_create_point",
                  "tortoise_query", "tortoise_list_graphs", "tortoise_get_entity")
 
@@ -139,9 +143,8 @@ def _tool_payload(body):
 def _assert_call_succeeded(body, what):
     """A `tools/call` DID what it was asked, or this reds naming the envelope.
 
-    ⛔ NOT `assert "error" not in _tool_payload(body)` (P2, PR #9852 review):
-    that spelling is true for both failure envelopes this transport produces, so
-    it is not evidence.
+    ⛔ NOT `assert "error" not in _tool_payload(body)`: that spelling is true
+    for both failure envelopes this transport produces, so it is not evidence.
 
     * a **JSON-RPC protocol error** is `{"jsonrpc", "id", "error": {...}}` — no
       `result` at all, so `_tool_payload` returns `{}` and `"error" not in {}`
@@ -171,7 +174,7 @@ def _assert_call_succeeded(body, what):
 def _assert_healthy_verify_payload(payload):
     """The journey's verify step really measured a healthy graph.
 
-    ⛔ NOT `"error" not in payload` ALONE (P2, PR #9852 review): `_SafeError` — a
+    ⛔ NOT `"error" not in payload` ALONE: `_SafeError` — a
     dict subclass whose only key is `error`, returned as an ORDINARY successful
     `tools/call` result and never as `isError` (`mcp_server._safe`: "every tool
     returns the SDK result on success or `{"error": message}` on failure") — is
@@ -183,7 +186,7 @@ def _assert_healthy_verify_payload(payload):
     `status == "ok"` — set only when the db probe observed success
     (`monitoring.py`, the `db["ok"] is True` branch). It is absent from the
     `_SafeError`/empty shapes entirely, and it is `degraded`/`unknown` for a probe
-    failure, so one assertion closes every shape the first cut let through.
+    failure, so one assertion closes every failure shape.
 
     ⚠️ TWO checks were considered and are deliberately NOT here:
 
@@ -212,8 +215,9 @@ def _database(monkeypatch):
     """ARM the record, and hand back a connection that can assert on it.
 
     ⛔ ARMING IS A SEPARATE ACT FROM HAVING A DATABASE, and this file exists partly
-    because the first cut of it forgot (`TEST_RECORD_DB_URI` set, `TORTOISE_RECORD_DSN`
-    unset): an UNARMED deployment is byte-identical by design — `write_live_record`
+    because the two variables are independent — `TEST_RECORD_DB_URI` set and
+    `TORTOISE_RECORD_DSN` unset is a reachable state: an UNARMED deployment is
+    byte-identical by design — `write_live_record`
     returns `None` with no row, no counter and no warning — so the journey completed
     and every record assertion simply found nothing. That is the same silent shape
     the seam's own "armed but unreachable FAILS" decision exists to keep apart, one
@@ -411,7 +415,7 @@ def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypa
     itself — an unauthenticated call must not leave a row behind.
 
     ⛔ THE RECORD HALF IS ONLY EVIDENCE IF A WRITE COULD HAVE LANDED, so the two
-    preconditions for that are asserted, not assumed (P2, PR #9852 review):
+    preconditions for that are asserted, not assumed:
 
     * the tenant is SEEDED. Without `public.organizations`/`public.graphs` the
       layer tables FK-refuse every insert, so `count(*) == 0` would be true by
@@ -540,7 +544,7 @@ def test_the_verify_step_assertions_reject_the_failure_envelopes_they_name():
                             "result": {"content": [], "isError": False}},
                            "a healthy call")
 
-    # ⛔ the shapes the FIRST cut of this fix let through (P2, PR #9852 review):
+    # ⛔ the failure shapes that carry neither an `error` key nor `isError`:
     # `_SafeError` is a dict with only `error`, returned as a SUCCESSFUL result;
     # an empty result and a missing result carry no `error` key at all.
     safe_error = {"error": "Authentication required. MCP transport mode not "
@@ -626,9 +630,6 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
         _assert_call_succeeded(body, "filing the first memory")
 
         payload = _tool_payload(body)
-        assert "error" not in payload, (
-            "the first memory was REFUSED by the tool, so there is no record to "
-            f"prove: {json.dumps(payload)[:800]}")
         point_id = payload.get("id")
         assert point_id, f"the tool returned no reusable identifier: {payload!r}"
 
@@ -653,8 +654,7 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
             rows = cur.fetchall()
         assert len(rows) == 1, (
             f"expected exactly the one Point this call filed, found {rows!r} — a "
-            "row count above 1 means another tenant's or another call's write "
-            "was filed here")
+            "row count above 1 means this request filed more than one Point")
         recorded_key, recorded_content = rows[0]
         assert recorded_key == point_id, (
             f"the identifier handed to the client ({point_id!r}) is not the "
@@ -670,8 +670,6 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
         assert response.status_code == 200, response.text[:600]
         _assert_call_succeeded(body, f"reading {point_id!r} back")
         read_back = _tool_payload(body)
-        assert "error" not in read_back, (
-            f"the id the client was handed does not read back: {read_back!r}")
         assert read_back.get("id") == point_id, (
             "the read-back payload does not carry the identifier the client was "
             f"handed ({point_id!r}) — got {read_back.get('id')!r}. No `.get` "
@@ -690,7 +688,7 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
 #:
 #: Measured at `dced2b29b`, BY WHOLE TOKEN: **2 tools, 3 names**. "Live" is
 #: `TOOL_REGISTRY` membership — NOT `http_policy`, and the two are not the same
-#: surface (P3, PR #9852 review). `tortoise_index_files` carries
+#: surface. `tortoise_index_files` carries
 #: `http_policy=False` (`tortoise/tool_registry.py`, "EXCLUDED from tenant HTTP"
 #: in its own description), so it is absent from a connector's `tools/list` and
 #: the CONNECTOR-facing half of this defect is `tortoise_query` alone
@@ -699,9 +697,9 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
 #: `tortoise_get_entity(id, type="point")` (the registry's own
 #: `RETIRED_USE_INSTEAD` entry says so).
 #:
-#: ⛔ ONE NAME, NOT TWO, FOR `tortoise_query` (BLOCKING, PR #9852 review). The
-#: first cut of this dict pinned `("tortoise_get", "tortoise_get_point")` because
-#: the matcher was `name in description` — and `tortoise_get` is a strict PREFIX
+#: ⛔ ONE NAME, NOT TWO, FOR `tortoise_query`. A dict that pins
+#: `("tortoise_get", "tortoise_get_point")` because the matcher was
+#: `name in description` is wrong — and `tortoise_get` is a strict PREFIX
 #: of `tortoise_get_point`, so it was counted as "named" without being present.
 #: That is a measurement artifact, not a fact, and it had a second consequence:
 #: `tortoise_get` is ALSO a prefix of `tortoise_get_entity`, the live canonical
@@ -736,7 +734,7 @@ def _retired_names_in_text(text, retired_names):
     """The RETIRED tool names this text NAMES — whole tokens, never substrings.
 
     ⛔ A substring test is the wrong instrument for "this description recommends
-    tool X" (BLOCKING, PR #9852 review): `"tortoise_get" in "...tortoise_get_point"`
+    tool X": `"tortoise_get" in "...tortoise_get_point"`
     is `True`, so every prefix relationship between a retired name and a longer
     name (live or retired) manufactures a hit. Tokenising the prose and
     intersecting with the retired set answers the question that was asked.
@@ -785,8 +783,8 @@ def test_the_retired_name_matcher_reads_whole_tool_names_not_substrings():
 
     The last assertion pins the INSTRUMENT: a name whose spelling falls outside
     `tortoise_[a-z0-9_]+` would be invisible to the matcher, i.e. a stale
-    description naming it would measure CLEAN without having been looked at
-    (P3, PR #9852 review). Every name in both registries matches today; this reds
+    description naming it would measure CLEAN without having been looked at.
+    Every name in both registries matches today; this reds
     on the first one that does not, so the matcher is re-examined instead of
     silently under-reporting.
     """
@@ -822,9 +820,9 @@ def test_the_prescribed_fix_clears_the_stale_description_flag():
     """The xfail above claims it DELETE-ITSELF when the copy is fixed. Prove it.
 
     `RETIRED_USE_INSTEAD` prescribes the replacement for every retired spelling,
-    so applying it to each measured description must empty the measurement. The
-    first cut of this file could not survive that check: with a substring matcher
-    the prescribed replacement for `tortoise_get_point` —
+    so applying it to each measured description must empty the measurement. A
+    substring matcher cannot survive that check: the prescribed replacement for
+    `tortoise_get_point` —
     `tortoise_get_entity(id, type="point")` — still CONTAINS `tortoise_get`, so
     the corrected copy measured as stale, the strict xfail stayed armed over a
     fixed defect, and the equality pins told the fixer "do not widen this pin".
@@ -919,8 +917,8 @@ def test_the_stale_description_set_is_exactly_what_was_measured():
 def test_the_stale_description_set_says_which_half_is_the_connectors():
     """The measured set is 2 tools / 3 names, and only ONE tool is advertised.
 
-    P3, PR #9852 review: the constant and the `xfail` reason above first read as
-    though four *advertised* descriptions were stale — a count that was itself an
+    The constant and the `xfail` reason above could read as though four
+    *advertised* descriptions were stale — a count that would itself be an
     artifact of the substring matcher (`tortoise_get` counted as "named" because
     it prefixes `tortoise_get_point`). It is 2 tools / 3 names, and a ChatGPT-style
     tool-grant client is mis-instructed once. `tortoise_index_files`
