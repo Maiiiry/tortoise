@@ -1254,6 +1254,131 @@ try {
   process.exit(1);
 }
 
+// ── #9553 (R5 class 4): a STRUCTURAL edge lands a `relation` row ──────────
+//
+// The structural predicates (`ownedBy`, `hasPart`, `dependsOn`,
+// `wasDerivedFrom`, `references`, the bare `about*`) had a working
+// `DirectEdgeCreated` fold and NO PRODUCER: the edge lane wrote a bare MERGE
+// and journaled nothing, so both rebuild routes lost the topology. The producer
+// now emits §4.4's flat descriptor WITH `source_label`/`target_label`, because
+// `relation.src_label`/`tgt_label` are bound VALUES and each label resolves its
+// endpoint through its own key column — a `Subject` keys `name`, so a
+// descriptor naming only `Point` would resolve an absent endpoint and land
+// NOTHING, silently. That is what the key assertion below measures: the row
+// must file the SUBJECT by its NAME, not by the journal id.
+//
+// The segment is built from the SHARED fixture's own records (its `PointAdded`
+// and `SubjectAdded`) plus the descriptor the producer emits, so this leg
+// cannot drift from the record shapes the rest of the suite replays.
+try {
+  const tenant = ['9553c4-org', '9553c4-graph'];
+  await db.exec(`
+    INSERT INTO public.organizations (id, name, graph_name)
+      VALUES ('9553c4-org', '9553c4-org', 'org_9553c4-org');
+    INSERT INTO public.graphs (id, org_id, name, namespace)
+      VALUES ('9553c4-graph', '9553c4-org', '9553c4-graph',
+              'org_9553c4-org_9553c4-graph');
+  `);
+  const fixture = join(HERE, '..', 'fixtures', 'record_projection_journal.jsonl');
+  const all = readFileSync(fixture, 'utf8').split('\n').filter((l) => l.trim());
+  // Matched on the COMPACT spelling the fixture file uses (no space after the
+  // colon) — a pretty-printed assumption here would silently find nothing and
+  // turn this leg into the skip it refuses to be.
+  const subjectRecord = all.find(
+    (l) => l.includes('"type":"SubjectAdded"') && l.includes('"id":"sub1"'));
+  const pointRecord = all.find(
+    (l) => l.includes('"type":"PointAdded"') && l.includes('"id":"p1"'));
+  if (!subjectRecord || !pointRecord) {
+    throw new Error('the shared fixture no longer carries SubjectAdded sub1 and '
+      + 'PointAdded p1 — this leg would prove nothing, and a silent skip reads '
+      + 'as a pass');
+  }
+  // The descriptor the PRODUCER writes (TortoiseSDK._record_structural_edge).
+  // Restated here on purpose: this leg is the record route's gate, so it must
+  // consume the shape the producer emits rather than derive it from the same
+  // code the producer runs.
+  const descriptor = JSON.stringify({
+    type: 'DirectEdgeCreated',
+    ts: '2026-10-24T00:00:00Z',
+    event_id: 'ev-c4-ownedby',
+    projection_version: 2,
+    id: 'p1->sub1:ownedBy',
+    src: 'p1',
+    tgt: 'sub1',
+    edge_type: 'ownedBy',
+    source_label: 'Point',
+    target_label: 'Subject',
+  });
+  const segment = join(tmpdir(), `9553c4-${process.pid}.jsonl`);
+  writeFileSync(segment, `${pointRecord}\n${subjectRecord}\n${descriptor}\n`);
+  const emitted = JSON.parse(execFileSync(
+    'python3',
+    ['-c', PROJECTION_PY, join(REPO_ROOT, 'tortoise', 'record_projection.py'),
+     segment, ...tenant],
+    { encoding: 'utf8' },
+  ));
+  if (!emitted.plan.some((x) => x.sql.startsWith('INSERT INTO public.relation'))) {
+    throw new Error('the segment emitted NO relation statement at all — the '
+      + 'DirectEdgeCreated carrier stopped materialising (#9553 R5 class 4)');
+  }
+  const applySegment = async () => {
+    await db.exec('BEGIN');
+    for (const statement of emitted.plan) {
+      await db.query(statement.sql, statement.params);
+    }
+    await db.exec('COMMIT');
+  };
+  const readOwnedBy = async () => db.query(
+    `SELECT rel_type, src_label, src_key, tgt_label, tgt_key, idx
+       FROM public.relation
+      WHERE org_id = $1 AND graph_id = $2 AND rel_type = 'ownedBy'`,
+    tenant);
+  await applySegment();
+  const first = await readOwnedBy();
+  if (first.rows.length !== 1) {
+    const diag = await db.query(
+      `SELECT
+         (SELECT count(*) FROM public.point
+            WHERE org_id = $1 AND graph_id = $2 AND node_key = 'p1')     AS point_row,
+         (SELECT count(*) FROM public.subject
+            WHERE org_id = $1 AND graph_id = $2 AND id = 'sub1')         AS subject_by_id,
+         (SELECT count(*) FROM public.subject
+            WHERE org_id = $1 AND graph_id = $2 AND node_key = 'team-x') AS subject_by_name,
+         (SELECT count(*) FROM public.node_identity
+            WHERE org_id = $1 AND graph_id = $2
+              AND node_label = 'Subject' AND node_key = 'team-x')        AS subject_identity`,
+      tenant);
+    throw new Error(
+      `expected exactly 1 ownedBy relation row, got ${first.rows.length} — the `
+      + 'descriptor landed no row (an ABSENT endpoint: the Point/Subject record '
+      + `rows or their node_identity rows are missing). endpoints: ${JSON.stringify(diag.rows[0])}`);
+  }
+  const row = first.rows[0];
+  const got = `${row.src_label}/${row.src_key} -> ${row.tgt_label}/${row.tgt_key} idx=${row.idx}`;
+  const want = 'Point/p1 -> Subject/team-x idx=0';
+  if (got !== want) {
+    throw new Error(
+      `the ownedBy row is ${got}, expected ${want} — a `
+      + '`source_label`/`target_label` the record does not honour would file the '
+      + 'endpoint under the wrong label (or land nothing), which is the silently '
+      + 'empty shape this family exists to prevent');
+  }
+  await applySegment();
+  const second = await readOwnedBy();
+  if (second.rows.length !== 1) {
+    throw new Error(
+      `a second replay produced ${second.rows.length} ownedBy rows (expected 1) `
+      + '— the relation upsert is not idempotent for this family');
+  }
+  unlinkSync(segment);
+  console.log('✓ #9553: a structural `ownedBy` edge lands one `relation` row '
+    + '(Point/p1 -> Subject/team-x, the Subject filed by its NAME), and '
+    + 're-replays idempotently');
+} catch (e) {
+  console.error(`✗ #9553 R5/class-4 FAILED:\n  ${e.message.split('\n').slice(0, 6).join('\n  ')}`);
+  process.exit(1);
+}
+
 // ── #1383/20261023000002: the backfill repair is ONE statement, and it repairs ─
 //
 // Two drills, because the two claims are different:

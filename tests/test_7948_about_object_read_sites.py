@@ -2476,14 +2476,23 @@ def _route_table() -> dict[tuple[str, str], frozenset[str]]:
 #: How many reference hops a door→reader attribution may take. See the residual
 #: note above: this is a BOUND, not a proof.
 #:
-#: ⚠️ **Three, and the tighter number is what makes the arm discriminate.** A
-#: uniform budget of 5 was measured to accept **16.5 % of the 418
-#: (row, table-door) pairs** — three substitutions that keep a REAL tool in a
-#: cell were green under it (rows 22/24's reach cells swapped, rows 28/30's REST
-#: doors swapped, and row 28's verb changed). A uniform 3 accepts **15.6 %**, and
-#: all three of those red; the shipped predicate, with the two exceptions below,
-#: accepts 69/418 = **16.5 %**. Every one of the 31 true attributions is within 3
-#: hops except the two named in `_DISTANCE_EXCEPTIONS`.
+#: ⚠️ **Three, and this is a BOUND, not a proof.** Re-measured 2026-10-24 at
+#: `d07c9e99e`, with function LOCALS excluded from the symbol index (see
+#: `_symbol_index`) and the per-reader exceptions DISABLED, so these are the PURE
+#: relation's figures: a uniform 2 accepts 24/418 = 5.7 %, a uniform 3 34/418 =
+#: **8.1 %**, a uniform 4 43/418 = 10.3 %, a uniform 5 52/418 = 12.4 %. The SHIPPED
+#: predicate — the two exceptions in `_DISTANCE_EXCEPTIONS` added — accepts 36/418 =
+#: **8.6 %**, i.e. the exceptions are worth exactly the 34 -> 36 above, stated
+#: separately so neither figure hides the other. Every one of the 31 true
+#: attributions is within 3 hops except the two named in `_DISTANCE_EXCEPTIONS`.
+#: ⚠️ An earlier wording here reported 16.5 % for a uniform 5 and 15.6 % for a
+#: uniform 3, and justified the tighter number with three substitutions that stayed
+#: green at 5 and red at 3 (rows 22/24's reach cells swapped, rows 28/30's REST
+#: doors swapped, row 28's verb changed). **Those figures were measured before the
+#: local-symbol rule and they do not reproduce**: under the current index all three
+#: of those substitutions are REFUSED even at a uniform 5. The budget stays at 3 —
+#: it is a bound and nothing depends on the old figures — but a rate restated from
+#: the pre-fix predicate would be a measurement of a defect, so it is not restated.
 _DOOR_REACH_HOPS = 3
 
 #: Readers whose door chain is legitimately LONGER than `_DOOR_REACH_HOPS`,
@@ -2524,6 +2533,26 @@ def _symbol_index() -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]
     `_COUNT_ALL_EDGES_QUERY`, which are strings rather than functions, and a
     function-only index would have reported those two rows as unreachable — a
     false red produced by the instrument, not by the table.
+
+    ⚠️ **A LOCAL variable is NOT a symbol, and indexing one INVENTS reach.** The
+    indexer used to register every `x = …` it walked past, function bodies
+    included, so a local `ids`/`edges`/`result` in one module was a definition
+    node that a same-named local ANYWHERE else resolved to — a hop through
+    nothing but a repeated identifier. Measured on this tree before the rule was
+    added: `MCP tortoise_search` acquired an attribution to
+    `hosted_backup.py::_COUNT_ALL_EDGES_QUERY` over the chain
+    `tortoise_fts_query` → `_review_prune.ids` →
+    `hosted_backup._independent_counts.edges` → the constant, where the two
+    middle hops are the locals `ids` and `edges` in functions that have nothing
+    to do with each other (`#9720` added the `ids` local, which shortened the
+    same collision from 5 hops to 4 and took the accepted count from 69 pairs
+    to 70). The relation's own note claims it "can miss a bad door; it cannot
+    invent reach" — this was reach invented, so locals are excluded here and
+    the negative probe for that exact pair lives in
+    `test_the_door_attribution_refuses_a_door_that_reaches_another_reader`.
+    Values of a local assignment are still REACHED from the enclosing function
+    (`mentions` walks every `Assign` value), so dropping the target nodes loses
+    no real reference.
     """
     defs: dict[str, set[str]] = {}
     refs: dict[str, frozenset[str]] = {}
@@ -2566,18 +2595,27 @@ def _symbol_index() -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]
                 reference(inner.value)
         return frozenset(names)
 
-    def index(body, rel: str, prefix: str) -> None:
+    def index(body, rel: str, prefix: str, *, in_function: bool = False) -> None:
         for node in body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 qual = f"{prefix}{node.name}"
                 node_id = f"{rel}::{qual}"
                 defs.setdefault(node.name, set()).add(node_id)
                 refs[node_id] = mentions(node)
-                index(node.body, rel, f"{qual}.")
+                index(node.body, rel, f"{qual}.", in_function=True)
             elif isinstance(node, ast.ClassDef):
                 defs.setdefault(node.name, set()).add(f"{rel}::{prefix}{node.name}")
-                index(node.body, rel, f"{prefix}{node.name}.")
-            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+                # A class BODY still declares symbols (`Class.ATTR` constants), so
+                # the flag does not survive into it.
+                index(node.body, rel, f"{prefix}{node.name}.", in_function=False)
+            elif (
+                isinstance(node, (ast.Assign, ast.AnnAssign))
+                and node.value is not None
+                and not in_function
+            ):
+                # Module- and class-level only: a function-local target is not a
+                # symbol (see the docstring). Nested `def`s above are still
+                # indexed either way.
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for target in targets:
                     if isinstance(target, ast.Name):
@@ -2699,6 +2737,28 @@ def test_the_door_attribution_refuses_a_door_that_reaches_another_reader():
             "substituted door."
         )
 
+    # ⚠️ A chain built out of a REPEATED NAME is not reach, and this pair is the
+    # measured case: `MCP tortoise_search` was attributed to row 29's backup count
+    # constant over `tortoise_fts_query` → `_review_prune.ids` →
+    # `_independent_counts.edges` → the constant — hops two and three being the
+    # locals `ids` and `edges` in unrelated functions, because the indexer used to
+    # register function-local assignments as symbols. None of the dumps' own
+    # symbols is inside this door's budget and that stays so — measured,
+    # `dump_graph` is 12 hops, `create_backup` 11, `restore_graph` /
+    # `_independent_counts` / `_DUMP_EDGE_PAGE_QUERY` / `_COUNT_ALL_EDGES_QUERY` /
+    # `_restore_copy_settled` unreachable — so if THIS pair reds, a local is a
+    # symbol again. (Other
+    # `hosted_backup.py` symbols ARE reachable at 2-3 hops through attribute names —
+    # `list`, `delete` — which is the relation's declared permissive direction: it
+    # can invent a hop, so only the shape the door is FOR is pinned here.)
+    assert not _door_reaches("MCP tortoise_search", "hosted_backup.py::_COUNT_ALL_EDGES_QUERY"), (
+        "the search door is attributed to `hosted_backup.py::_COUNT_ALL_EDGES_QUERY`, "
+        "which the search path never reaches — the attribution walked a bare NAME "
+        "(`ids`/`edges`) through a function-LOCAL assignment, so any file that reuses "
+        "a common variable name becomes reachable from any door. Locals must not be "
+        "symbol definitions (`_symbol_index`)."
+    )
+
 
 #: Measured at this head: how many of the table's own TWENTY-TWO doors the attribution
 #: predicate accepts, summed over the nineteen customer-callable rows, and the
@@ -2710,12 +2770,32 @@ def test_the_door_attribution_refuses_a_door_that_reaches_another_reader():
 #: `TortoiseSDK.ingest`), not a looser relation — no existing row's accepted set
 #: grew, and no existing row gained a door, which is what distinguishes this from
 #: the tripwire's failure mode.
-_ACCEPTED_PAIRS_AT_THIS_HEAD = 69
+#: ⛔ RE-DERIVED 2026-10-24: 69 -> 36, and the FALL is the whole point — the 70th
+#: pair was REFUSED, not pinned. `_symbol_index` was registering a function-LOCAL
+#: assignment as a symbol definition, so a hop could resolve the bare name to a
+#: local in an unrelated function. The 70th pair was exactly that:
+#: `MCP tortoise_search` -> row 29's `hosted_backup.py::_COUNT_ALL_EDGES_QUERY`
+#: over `tortoise_fts_query` ->(ids)-> `_review_prune.ids` ->(edges)->
+#: `_independent_counts.edges` -> the constant, where hops two and three are the
+#: locals `ids` and `edges` in functions that share no reference at all (`#9720`
+#: added the `ids` local, which shortened that same collision from 5 hops to 4 and
+#: took the count 69 -> 70; the pair was never reach). Locals are not symbols any
+#: more, and re-measuring the corpus shows how much of the 70 was the defect:
+#: **34 of the 70 pairs the predicate accepted at that head were collision chains**
+#: (33 of the pinned 69, plus the 70th itself), so the honest figure is 36. Every
+#: row's OWN declared door still attributes, the three measured substitutions
+#: still red, and the 31-cell floor still holds — which is what makes this a
+#: tightening, not a relaxation. The refused pair is pinned as a negative probe in
+#: `test_the_door_attribution_refuses_a_door_that_reaches_another_reader`.
+_ACCEPTED_PAIRS_AT_THIS_HEAD = 36
 #: 15 -> 17 on 2026-10-21: the TABLE's door set grew by the two SDK doors the new
 #: call-time rows name, and `_hop_query` (an all-edge walk) legitimately reaches
 #: more of a larger set. It is the same relation over a larger population, not a
 #: looser predicate — no door was added to any row's own reach cell.
-_WORST_ROW_AT_THIS_HEAD = 17
+#: ⛔ 17 -> 4 on 2026-10-24, with the pair count above and for the same reason: a
+#: row's accepted set was measured over collision hops as well as references, so
+#: the old 17 counted the defect too. Rows 2 and 17 now lead at 4 accepted doors.
+_WORST_ROW_AT_THIS_HEAD = 4
 
 
 def test_the_attribution_predicate_does_not_swallow_the_whole_table():
@@ -2736,6 +2816,16 @@ def test_the_attribution_predicate_does_not_swallow_the_whole_table():
     ⚠️ **Both figures are MEASURED, and neither is to be nudged.** A RISE means
     the relation loosened (fix the relation, not the ceiling); a FALL means it
     tightened, and the new figure should be re-derived and the reason recorded.
+    ⛔ **The 2026-10-24 red is the precedent, and it was a RISE that was REFUSED.**
+    The pin read 69 and measured 70; the 70th pair was traced (the arm's own
+    enumeration, diffed against the previous head) to `MCP tortoise_search` ->
+    `hosted_backup.py::_COUNT_ALL_EDGES_QUERY`, a chain of two bare-name hops
+    through function LOCALS in unrelated functions — not reach. The relation was
+    tightened, the pair became a negative probe, and the re-derivation that
+    followed found 34 of the 70 accepted pairs were the same defect (33 of the
+    pinned 69, plus the 70th), so the pin FELL to 36. A
+    ceiling raised past a pair nobody can name is the failure this arm exists for;
+    a ceiling LOWERED with the diff recorded is the arm working.
     """
     rows = [row for row in _rows() if _reach(row) == "customer-callable"]
     table_doors = sorted({door for row in rows for door in _doors(str(row["reach"]))})

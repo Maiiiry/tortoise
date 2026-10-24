@@ -105,9 +105,10 @@ property — it DROPS `confidence` (filed as `#9417`). `_rebuild_all_replay`
 carries TWO `SET r += $attrs` statements, and neither is protected the same way:
 the `DirectEdgeCreated` fold has TWO producers since `#9553` — `create_direct_edge`,
 whose `op_type` allowlist is `{IMPL, NAND}` so its descriptor can never name an
-`about*` edge, and `sdk.create_edge`, which DOES journal an
-`aboutSubject`/`aboutObject`/… predicate but emits no attribute from the map's
-vocabulary at all. Both halves are load-bearing and both are pinned
+`about*` edge, and `_record_structural_edge` (reached by the edge MINTS —
+`create_edge`, `create_about_edge` and the three typed wrappers), which DOES
+journal an `aboutSubject`/`aboutObject`/… predicate but emits no attribute from
+the map's vocabulary at all. Both halves are load-bearing and both are pinned
 (`test_every_direct_edge_created_producer_is_safe_for_an_about_edge`), because
 the mechanism that actually protects this statement is the FIXED key vocabulary:
 no `DirectEdgeCreated` in this package can reach an `about*` edge carrying one of
@@ -117,8 +118,9 @@ statement is the map being built from a fixed attribute vocabulary — structura
 repoint descriptors carry none of those keys, the map is empty, and nothing is
 written.
 Its about/structural transfer is a separate BARE `MERGE` whose own comment says
-so (*"Structural 2b transfers are bare: NO attr SET"*), and `create_about_edge`
-journals no `DirectEdgeCreated` at all. Both
+so (*"Structural 2b transfers are bare: NO attr SET"*). (`create_about_edge`
+DOES journal a bare `DirectEdgeCreated` since `#9553` — attribute-free, which is
+what this leg pins — so it is a producer here, not an absence.) Both
 functions therefore carry NO property on an about edge. The census's whole-function
 variable union cannot tell which edge the `SET` lands on, so BOTH rows are
 declared FALSE POSITIVES in `NOT_AN_ABOUT_WRITER` rather than counted as
@@ -382,14 +384,19 @@ WHAT IS PINNED (one entry per test, in file order)
    `_rebuild_all_replay` creation fold does NOT filter on `edge_type`, so what
    keeps a property off an `about*` edge is the `attrs` map's FIXED vocabulary,
    and that gate holds only while every attribute-carrying producer provably
-   cannot name one. `#9553` added a SECOND producer (`sdk.create_edge`) that
-   journals the whole `about*` family, which falsified the "ONLY producer
-   (`create_direct_edge`) refuses any `op_type` outside `{IMPL, NAND}`" premise
-   three sites in this file rested on, while the conclusion stayed true for a
-   different reason. The leg compares the map and the code in BOTH directions:
-   a producer carrying a vocabulary key with no declared statement-level proof
-   reds, a declared proof whose statement is gone reds, and so does the
-   about-capable producer acquiring a key.
+   cannot name one. `#9553` added a SECOND producer — one that journals the whole
+   `about*` family — which falsified the "ONLY producer (`create_direct_edge`)
+   refuses any `op_type` outside `{IMPL, NAND}`" premise three sites in this file
+   rested on, while the conclusion stayed true for a different reason. The leg
+   compares the map and the code in BOTH directions: a producer carrying a
+   vocabulary key with no declared statement-level proof reds, a declared proof
+   whose statement is gone reds, and so does the about-capable producer
+   acquiring a key.
+   ⚠️ THE SYMBOL MOVED, and it is named once here so the next reader does not
+   re-derive it: the about-capable, attribute-free emission is
+   `tortoise/sdk.py::_record_structural_edge` — the recorder the projection's
+   edge mints call — NOT `sdk.create_edge`, whose door-level emission `#9827`
+   added and this change replaced with the mint-level one.
 
 NOT promised: this does not re-open stored-vs-derived (the ruling stands, and
 the edge stays), and it does not decide §11.4 rule 1's tension with `#1370`
@@ -2583,9 +2590,9 @@ def test_the_declared_false_positive_premises_hold_at_the_statement():
     so on an about edge it writes nothing and DROPS `confidence` (`#9417`); and
     `_rebuild_all_replay` carries TWO `SET r += $attrs` statements — the
     `DirectEdgeCreated` fold, which has TWO producers since `#9553`
-    (`create_direct_edge`, restricted to `{IMPL, NAND}`, and `sdk.create_edge`,
-    which CAN journal an `about*` predicate and emits no attribute from the
-    map's vocabulary — see
+    (`create_direct_edge`, restricted to `{IMPL, NAND}`, and
+    `_record_structural_edge`, reached by the edge mints, which CAN journal an
+    `about*` predicate and emits no attribute from the map's vocabulary — see
     `test_every_direct_edge_created_producer_is_safe_for_an_about_edge`), and the
     structural-`DirectEdgeRepoint` fold, whose interpolated `etype` IS
     allowlisted (`validate_rel_type`) and can be `aboutObject` — while its
@@ -3807,8 +3814,9 @@ def test_every_direct_edge_created_producer_is_safe_for_an_about_edge():
     `#9553` review P2 measured the hole this closes: three sites in this file
     justified the `_rebuild_all_replay` exemption with *"the `DirectEdgeCreated`
     fold, whose ONLY producer (`create_direct_edge`) refuses any `op_type`
-    outside `{IMPL, NAND}`"*. `#9553` added a SECOND producer — `sdk.create_edge`,
-    which journals `aboutSubject`/`aboutObject`/… as readily as `ownedBy` — so
+    outside `{IMPL, NAND}`"*. `#9553` added a SECOND producer — one reached by
+    the edge mints, which journals `aboutSubject`/`aboutObject`/… as readily as
+    `ownedBy` — so
     that sentence became false while the conclusion happened to remain true,
     for a DIFFERENT reason (the new producer emits no attribute). The file's own
     doctrine is that an EXEMPTION is a fail-open cell unless something compares
@@ -3816,8 +3824,11 @@ def test_every_direct_edge_created_producer_is_safe_for_an_about_edge():
     still passed. This leg is that comparison.
 
     Two facts, asserted separately, because either alone is insufficient:
-      1. the producer that CAN name an `about*` edge (`sdk.create_edge`) emits
-         NO key from the vocabulary — so nothing lands; and
+      1. the producer that CAN name an `about*` edge carries NO key from the
+         vocabulary — so nothing lands. That is `_record_structural_edge`, the
+         recorder the edge MINTS call: it journals whatever predicate the mint
+         wrote, which is the whole `about*` family, and it passes only
+         `{id, src, tgt, edge_type, source_label, target_label}`; and
       2. the producer that DOES emit them (`create_direct_edge`: `direction`
          always, plus optional confidence/weight/label/batch_id) is restricted
          to `{IMPL, NAND}` AT ITS OWN STATEMENT — asserted in its function body,
@@ -3879,12 +3890,13 @@ def test_every_direct_edge_created_producer_is_safe_for_an_about_edge():
         for module, symbol, _lineno, kwargs in sites
         if not (kwargs & FALSE_POSITIVE_ATTR_VOCAB)
     }
-    assert ("tortoise/sdk.py", "create_edge") in about_capable, (
-        "`sdk.create_edge` is no longer an attribute-free `DirectEdgeCreated` "
-        "producer — it journals `_VALID_EDGE_PREDICATES`, which includes the "
-        "whole `about*` family, so ANY vocabulary key on that emission lands on "
-        "an about edge. If it now passes one, it belongs in "
-        "`DIRECT_EDGE_CREATED_ATTR_GUARDS` WITH a restriction on `relation`, "
+    assert ("tortoise/sdk.py", "_record_structural_edge") in about_capable, (
+        "`_record_structural_edge` — the recorder the structural-edge MINTS call "
+        "— is no longer an attribute-free `DirectEdgeCreated` producer. It "
+        "journals whatever the mint wrote, which includes the whole `about*` "
+        "family, so ANY vocabulary key on that emission lands on an about edge. "
+        "If it now passes one, it belongs in "
+        "`DIRECT_EDGE_CREATED_ATTR_GUARDS` WITH a restriction on the relation, "
         "and the `NOT_AN_ABOUT_WRITER` row plus the documents' 'carries no "
         "property on an about edge' would have to be re-derived"
     )
