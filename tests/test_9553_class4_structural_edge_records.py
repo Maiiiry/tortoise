@@ -44,6 +44,7 @@ from tortoise.projection.edges import (
     RECORD_CARRIED_STRUCTURAL_RELS,
     SOURCE_TARGETED_ABOUT_RELS,
     STRUCTURAL_EDGE_LANE_PREDICATES,
+    SUPERSEDE_TRANSFERRED_RELS,
     structural_edge_record_carrier,
 )
 from tortoise.sdk import TortoiseSDK
@@ -477,3 +478,54 @@ def test_a_rebuild_does_not_append_to_the_journal_it_replays(edge_sdk, tmp_path)
         "a rebuild appended to the journal it was replaying "
         f"({live_lines} → {after_first} → {after_second} lines)")
     assert len(_direct_edges(journal)) == live_edges
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 6. A SUPERSEDE must not cost the edge — the fold's skip is gated on the
+#    rels a supersede actually MOVES
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_supersede_transfer_set_matches_the_writer():
+    """The fold's mirror of the writer's own `SUPERSEDE_STRUCTURAL_RELS`.
+
+    The fold cannot import `tortoise.sdk` (cycle), so the set is mirrored —
+    and pinned here, so a rel added to the writer's transfer cannot silently
+    stop being skipped on replay (or start being skipped when it is not moved).
+    """
+    from tortoise.projection import _supersede_moved_rels
+    from tortoise.sdk import SUPERSEDE_STRUCTURAL_RELS
+
+    assert frozenset(SUPERSEDE_STRUCTURAL_RELS) == SUPERSEDE_TRANSFERRED_RELS
+    assert (_supersede_moved_rels()
+            == frozenset({"IMPL", "NAND"}) | SUPERSEDE_TRANSFERRED_RELS)
+
+
+def test_a_supersede_does_not_drop_a_structural_edge_the_live_graph_kept(edge_sdk):
+    """⛔ THE GUARD'S PREMISE, measured.
+
+    `DirectEdgeCreated`'s fold skipped every creation whose endpoint had been
+    superseded, arguing that supersede had already moved the edge and journaled
+    a repoint. That is true only for the rels supersede MOVES — for
+    `dependsOn`/`ownedBy`/… it never touches the edge, so LIVE keeps it at the
+    old point and the skip made `rebuild_all` drop it. Measured before the gate:
+    `dependsOn` live at old, rebuild → gone.
+    """
+    sdk, _journal = edge_sdk
+    ids = _world(sdk)
+    proj = sdk._get_proj()
+    assert proj.create_edge(ids["p1"], ids["p2"], "dependsOn") is True
+    successor = sdk.create_point("claim", "class 4 successor", pointKind="statement")
+    sdk.supersede_point(ids["p1"], successor["id"])
+
+    def outgoing(pid: str) -> set[str]:
+        return {row[0] for row in proj.g.query(
+            "MATCH (:Point {id:$p})-[r]->() RETURN type(r)",
+            params={"p": pid}).result_set}
+
+    live_old = outgoing(ids["p1"])
+    assert "dependsOn" in live_old, live_old
+    proj.rebuild_all(str(edge_sdk[1].parent), confirm_destructive=True)
+    assert outgoing(ids["p1"]) == live_old, (
+        "a rebuild dropped an edge the live graph still holds at the superseded "
+        "point — the fold's supersede skip was applied to a rel supersede never moves")

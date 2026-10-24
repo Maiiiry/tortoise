@@ -4662,6 +4662,39 @@ def _prewipe_synthetic_write_scope(reason: str):
 _NO_FOLD_LANE = contextlib.nullcontext()
 
 
+def _supersede_moved_rels() -> frozenset[str]:
+    """The edge types a SUPERSEDE **MOVES live** — the only ones its guard may skip.
+
+    Read by the `DirectEdgeCreated` fold's superseded-endpoint guard (`#9553`).
+    That guard's premise is *"supersede already transferred this edge LIVE, and
+    journaled its own `DirectEdgeRepoint` descriptor for the NEW endpoint"*, so it
+    may only skip a creation for rels a supersede actually moves:
+
+      * `IMPL`/`NAND` — leg 2a transfers them and emits the repoint
+        unconditionally;
+      * `SUPERSEDE_TRANSFERRED_RELS` — leg 2b's `structural_rels` loop moves them.
+
+    ⛔ Every OTHER rel is untouched by a supersede, so its creation must still be
+    replayed at the old endpoint — skipping it is how a rebuild dropped an edge
+    live still held (`dependsOn`, `ownedBy`, …, #9553 class 4).
+
+    ⚠️ RESIDUAL, stated where the gate is (`wasDerivedFrom`/`aboutAction`): those
+    two are MOVED live by 2b but are not derivable, so 2b emits NO repoint
+    descriptor for them. Skipping their creation keeps the `E2E-11.6`
+    no-dead-point invariant (no phantom at the old point) at the price of losing
+    the edge on the journal route; the RECORD route keeps its pre-supersede row.
+    Closing that needs a repoint descriptor for non-derivable structural rels AND
+    a delete-old leg on the record side — a separate behaviour, filed as its own
+    issue.
+
+    Late import: `tortoise.projection.edges` imports THIS module (the same
+    reason `_structural_edge_write_scope` imports late).
+    """
+    from .edges import SUPERSEDE_TRANSFERRED_RELS
+
+    return frozenset({"IMPL", "NAND"}) | SUPERSEDE_TRANSFERRED_RELS
+
+
 def _fold_lane_for_event(seq: int, event_source):
     """The declaration a FOLD write runs under, chosen by event PROVENANCE.
 
@@ -16156,19 +16189,38 @@ class FalkorProjection(
                     # Phantom self-edge: never re-create (E2E-11.6 no-self
                     # contract — the same guard the repoint leg applies).
                     continue
-                if src in succ or tgt in succ:
-                    # A SUPERSEDED endpoint. Supersede already transferred (or
-                    # collapsed) this edge LIVE, and journaled its own
-                    # ``DirectEdgeRepoint`` descriptor for the NEW endpoint
-                    # (that descriptor's ``src`` is new_id — it records where
-                    # the edge NOW is, not where it was). Re-creating the edge
-                    # here would leave a phantom at the DEAD source that no
-                    # later leg cleans: the repoint leg's delete-leg is
-                    # STRUCTURAL-only, and its direct branch MERGEs at the
-                    # successor. So the repoint descriptor owns the edge's
-                    # post-transfer form — and in the collapse-to-self-edge
-                    # lane (which deliberately emits NO descriptor) this skip
-                    # is what makes the edge disappear, matching live.
+                if (src in succ or tgt in succ) and etype in _supersede_moved_rels():
+                    # A SUPERSEDED endpoint OF A RELATION SUPERSEDE ACTUALLY MOVED.
+                    #
+                    # ⛔ THE GATE IS THE PREMISE (#9553). This guard's argument is
+                    # "supersede already transferred (or collapsed) this edge LIVE,
+                    # and journaled its own `DirectEdgeRepoint` descriptor for the
+                    # NEW endpoint", so re-creating it here would leave a phantom at
+                    # the DEAD source. That premise is TRUE for exactly two
+                    # families: the direct IMPL/NAND edges (`sdk.supersede_point`
+                    # 2a transfers them and ALWAYS emits a repoint) and the
+                    # `DERIVABLE_STRUCTURAL_RELS` (2b's `structural_rels` loop emits
+                    # a repoint only `if derivable`).
+                    #
+                    # It is FALSE for every other rel a `DirectEdgeCreated` can now
+                    # carry (the structural-edge lane's `ownedBy`/`hasPart`/
+                    # `dependsOn`/… — #9553 class 4): 2b never touches them, so a
+                    # supersede leaves the edge AT THE OLD POINT live, and skipping
+                    # the creation here was what made a rebuild DROP an edge live
+                    # still holds (measured: `dependsOn`/`ownedBy` live at old,
+                    # `rebuild_all` → gone). Before the producer existed those
+                    # records did not exist, so this gate could not be wrong; it can
+                    # now, and this is where it is narrowed.
+                    #
+                    # ⚠️ RESIDUAL, named (not fixed here — a different behaviour):
+                    # `wasDerivedFrom`/`aboutAction` are in `SUPERSEDE_STRUCTURAL_RELS`
+                    # (supersede MOVES them live) but are NOT derivable, so 2b emits
+                    # NO repoint descriptor for them. They therefore fall in neither
+                    # half: live has the edge at the successor, this fold still
+                    # skips it, and the record route keeps the pre-supersede row at
+                    # the old point. Closing it needs a repoint descriptor for
+                    # non-derivable structural rels AND a delete-old leg on the
+                    # record side — filed as its own issue (see #9553's PR).
                     continue
                 labels: dict[str, str] = {}
                 for _label in EPISTEMIC_LABELS:

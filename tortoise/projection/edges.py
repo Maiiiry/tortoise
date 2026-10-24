@@ -760,14 +760,18 @@ def source_change_notices(g, source_refs, current_versions: dict[str, str] | Non
 #     `entities._upsert_point_edges` at replay) is a carrier, so an edge minted
 #     HERE is resurrected when that snapshot already carries the same link —
 #     which is how the sanctioned writers write it (`create_point(aboutSubject=
-#     …)`, `extractedFrom=…`) — and NOT when it is a bare assertion on a node
-#     whose record never held it.
-#   * **record-carried** — every other predicate in
-#     `STRUCTURAL_EDGE_LANE_PREDICATES`, via `structural_edge_record_carrier`:
-#     the mint journals a flat `DirectEdgeCreated` (`related`, `dependsOn`,
-#     `ownedBy`, `managedBy`, `authoredBy`, `memberOf`, `hasMember`, `holdsRole`,
-#     `reportsTo`, `participatesIn`, `hasPart`, `performs`, `produces`, `uses`,
-#     `wasDerivedFrom`, `references`). MEASURED after this landed: mint them live
+#     …)`, `extractedFrom=…`). ⚠️ The snapshot half is NOT the only carrier for a
+#     bare `about*` mint any more: since #9553 the record half carries it too
+#     (`RECORD_CARRIED_STRUCTURAL_RELS` below), so "a bare assertion on a node
+#     whose record never held it" is carried by the record rather than lost.
+#   * **record-carried** — every predicate in `RECORD_CARRIED_STRUCTURAL_RELS`,
+#     via `structural_edge_record_carrier`: the mint journals a flat
+#     `DirectEdgeCreated` (`related`, `dependsOn`, `ownedBy`, `managedBy`,
+#     `authoredBy`, `memberOf`, `hasMember`, `holdsRole`, `reportsTo`,
+#     `participatesIn`, `hasPart`, `performs`, `produces`, `uses`,
+#     `wasDerivedFrom`, `references`, plus the epistemic-targeted `about*`:
+#     `aboutSubject`, `aboutObject`, `aboutEvent`, `aboutPoint`, `aboutAction` —
+#     the last five are snapshot-carried TOO, and the bare mint needed this half). MEASURED after this landed: mint them live
 #     and `rebuild_all` restores each one (they used to report `edges: 0`), and
 #     the record's `relation` table gains one row each — the same family, one
 #     carrier, both routes.
@@ -846,9 +850,14 @@ def structural_edge_carrier(rel: str) -> str | None:
 
     ``None`` — the endpoint snapshot carries no such link. ⛔ THIS IS NOT "no
     carrier at all" any more (#9553 class 4): :func:`structural_edge_record_carrier`
-    answers the RECORD half, and since the lane journals its own edges every
-    predicate it can write is carried there. Read the two together; a `None`
-    here reads "no snapshot carrier", never "nothing carried it".
+    answers the RECORD half. Read the two together; a `None` here reads "no
+    snapshot carrier", never "nothing carried it".
+
+    ⚠️ And do NOT read the sibling as "every predicate the lane can write is
+    carried": it answers `None` for `SOURCE_TARGETED_ABOUT_RELS`
+    (`aboutDocument`, `aboutSource`), whose contract target is a `:Source` and is
+    therefore never addressable by the fold. The ledger's two literals are what
+    partition the lane's write set — this pair of functions answers per carrier.
 
     DERIVED from ``DERIVABLE_STRUCTURAL_RELS`` — the one set the replay engines
     read — rather than a second hand-maintained table, so adding a rel to that
@@ -932,6 +941,24 @@ def structural_edge_record_carrier(rel: str) -> str | None:
     record can address", not "every instance of it is carried".
     """
     return "record" if rel in RECORD_CARRIED_STRUCTURAL_RELS else None
+
+
+#: The structural rels `TortoiseSDK.supersede_point`'s 2b leg MOVES from the old
+#: point to the successor live. Mirrored from the writer's own
+#: `sdk.SUPERSEDE_STRUCTURAL_RELS` (the single source of truth the MCP dry-run
+#: preview also imports) rather than restated from prose, and pinned equal by
+#: `tests/test_9553_class4_structural_edge_records.py::test_the_supersede_transfer_set_matches_the_writer`.
+#:
+#: ⛔ WHY IT LIVES HERE. `rebuild_all`'s `DirectEdgeCreated` fold must not skip a
+#: creation whose endpoint was superseded UNLESS a supersede actually MOVED that
+#: edge — otherwise a rebuild drops an edge live still holds (`dependsOn`,
+#: `ownedBy`, …: the 2b leg never touches them, so live keeps them at the OLD
+#: point). The fold cannot import `tortoise.sdk` (cycle), so the set is mirrored
+#: here and drift-pinned.
+SUPERSEDE_TRANSFERRED_RELS = frozenset({
+    "aboutSubject", "aboutObject", "aboutAction", "aboutEvent",
+    "aboutPoint", "aboutDocument", "extractedFrom", "wasDerivedFrom",
+})
 
 
 #: Logged once per relation, not once per write: the decline is a DECLARED gap
