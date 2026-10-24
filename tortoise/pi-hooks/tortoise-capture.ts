@@ -1,4 +1,4 @@
-// tortoise-hook-version: 8
+// tortoise-hook-version: 9
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
@@ -40,6 +40,17 @@
 // shipped bytes move. `session verify`'s "it captures with older logic"
 // wording is imprecise for this one generation; the classification and the
 // repair it prompts are right.
+//
+// Generation 9 (#3515 review): the extension now RECORDS a sweep failure it
+// alone can observe. `sweep-status.json` was written only by the CLI's `main`,
+// so a failure BEFORE it runs — a `node` too old to parse the shipped worker, a
+// removed `node`, a truncated artifact — wrote nothing and left an EARLIER
+// healthy status on disk: the line printed `capture: OK` over a backstop that
+// had just died, which is the silent death the seam exists to end (and worse
+// than the original, because the line now looks informed). `recordSweepFailure`
+// writes `ok: false` from the child's `exit`, and both legs of the line render
+// it. Generation 8's bytes are preserved as the generation-8 digest; this is a
+// new byte set, so it is a new generation rather than a rewritten entry.
 //
 // Generation 8 (#3515 review): the `capture:` health line now also reports the
 // store-sync backstop's DEAD-LETTER count. A permanent refusal dead-letters a
