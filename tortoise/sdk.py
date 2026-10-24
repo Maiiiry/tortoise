@@ -12312,8 +12312,14 @@ class TortoiseSDK:
         # payload point); what remains is to write the UNION of both sides'
         # attachments onto that survivor and the losing document's provenance
         # (its session) onto the claim. `apply_merge_union` is the one
-        # implementation of that write, shared with the eval lane, and it never
-        # raises — a failed attachment is a warning, never a lost capture.
+        # implementation of that write, invoked from HERE; it never raises — a
+        # failed attachment is a warning, never a lost capture.
+        #
+        # ⚠️ The eval lane does NOT come through this path, and it is not a
+        # missing wire — it injects no `vet_arbiter`
+        # (`tools/longmem_eval/ingest_v2.py:1017`) and consumes only `noops`,
+        # so `merges` is always empty there. Giving eval merge coverage would
+        # need its own `_apply_merges`, in that lane.
         #
         # It is data-driven, not flag-driven: with no arbiter and
         # `TORTOISE_VET` unset there are no `MERGE` verdicts, so `merges` is

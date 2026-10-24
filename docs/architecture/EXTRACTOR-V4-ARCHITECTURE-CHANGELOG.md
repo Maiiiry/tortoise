@@ -870,7 +870,6 @@ declaration"*, while §4.0/§4.1 declare **EIGHT** (and §4.4 covers all eight),
 *"not a ninth declaration"*. Both are corrected in the design document; a guard now reds if that subsection states a
 spelled or numeric step count other than §4.0's canonical one, or a `… declaration` ordinal other than the next one.
 
-
 ## 2026-10-23 — §4.2's `S0a/S0b` verdict was stale in both directions
 
 The four-way dedup audit's closing sentence said *"`S0a NORMALIZE + HASH → S0b SOURCE DEDUP` is genuinely absent"*. That

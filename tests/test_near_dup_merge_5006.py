@@ -35,6 +35,17 @@ paraphrase band REFUSE a fold that would drop an entity, and this mechanism is
 the authorised alternative for that case only when the pair is near-IDENTICAL.
 A mid-band paraphrase pair still falls through to `ADD` (both claims survive),
 and `test_a_mid_band_paraphrase_is_still_not_merged` pins that boundary.
+
+A THIRD PROPERTY, PINNED BECAUSE IT IS THE ONE THE FUSION SILENTLY LOSES
+-----------------------------------------------------------------------
+The union is COMPARED case-folded and WRITTEN case-preserved. `Object.name` is
+stored verbatim (`projection/entities.py`, and capture's own attachment pass
+resolves with `name.strip()` at `sdk.py:12123`), so a union emitted in the
+lowered form resolves NOTHING on ordinary data: the `MATCH (o:Object {name:$n})`
+returns no rows, the candidate's exclusive attachment lands in `unresolved`, and
+the record still claims a union that never reached the graph. Every graph-level
+fixture here is therefore CAPITALISED, which is the shape real data carries —
+lowercase names make the defect an identity operation and hide it.
 """
 
 from __future__ import annotations
@@ -112,12 +123,48 @@ class TestThePlanMergesANearIdenticalFlaggedPair:
         assert plan.added_entities == ("office",)
         assert plan.reason == "near_identical"
 
-    def test_case_and_whitespace_are_normalised_in_the_union(self):
+    def test_the_union_carries_the_spelling_the_graph_stores(self):
+        """COMPARISON is case-folded; the WRITE is not.
+
+        `Object.name` is stored case-preserved (`projection/entities.py` MERGEs
+        on the verbatim name, capture's own attachment pass resolves with
+        `name.strip()` — `sdk.py:12123`). A union carrying the lowered form is
+        a union that resolves NOTHING on ordinary data, so the candidate's
+        exclusive attachment is dropped while the record claims it landed.
+        *Mutant it catches: `_entity_names` returning the normalised form as
+        the emitted name — a one-line change that turns every real merge into
+        an `unresolved` no-op.*
+        """
+        plan = ndm.near_dup_merge(
+            _candidate(about_entities=["Team", "Office"]),
+            _prior(about_entities=["Team"]),
+            overlap=1.0, difference=None, identity=frozenset(), flagged=True)
+        assert plan.merge is True, plan.evidence
+        assert plan.union_entities == ("Office", "Team")
+        assert plan.added_entities == ("Office",)
+
+    def test_whitespace_is_stripped_and_case_is_only_identity(self):
+        """The two halves of `_entity_names`, each doing its own job.
+
+        Whitespace is presentation and is stripped; case is identity for the
+        COMPARISON (a `Team` the prior already carries adds nothing, so the
+        pair is NOOP's) but must survive into the spelling that gets written.
+        """
         plan = ndm.near_dup_merge(
             _candidate(about_entities=["Team", " OFFICE "]), _prior(),
             overlap=1.0, difference=None, identity=frozenset(), flagged=True)
         assert plan.merge is True, plan.evidence
-        assert plan.union_entities == ("office", "team")
+        # `Team` is the prior's own entity in another case -> not "added";
+        # `OFFICE` is new, and it is emitted without its padding.
+        assert plan.added_entities == ("OFFICE",)
+        assert plan.union_entities == ("OFFICE", "team")
+
+        # …and the prior's spelling wins for a name both sides carry.
+        same = ndm.near_dup_merge(
+            _candidate(about_entities=["TEAM"]), _prior(),
+            overlap=1.0, difference=None, identity=frozenset(), flagged=True)
+        assert same.merge is False
+        assert same.reason == "nothing_to_union"
 
 
 class TestTheClassifierProducesMerge:
@@ -149,13 +196,16 @@ class TestTheWritePathEmitsOneEntityAndKeepsTheLosersEvidence:
     """THE END-TO-END CASE: two near-duplicate documents → ONE entity."""
 
     def test_payload_creates_no_second_point(self):
-        prior = _prior(pointKind="statement")
+        # ⚠️ Capitalised on purpose: the store's `Object.name` is
+        # case-preserved, so a union that lowercases resolves nothing. Lowercase
+        # fixture names made the case bug an identity operation and hid it.
+        prior = _prior(pointKind="statement", about_entities=["Team"])
         embed = {
-            "entities": [{"name": "team", "kind": "core:team"},
-                         {"name": "office", "kind": "core:location"}],
+            "entities": [{"name": "Team", "kind": "core:team"},
+                         {"name": "Office", "kind": "core:location"}],
             "points": [{"content": CANDIDATE_CONTENT,
                         "pointKind": "statement",
-                        "about_entities": ["team", "office"],
+                        "about_entities": ["Team", "Office"],
                         "quote": CANDIDATE_CONTENT}],
             "events": [], "operators": [], "chain_notes": [],
             "link_before_create": [],
@@ -172,7 +222,9 @@ class TestTheWritePathEmitsOneEntityAndKeepsTheLosersEvidence:
 
         # …and the survivor is the PRIOR, with the union the write path needs.
         assert record["point_id"] == "pt_prior"
-        assert record["about_entities"] == ["office", "team"]
+        # the spelling is the GRAPH's, not a normalised form: these names are
+        # what `apply_merge_union` resolves with an exact `Object {name:$n}`.
+        assert record["about_entities"] == ["Office", "Team"]
 
         # THE LOSING DOCUMENT IS NOT SILENTLY DROPPED. Its evidence goes:
         #   1. its own quote + content survive on the merge record, so the
@@ -181,12 +233,12 @@ class TestTheWritePathEmitsOneEntityAndKeepsTheLosersEvidence:
         #      that into a `(Session)-[:CONTAINS]->(Point)` edge — the losing
         #      document becomes a member of the claim's memory rather than a
         #      discarded row;
-        #   3. the entity it alone named (`office`) is in the union, so the
+        #   3. the entity it alone named (`Office`) is in the union, so the
         #      attachment it contributed is not dropped either.
         assert record["merged_quote"] == CANDIDATE_CONTENT
         assert record["merged_content"] == CANDIDATE_CONTENT
         assert record["session_ref"] == "s_second_document"
-        assert "office" in record["about_entities"]
+        assert "Office" in record["about_entities"]
         # the surviving claim is the prior's, byte-identical — never fused
         assert record["content"] == PRIOR_CONTENT
 
@@ -378,8 +430,15 @@ class TestApplyMergeUnionWritesTheUnionAndTheLostProvenance:
         s.close()
 
     def test_union_edges_and_the_losing_session_are_written(self, sdk):
-        team = sdk.create_object("team", objectKind="core:team")
-        office = sdk.create_object("office", objectKind="core:location")
+        # ⚠️ The objects are CAPITALISED because that is the shape the graph
+        # stores (`Object.name` is case-preserved) and the shape real data
+        # carries. The merge record's `about_entities` is taken from a REAL
+        # `near_dup_merge` plan, not hand-written, so this test walks the same
+        # spelling the capture path emits: lowercase fixture names made the
+        # case defect an identity operation, and a hand-written record could
+        # not see it either way.
+        team = sdk.create_object("Team", objectKind="core:team")
+        office = sdk.create_object("Office", objectKind="core:location")
         pt = sdk.create_point("statement", PRIOR_CONTENT)
         prior_id = pt["id"]
         # The :Session node is S6's to create; the fusion only writes the edge
@@ -391,16 +450,28 @@ class TestApplyMergeUnionWritesTheUnionAndTheLostProvenance:
 
         from tortoise.near_dup_merge import apply_merge_union
 
+        plan = ndm.near_dup_merge(
+            {"content": CANDIDATE_CONTENT,
+             "about_entities": ["Team", "Office"]},
+            {"id": prior_id, "content": PRIOR_CONTENT,
+             "about_entities": ["Team"]},
+            overlap=1.0, difference=None, identity=frozenset(), flagged=True)
+        assert plan.merge is True, plan.evidence
+
         res = apply_merge_union(
             sdk._get_proj(),
             {"point_id": prior_id,
-             "about_entities": ["office", "team"],
+             "about_entities": list(plan.union_entities),
              "content": PRIOR_CONTENT},
             session_id="s_second_document", sdk=sdk)
 
         assert res["point_id"] == prior_id
         assert res["contained"] == 1
         assert res["warnings"] == [], res["warnings"]
+        # ⚠️ THE ASSERTION THAT MAKES THE SPELLING CONTRACT DISCRIMINATING:
+        # every unioned name must RESOLVE. A lowered union reports them here
+        # and links nothing, which is the fusion silently not happening.
+        assert res["unresolved"] == [], res["unresolved"]
 
         # the union: the survivor now carries BOTH attachments
         rows = sdk._get_proj().g.query(
@@ -408,6 +479,16 @@ class TestApplyMergeUnionWritesTheUnionAndTheLostProvenance:
             "RETURN o.id ORDER BY o.id", params={"pid": prior_id}).result_set
         linked = {r[0] for r in rows}
         assert linked == {team["id"], office["id"]}, linked
+
+        # …and the resolution is EXACT-match on purpose: the same name in
+        # another case is not the same node, and conflating them by
+        # `toLower()` would be a behaviour nothing else in the code base uses.
+        mismatched = apply_merge_union(
+            sdk._get_proj(),
+            {"point_id": prior_id, "about_entities": ["office"]},
+            session_id="s_second_document", sdk=sdk)
+        assert mismatched["linked"] == 0
+        assert mismatched["unresolved"] == ["office"]
 
         # the losing document's provenance: its session now CONTAINS the claim
         contains = sdk._get_proj().g.query(

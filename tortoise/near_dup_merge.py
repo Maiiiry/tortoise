@@ -112,11 +112,15 @@ class MergePlan:
     merge: bool
     prior_id: str = ""
     overlap: float = 0.0
-    #: The whole attachment set the survivor must carry after the fusion.
+    #: The whole attachment set the survivor must carry after the fusion,
+    #: **spelled the way the graph stores it** (`Object.name` is case-keeping;
+    #: see ``_entity_names``). Ordered by the NORMALISED key so the tuple is
+    #: deterministic without re-casing what the write must address.
     union_entities: tuple[str, ...] = ()
     #: What the candidate contributes that the prior does not already carry —
     #: the evidence the fold would have dropped, which is the reason this
     #: mechanism exists. Empty on a merge means `NOOP` was already lossless.
+    #: Original spelling, same ordering rule as ``union_entities``.
     added_entities: tuple[str, ...] = ()
     #: Machine-readable why: one of the ladder's refusal reasons, or
     #: ``"near_identical"``.
@@ -125,24 +129,46 @@ class MergePlan:
     evidence: str = ""
 
 
-def _entity_ids(value: object) -> frozenset[str] | None:
-    """The normalised attachment ids in an ``about_entities``-shaped value, or
+def _entity_names(value: object) -> dict[str, str] | None:
+    """An ``about_entities``-shaped value as ``{normalised: original}``, or
     ``None`` when the value is not a usable attachment set.
 
-    ``None`` — not an empty set — for anything that is not a sequence of
+    ``None`` — not an empty dict — for anything that is not a sequence of
     strings: *"this row names no entities"* and *"this row's entities could not
     be read"* are different facts, and only the FIRST may be merged across
     (see the module docstring's fail-closed note).
+
+    ⚠️ **The two halves have two DIFFERENT jobs and must not be conflated.**
+    The normalised key is for COMPARISON only (union identity, "what does the
+    candidate add"): `Acme` and `acme` name one entity, because case is
+    presentation, not identity. The ORIGINAL spelling is what the WRITE must
+    spell, because `Object.name` is stored **case-preserved** everywhere —
+    `projection/entities.py` MERGEs on the verbatim name, capture's own
+    attachment pass resolves the SAME `about_entities` list with
+    `name.strip()` (no lowering, `sdk.py:12123`), and the S3 enrichment that
+    fills a prior row reads `collect(o.name)` verbatim. Emitting the
+    normalised form here is what made the fusion's central promise fail on
+    ordinary data: `MATCH (o:Object {name:'acme'})` matches nothing when the
+    node is `Acme`, so the edge was never written, the candidate's exclusive
+    attachment was reported `unresolved`, and the merge record claimed a union
+    it had not landed.
+
+    Within one side, the lexicographically-first spelling of a name wins, so
+    the result does not depend on the iteration order of a ``set``/``frozenset``.
     """
     if not isinstance(value, (list, tuple, set, frozenset)):
         return None
-    ids: set[str] = set()
+    items: list[str] = []
     for item in value:
         if not isinstance(item, str):
             return None
-        if item.strip():
-            ids.add(item.strip().lower())
-    return frozenset(ids)
+        original = item.strip()
+        if original:
+            items.append(original)
+    names: dict[str, str] = {}
+    for original in sorted(items):
+        names.setdefault(original.lower(), original)
+    return names
 
 
 def near_dup_merge(candidate: dict, prior: dict, *, overlap: float,
@@ -201,16 +227,25 @@ def near_dup_merge(candidate: dict, prior: dict, *, overlap: float,
 
     # Fail-closed on an unknown set: `_attachments_preserved` is fail-OPEN
     # because it only DECLINES to fold; this writes, so unknown means refuse.
-    prior_ids = _entity_ids(prior.get("about_entities"))
-    cand_ids = _entity_ids(candidate.get("about_entities"))
-    if prior_ids is None or cand_ids is None:
+    prior_names = _entity_names(prior.get("about_entities"))
+    cand_names = _entity_names(candidate.get("about_entities"))
+    if prior_names is None or cand_names is None:
         return MergePlan(
             False, overlap=ov, reason="unreadable_attachments",
             evidence="an attachment set could not be read on this pair — "
                      "nothing can be unioned, so nothing is merged")
 
-    union = prior_ids | cand_ids
-    added = cand_ids - prior_ids
+    # The PRIOR's spelling wins where both sides name the same entity: the
+    # survivor is the prior, and the write must address the node it already
+    # points at. The candidate contributes spelling only for names the prior
+    # does not carry (see `_entity_names` on why the write keeps case).
+    union: dict[str, str] = dict(prior_names)
+    added: dict[str, str] = {}
+    for key in sorted(cand_names):
+        if key in union:
+            continue
+        union[key] = cand_names[key]
+        added[key] = cand_names[key]
     if not added:
         return MergePlan(
             False, overlap=ov, reason="nothing_to_union",
@@ -221,12 +256,12 @@ def near_dup_merge(candidate: dict, prior: dict, *, overlap: float,
         True,
         prior_id=str(prior.get("id") or ""),
         overlap=round(ov, 3),
-        union_entities=tuple(sorted(union)),
-        added_entities=tuple(sorted(added)),
+        union_entities=tuple(union[k] for k in sorted(union)),
+        added_entities=tuple(added[k] for k in sorted(added)),
         reason="near_identical",
         evidence=(f"near-identical (overlap {ov:.3f} >= {MERGE_MIN_OVERLAP}) "
                   f"with no distinguishing difference; attachments unioned "
-                  f"({len(prior_ids)} -> {len(union)}, +"
+                  f"({len(prior_names)} -> {len(union)}, +"
                   f"{len(added)} from the candidate); the claim is the "
                   f"prior's, unchanged — never fused"),
     )
@@ -255,6 +290,30 @@ def apply_merge_union(proj: Any, record: dict, *, session_id: str,
     write path: a failed attachment is a warning, not a lost session). The
     returned dict is the merge's record of what actually landed, so a reader
     can tell a written union from an attempted one.
+
+    ⚠️ **The lookup is EXACT and case-SENSITIVE on purpose**, and it is the
+    contract `_entity_names` satisfies: the union carries each name spelled the
+    way the graph stores it, so `MATCH (o:Object {name:$n})` addresses the same
+    node capture would. A `WHERE toLower(o.name) = $n` form is deliberately
+    NOT used — nothing else in the code base matches entity names that way, and
+    it would silently conflate two `Object`s that differ only in case.
+    `unresolved` therefore means one thing only: *no node in this graph has
+    that name*.
+
+    ⚠️ **A DESIGN GAP, stated here rather than closed (and PRE-EXISTING, not
+    introduced by this module).** `about_entities` is not object-only — the
+    SUBJECT channel (team/role/person, the gated `aboutSubject` edge) also
+    contributes names to it, and capture skips those explicitly (`sdk.py:12124`:
+    *"the #1370 binder owns the gated `aboutSubject` edge; the topic channel
+    must not produce an un-gated one"*). This write has no binder and resolves
+    only `:Object {name:$n}`, so a subject-kind attachment the candidate alone
+    names lands in `unresolved` instead of being bound; and because a merge
+    emits no payload point, `bind_point_subjects` never runs for the candidate,
+    so its confidence-gated subject binding is dropped. *"Nothing it argued
+    for is silently dropped"* is therefore true of OBJECT attachments only. This is
+    the same blind spot `extractor_v2._attachment_ids` already has, which is
+    why it is not a regression — but it is a gap, and closing it needs a
+    subject-resolution path here, not a wider `MATCH`.
     """
     out: dict = {"point_id": "", "contained": 0, "linked": 0,
                  "unresolved": [], "warnings": []}

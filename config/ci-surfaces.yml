@@ -3783,6 +3783,15 @@ surfaces:
   # `extractor_v2.py` is not a SHARED_MODULE, so a diff touching only it selects
   # `core` — unregistered, this guard would run in NO leg at all.
   - test_merge_fold_5006.py
+  # #5006: the FUSION half of the same ruling — `near_dup_merge` + the write
+  # path that unions both sides' attachments onto ONE survivor. Registered
+  # `core` for the same reason as its sibling above: its subjects are
+  # `extractor_v2.py` (not a SHARED_MODULE — a diff touching only it selects
+  # `core`, so unregistered this battery would run in NO leg at all) and
+  # `sdk.py`'s capture write path, which the `core` lane drives. It asserts
+  # reachability against a real graph, not embedded-only semantics, so it takes
+  # no `carve_out` slot and no `TEST_NO_REDIRECT_STEMS` mirror.
+  - test_near_dup_merge_5006.py
   - test_no_tests_imports_in_production.py
   - test_notify.py
   - test_notify_offloop_4456.py  # #4456: billing notify off-loop + never-raise in webhooks_stripe (dual: api)
@@ -8004,6 +8013,7 @@ durations:
   test_never_across_fold_5080.py: 2.0  # unmeasured
   test_operator_alert.py: 3.8  # ci-timing top-15 2026-10-20 (run 39467226356); was 2.3
   test_merge_fold_5006.py: 2.0  # unmeasured — new in #5006; the weight is the flat default, not a measurement
+  test_near_dup_merge_5006.py: 2.0  # unmeasured — new in #5006 (the FUSION half); the weight is the flat default, not a measurement. Without this row the file packs at the same 2.0s but counts as UNCOVERED, dropping the repo-wide coverage floor (#3400) and redding manifest-integrity
   test_consumed_sdk_binding_3904.py: 2.0  # unmeasured — new in #3904. Without a row this file packs at the flat 2.0s default anyway, but it would count as UNCOVERED, dropping the repo-wide coverage floor (#3400) to 89.9% and redding the manifest-integrity gate. The 2.0 value is the default it would have received; it is a weight, not a measurement.
   bench/test_smoke_embedded.py: 38.6  # ci-timing top-15 2026-10-21 (run 39467226356): a single-test file cannot prove full coverage from a top-15 projection; the reading (28.9s) is a LOWER bound; kept 38.6
   test_about_edges.py: 3.0  # #9017 CI-junit 2026-10-18 (run 39165691659); was 6.2
