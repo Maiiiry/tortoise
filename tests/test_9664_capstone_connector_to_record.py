@@ -146,10 +146,18 @@ def _assert_call_succeeded(body, what):
     * a **JSON-RPC protocol error** is `{"jsonrpc", "id", "error": {...}}` — no
       `result` at all, so `_tool_payload` returns `{}` and `"error" not in {}`
       passes;
-    * a **tool error** arrives as `result: {"content": [...prose...],
-      "isError": true}` (`mcp_server._safe`, `ToolError` → `CallToolResult(
-      isError=True)`) — the flag is spelled `isError`, never `error`, and a
-      non-JSON text block falls through `_tool_payload` to the raw result.
+    * a **tool error** is `result: {"content": [...prose...], "isError": true}` —
+      produced when a `ToolError`/exception is RAISED inside the tool and FastMCP
+      converts it to `CallToolResult(isError=True)`. The flag is spelled
+      `isError`, never `error`, and a non-JSON text block falls through
+      `_tool_payload` to the raw result.
+
+    ⚠️ `mcp_server._safe` deliberately produces the OTHER shape — an ORDINARY
+    successful result carrying `{"error": …}` (`_SafeError`), `isError` false.
+    Pairing the two producers is the mistake `_SafeError`'s own module docstring
+    spends its length keeping apart ("two separate questions, two separate
+    gates"), and it is why the verify step's payload check below cannot rely on
+    the absence of `error`: only POSITIVE evidence separates the two.
 
     So both checks are made on the RAW body, where the envelopes actually are.
     """
@@ -160,7 +168,7 @@ def _assert_call_succeeded(body, what):
         f"{what} returned a tool ERROR: {json.dumps(result)[:800]}")
 
 
-def _assert_healthy_verify_payload(payload, body):
+def _assert_healthy_verify_payload(payload):
     """The journey's verify step really measured a healthy graph.
 
     ⛔ NOT `"error" not in payload` ALONE (P2, PR #9852 review): `_SafeError` — a
@@ -171,28 +179,30 @@ def _assert_healthy_verify_payload(payload, body):
     `isError` nor a JSON-RPC `error` key accompanies it, and an empty/absent
     result carries no `error` either, so the check has to demand POSITIVE evidence.
 
-    The positive terms are `monitoring.metrics()`'s own:
+    The positive term is `monitoring.metrics()`'s own success verdict —
+    `status == "ok"` — set only when the db probe observed success
+    (`monitoring.py`, the `db["ok"] is True` branch). It is absent from the
+    `_SafeError`/empty shapes entirely, and it is `degraded`/`unknown` for a probe
+    failure, so one assertion closes every shape the first cut let through.
 
-    * `status == "ok"` is the report's success verdict, and it is set only when
-      the db probe observed success (`monitoring.py`, the `db["ok"] is True`
-      branch) — so it is False for the `degraded`/`unknown` and the
-      `_SafeError`/empty shapes alike (they carry no `status` at all);
-    * `graph_size_error is None` stays because it is the UNIQUE marker that
-      `graph_size` was really MEASURED — a 0 from a failed count is otherwise
-      indistinguishable from a genuinely empty graph (#3253).
+    ⚠️ TWO checks were considered and are deliberately NOT here:
 
-    The `db.ok` clause the first cut carried was dropped: `status` is DERIVED
-    from `db["ok"]` (`monitoring.py`), so it could never fail once `status` had
-    been asserted — a check with no failure behind it.
+    * `db["ok"] is not False` — `status` is DERIVED from `db["ok"]`
+      (`monitoring.py`), so it can never fail once `status == "ok"` is asserted.
+      A check with no failure behind it.
+    * `graph_size_error is None` — real (a count overrun leaves
+      `status == "ok"` with the marker set), but it reads evidence this leg never
+      consumes: the file asserts no `graph_size`, and the marker fires on a
+      HEALTHY graph whose taxonomy count overran `GRAPH_SIZE_TIMEOUT` — the
+      #3253/#3143 false-degrade class. Demanding it would make a required job red
+      on a slow count that has nothing to do with whether the connector reached
+      the record, which is this leg's subject; the count has its own coverage.
     """
     assert payload.get("status") == "ok", (
         "the journey's verify step did not report a measured-healthy graph — "
         "`status` is `ok` only when the probe observed success, so a degraded, "
         "unknown, empty or `_SafeError` payload cannot pass here: "
         f"{json.dumps(payload)[:600]}")
-    assert payload.get("graph_size_error") is None, (
-        "the journey's verify step could not MEASURE the graph size, so its "
-        f"graph_size is not evidence of an empty graph: {json.dumps(body)[:600]}")
 
 
 # ── the record's database, provisioned the way the CI job provisions it ────
@@ -499,10 +509,13 @@ def test_the_verify_step_assertions_reject_the_failure_envelopes_they_name():
     always raises.
 
     Mutation check: restore `assert "error" not in _tool_payload(body)` for the
-    call check → every `pytest.raises` below fails, because that spelling passes
-    all four. The POSITIVE cases matter as much as the raises: a check that
-    always fails, or one that rejects the `_SafeError`/empty shapes only by
-    accident, would otherwise satisfy this test.
+    call check → the FIRST TWO `pytest.raises` fail (the two call envelopes);
+    the payload-check raises that follow are governed by
+    `_assert_healthy_verify_payload` and are unaffected by that mutation — they
+    are proven by the `_SafeError`/empty/absent cases below. The POSITIVE cases
+    matter as much as the raises: a check that always fails, or one that rejects
+    the `_SafeError`/empty shapes only by accident, would otherwise satisfy this
+    test.
     """
     protocol_error = {"jsonrpc": "2.0", "id": 1,
                       "error": {"code": -32603, "message": "boom"}}
@@ -533,32 +546,32 @@ def test_the_verify_step_assertions_reject_the_failure_envelopes_they_name():
     safe_error = {"error": "Authentication required. MCP transport mode not "
                            "initialized."}
     with pytest.raises(AssertionError):
-        _assert_healthy_verify_payload(safe_error, {"result": {}})
+        _assert_healthy_verify_payload(safe_error)
     with pytest.raises(AssertionError):
-        _assert_healthy_verify_payload({}, {"result": {}})
+        _assert_healthy_verify_payload({})
     with pytest.raises(AssertionError):
-        _assert_healthy_verify_payload({"content": []}, {"result": {}})
+        _assert_healthy_verify_payload({"content": []})
 
     degraded = {"status": "degraded", "db": {"ok": False}, "graph_size": 0,
                 "graph_size_error": "graph_size_unavailable: db probe failed"}
     with pytest.raises(AssertionError):
-        _assert_healthy_verify_payload(degraded, {"result": {}})
+        _assert_healthy_verify_payload(degraded)
 
     unmeasured = {"status": "unknown", "db": {"ok": None}, "graph_size": 0,
                   "graph_size_error": "graph_size_unavailable: timed out"}
     with pytest.raises(AssertionError):
-        _assert_healthy_verify_payload(unmeasured, {"result": {}})
+        _assert_healthy_verify_payload(unmeasured)
 
     # `status: degraded` with a MEASURED size is still a failure (the db probe
     # failed for a reason that is not the count) — the status term is load-bearing.
     measured_but_degraded = {"status": "degraded", "db": {"ok": False},
                              "graph_size": 7, "graph_size_error": None}
     with pytest.raises(AssertionError):
-        _assert_healthy_verify_payload(measured_but_degraded, {"result": {}})
+        _assert_healthy_verify_payload(measured_but_degraded)
 
     healthy = {"status": "ok", "db": {"ok": True}, "graph_size": 0,
                "graph_size_error": None}
-    _assert_healthy_verify_payload(healthy, {"result": {}})
+    _assert_healthy_verify_payload(healthy)
 
 
 def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
@@ -601,7 +614,7 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
         # The served first job: verify through the ADVERTISED health section.
         _status, health = _call(client, "tortoise_overview", {"section": "health"})
         _assert_call_succeeded(health, "the journey's verify step")
-        _assert_healthy_verify_payload(_tool_payload(health), health)
+        _assert_healthy_verify_payload(_tool_payload(health))
 
         before = dict(monitoring.record_write_failure_counts())
         content = (f"#9664 capstone: this Point came through the connector "
@@ -885,7 +898,7 @@ def test_a_live_tool_description_never_recommends_a_retired_tool():
 def test_the_stale_description_set_is_exactly_what_was_measured():
     """The pin that keeps the xfail above from hiding a NEW stale description.
 
-    An allowance keyed on "is the set non-empty" would silently absorb a fifth
+    An allowance keyed on "is the set non-empty" would silently absorb a fourth
     entry. Pinned by EQUALITY instead: the measured set may only change when this
     line changes, and fixing one entry reds it too — so neither a new defect nor a
     fix can land unnoticed. (The #9200 idiom, from `test_9078`.)
