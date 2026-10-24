@@ -729,6 +729,55 @@ def test_an_EXISTING_0755_store_directory_is_narrowed_by_the_CLI_too(tmp_path):
     assert (store / "sweep-status.json").stat().st_mode & 0o777 == 0o600
 
 
+def test_every_reason_source_is_sanitised_at_the_SINGLE_write_site(tmp_path):
+    """The health line renders the reason inside a COMMA-DELIMITED field.
+
+    A per-producer fix was the generation-13 shape, and `spool.error` — a raw
+    exception message, which is precisely where commas and em-dashes live —
+    walked straight past it. This pins the sanitiser AND the three producers that
+    feed it, so a new source cannot be added without passing through it.
+    """
+    from tortoise import store_sync
+
+    forbidden = set(",;—–\"'()")
+
+    def reason_for(receipt):
+        store = tmp_path / f"store-{reason_for.n}"
+        reason_for.n += 1
+        store_sync.write_sweep_status(receipt, str(store))
+        return json.loads((store / "sweep-status.json").read_text())["reason"]
+
+    reason_for.n = 0
+
+    # (a) known classes become TOKENS, per leg of the failure
+    assert reason_for({"ok": False, "log": {"errors": [
+        "SyntaxError: Unexpected token , in JSON at position 41"]}}) == "bad_json"
+    assert reason_for({"ok": False, "log": {"errors": [
+        "EACCES: permission denied, open '/a/b'"]}}) == "permission_denied"
+    assert reason_for({"ok": False, "log": {"errors": [
+        "ENOSPC: no space left on device"]}}) == "no_space"
+    assert reason_for({"ok": False, "log": {"errors": [
+        "/s/f.jsonl: no session header id — refused (never invented)"]}}) == "no_header_id"
+
+    # (b) an UNRECOGNISED error keeps its information but loses the punctuation
+    # that would forge a sibling term in the line.
+    odd = reason_for({"ok": False, "log": {"errors": [
+        "weird: a, b — c (d) \"e\"'f"]}})
+    assert not (set(odd) & forbidden), f"punctuation survived: {odd!r}"
+    assert "weird" in odd, "the information must survive the sanitisation"
+
+    # (c) `spool.error` is a RAW EXCEPTION MESSAGE and used to bypass the
+    # sanitiser entirely — measured through the line as:
+    #   store-sync FAILED (FileNotFoundError: [Errno 2] ... '/tmp/a, b' — gave up)
+    spool = reason_for({"ok": False, "spool": {
+        "error": "FileNotFoundError: [Errno 2] No such file or directory: '/tmp/a, b' — gave up"}})
+    assert not (set(spool) & forbidden), f"spool.error bypassed the sanitiser: {spool!r}"
+    assert "FileNotFoundError" in spool
+
+    # (d) `worker_status` tokens stay exact
+    assert reason_for({"ok": False, "log": {"worker_status": "worker_missing"}}) == "worker_missing"
+
+
 def test_a_dry_run_never_overwrites_a_real_failure(tmp_path, monkeypatch):
     """A PLAN is not an outcome — `--dry-run` must not turn a failure healthy.
 

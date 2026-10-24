@@ -21,12 +21,12 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
+  statSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { statSync } from "node:fs";
 import {
   CAPTURE_LANES,
   COHORT_COST_CAP_CODE,
@@ -1083,6 +1083,26 @@ test("#3515: a sweep that fails is RECORDED, not just warned about", async () =>
     await sweepWithShim(() => "exit 3"),
     "exit_3",
     "a non-zero sweep must reach the disk, because its stderr goes nowhere",
+  );
+});
+
+test("#3515: a COARSE stamp is still recognised as this sweep's own", async () => {
+  if (process.platform === "win32") return;
+  // The tolerance belongs to BOTH arms that compare a persisted `at` with our
+  // spawn stamp. Generation 13 gave it to the exit-0 arm only, so on a platform
+  // whose `at` resolves to a SECOND — or after a backwards clock step — a fast
+  // graceful failure stamped half a second before the comparison stopped being
+  // recognised as this sweep's, and the extension overwrote the CLI's
+  // `worker_missing` with `exit_1`: the generation-11 defect, reintroduced on the
+  // one platform the tolerance accepts as real.
+  assertSweepFailure(
+    await sweepWithShim((store) =>
+      `node -e 'const f=require("fs");f.mkdirSync(${JSON.stringify(store)},{recursive:true});`
+        + `f.writeFileSync(${JSON.stringify(join(store, "sweep-status.json"))},`
+        + `JSON.stringify({version:1,ok:false,reason:"worker_missing",`
+        + `at:Date.now()/1000-0.5}))'; exit 1`),
+    "worker_missing",
+    "a record half a second 'older' than our ms stamp is still this sweep's",
   );
 });
 

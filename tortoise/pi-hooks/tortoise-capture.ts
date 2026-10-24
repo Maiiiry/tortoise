@@ -1,4 +1,4 @@
-// tortoise-hook-version: 13
+// tortoise-hook-version: 14
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
@@ -40,6 +40,14 @@
 // shipped bytes move. `session verify`'s "it captures with older logic"
 // wording is imprecise for this one generation; the classification and the
 // repair it prompts are right.
+//
+// Generation 14 (#3515 review): the clock tolerance is ONE value shared by the
+// two arms that compare a persisted `at` with our spawn stamp. Generation 13
+// added it to the exit-0 arm only, leaving the precedence arm exact — so on a
+// platform whose `at` resolves to a second (or after a backwards step) the
+// extension stopped recognising the CLI's just-written record as THIS sweep's and
+// overwrote `worker_missing` with `exit_1`, which is exactly the generation-11
+// defect. Both arms now derive the slack from `CLOCK_SLACK_S`.
 //
 // Generation 13 (#3515 review): the exit-0 corroboration gained a ONE-SECOND
 // tolerance on `at`. Without it, any writer whose stamp is second-granular in the
@@ -2939,6 +2947,15 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
     // this backstop stops working. Record first, warn second: the warn is
     // deduplicated per process, the record must not be.
     const sweepStartedAt = Date.now() / 1000;
+    // ONE tolerance for comparing a persisted `at` (whatever resolution its
+    // writer had) with our millisecond spawn stamp, used by BOTH arms below.
+    // `time.time()` is a float here, but Python documents one-second resolution
+    // on some platforms, and a backwards clock step is possible — so an
+    // exact-to-the-millisecond comparison can read a record THIS sweep wrote as
+    // older. Deriving it once is the point: the two arms drifted apart once
+    // already, and the arm that was left exact reintroduced the gen-11 defect it
+    // was written to prevent.
+    const CLOCK_SLACK_S = 1;
     let failureRecorded = false;
     const noteFailure = (reason: string): void => {
       if (failureRecorded) return;
@@ -2950,7 +2967,7 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
       // failure. A record stamped at or after this spawn is this sweep's, and it
       // wins.
       const existing = readSweepStatus(storeDir);
-      if (existing && !existing.ok && (existing.at ?? 0) >= sweepStartedAt) return;
+      if (existing && !existing.ok && (existing.at ?? 0) >= sweepStartedAt - CLOCK_SLACK_S) return;
       recordSweepFailure(storeDir, reason);
     };
     try {
@@ -2986,15 +3003,12 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
           // a backstop that never swept. A `tortoise` on PATH that is not the
           // shipped CLI does the same. Corroborate with data already in hand.
           const after = readSweepStatus(storeDir);
-          // ONE SECOND OF TOLERANCE. `sweepStartedAt` is millisecond-precise,
-          // but `at` is whatever the writer stamped — `time.time()` is a float
-          // here, yet Python documents one-second resolution on some platforms.
-          // Without the tolerance a coarse-but-FRESH record reads as older, and
-          // this branch then OVERWRITES a healthy status and reports
-          // `exit_0_without_status` on a box whose backstop works, every sweep.
-          // A record from the previous sweep is far older than a second, so the
-          // tolerance cannot mask a genuinely stale verdict.
-          if (!after || (after.at ?? 0) < sweepStartedAt - 1) {
+          // A coarse-but-FRESH record must not read as older, or this branch
+          // OVERWRITES a healthy status and reports `exit_0_without_status` on a
+          // box whose backstop works, every sweep. A record from the previous
+          // sweep is far older than `CLOCK_SLACK_S`, so the tolerance cannot
+          // mask a genuinely stale verdict.
+          if (!after || (after.at ?? 0) < sweepStartedAt - CLOCK_SLACK_S) {
             noteFailure("exit_0_without_status");
             if (_SWEEP_UNAVAILABLE_WARNED) return;
             _SWEEP_UNAVAILABLE_WARNED = true;

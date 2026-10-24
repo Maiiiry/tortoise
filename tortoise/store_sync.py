@@ -345,25 +345,32 @@ _REASON_TOKENS = (
 )
 
 
-def _reason_token(errors: list[Any]) -> str | None:
-    """The first error as a short TOKEN for the health line (never free prose).
+#: Punctuation that would break the health line's grammar. The line renders the
+#: reason inside a COMMA-DELIMITED field, so a raw `,` forges a sibling term and
+#: an unquoted `—` clause reads as prose in a list of counts.
+_REASON_PUNCT = set(",;—–\"'()\n\t")
 
-    Truncation is NOT sanitisation: the raw errors that reach here carry commas
-    and em-dashes by nature (`…: no session header id — refused`,
-    `JSON.parse`'s `Unexpected token , in JSON at position 41`), and this string
-    is interpolated into `capture: OK (0 queued), store-sync FAILED (<reason>)`.
-    So a known class becomes a token, and the fallback has the punctuation that
-    would break that grammar replaced.
+
+def _sanitise_reason(text: str) -> str:
+    """Strip the punctuation that breaks `capture: … , store-sync FAILED (<reason>)`.
+
+    Applied ONCE, at the single write site, so no future reason source can
+    bypass it — a per-producer fix was the generation-13 shape, and `spool.error`
+    (a raw exception message) walked straight past it.
     """
+    cleaned = "".join("-" if ch in _REASON_PUNCT else ch for ch in text)
+    return " ".join(cleaned.split())[:80]
+
+
+def _reason_token(errors: list[Any]) -> str | None:
+    """The first error, as a known-class TOKEN or as its raw text (sanitised later)."""
     if not errors:
         return None
     text = str(errors[0])
     for needle, token in _REASON_TOKENS:
         if needle in text:
             return token
-    replaced = set(",;—–\"'()\n\t")
-    cleaned = "".join("-" if ch in replaced else ch for ch in text)
-    return " ".join(cleaned.split())[:80] or None
+    return text
 
 
 def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
@@ -407,6 +414,11 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
             reason = spool.get("error") if isinstance(spool, dict) else None
         if not reason and receipt.get("ok") is False:
             reason = "worker exited non-zero"
+        # ONE place, after all three sources are resolved: `errors[]`,
+        # `worker_status`, and `spool.error` (a raw exception message, which is
+        # how a comma and an em-dash reached the line in generation 13).
+        if reason:
+            reason = _sanitise_reason(str(reason))
         payload = {
             "version": 1,
             # `at` is consumed for PRECEDENCE, not for freshness: the extension
