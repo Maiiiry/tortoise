@@ -10108,6 +10108,15 @@ class TortoiseSDK:
             model, _redact_turn_contents(conversation)[0],
             sdk=self, session_id=session_id, chunk_size=chunk_size,
             session_date=session_date)
+        # ⚠️ A `MERGE` verdict decided HERE has no applier on this path: only
+        # ``_extract_session_v2`` reads ``out["merges"]`` (the ``merges = out.get("merges")``
+        # line below its extraction call) and executes ``apply_merge_union``. This
+        # entry passes no ``vet_arbiter``, and #5006's
+        # verdicts come from one, so any ``MERGE`` it could see today would suppress a
+        # payload point with no union written — no Point, no edges, no warning. If an
+        # arbiter is ever wired here, this call needs its own merge relay (or an
+        # ``allow_merge=False`` switch on ``extract_session_v2``), because the payload
+        # point is already gone by the time the record exists (#9872).
         payload = out.get("payload")
         errors = list(out.get("errors", []) or [])
         if payload is None and not errors:
@@ -12405,6 +12414,56 @@ class TortoiseSDK:
                     f"{skipped_noops} consolidation fold(s) not surfaced "
                     "(non-capture canonical / paraphrase fold / missing "
                     "node — deferred surface)")
+
+        # #5006 (D12/O4): execute the near-duplicate FUSIONs the extractor's S3
+        # decided. Unlike the noop surface above this is NOT a display path —
+        # the merge has already happened at decision time (ONE survivor, no new
+        # payload point); what remains is to write the UNION of both sides'
+        # attachments onto that survivor and the losing document's provenance
+        # (its session) onto the claim. `apply_merge_union` is the one
+        # implementation of that write, invoked from HERE; it never raises — a
+        # failed attachment is a warning, never a lost capture.
+        #
+        # ⚠️ The eval lane does NOT come through this path, and it is not a
+        # missing wire — it injects no `vet_arbiter`
+        # (`tools/longmem_eval/ingest_v2.py:1017`) and consumes only `noops`,
+        # so `merges` is always empty there. Giving eval merge coverage would
+        # need its own `_apply_merges`, in that lane.
+        #
+        # It is data-driven, not flag-driven: with no arbiter and
+        # `TORTOISE_VET` unset there are no `MERGE` verdicts, so `merges` is
+        # empty and this block is a no-op on every default capture.
+        merges = out.get("merges") or []
+        if merges:
+            from tortoise.near_dup_merge import apply_merge_union
+
+            for _m in merges:
+                _m_res = apply_merge_union(proj, _m, session_id=session_id,
+                                           sdk=self,
+                                           subject_names=subject_entity_names)
+                for _w in (_m_res.get("warnings") or []):
+                    warnings.append(f"merge {_m_res.get('point_id')}: {_w}")
+                if _m_res.get("unresolved"):
+                    # An attachment the graph could not resolve is NOT a silent
+                    # drop: it is named, and the merge record still carries the
+                    # entity so a later backfill can link it.
+                    warnings.append(
+                        "merge " + str(_m_res.get("point_id")) +
+                        ": unresolved attachment(s) " +
+                        ", ".join(_m_res["unresolved"][:5]))
+                if _m_res.get("skipped_subject"):
+                    # #5006 review (F2): a subject-kind name must NOT get the
+                    # un-gated `aboutObject` edge — the same skip this method's
+                    # own attachment pass makes above (`_n in
+                    # subject_entity_names`). It is a DROP, not a resolution
+                    # failure, so it is named separately from `unresolved`: a
+                    # merge emits no payload point, so `bind_point_subjects`
+                    # never runs for the candidate and that binding is lost.
+                    warnings.append(
+                        "merge " + str(_m_res.get("point_id")) +
+                        ": subject-kind attachment(s) skipped (the binder owns "
+                        "the gated aboutSubject edge): " +
+                        ", ".join(_m_res["skipped_subject"][:5]))
 
         # ── events ──
         # #2552: payload events are created under their CONTENT-ADDRESSED
