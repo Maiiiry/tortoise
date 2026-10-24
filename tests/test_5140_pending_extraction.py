@@ -461,6 +461,12 @@ _GRID = [
     ("false/captured", False, "captured"),
     ("false/extracted", False, "extracted"),
     ("false/draft", False, "draft"),
+    # Non-boolean stored values: the Cypher twin asks `= true`, which is false
+    # for each of these on FalkorDB (measured), and the Python arm asks `is
+    # True`. Pinned so a coercion on either side is a red test, not a silent
+    # selection difference.
+    ("int-one/absent", 1, None),
+    ("str-false/absent", "false", None),
 ]
 
 
@@ -664,3 +670,54 @@ def test_include_unstamped_does_not_reach_a_replayed_legacy_false(monkeypatch):
         "the replayed legacy shape became reachable — if that is deliberate, "
         "the discriminator is now extraction evidence and BOTH this test and the "
         f"help text must change deliberately:\n{out}")
+
+
+@_live_db
+def test_sweeping_a_transcript_does_not_move_it_into_the_documents_meter(monkeypatch):
+    """#5140 review round 5, P1: the arms this PR widens can select a transcript
+    Source, and the upgrade then re-ingests it — which used to overwrite its
+    genre with ``''``.
+
+    ``quota.DOCUMENT_METER_PREDICATE`` is ``documentKind IS NOT NULL AND
+    documentKind <> 'transcript'``, so ``''`` is METERED and ``'transcript'`` is
+    exempt: the genre overwrite moved a captured session INTO the documents cap
+    (the inverse of the demotion #9536 closed, and just as wrong — the genre is
+    the identity key). Cause: ``document_kind=fm.get("type", "")`` passes ``''``,
+    which is a VALUE to the fold's ``coalesce($dk, s.documentKind, '')``; it must
+    pass ``None`` so a stored genre survives.
+    """
+    from tortoise.quota import is_metered_document_kind
+
+    if not _require_live_falkor():
+        return
+    uri = _live_uri(f"test_5140_genre_{os.urandom(4).hex()}")
+    _reset(uri)
+    base = tempfile.mkdtemp(prefix="tortoise_5140_corpus_")
+    monkeypatch.setenv("TORTOISE_INGEST_BASE_DIR", base)
+    # A transcript as the capture writer mints it: genre set, no signal, and a
+    # section so the sweep actually extracts it.
+    doc = Path(base) / "session_transcript.md"
+    doc.write_text("## Session\nwe decided to ship it\n", encoding="utf-8")
+    _seed_document(uri, doc.name, str(doc), document_kind="transcript")
+    assert is_metered_document_kind("transcript") is False
+    assert is_metered_document_kind("") is True
+
+    out = _run(["--db", uri, "--log", _tmp("events.jsonl"),
+                "--out", _tmp("graph.html"), "--upgrade-all",
+                "--include-unstamped", "--point-model", "mock:cheap",
+                "--relation-model", "mock:reason"], capture=True)
+
+    proj = FalkorProjection.from_uri(uri)
+    try:
+        rows = proj.g.query(
+            "MATCH (s:Source {url:$u}) RETURN s.documentKind, s.needs_extraction",
+            params={"u": doc.name},
+        ).result_set
+    finally:
+        proj.close()
+    kind, nx = rows[0]
+    assert kind == "transcript", (
+        f"the upgrade overwrote the transcript's genre with {kind!r}, which "
+        f"moves it into the `documents` meter (metered={is_metered_document_kind(kind)});"
+        f" output was:\n{out}")
+    assert nx is False, f"the sweep did not complete the document (got {nx!r}):\n{out}"

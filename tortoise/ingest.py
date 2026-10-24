@@ -77,6 +77,23 @@ def _parse_frontmatter(text: str) -> dict:
     return fm
 
 
+def _frontmatter_kind(fm: dict) -> str | None:
+    """The document genre from frontmatter, or ``None`` when it names none.
+
+    ``None`` rather than ``""`` DELIBERATELY (#5140 review round 5). The fold's
+    genre clause is ``ELSE coalesce($dk, s.documentKind, '')``: an empty string
+    is a VALUE, so it OVERWROTE a stored genre on every re-ingest — measured
+    pre-fix, a re-extracted transcription became ``documentKind=''``, and
+    ``quota.DOCUMENT_METER_PREDICATE`` counts ``''`` as metered while
+    ``'transcript'`` is exempt, so a sweep could silently move a captured
+    session INTO the ``documents`` meter (the inverse of the demotion #9536
+    closed, and just as wrong: the genre is the identity key). ``None`` lets
+    the coalesce preserve a stored genre, while a CREATE still lands the
+    non-null ``''`` default the documents meter requires (D10 B3).
+    """
+    return fm.get("type") or fm.get("document_kind") or None
+
+
 def _infer_format(filepath: Path) -> str:
     """Map file extension to format field."""
     ext = filepath.suffix.lower()
@@ -256,13 +273,16 @@ def _document_is_pending(needs_extraction, doc_status, *,
        marker → not pending.
     6. with no signal at all, ``unmarked_is_pending`` decides. ``_do_upgrade``
        keeps the pre-D10 default (pending — the operator named this document);
-       the corpus SWEEP passes ``False``, because BOTH writers that mint a
-       document Source without a signal are transcript writers
+       the corpus SWEEP passes ``False``, because the two in-tree writers that
+       mint a document Source without a signal are transcript writers
        (``hosted_api._execute_commit_writes``, and ``_event_plain_merge``'s
        ``objectType='Document'`` branch, which stamps
        ``documentKind='transcript'``), and selecting those would queue every
-       captured session for LLM extraction. ``--include-unstamped`` is the
-       operator's explicit opt-in to that wider population.
+       captured session for LLM extraction. The widened set is not ONLY
+       transcripts: a caller-minted Source (``create_source``/``update_entity``
+       take a ``documentKind``, and ``needs_extraction`` is not caller-settable)
+       is selected too. Whole-population widening is therefore an explicit
+       operator choice — ``--include-unstamped`` — never a default.
 
     ⛔ The REBUILT-graph legacy shape is NOT covered, and that is a decision this
     PR deliberately did not take. Replaying a pre-D10 journal folds the old
@@ -378,7 +398,7 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
         api.add_document(
             doc_id=source_id,
             title=fm.get("title", transcript.stem),
-            document_kind=fm.get("type", fm.get("document_kind", "")),
+            document_kind=_frontmatter_kind(fm),
             document_knowledge_domain=domain,
             authored_by=api.agent_id or "extractor@0",
             owned_by=fm.get("ownedBy", ""),
@@ -618,7 +638,7 @@ def _do_upgrade_all(proj, api, args):
         api.add_document(
             doc_id=source_id,
             title=fm.get("title", filepath.stem),
-            document_kind=fm.get("type", fm.get("document_kind", "")),
+            document_kind=_frontmatter_kind(fm),
             document_knowledge_domain=domain,
             authored_by=api.agent_id or "extractor@0",
             owned_by=fm.get("ownedBy", ""),
@@ -784,11 +804,15 @@ def main(argv=None):
                          "doc_status='captured' marker) and upgrade each")
     ap.add_argument("--include-unstamped", action="store_true",
                     help="#5140: with --upgrade-all, also select document Sources "
-                         "that carry NO `needs_extraction` property at all. The default "
-                         "sweep selects an explicit needs_extraction=true or a "
-                         "surviving doc_status='captured' marker; the sanctioned "
-                         "session-capture writer mints transcripts with no signal, so "
-                         "widening the sweep to them is an explicit choice. "
+                         "that carry no extraction signal at all (`needs_extraction` "
+                         "absent AND no legacy `doc_status` marker — a surviving "
+                         "`doc_status` such as 'draft' is still not selected). The "
+                         "default sweep takes an explicit needs_extraction=true or a "
+                         "surviving doc_status='captured' marker; the two in-tree "
+                         "writers that mint a document Source with no signal are "
+                         "transcript writers, so widening the sweep onto them is an "
+                         "explicit choice, and a caller-minted Source "
+                         "(`create_source(documentKind=…)`) is selected too. "
                          "⛔ It does NOT select a document whose stored "
                          "needs_extraction=false came from a REPLAYED pre-D10 record "
                          "(that value is indistinguishable from a real completion "
@@ -914,7 +938,7 @@ def main(argv=None):
                 api.add_document(
                     doc_id=source_id,
                     title=fm.get("title", args.transcript.stem),
-                    document_kind=fm.get("type", fm.get("document_kind", "")),
+                    document_kind=_frontmatter_kind(fm),
                     document_knowledge_domain=domain,
                     authored_by=extractor.version,
                     owned_by=fm.get("ownedBy", ""),
