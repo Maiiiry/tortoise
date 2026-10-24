@@ -2000,64 +2000,125 @@ class TestCommittedRepoMcpJson:
 # arm it opens (#9660 review).
 _CHATGPT_ARM_MARKER = "wizardConnectHarness === 'chatgpt'"
 
-# The arm's END: the NEXT harness arm's ternary terminator. Anchored on the
-# arm-SHAPED terminator (`) : <name> ?`) rather than on the bare identifier —
-# `wizardKeyless` also names a const, an `else if (wizardKeyless)` node branch
-# BEFORE this arm and a nav-button label AFTER every arm, so a bare
-# `find("wizardKeyless")` answers a question nobody asked (#9660 review, P1) — and
-# the match must BE the key-less one, so a sibling arm inserted in between cannot
-# be swallowed (#9660 review, P3: blacklisting one identifier spelling missed
-# `) : wizardDesktop ? (` and `) : wizardKeyless && wizardExtra ? (`).
-_ARM_TERMINATOR = re.compile(r"\)\s*:\s*([A-Za-z_$][\w$.]*)\s*(\?|&&|\|\||===|!==)")
+# The arm's END is the first `) :` in the source after the card — the token every
+# ternary continuation starts with, whatever the condition looks like. Detecting
+# it by the SHAPE of the condition (`) : <name> ?`) was tried for several review
+# rounds and each round found a form it skipped (`(cond) ?`, `!cond ?`,
+# `typeof x ?`, `new X() ?`, a regex or template literal, `a in b`, `.5 ?`), each
+# one a silent swallow of a sibling arm. A guard that enumerates JavaScript's
+# expression shapes is a subset of a parser; this one enumerates a punctuation
+# token and then checks it against the ONE clause it expects.
+_ARM_END_TOKEN = re.compile(r"\)\s*:")
+# A nested arm compares or tests the selector. It is matched in ANY of those
+# spellings (`===`, `==`, `!==`, `!==` reversed, a bare truthiness `?`, a leading
+# `!`), because matching only the `===` form reported the others as absent. It is
+# deliberately NOT "any mention": the selector also appears as DATA in the real arm
+# (`wizardBeacon(wizardConnectHarness, 'prompt')`), which is not a nested arm.
+_NESTED_SELECTOR = re.compile(
+    r"wizardConnectHarness\s*(?:===|==|!==|!=|&&|\|\||\?)"
+    r"|(?:===|==|!==|!=)\s*wizardConnectHarness"
+    r"|!\s*wizardConnectHarness")
+_KEYLESS_CLAUSE = re.compile(r"\)\s*:\s*wizardKeyless\s*\?\s*\(")
+
+
+def _blank_comments(src: str) -> str:
+    """`src` with JS comment bodies replaced by spaces — offsets preserved.
+
+    Needed because prose inside a comment can contain the tokens this module
+    searches for (`): ChatGPT Web is a …` sits 66 characters into the ChatGPT
+    arm, and a comment quoting `wizardConnectHarness ===` used to look like a
+    sibling arm). Replacing characters instead of deleting them keeps every
+    offset usable against the raw source.
+    """
+    out = list(src)
+    for match in re.finditer(r"/\*.*?\*/", src, re.S):
+        for i in range(match.start(), match.end()):
+            if out[i] != "\n":
+                out[i] = " "
+    for match in re.finditer(r"(?<!:)//[^\n]*", src):
+        for i in range(match.start(), match.end()):
+            out[i] = " "
+    return "".join(out)
 
 
 def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
     """(start, end) of the ChatGPT connect card inside `main.jsx` source.
 
-    `start` is the first character AFTER the arm's opening selector; `end` is the
-    start of the `) : wizardKeyless ? (` terminator — the key-less Claude arm that
-    follows the chatgpt one. Extracted (and unit-tested on synthetic source by
-    `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`) because the two ways
-    this can go wrong are silent, not loud:
+    `start` is the first character AFTER the arm's opening selector. `end` is the
+    key-less Claude clause (`_KEYLESS_CLAUSE`) that this arm must precede — so the
+    bound is a question about ORDER, not about the shape of anything in between.
+
+    Extracted (and unit-tested on synthetic source by
+    `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`) because the ways this
+    can go wrong are silent, not loud:
 
     * an anchor keyed on the bare identifier also matches a nav-button label far
-      below every arm, which makes the ordering claim and the slice pass from the
-      WRONG position — moving the chatgpt card after the key-less branch, the
-      exact regression the claim names, then stays green;
-    * an arm whose end simply runs to the next terminator swallows any sibling
-      arm inserted in between, so `after()` can be satisfied by another harness's
-      copy while this card lost it. The end is therefore taken from the first
-      arm-SHAPED terminator and REQUIRED to be the key-less one, which reds on a
-      sibling however it is spelled.
+      below every arm, so the arm's END lands in the wrong place and the slice
+      spans more than this card — under such an anchor a card MOVED after the
+      key-less branch stays green;
+    * an end anchor that runs to "the next arm-shaped clause" swallows a sibling
+      arm in between, so `after()` can be satisfied by another harness's copy
+      while this card lost it. Recognising that clause by its SPELLING is a
+      subset of a parser, and each review round found a form it skipped
+      (`(cond) ?`, `!cond ?`, `typeof x ?`, `new X() ?`, regex/template literals,
+      `a in b`, `.5 ?`). So no condition shape is matched here: the bound is the
+      first `) :` token after the card (`_ARM_END_TOKEN`), and the clause behind
+      it must be the key-less one (`_KEYLESS_CLAUSE`, whitespace-tolerant); any
+      further USE of the harness selector in the arm is an error too (a sibling
+      arm, or a nested selector in the card). Comments are blanked with their
+      offsets preserved, so prose in a comment cannot supply either token.
+      A nested arm is recognised by a comparison/truthiness USE of the selector;
+      a membership test (`[…].includes(wizardConnectHarness)`) is not detected —
+      the end-token rule is the primary bound and this one is a belt.
 
-    Both raise `AssertionError` naming what moved — never a bare `ValueError` from
-    `str.index`.
+    LIMITS, stated because this is a bound-checker and not a parser: it assumes
+    the arm body is parenthesised (asserted, so a different shape reds instead of
+    under-bounding), and copy that RENDERS the token text (`) : wizardKeyless ? (`
+    inside a `<pre>`) would end the bound early — that direction fails the copy
+    assertions rather than passing them, and no arm in this file does it.
+
+    Both failure modes raise `AssertionError` naming what moved, never a bare
+    `ValueError` from `str.index`.
     """
-    branch = main.find(_CHATGPT_ARM_MARKER)
+    code = _blank_comments(main)
+    branch = code.find(_CHATGPT_ARM_MARKER)
     assert branch != -1, (
         "the chatgpt connect arm is gone from main.jsx — the selector "
         f"{_CHATGPT_ARM_MARKER!r} no longer appears, so every copy assertion in "
         "the journey test would be judging some other arm. Restore the arm or "
         "update this guard with it.")
     start = branch + len(_CHATGPT_ARM_MARKER)
-    terminator = _ARM_TERMINATOR.search(main, start)
-    assert terminator is not None, (
-        "the chatgpt arm's end anchor is gone from main.jsx: the connect step no "
-        "longer offers a `) : wizardKeyless ? (` branch after the chatgpt one. "
-        "The chatgpt card must come BEFORE the key-less one — chatgpt is key-less "
-        "too, so ordering decides which copy it gets. Update this guard.")
-    assert (terminator.group(1), terminator.group(2)) == ("wizardKeyless", "?"), (
-        "the terminator this guard found is not the chatgpt arm's end: the next "
-        f"arm-shaped clause is {terminator.group(0).strip()!r}, not the key-less "
-        "branch. Either the arm was moved behind another harness branch (so every "
-        "copy assertion below would be satisfied from a SIBLING) or the key-less "
-        "branch was removed/re-spelled. Update this guard with the new shape.")
-    end = terminator.start()
-    assert "wizardConnectHarness ===" not in main[start:end], (
-        "a second harness branch sits between the chatgpt card and the key-less "
-        "one — every copy assertion below would be satisfied from that SIBLING "
-        "arm while the chatgpt card lost the copy")
-    return start, end
+
+    sibling_match = _NESTED_SELECTOR.search(code, start)
+    sibling = sibling_match.start() if sibling_match else -1
+    end_token = _ARM_END_TOKEN.search(code, start)
+    assert end_token is not None, (
+        "no ternary continuation (`) :`) follows the chatgpt card: the arm is the "
+        "last one in the connect step, so its copy can no longer be bounded. The "
+        "card must come BEFORE the key-less Claude branch. Update this guard.")
+    if sibling != -1 and sibling < end_token.start():
+        raise AssertionError(
+            "a harness selector appears between the chatgpt card and the next "
+            f"ternary clause (at offset {sibling}) — another harness arm sits "
+            "there, or the card renders a nested selector. Every copy assertion "
+            "below would be satisfiable from that inner arm while the chatgpt "
+            "card lost the copy. Update this guard with the new shape.")
+    # The arm's body must be PARENTHESISED (`? ( … )`), which is how this file
+    # writes every arm. Without that assumption an unparenthesised body moves the
+    # first `) :` inside the arm, and the sibling's own terminator would be read as
+    # the arm's end — a silent under-bound.
+    assert re.match(r"\s*\?\s*\(", code[start:]), (
+        "the chatgpt arm's body is not parenthesised: this guard bounds the arm by "
+        "the first `) :` and assumes `? ( … )`. Re-pin the guard for the new shape "
+        "rather than letting it bound the wrong region.")
+    tail = code[end_token.start():]
+    assert _KEYLESS_CLAUSE.match(tail), (
+        "the clause that follows the chatgpt card is not the key-less branch: the "
+        f"next ternary reads {tail[:60]!r}. Either the key-less arm was removed, "
+        "or ANOTHER arm now sits between the two (so every copy assertion below "
+        "would be satisfied from that sibling). Update this guard with the shape "
+        "that is actually there.")
+    return start, end_token.start()
 
 
 def _inside(main: str, marker: str, start: int, end: int) -> int:
@@ -2100,9 +2161,8 @@ def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
     assert _inside(good, "<p>card</p>", start, end) == good.index("<p>card</p>")
 
     # The card MOVED AFTER the key-less branch and is now the LAST arm: no
-    # arm-shaped terminator follows it, so the guard reports the missing end
-    # anchor (it cannot see an ordering violation it has no end for). The
-    # sibling-shaped case below is what exercises the ordering assertion.
+    # ternary continuation follows it at all, so the guard reports that it cannot
+    # bound the arm rather than guessing.
     moved = (
         "{wizardConnectHarness === 'codex' ? (\n"
         "  <p>other</p>\n"
@@ -2112,41 +2172,117 @@ def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
         "  <p>card</p>\n"
         "{busy ? 'Checking…' : (wizardKeyless\n"
     )
-    with pytest.raises(AssertionError, match="end anchor is gone"):
+    with pytest.raises(AssertionError, match="no ternary continuation"):
         _chatgpt_arm_bounds(moved)
 
-    # The key-less ternary deleted outright: the anchor names that, too.
-    with pytest.raises(AssertionError, match="end anchor is gone"):
+    # The key-less ternary deleted outright, with some OTHER arm following: the
+    # next ternary is not the key-less one.
+    with pytest.raises(AssertionError, match="not the key-less branch"):
         _chatgpt_arm_bounds(
-            "{wizardConnectHarness === 'chatgpt' ? (\n  <p>card</p>\n")
+            "{wizardConnectHarness === 'chatgpt' ? (\n  <p>card</p>\n"
+            ") : wizardDesktop ? (\n  <p>other</p>\n")
 
-    # A SIBLING harness arm inserted between the card and the key-less branch:
-    # the arm must not swallow it, or its copy satisfies the pins.
-    sibling = (
-        "{wizardConnectHarness === 'chatgpt' ? (\n"
-        "  <p>card</p>\n"
-        ") : wizardConnectHarness === 'codex' ? (\n"
-        "  <p>other</p>\n"
-        ") : wizardKeyless ? (\n"
-    )
-    with pytest.raises(AssertionError, match="not the chatgpt arm's end"):
-        _chatgpt_arm_bounds(sibling)
-
-    # …and the same guard under the TWO spellings a blacklist of
-    # `wizardConnectHarness ===` missed (#9660 review, P3): a differently-named
-    # sibling arm, and a REFINEMENT of the key-less one. Both keep a terminator
-    # in the arm, so an end anchor that only looks for `: wizardKeyless ?` in the
-    # text would return a region that includes the sibling.
-    for spelling in (") : wizardDesktop ? (\n  <p>other</p>\n",
-                    ") : wizardKeyless && wizardExtra ? (\n  <p>other</p>\n"):
+    # EVERY sibling spelling reds, because the boundary is the `) :` token and the
+    # clause behind it must be the key-less one — no enumeration of JS expression
+    # shapes (each earlier attempt missed forms: `(cond) ?`, `!cond ?`,
+    # `typeof x ?`, `new X() ?`, a regex literal, a template literal, `a in b`).
+    for spelling in (
+        ") : wizardConnectHarness === 'codex' ? (\n  <p>other</p>\n",
+        ") : wizardDesktop ? (\n  <p>other</p>\n",
+        ") : wizardKeyless && wizardExtra ? (\n  <p>other</p>\n",
+        ") : (wizardDesktop) ? (\n  <p>other</p>\n",
+        ") : (harnessA || harnessB) ? (\n  <p>other</p>\n",
+        ") : !wizardDesktop ? (\n  <p>other</p>\n",
+        ") : typeof wizardDesktop === 'x' ? (\n  <p>other</p>\n",
+        ") : new Wizard() ? (\n  <p>other</p>\n",
+        ") : /wizard/.test(h) ? (\n  <p>other</p>\n",
+        ") : `x` ? (\n  <p>other</p>\n",
+        ") : 0 ? (\n  <p>other</p>\n",
+    ):
         widened = (
             "{wizardConnectHarness === 'chatgpt' ? (\n"
             "  <p>card</p>\n"
             + spelling
             + ") : wizardKeyless ? (\n"
         )
-        with pytest.raises(AssertionError, match="not the chatgpt arm's end"):
+        with pytest.raises(AssertionError,
+                           match="a harness selector appears between|not the key-less branch"):
             _chatgpt_arm_bounds(widened)
+
+    # A selector referenced INSIDE the card (a nested ternary) is caught before
+    # the end token: the bound would otherwise stop inside the card.
+    nested = (
+        "{wizardConnectHarness === 'chatgpt' ? (\n"
+        "  {wizardConnectHarness === 'codex' ? (\n"
+        "    <p>card</p>\n"
+        "  ) : null}\n"
+        ") : wizardKeyless ? (\n"
+    )
+    # A nested selector is caught by the sibling check — the arm would otherwise
+    # contain an inner harness arm whose copy could satisfy the pins.
+    with pytest.raises(AssertionError, match="a harness selector appears between"):
+        _chatgpt_arm_bounds(nested)
+
+    nested_before_token = (
+        "{wizardConnectHarness === 'chatgpt' ? (\n"
+        "  {wizardConnectHarness === 'codex' && <p>inner</p>}\n"
+        "  <p>card</p>\n"
+        ") : wizardKeyless ? (\n"
+    )
+    with pytest.raises(AssertionError, match="a harness selector appears between"):
+        _chatgpt_arm_bounds(nested_before_token)
+
+    # …and prose in a COMMENT cannot make a sibling look real: the token scan runs
+    # on a copy whose comment bodies are blanked (a comment quoting
+    # `wizardConnectHarness ===` and `) :` used to red this, and one quoting
+    # `): ChatGPT Web is a …` sits inside the real arm).
+    with_comment = (
+        "{wizardConnectHarness === 'chatgpt' ? (\n"
+        "  /* a sibling would be ) : wizardConnectHarness === 'codex' ? ( */\n"
+        "  <p>card</p>\n"
+        ") : wizardKeyless ? (\n"
+        "  <p>keyless</p>\n"
+    )
+    start_c, end_c = _chatgpt_arm_bounds(with_comment)
+    assert "<p>card</p>" in with_comment[start_c:end_c]
+    assert "<p>keyless</p>" not in with_comment[start_c:end_c]
+
+    # A COSMETIC reflow of the key-less clause must not red: the clause pattern is
+    # whitespace-tolerant, so a line wrap cannot teach the next lane to delete this
+    # guard.
+    for reflow in (
+        ") : wizardKeyless\n      ? (\n",
+        ") : wizardKeyless  ?  (\n",
+        ") : wizardKeyless ?\n    (\n",
+    ):
+        s_r, e_r = _chatgpt_arm_bounds(
+            "{wizardConnectHarness === 'chatgpt' ? (\n  <p>card</p>\n"
+            + reflow
+            + "  <p>keyless</p>\n")
+        assert "<p>card</p>" in (
+            "{wizardConnectHarness === 'chatgpt' ? (\n  <p>card</p>\n"
+            + reflow)[s_r:e_r]
+
+    # An UNPARENTHESISED arm body would move the first `) :` inside the arm, so the
+    # guard refuses the shape instead of silently under-bounding to it.
+    with pytest.raises(AssertionError, match="not parenthesised"):
+        _chatgpt_arm_bounds(
+            "{wizardConnectHarness === 'chatgpt' ? <p>card</p>\n"
+            "  : wizardDesktop ? (\n    <p>sibling</p>\n  ) : wizardKeyless ? (\n")
+
+    # …and the nested-arm belt spans the comparison spellings, not just `===`.
+    for nested_spelling in (
+        "  {wizardConnectHarness !== 'chatgpt' && <p>inner</p>}\n",
+        "  {'codex' === wizardConnectHarness && <p>inner</p>}\n",
+        "  {!wizardConnectHarness && <p>inner</p>}\n",
+        "  {wizardConnectHarness ? <p>inner</p> : null}\n",
+    ):
+        with pytest.raises(AssertionError, match="a harness selector appears between"):
+            _chatgpt_arm_bounds(
+                "{wizardConnectHarness === 'chatgpt' ? (\n"
+                + nested_spelling
+                + "  <p>card</p>\n"
+                ") : wizardKeyless ? (\n")
 
     # …and `after()` itself is bounded at the far end: a marker that only exists
     # in the sibling branch is not the chatgpt card's copy.
@@ -2200,8 +2336,8 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     #    marker that survives only in a sibling branch is not this card's copy.
     #    That makes the arm's end a real dependency, so the guard reds on a change
     #    of STRUCTURE (a sibling arm inserted, the key-less branch removed or
-    #    re-spelled) and never on whitespace or line wrapping — `_ARM_TERMINATOR`
-    #    tolerates any spacing. `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`
+    #    re-spelled) and never on whitespace or line wrapping — `_ARM_END_TOKEN`
+    #    and `_KEYLESS_CLAUSE` both allow any spacing. `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`
     #    proves each wrong shape actually fails (#4880: a guard deciding from the
     #    SHAPE of the source is defeated by a source of a different shape).
     arm_start, arm_end = _chatgpt_arm_bounds(main)
@@ -2321,6 +2457,28 @@ def test_9660_the_org_choice_precedes_authorize_on_every_recipe_carrier():
                 return line
         raise AssertionError(f"no wizard step contains {needle!r} — moved or reworded")
 
+    def list_block(text: str, anchor: str) -> str:
+        """The `<ol>` that CONTAINS `anchor`, from `<ol` to its `</ol>`.
+
+        Anchored on the CONTAINER, not on the content: bounding from the anchor
+        itself lets a pick `<li>` hoisted out of the list widen the block to the
+        next list in the file, where the offsets stop describing the recipe
+        (#9660 review). Both edges are asserted, so a move is reported by name.
+        """
+        at = text.find(anchor)
+        assert at != -1, (
+            f"the Claude key-less recipe moved: {anchor!r} no longer appears, so "
+            "the list it belongs to cannot be bounded")
+        start = text.rfind("<ol", 0, at)
+        assert start != -1, f"{anchor!r} is no longer inside an ordered list"
+        end = text.find("</ol>", start)
+        assert end != -1, f"the ordered list holding {anchor!r} lost its closing tag"
+        block = text[start:end]
+        assert anchor in block, (
+            f"{anchor!r} is no longer inside the nearest ordered list — the copy "
+            "moved out of its list, so this block would be some earlier recipe's")
+        return block
+
     def span(text: str, start_needle: str, end_needle: str) -> str:
         """`text` from its first `start_needle` to the next `end_needle`.
 
@@ -2341,8 +2499,7 @@ def test_9660_the_org_choice_precedes_authorize_on_every_recipe_carrier():
     # here too rather than left to a comment.
     blocks = [
         ("Claude key-less card list",
-         main[main.rindex("<ol", 0, main.index("Pick the Organization you&apos;re onboarding")):
-              main.index("</ol>", main.index("Pick the Organization you&apos;re onboarding"))]),
+         list_block(main, "Pick the Organization you&apos;re onboarding")),
         ("claude-web step", step_line(harnesses, "Claude opens the authorization page")),
         ("Claude Desktop snippet",
          span(harnesses, "'claude-desktop': () =>", "'claude-web': () =>")),
@@ -2359,8 +2516,11 @@ def test_9660_the_org_choice_precedes_authorize_on_every_recipe_carrier():
         # still the phrase a reader sees (the served note wraps mid-sentence).
         flat = " ".join(block.replace("> ", " ").split())
         assert "asks you to choose" in flat, (
-            f"the {label} describes the consent page's single-Organization shape "
-            "only — a second-org user meets a chooser (tortoise/oauth.py)")
+            f"the {label} no longer carries the chooser wording this pin looks "
+            "for ('asks you to choose'): the copy must tell a user that the page "
+            "asks them to pick when their account can use more than one "
+            "Organization (tortoise/oauth.py). If the sentence was reworded, "
+            "update BOTH the copy and this pin — do not drop the fact.")
         # Case-insensitive: docs.html and the served document write
         # "organization", the dashboard writes "Organization". The ORDER is the
         # property; the house capitalisation belongs to each surface.
