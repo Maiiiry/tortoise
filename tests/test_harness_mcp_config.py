@@ -930,6 +930,7 @@ class TestDocsPageAndSkillConfig:
             "settings/plugins-settings",  # 3 — where the installed plugin + its Connect live
             "View details",              # 3 — the observed control on the plugin row
             "Connect",                   # 3 — the OAuth grant is a SEPARATE act
+            "Connect Tortoise",          # 3 — the consent dialog between Connect and Authorize
             "Authorize",                 # 3 — consent (key-less connect completes here)
             "chatgpt.com/skills",        # 4 — the Skills surface the archives install on
             "Install the Tortoise skills",  # 4 — the hand-over is an INSTALL, not a paste
@@ -2057,13 +2058,17 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     #    #9660).
     for fact in ("chatgpt.com/plugins", "Add custom MCP server", "Create as a plugin</strong>",
                  "settings/plugins-settings", "View details</strong>",
-                 "<strong>Connect</strong>", "Authorize</strong>"):
+                 "<strong>Connect</strong>", "Connect Tortoise</strong>", "Authorize</strong>"):
         after(fact)
-    # …and the GRANT is a sequence, so its three controls must be in order:
-    # View details → Connect → Authorize. Deleting the middle one (the only act
-    # that actually connects) reds this, which bare-word presence did not.
+    # …and the GRANT is a sequence, so its controls must be in order: View
+    # details → Connect → Connect Tortoise → Authorize. Each is a separate click
+    # in the live UI (2026-10-23): Connect opens ChatGPT's consent dialog, whose
+    # primary button is `Connect Tortoise`; only then does the Tortoise consent
+    # page offer Authorize. An earlier card folded all three into "Connect, sign
+    # in … Authorize" and left a user staring at a dialog no step had told them
+    # to expect — deleting either middle act reds this.
     grant = [after(m) for m in ("View details</strong>", "<strong>Connect</strong>",
-                                "Authorize</strong>")]
+                                "Connect Tortoise</strong>", "Authorize</strong>")]
     assert grant == sorted(grant), (
         "the OAuth grant reads View details → Connect → Authorize; the card must "
         "render them in that order")

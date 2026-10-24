@@ -509,6 +509,13 @@ def test_4365_served_document_sends_chatgpt_to_a_path_that_exists():
             "(#9660)")
     assert "Add custom MCP server" in skill, (
         "the served document must name the real connector entry point (#9660)")
+    # #9660: the grant is three clicks, and the middle one opens a dialog the user
+    # has to answer. The note said "connect the plugin", which left the consent
+    # dialog between Connect and Authorize unmentioned — the live run stopped
+    # there until it was answered (2026-10-23).
+    assert "Connect Tortoise" in skill, (
+        "the served document must name the consent dialog's button, not just "
+        "'connect the plugin' — the grant does not complete without it")
     assert "ChatGPT tab" not in skill, (
         "the served document must not name the retired dashboard ChatGPT tab")
     # #9660 OWNER RULING (2026-10-23): the chooser DOES carry a ChatGPT
