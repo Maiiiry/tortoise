@@ -978,6 +978,79 @@ test("#3515: hermetic test deps SEAL the sweep — a test can never spawn the re
   }
 });
 
+/**
+ * Run ONE real sweep against a `tortoise` shim and return the status it left.
+ *
+ * The REAL spawn path on purpose: `hermeticDeps` injects `sweepImpl` precisely
+ * so no row can reach the real CLI (see the seal row above), and this helper is
+ * the one place that needs the spawn. PATH holds only a shim and the spool is a
+ * temp dir, so nothing real is read, written or uploaded.
+ */
+async function sweepWithShim(script: string): Promise<SweepStatus | undefined> {
+  const dir = mkdtempSync(join(tmpdir(), "tortoise-capture-sweep-fail-"));
+  writeFileSync(join(dir, "tortoise"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${dir}:${originalPath ?? ""}`;
+  // A PRIVATE parent, not `tmpdir()`: the status file lands in the SPOOL ROOT's
+  // sibling `store-sync/`, and `tmpSpool()` shares one temp root with every
+  // other fixture — so a FAILED status written here would be read by every
+  // health-line row that follows (the same trap the dead-letter row documents,
+  // #3721).
+  const parent = mkdtempSync(join(tmpdir(), "tortoise-capture-sweep-status-"));
+  const spool = join(parent, "capture-spool");
+  mkdirSync(spool, { recursive: true });
+  const storeDir = join(parent, "store-sync");
+  try {
+    const pi = mockPi();
+    const { fetchImpl } = mockFetch([]);
+    // `hermeticDeps` DEFAULTS its own `tmpSpool()`, so the spool must be passed
+    // or the extension writes its status into the shared temp root's sibling
+    // `store-sync/` — where every health-line row in this file would read it.
+    tortoiseCapture(pi as never, { ...hermeticDeps(fetchImpl, spool), sweepImpl: undefined });
+    await pi.handlers.session_start(
+      undefined,
+      mockCtx({ entries: [], sessionId: "sid-live" }) as never,
+    );
+    await settle();
+    // The child is DETACHED, so it lands on its own clock.
+    for (let i = 0; i < 50; i += 1) {
+      if (existsSync(join(storeDir, "sweep-status.json"))) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return readSweepStatus(storeDir);
+  } finally {
+    process.env.PATH = originalPath;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(parent, { recursive: true, force: true });
+  }
+}
+
+test("#3515: a sweep that fails is RECORDED, not just warned about", async () => {
+  if (process.platform === "win32") return; // the shim is a /bin/sh script
+  // The extension spawns with `stdio: "ignore"`, so the CLI's stderr — where
+  // every post-spawn failure is named — is discarded. Before this row, deleting
+  // the WHOLE `child.on(...)` failure listener left 128/128 green: the one line
+  // that connects a failing sweep to the health line had no discriminator, and
+  // the box printed `capture: OK` over an inert backstop.
+  assert.deepEqual(
+    await sweepWithShim("exit 3"),
+    { ok: false, reason: "exit_3" },
+    "a non-zero sweep must reach the disk, because its stderr goes nowhere",
+  );
+});
+
+test("#3515: a KILLED sweep is recorded with its SIGNAL, never as `exit_null`", async () => {
+  if (process.platform === "win32") return;
+  // A swept that the OOM killer or a box shutdown takes out is a realistic death
+  // of exactly this process, and it reports `code === null`. Reading only the
+  // exit code wrote the literal string `exit_null` — the reason thrown away
+  // precisely where the diagnosis matters.
+  assert.deepEqual(
+    await sweepWithShim("kill -9 $$"),
+    { ok: false, reason: "signal_SIGKILL" },
+  );
+});
+
 test("session_start resolves WITHOUT awaiting the probe (Pi awaits the handler at startup)", async () => {
   const pi = mockPi();
   // A probe fetch that never settles — models a BLACKHOLED endpoint (SYN

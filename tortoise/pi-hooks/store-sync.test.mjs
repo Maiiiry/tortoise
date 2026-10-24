@@ -1030,8 +1030,15 @@ test("a RE-ANCHORED plan that also hits the unproven arm is still REFUSED", asyn
   // about THIS delivery, and following the rewrite there ships a short window
   // whose turns the store hard-DETACH-DELETEs (#1920).
   //
-  // Without this row, `if (unproven) ...` -> `if (unproven && !reanchored) ...`
-  // leaves all 44 rows green while the guard fail-opens on the compound path.
+  // What this row pins is the OUTER condition at the refusal site
+  // (`if (unproven || (!reanchored && turns.length < priorWindow))`): exempting
+  // the whole arm when re-anchored — `(unproven && !reanchored) || ...` — leaves
+  // every other row green AND posts the short window, so that is the fail-open
+  // shape. The INNER `if (unproven)` (the persistence branch) is a different
+  // mutation and it does NOT fail open: the outer test already refused, so the
+  // window is still not shipped; what changes is that a prove-nothing cursor row
+  // gets written instead of the refusal being sticky. That is pinned separately
+  // below, by asserting NO row is written.
   const root = tmp("sessions-reanchor-unproven-");
   const cursorDir = tmp("cursor-reanchor-unproven-");
   const path = join(root, "s.jsonl");
@@ -1073,6 +1080,17 @@ test("a RE-ANCHORED plan that also hits the unproven arm is still REFUSED", asyn
   assert.ok(
     logLines.some((l) => l.includes("REFUSED a shrunk window")),
     "the refusal is logged",
+  );
+  // STICKY BY CONSTRUCTION: an unproven refusal writes NO cursor row, so the
+  // file stays unproven and the guard fires again on the next sweep. Writing a
+  // row here would make the next run look like it had a prior, `priorWindow`
+  // would read 0, and the short window would ship — the deletion this guard
+  // exists to prevent, one run later. This is the inner `if (unproven)` branch's
+  // discriminator (the outer condition is pinned by the no-POST assertion above).
+  assert.equal(
+    loadCursor(cursorDir).state.files[path],
+    undefined,
+    "an unproven refusal must leave NO row — the next sweep must stay unproven",
   );
 });
 

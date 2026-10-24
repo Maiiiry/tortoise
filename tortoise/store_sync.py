@@ -363,6 +363,9 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
             reason = "worker exited non-zero"
         payload = {
             "version": 1,
+            # `at` is FORENSIC (when the last sweep reported) and deliberately
+            # unconsumed: the failure paths all OVERWRITE this file, so a stale
+            # entry is never read as current.
             "ok": bool(receipt.get("ok")),
             "reason": reason,
             "shipped": log.get("shipped", 0),
@@ -417,5 +420,11 @@ def main(args) -> int:
                   file=sys.stderr)
         if receipt.get("spool"):
             print(f"store-sync: spool — {receipt['spool']}", file=sys.stderr)
-    write_sweep_status(receipt, getattr(args, "cursor_dir", None))
+    if not getattr(args, "dry_run", False):
+        # A `--dry-run` is a PLAN, not an outcome. `main` used to write the
+        # status unconditionally, so a human running `tortoise store-sync
+        # --dry-run` on a box whose real sweep had recorded `ok: false`
+        # (no credential, no worker) turned it back into a HEALTHY status and
+        # erased a failure that was still true and unaddressed.
+        write_sweep_status(receipt, getattr(args, "cursor_dir", None))
     return 0 if receipt.get("ok") else 1

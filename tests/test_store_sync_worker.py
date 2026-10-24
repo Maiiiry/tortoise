@@ -15,6 +15,7 @@ Python copy of it (§C(b),(e)).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -650,6 +651,63 @@ def test_a_failed_sweep_leaves_its_reason_where_the_caller_can_read_it(tmp_path)
     blocker = tmp_path / "blocked"
     blocker.write_text("not a directory")
     store_sync.write_sweep_status(receipt, str(blocker))
+
+
+def _main_args(cursor_dir, **overrides):
+    """The exact attribute set `main` reads — so a new CLI flag fails loudly here."""
+    base = dict(
+        api_key=None, api_url=None, no_spool=True, session_dir=None,
+        cursor_dir=str(cursor_dir), file=None, max_files=None, max_requests=None,
+        dry_run=False, exclude_session_id=None, json=False,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_MAIN_persists_the_failure_it_reports(tmp_path, monkeypatch):
+    """The CALL must write the status, not just the function when called by hand.
+
+    The extension discards `main`'s output, so the write in `main` is the ONLY
+    thing connecting a real failing sweep to the health line. The row above calls
+    `write_sweep_status` itself, which proves the function and not the wiring:
+    deleting the call from `main` left this file green.
+    """
+    from tortoise import store_sync
+
+    # No worker artifact => a FAILED sweep with a named reason, deterministically
+    # (no `node`, no network, no clock).
+    monkeypatch.setattr(store_sync, "worker_path", lambda: tmp_path / "missing-worker.ts")
+    cursor = tmp_path / "store-sync"
+    assert store_sync.main(_main_args(cursor)) == 1, "a failed sweep exits non-zero"
+
+    status = json.loads((cursor / "sweep-status.json").read_text())
+    assert status["ok"] is False
+    assert status["reason"] == "worker_missing", status
+
+
+def test_a_dry_run_never_overwrites_a_real_failure(tmp_path, monkeypatch):
+    """A PLAN is not an outcome — `--dry-run` must not turn a failure healthy.
+
+    `main` wrote the status unconditionally, so a human running
+    `tortoise store-sync --dry-run` on a box whose real sweep had recorded
+    `ok: false` erased that failure and the health line went back to OK until the
+    next real sweep.
+    """
+    from tortoise import store_sync
+
+    cursor = tmp_path / "store-sync"
+    cursor.mkdir()
+    (cursor / "sweep-status.json").write_text(
+        json.dumps({"version": 1, "ok": False, "reason": "no_credential"})
+    )
+    monkeypatch.setattr(store_sync, "worker_path", lambda: tmp_path / "missing-worker.ts")
+    store_sync.main(_main_args(cursor, dry_run=True))
+
+    status = json.loads((cursor / "sweep-status.json").read_text())
+    assert status["reason"] == "no_credential", (
+        "a dry run reported an outcome it did not produce"
+    )
+    assert status["ok"] is False
 
 
 # ── the SPOOL half: consent, credential, and the two filters ──────────────

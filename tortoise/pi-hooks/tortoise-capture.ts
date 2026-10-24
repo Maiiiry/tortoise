@@ -2863,35 +2863,47 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
       }
       return;
     }
+    const storeDir = join(dirname(spoolDir), "store-sync");
+    // ONE failure record per sweep, carrying the FIRST reason. A PATH-missing CLI
+    // reports BOTH `error` (ENOENT) and `close` (code -2) and NO `exit` event at
+    // all, so a recorder wired to `exit` alone never fires on the likeliest way
+    // this backstop stops working. Record first, warn second: the warn is
+    // deduplicated per process, the record must not be.
+    let failureRecorded = false;
+    const noteFailure = (reason: string): void => {
+      if (failureRecorded) return;
+      failureRecorded = true;
+      recordSweepFailure(storeDir, reason);
+    };
     try {
       const args = ["store-sync", "--no-spool"];
       if (excludeSessionId) args.push("--exclude-session-id", excludeSessionId);
       const child = spawn(CANDIDATE_CLIS[0], args, { detached: true, stdio: "ignore" });
       child.on("error", () => {
+        noteFailure("cli_missing");
         if (_SWEEP_UNAVAILABLE_WARNED) return;
         _SWEEP_UNAVAILABLE_WARNED = true;
         warn("store-sync sweep: no `tortoise` CLI on PATH — killed/crashed sessions "
           + "are only caught when it is installed (`tortoise store-sync`)");
       });
-      // A spawn that SUCCEEDED can still fail (`node` too old for the shipped
-      // `.ts` worker, missing artifact, no receipt). `stdio: "ignore"` throws
-      // away the CLI's own diagnosis, so the exit code is the only signal left
-      // on this path — and without it those failures are silent. The persisted
-      // `sweep-status.json` carries the REASON onto the health line; this is the
-      // immediate, once-per-process warning.
-      child.on("exit", (code) => {
+      // `close` (not `exit`) is the listener that covers EVERY end: it fires for
+      // a child that ran and failed (`node` too old for the shipped `.ts` worker,
+      // missing artifact, no receipt) AND for one that never started. `signal` is
+      // the only diagnosis for a swept that was KILLED (OOM, shutdown): `code` is
+      // null there, and `exit_null` would throw the reason away exactly where it
+      // matters.
+      child.on("close", (code, signal) => {
         if (code === 0) return;
-        // Record FIRST and unconditionally: the once-per-process warn flag must
-        // not stop later failures from being written down, or the health line
-        // would go quiet after the first one.
-        recordSweepFailure(join(dirname(spoolDir), "store-sync"), `exit_${String(code)}`);
+        const why = code === null ? `signal_${String(signal)}` : `exit_${String(code)}`;
+        noteFailure(why);
         if (_SWEEP_UNAVAILABLE_WARNED) return;
         _SWEEP_UNAVAILABLE_WARNED = true;
-        warn("store-sync sweep FAILED (exit " + String(code) + ") — killed/crashed "
+        warn("store-sync sweep FAILED (" + why.replace("_", " ") + ") — killed/crashed "
           + "sessions are not being recovered; run `tortoise store-sync --json`");
       });
       child.unref();
     } catch {
+      noteFailure("spawn_failed");
       if (_SWEEP_UNAVAILABLE_WARNED) return;
       _SWEEP_UNAVAILABLE_WARNED = true;
       warn("store-sync sweep could not be started");
