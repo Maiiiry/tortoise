@@ -363,9 +363,15 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
             reason = "worker exited non-zero"
         payload = {
             "version": 1,
-            # `at` is FORENSIC (when the last sweep reported) and deliberately
-            # unconsumed: the failure paths all OVERWRITE this file, so a stale
-            # entry is never read as current.
+            # `at` is consumed for PRECEDENCE, not for freshness: the extension
+            # reads it to decide whether a record is the CLI's own name for THIS
+            # sweep (and must not be replaced by its exit code). What it does
+            # NOT do is age an entry out. A sweep killed before it reaches this
+            # write leaves the PREVIOUS verdict standing, so one `capture: OK`
+            # line can survive a backstop that died with its parent (OOM,
+            # shutdown) until the next sweep completes. Named rather than
+            # papered over: closing it needs a `started` marker with no matching
+            # completion, which is a heartbeat, not a status.
             "ok": bool(receipt.get("ok")),
             "reason": reason,
             "shipped": log.get("shipped", 0),

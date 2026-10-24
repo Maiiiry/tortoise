@@ -3432,7 +3432,7 @@ def test_every_capture_artifact_ships_in_the_wheel():
 # also flags the missing script/entry on its own, so the bump is what carries
 # the change to an install whose bytes are frozen at generation 3.
 _EXPECTED_INSTALL_CONTRACT = {"claude": 11, "codex": 3, "cursor": 4,
-                             "pi": 10}
+                             "pi": 11}
 
 
 @pytest.mark.parametrize("harness", sorted(_EXPECTED_INSTALL_CONTRACT))
@@ -3528,12 +3528,12 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
     siblings, so a stale installed copy is comparable rather than
     unmeasurable (#4680).
 
-    Mutation: delete ``// tortoise-hook-version: 10`` from
+    Mutation: delete ``// tortoise-hook-version: 11`` from
     ``tortoise/pi-hooks/tortoise-capture.ts`` — ``read_hook_version`` returns
     ``None``, ``contract_version_for('pi')`` returns ``None``, and both this
     test and the generation pin RED.
     """
-    assert hook_install.read_hook_version(_PI_SRC) == 10
+    assert hook_install.read_hook_version(_PI_SRC) == 11
     assert hook_install.count_canonical_markers(_PI_SRC) == 1, (
         "the Pi seam must carry exactly ONE column-0 marker (a second one is a "
         "site marker that would be mistaken for the contract)")
@@ -3549,7 +3549,7 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
 #: SHIPPED bytes and so compares equal by construction.  Edit the artifact, move
 #: the generation, update this pair — all three in one commit.
 _PINNED_PI_SEAM_INSTALL_CONTRACT = (
-    10, "f6ddd866ab6a265fb15624e9ed0f8c35315743b109d09c0ad7ea056ae6189502")
+    11, "319994020b7fd5ed368384dee12f620fd89321ed2bd3cff7ed2777115391cec0")
 
 #: One digest per generation from generation 3 forward, so "bytes changed,
 #: generation left alone" cannot be certified by editing the pair above by itself:
@@ -3599,6 +3599,13 @@ _GENERATION_DIGESTS = {
     # when a sweep is killed (`code` is null there, which wrote the literal
     # string `exit_null`), and records a spawn failure too.
     10: "f6ddd866ab6a265fb15624e9ed0f8c35315743b109d09c0ad7ea056ae6189502",
+    # Generation 11: the extension's record is SUBORDINATE to the CLI's own
+    # (`close` fires after `main` has written `reason: worker_missing`, so an
+    # unconditional write replaced the named diagnosis with `exit_1` on every
+    # graceful failure), the spawn names `--cursor-dir` so the writer and both
+    # readers agree under a spool override, and the bookkeeping dir is 0o700 /
+    # 0o600 like every sibling writer.
+    11: "319994020b7fd5ed368384dee12f620fd89321ed2bd3cff7ed2777115391cec0",
 }
 
 

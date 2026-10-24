@@ -986,9 +986,10 @@ test("#3515: hermetic test deps SEAL the sweep — a test can never spawn the re
  * the one place that needs the spawn. PATH holds only a shim and the spool is a
  * temp dir, so nothing real is read, written or uploaded.
  */
-async function sweepWithShim(script: string): Promise<SweepStatus | undefined> {
+async function sweepWithShim(
+  build: (storeDir: string) => string,
+): Promise<SweepStatus | undefined> {
   const dir = mkdtempSync(join(tmpdir(), "tortoise-capture-sweep-fail-"));
-  writeFileSync(join(dir, "tortoise"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
   const originalPath = process.env.PATH;
   process.env.PATH = `${dir}:${originalPath ?? ""}`;
   // A PRIVATE parent, not `tmpdir()`: the status file lands in the SPOOL ROOT's
@@ -1000,6 +1001,9 @@ async function sweepWithShim(script: string): Promise<SweepStatus | undefined> {
   const spool = join(parent, "capture-spool");
   mkdirSync(spool, { recursive: true });
   const storeDir = join(parent, "store-sync");
+  // The shim is written AFTER the store path is known, so a row can have the
+  // "CLI" write its own status exactly where the extension will look.
+  writeFileSync(join(dir, "tortoise"), `#!/bin/sh\n${build(storeDir)}\n`, { mode: 0o755 });
   try {
     const pi = mockPi();
     const { fetchImpl } = mockFetch([]);
@@ -1025,6 +1029,14 @@ async function sweepWithShim(script: string): Promise<SweepStatus | undefined> {
   }
 }
 
+/** ok/reason only: the record also carries `at`, which is asserted where it
+ *  matters rather than pinned to a wall clock. */
+function assertSweepFailure(status: SweepStatus | undefined, reason: string, why: string): void {
+  assert.ok(status, `${why} — no status file was written at all`);
+  assert.equal(status.ok, false, why);
+  assert.equal(status.reason, reason, why);
+}
+
 test("#3515: a sweep that fails is RECORDED, not just warned about", async () => {
   if (process.platform === "win32") return; // the shim is a /bin/sh script
   // The extension spawns with `stdio: "ignore"`, so the CLI's stderr — where
@@ -1032,10 +1044,28 @@ test("#3515: a sweep that fails is RECORDED, not just warned about", async () =>
   // the WHOLE `child.on(...)` failure listener left 128/128 green: the one line
   // that connects a failing sweep to the health line had no discriminator, and
   // the box printed `capture: OK` over an inert backstop.
-  assert.deepEqual(
-    await sweepWithShim("exit 3"),
-    { ok: false, reason: "exit_3" },
+  assertSweepFailure(
+    await sweepWithShim(() => "exit 3"),
+    "exit_3",
     "a non-zero sweep must reach the disk, because its stderr goes nowhere",
+  );
+});
+
+test("#3515: the CLI's own diagnosis SURVIVES the extension's exit code", async () => {
+  if (process.platform === "win32") return;
+  // `close` fires AFTER the CLI's `main` has written its own reason and exited
+  // non-zero, so an unconditional write replaced `worker_missing` /
+  // `node_unavailable` / `no_receipt` with an opaque `exit_1` on every GRACEFUL
+  // failure — the whole product of this seam, thrown away on its commonest path.
+  // The shim below IS that sequence: write the named status, then fail.
+  const status = await sweepWithShim((store) =>
+    `node -e 'const f=require("fs");f.mkdirSync(${JSON.stringify(store)},{recursive:true});`
+      + `f.writeFileSync(${JSON.stringify(join(store, "sweep-status.json"))},`
+      + `JSON.stringify({version:1,ok:false,reason:"worker_missing",at:Date.now()/1000}))'; exit 1`);
+  assertSweepFailure(
+    status,
+    "worker_missing",
+    "the CLI named the failure; the extension must not rename it to `exit_1`",
   );
 });
 
@@ -1045,9 +1075,10 @@ test("#3515: a KILLED sweep is recorded with its SIGNAL, never as `exit_null`", 
   // of exactly this process, and it reports `code === null`. Reading only the
   // exit code wrote the literal string `exit_null` — the reason thrown away
   // precisely where the diagnosis matters.
-  assert.deepEqual(
-    await sweepWithShim("kill -9 $$"),
-    { ok: false, reason: "signal_SIGKILL" },
+  assertSweepFailure(
+    await sweepWithShim(() => "kill -9 $$"),
+    "signal_SIGKILL",
+    "a killed sweep must name its SIGNAL, never the literal `exit_null`",
   );
 });
 
@@ -3141,9 +3172,10 @@ test("#2100: the per-box health line is present in every state", async () => {
     "a FAILED sweep is named on the human line with its reason",
   );
   assert.equal(failed.state, "ok", "the backstop's health is not the spool's state");
-  assert.deepEqual(
+  assertSweepFailure(
     readSweepStatus(join(parent, "store-sync")),
-    { ok: false, reason: "node_unavailable" },
+    "node_unavailable",
+    "a CLI-written status is read back verbatim",
   );
 
   // A status that says `ok` adds nothing — the line must not become noisy.
@@ -3170,9 +3202,10 @@ test("#2100: the per-box health line is present in every state", async () => {
     "capture: OK (0 queued), 2 store-sync dead-lettered, store-sync FAILED (exit_1)",
     "an exit-code failure OVERWRITES a stale healthy status the CLI could not update",
   );
-  assert.deepEqual(
+  assertSweepFailure(
     readSweepStatus(join(parent, "store-sync")),
-    { ok: false, reason: "exit_1" },
+    "exit_1",
+    "the recorded failure is the one the line renders",
   );
 
   // A HEALTH CHECK MUST NOT MUTATE WHAT IT DESCRIBES. `listSpoolEntries` (the
