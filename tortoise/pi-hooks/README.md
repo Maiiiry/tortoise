@@ -350,6 +350,18 @@ capture: INACTIVE (no TORTOISE_API_KEY, 3 queued)
 capture: UNREADABLE (cannot list …/capture-spool/entries)
 ```
 
+The store-sync backstop that shares this directory (`~/.tortoise/store-sync/`)
+appends up to two terms to whichever of those states it finds, and the Python
+leg prints the **same** string (`, 2 store-sync dead-lettered` — a permanent
+refusal crossed a per-file cursor, so those turns never re-ship; and
+`, store-sync FAILED (node_unavailable)` — the last sweep ran and failed, so the
+crash/kill recovery is inert). Both come from the receipt's substrates, and the
+production spawn discards the receipt, so the line is where they have to appear:
+
+```text
+capture: OK (0 queued), 2 store-sync dead-lettered, store-sync FAILED (node_unavailable)
+```
+
 `queued` is **pending** work — recomputed from the spool on every call as
 entries that are neither FILED (the server already accepted exactly that
 content; the entry is kept, not unlinked) nor TERMINAL (kept, never retried — see

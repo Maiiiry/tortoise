@@ -350,7 +350,9 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
     """
     try:
         target = Path(cursor_dir) if cursor_dir else default_cursor_dir()
-        target.mkdir(parents=True, exist_ok=True)
+        # `0o700`, like every other `~/.tortoise` subdirectory this tree creates
+        # (and like the worker's own `mkdirSync(dir, { mode: 0o700 })`).
+        target.mkdir(parents=True, exist_ok=True, mode=0o700)
         log = receipt.get("log") or {}
         errors = log.get("errors") or []
         reason = log.get("worker_status") or (errors[0] if errors else None)

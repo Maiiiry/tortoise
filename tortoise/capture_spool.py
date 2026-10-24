@@ -1724,6 +1724,48 @@ def _refusal_label(reason: object) -> str:
     return str(reason)
 
 
+def _store_sync_dir(root: Path) -> Path:
+    """The store-sync backstop's bookkeeping, BESIDE the spool (#3515 piece 11).
+
+    Derived from the spool root's PARENT rather than from ``HOME``, because the
+    Pi leg derives it the same way (``join(dirname(spoolDir), "store-sync")``):
+    a caller that hands in a temp spool — every test does — must not read the
+    machine's real cursor store (#3721), and the two legs must derive the SAME
+    directory from the same spool or the parity contract is unenforceable.
+    """
+    return root.parent / "store-sync"
+
+
+def _count_store_sync_dead_letters(store: Path) -> int:
+    """Rows in the backstop's dead-letter substrate. Absent/unreadable = 0.
+
+    A missing bookkeeping file means "no drops", never an error: the health
+    line must not fail because a substrate has not been created yet.
+    """
+    try:
+        text = (store / "dead-letter.jsonl").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return 0
+    return sum(1 for line in text.split("\n") if line.strip())
+
+
+def _read_sweep_status(store: Path) -> tuple[bool, str | None] | None:
+    """The last sweep's outcome as ``store_sync.write_sweep_status`` persisted it.
+
+    ``None`` means "no sweep has reported yet", which is NOT a failure and must
+    never be rendered as one. A file we cannot read or parse is also ``None``:
+    an unreadable status is not evidence that the backstop failed.
+    """
+    try:
+        parsed = json.loads((store / "sweep-status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    reason = parsed.get("reason")
+    return (parsed.get("ok") is True, reason if isinstance(reason, str) and reason else None)
+
+
 def capture_health_line(root: Path, *, api_key: str | None = None) -> CaptureHealth:
     """The ONE per-box health line (agent-infra#2100), byte-identical to the Pi leg's.
 
@@ -1737,6 +1779,15 @@ def capture_health_line(root: Path, *, api_key: str | None = None) -> CaptureHea
     DIFFERENT answers on purpose: "nothing to file", "waiting", "refused",
     "capture is off", and "could not look" must never read alike.
 
+    The SPOOL state is the base; two STORE-SYNC terms are appended to it when
+    the backstop that shares this directory has something to report — a
+    dead-lettered drop (a permanent refusal crossed a per-file cursor, so those
+    turns can never re-ship) and a sweep that RAN and FAILED (the crash/kill
+    recovery is inert). Both are counts a receipt carries and the production
+    caller throws away (``stdio: "ignore"``), so the one line a user sees is
+    where they have to appear — on BOTH legs, since a checker may run either.
+    Absence of either substrate adds nothing.
+
     ``api_key`` is a TRI-state: ``None`` (the caller cannot know — do not claim
     INACTIVE), ``""`` (this box has no credential, so nothing can ever file:
     the backlog is reported WITH that cause), or a non-empty placeholder.
@@ -1749,6 +1800,11 @@ def capture_health_line(root: Path, *, api_key: str | None = None) -> CaptureHea
     reported ``BLOCKED`` forever on a box that was filing perfectly is how an
     operator learns to ignore the line.
     """
+    return _with_store_sync_terms(_spool_health_line(root, api_key=api_key), root)
+
+
+def _spool_health_line(root: Path, *, api_key: str | None = None) -> CaptureHealth:
+    """The SPOOL half of the health line — every state, no store-sync terms."""
     pending = count_pending_captures(root)
     if pending is None:
         return CaptureHealth(
@@ -1786,6 +1842,27 @@ def capture_health_line(root: Path, *, api_key: str | None = None) -> CaptureHea
         return CaptureHealth("draining", queued, None,
                              f"capture: DRAINING ({queued} queued)")
     return CaptureHealth("ok", 0, None, "capture: OK (0 queued)")
+
+
+def _with_store_sync_terms(base: CaptureHealth, root: Path) -> CaptureHealth:
+    """Append the store-sync terms to a spool verdict — the Pi leg's exact shape.
+
+    Order and wording are pinned by the cross-leg parity test: the dead-letter
+    count first, then the failed sweep, joined by ``, ``. The STATE and the
+    queued count are the SPOOL's and never move because the backstop has news.
+    """
+    store = _store_sync_dir(root)
+    parts: list[str] = []
+    dead_lettered = _count_store_sync_dead_letters(store)
+    if dead_lettered > 0:
+        parts.append(f"{dead_lettered} store-sync dead-lettered")
+    sweep = _read_sweep_status(store)
+    if sweep is not None and not sweep[0]:
+        reason = f" ({sweep[1]})" if sweep[1] else ""
+        parts.append(f"store-sync FAILED{reason}")
+    if not parts:
+        return base
+    return base._replace(line=f"{base.line}, {', '.join(parts)}")
 
 
 def _record_capture_status(root: Path, summary: FlushSummary) -> None:

@@ -203,7 +203,10 @@ export function saveCursor(
   const target = cursorPath(dir);
   const tmp = `${target}.tmp.${process.pid}`;
   try {
-    mkdirSync(dir, { recursive: true });
+    // `0o700`, like every other `~/.tortoise` subdirectory this tree creates
+    // (`capture_spool.py`, `tortoise-capture.ts`, `index_lock.py`): the FILES
+    // are `0o600` already, so this is consistency, not a leak.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     const toWrite = opts.prune === true ? pruneMissing(state) : state;
     const body = `${JSON.stringify(serialise(toWrite), null, 1)}\n`;
     const fd = openSync(tmp, "w", 0o600);
@@ -269,7 +272,7 @@ export const DEAD_LETTER_MAX_ROWS = 500;
 export function recordDeadLetter(dir: string, row: DeadLetter): void {
   const path = join(dir, DEAD_LETTER_FILE);
   try {
-    mkdirSync(dir, { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
     const rows: DeadLetter[] = [];
     if (existsSync(path)) {
       for (const line of readFileSync(path, "utf8").split("\n")) {

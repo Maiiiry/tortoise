@@ -157,7 +157,16 @@ const NO_CONFIG_PATH = "/nonexistent/tortoise-config.json";
  */
 let spoolSeq = 0;
 function tmpSpool(): string {
-  return mkdtempSync(join(tmpdir(), `tortoise-capture-spool-${process.pid}-${spoolSeq++}-`));
+  // The PARENT is per-instance as well, not just the spool. The store-sync
+  // store is DERIVED from the spool's parent (`join(dirname(spoolDir),
+  // "store-sync")`), so a spool sitting directly in `$TMPDIR` makes every row
+  // share `$TMPDIR/store-sync` — which is the machine's, not the test's, and is
+  // exactly the #3721 read (a stale `$TMPDIR/store-sync/dead-letter.jsonl`
+  // reds a row that asserts the clean shape).
+  const parent = mkdtempSync(join(tmpdir(), `tortoise-capture-${process.pid}-${spoolSeq++}-`));
+  const spool = join(parent, "spool");
+  mkdirSync(spool, { recursive: true });
+  return spool;
 }
 
 /**
@@ -3023,8 +3032,20 @@ test("#2100: the per-box health line is present in every state", async () => {
     "a dead-lettered drop is named on the human line, not only in a receipt",
   );
   assert.equal(dropped.state, "ok", "the drop count must not change the SPOOL's state");
+  // The derivation is only hermetic if the PARENT is per-instance: two rows
+  // sharing `$TMPDIR` would share `$TMPDIR/store-sync`, which is the machine's.
+  //
+  // MUTATION THAT REDS THIS: make `tmpSpool()` an `mkdtemp` directly under
+  // `tmpdir()` → both parents are `tmpdir()` again.
+  assert.notEqual(
+    dirname(tmpSpool()),
+    dirname(tmpSpool()),
+    "each fixture spool has its own parent, so its derived store-sync store is its own",
+  );
   // Derived from the SPOOL ROOT, never from `homedir()`: the default must not
   // read the developer's real store (#3721 — the machine is not the code).
+  // `tmpSpool()` gives every row its own PARENT, so the derived sibling is the
+  // test's own empty `store-sync` and not a shared machine-level one.
   assert.equal(
     captureHealthLine(tmpSpool(), { apiKey: "tt_x" }).line,
     "capture: OK (0 queued)",
