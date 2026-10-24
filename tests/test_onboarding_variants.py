@@ -536,8 +536,12 @@ def test_4365_served_document_sends_chatgpt_to_a_path_that_exists():
     # …and the pick must be placed BEFORE Authorize: on the chooser branch the
     # button is disabled until a value is chosen (tortoise/oauth.py
     # `disableAuthorize()`, re-enabled only by the select's onchange), so
-    # "click Authorize, then pick" names an inert control.
-    assert skill.index("pick the Organization") < skill.index("**Authorize**"), (
+    # "click Authorize, then pick" names an inert control. Bounded to the ChatGPT
+    # NOTE: measured over the whole document, any bolded `**Authorize**` elsewhere
+    # would red this with a message blaming the ChatGPT recipe (#9660 review).
+    note_at = skill.index("#1701 — ChatGPT is a 7th harness")
+    note = skill[note_at:skill.index("installing the three reusable skills", note_at)]
+    assert note.index("pick the Organization") < note.index("**Authorize**"), (
         "the served document's ChatGPT recipe must pick the Organization before "
         "Authorize — an agent reads this list aloud to a user who cannot see "
         "which control is disabled")

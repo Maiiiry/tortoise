@@ -2001,12 +2001,28 @@ class TestCommittedRepoMcpJson:
 _CHATGPT_ARM_MARKER = "wizardConnectHarness === 'chatgpt'"
 
 # The arm's END: the NEXT harness arm's ternary terminator. Anchored on the
-# SELECTOR *as a ternary branch*, whitespace-tolerant (`) :\n  wizardKeyless ? (`
-# still matches), and deliberately not on the bare identifier — `wizardKeyless`
-# also names a const, an `else if (wizardKeyless)` node branch BEFORE this arm and
-# a nav-button label AFTER every arm, so a bare `find("wizardKeyless")` answers a
-# question nobody asked (#9660 review, P1).
-_KEYLESS_TERNARY = re.compile(r":\s*wizardKeyless\s*\?")
+# arm-SHAPED terminator (`) : <name> ?`) rather than on the bare identifier —
+# `wizardKeyless` also names a const, an `else if (wizardKeyless)` node branch
+# BEFORE this arm and a nav-button label AFTER every arm, so a bare
+# `find("wizardKeyless")` answers a question nobody asked (#9660 review, P1) — and
+# the match must BE the key-less one, so a sibling arm inserted in between cannot
+# be swallowed (#9660 review, P3: blacklisting one identifier spelling missed
+# `) : wizardDesktop ? (` and `) : wizardKeyless && wizardExtra ? (`).
+_ARM_TERMINATOR = re.compile(r"\)\s*:\s*([A-Za-z_$][\w$.]*)\s*(\?|&&|\|\||===|!==)")
+
+
+def _anchor(text: str, needle: str, what: str) -> int:
+    """`text.find(needle)`, asserted — never a bare `ValueError` from `.index()`.
+
+    Every offset this file derives from a source literal routes through here, so a
+    moved heading reports *which* anchor went missing instead of dying as
+    `ValueError: substring not found` naming nothing (#9660 review, P3).
+    """
+    position = text.find(needle)
+    assert position != -1, (
+        f"{what}: the anchor {needle!r} no longer appears — the copy this pin "
+        "reads is gone, or it moved behind different text. Update the anchor.")
+    return position
 
 
 def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
@@ -2024,7 +2040,9 @@ def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
       exact regression the claim names, then stays green;
     * an arm whose end simply runs to the next terminator swallows any sibling
       arm inserted in between, so `after()` can be satisfied by another harness's
-      copy while this card lost it.
+      copy while this card lost it. The end is therefore taken from the first
+      arm-SHAPED terminator and REQUIRED to be the key-less one, which reds on a
+      sibling however it is spelled.
 
     Both raise `AssertionError` naming what moved — never a bare `ValueError` from
     `str.index`.
@@ -2036,12 +2054,17 @@ def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
         "the journey test would be judging some other arm. Restore the arm or "
         "update this guard with it.")
     start = branch + len(_CHATGPT_ARM_MARKER)
-    terminator = _KEYLESS_TERNARY.search(main, start)
+    terminator = _ARM_TERMINATOR.search(main, start)
     assert terminator is not None, (
         "the chatgpt arm's end anchor is gone from main.jsx: the connect step no "
         "longer offers a `) : wizardKeyless ? (` branch after the chatgpt one. "
         "The chatgpt card must come BEFORE the key-less one — chatgpt is key-less "
         "too, so ordering decides which copy it gets. Update this guard.")
+    assert (terminator.group(1), terminator.group(2)) == ("wizardKeyless", "?"), (
+        "the first arm after the chatgpt card is not the key-less one "
+        f"({terminator.group(0).strip()!r}) — a SIBLING arm sits between them, and "
+        "every copy assertion below would be satisfied from it while the chatgpt "
+        "card lost the copy")
     end = terminator.start()
     assert "wizardConnectHarness ===" not in main[start:end], (
         "a second harness branch sits between the chatgpt card and the key-less "
@@ -2120,6 +2143,22 @@ def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
     )
     with pytest.raises(AssertionError, match="SIBLING arm"):
         _chatgpt_arm_bounds(sibling)
+
+    # …and the same guard under the TWO spellings a blacklist of
+    # `wizardConnectHarness ===` missed (#9660 review, P3): a differently-named
+    # sibling arm, and a REFINEMENT of the key-less one. Both keep a terminator
+    # in the arm, so an end anchor that only looks for `: wizardKeyless ?` in the
+    # text would return a region that includes the sibling.
+    for spelling in (") : wizardDesktop ? (\n  <p>other</p>\n",
+                    ") : wizardKeyless && wizardExtra ? (\n  <p>other</p>\n"):
+        widened = (
+            "{wizardConnectHarness === 'chatgpt' ? (\n"
+            "  <p>card</p>\n"
+            + spelling
+            + ") : wizardKeyless ? (\n"
+        )
+        with pytest.raises(AssertionError, match="SIBLING arm"):
+            _chatgpt_arm_bounds(widened)
 
     # …and `after()` itself is bounded at the far end: a marker that only exists
     # in the sibling branch is not the chatgpt card's copy.
@@ -2224,7 +2263,7 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     # disabled until a value is picked (`disableAuthorize()`, then the select's
     # onchange re-enables it), so "click Authorize, then pick" names an inert
     # control. The two offsets are compared, not just their presence.
-    chooser_line = after("or asks you to choose when you belong to more than one")
+    chooser_line = after("or asks you to choose when your account can use more than one")
     assert chooser_line < after("Authorize</strong>"), (
         "the card picks the Organization AFTER Authorize — on a multi-Organization "
         "account that button is disabled until the chooser has a value")
@@ -2271,6 +2310,7 @@ def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
     assertion cannot see that; two offsets can.
     """
     root = Path(__file__).resolve().parent.parent
+    main = (root / "website/apps/dashboard/src/main.jsx").read_text(encoding="utf-8")
     harnesses = (root / "website/apps/dashboard/src/harnesses.js").read_text(
         encoding="utf-8")
     docs = (root / "website/docs.html").read_text(encoding="utf-8")
@@ -2282,13 +2322,34 @@ def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
                 return line
         raise AssertionError(f"no wizard step contains {needle!r} — moved or reworded")
 
-    row_at = docs.index('<h4 id="chatgpt">')
-    note_at = skill.index("#1701 — ChatGPT is a 7th harness")
+    def span(text: str, start_needle: str, end_needle: str) -> str:
+        """`text` from its first `start_needle` to the next `end_needle`.
+
+        ROW-level on purpose. A whole-list slice takes the block's FIRST
+        `Organization`/`Authorize`, so an unrelated mention earlier in the same
+        list satisfies the order while the step that matters is inverted — a
+        false green demonstrated in review (#9660).
+        """
+        start = text.find(start_needle)
+        assert start != -1, f"the copy block starting {start_needle!r} moved or was reworded"
+        end = text.find(end_needle, start)
+        assert end != -1, f"the copy block starting {start_needle!r} lost its end"
+        return text[start:end]
+
+    # The Claude key-less carriers describe the SAME consent page and the same
+    # three acts: the chooser is a property of the page, not of ChatGPT
+    # (docs/oauth-mcp.md). They shipped the same inversion, so they are judged
+    # here too rather than left to a comment.
     blocks = [
+        ("Claude key-less card list", span(main, "Pick the Organization you&apos;re onboarding", "</ol>")),
+        ("claude-web step", step_line(harnesses, "Claude opens the authorization page")),
+        ("Claude Desktop snippet",
+         span(harnesses, "'claude-desktop': () =>", "'claude-web': () =>")),
         ("wizard step", step_line(harnesses, "confirm Connect Tortoise in the dialog")),
-        ("docs row", docs[row_at:docs.index("</ol>", row_at)]),
+        ("docs row", span(docs, "chatgpt.com/settings/plugins-settings", "</li>")),
         ("served document",
-         skill[note_at:skill.index("installing the three reusable skills", note_at)]),
+         span(skill, "#1701 — ChatGPT is a 7th harness",
+              "installing the three reusable skills")),
     ]
     for label, block in blocks:
         # Squash markdown/JSX wrapping so a phrase split across source lines is
