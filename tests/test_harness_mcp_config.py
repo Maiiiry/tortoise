@@ -1995,6 +1995,134 @@ class TestCommittedRepoMcpJson:
                         )
 
 
+# The ChatGPT arm's SELECTOR. `main.jsx` opens the card's ternary with it, and
+# every copy assertion in the chatgpt journey test below has to be bound to the
+# arm it opens (#9660 review).
+_CHATGPT_ARM_MARKER = "wizardConnectHarness === 'chatgpt'"
+
+# The arm's END: the NEXT harness arm's ternary terminator. Anchored on the
+# SELECTOR *as a ternary branch*, whitespace-tolerant (`) :\n  wizardKeyless ? (`
+# still matches), and deliberately not on the bare identifier — `wizardKeyless`
+# also names a const, an `else if (wizardKeyless)` node branch BEFORE this arm and
+# a nav-button label AFTER every arm, so a bare `find("wizardKeyless")` answers a
+# question nobody asked (#9660 review, P1).
+_KEYLESS_TERNARY = re.compile(r":\s*wizardKeyless\s*\?")
+
+
+def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
+    """(start, end) of the ChatGPT connect card inside `main.jsx` source.
+
+    `start` is the first character AFTER the arm's opening selector; `end` is the
+    start of the next harness arm's ternary terminator. Extracted (and unit-tested
+    on synthetic source by
+    `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`) because the two ways
+    this can go wrong are silent, not loud:
+
+    * an anchor keyed on the bare identifier also matches a nav-button label far
+      below every arm, which makes the ordering claim and the slice pass from the
+      WRONG position — moving the chatgpt card after the key-less branch, the
+      exact regression the claim names, then stays green;
+    * an arm whose end simply runs to the next terminator swallows any sibling
+      arm inserted in between, so `after()` can be satisfied by another harness's
+      copy while this card lost it.
+
+    Both raise `AssertionError` naming what moved, not a bare `ValueError`.
+    """
+    branch = main.index(_CHATGPT_ARM_MARKER)
+    start = branch + len(_CHATGPT_ARM_MARKER)
+    terminator = _KEYLESS_TERNARY.search(main, start)
+    assert terminator is not None, (
+        "the chatgpt arm's end anchor is gone from main.jsx: the connect step no "
+        "longer offers a `) : wizardKeyless ? (` branch after the chatgpt one. "
+        "The chatgpt card must come BEFORE the key-less one — chatgpt is key-less "
+        "too, so ordering decides which copy it gets. Update this guard.")
+    end = terminator.start()
+    assert "wizardConnectHarness ===" not in main[start:end], (
+        "a second harness branch sits between the chatgpt card and the key-less "
+        "one — every copy assertion below would be satisfied from that SIBLING "
+        "arm while the chatgpt card lost the copy")
+    return start, end
+
+
+def _inside(main: str, marker: str, start: int, end: int) -> int:
+    """Position of `marker` INSIDE the arm `[start, end)`, with a message.
+
+    Bounded on both sides: `find` alone accepts a marker that survives only in a
+    sibling branch, which is the false green this bound exists to kill.
+    """
+    position = main.find(marker, start)
+    assert position != -1, (
+        f"the chatgpt card no longer renders {marker!r} — the copy this test "
+        "pins is gone, or it now lives outside the card")
+    assert position < end, (
+        f"{marker!r} is rendered by a SIBLING harness branch, not the chatgpt "
+        "card — the copy this test pins is not in the arm it names")
+    return position
+
+
+def test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape():
+    """#9660 review, non-vacuity: the arm guards must RED on each wrong shape.
+
+    `_chatgpt_arm_bounds` is what makes every copy assertion in the journey test
+    arm-bound, and it cannot be proven by asserting over the real `main.jsx` —
+    that file is the CORRECT shape, so a guard returning "whatever is there"
+    passes. Each case below is synthetic source carrying one plausible defect.
+    """
+    # A correct shape: the card, then the key-less terminator, then a nav-button
+    # use of the SAME identifier further down (`{busy ? 'x' : (wizardKeyless`).
+    good = (
+        "{wizardConnectHarness === 'chatgpt' ? (\n"
+        "  <p>card</p>\n"
+        ") : wizardKeyless ? (\n"
+        "  <p>keyless</p>\n"
+        "{wizardConnectBusy ? 'Checking…' : (wizardKeyless\n"
+    )
+    start, end = _chatgpt_arm_bounds(good)
+    assert "<p>card</p>" in good[start:end] and "<p>keyless</p>" not in good[start:end], (
+        "the arm must stop at the multi-line terminator, not run down to the "
+        "key-less branch or the nav-button use of the identifier")
+    assert _inside(good, "<p>card</p>", start, end) == good.index("<p>card</p>")
+
+    # The regression the ordering claim names: the card MOVED AFTER the key-less
+    # branch. A bare-identifier anchor finds the nav-button label below and calls
+    # that the end, so the old helper stayed green here.
+    moved = (
+        "{wizardConnectHarness === 'codex' ? (\n"
+        "  <p>other</p>\n"
+        ") : wizardKeyless ? (\n"
+        "  <p>keyless</p>\n"
+        ") : wizardConnectHarness === 'chatgpt' ? (\n"
+        "  <p>card</p>\n"
+        "{busy ? 'Checking…' : (wizardKeyless\n"
+    )
+    with pytest.raises(AssertionError, match="must come BEFORE the key-less one"):
+        _chatgpt_arm_bounds(moved)
+
+    # The key-less ternary deleted outright: the anchor names that, too.
+    with pytest.raises(AssertionError, match="end anchor is gone"):
+        _chatgpt_arm_bounds(
+            "{wizardConnectHarness === 'chatgpt' ? (\n  <p>card</p>\n")
+
+    # A SIBLING harness arm inserted between the card and the key-less branch:
+    # the arm must not swallow it, or its copy satisfies the pins.
+    sibling = (
+        "{wizardConnectHarness === 'chatgpt' ? (\n"
+        "  <p>card</p>\n"
+        ") : wizardConnectHarness === 'codex' ? (\n"
+        "  <p>other</p>\n"
+        ") : wizardKeyless ? (\n"
+    )
+    with pytest.raises(AssertionError, match="SIBLING arm"):
+        _chatgpt_arm_bounds(sibling)
+
+    # …and `after()` itself is bounded at the far end: a marker that only exists
+    # in the sibling branch is not the chatgpt card's copy.
+    with pytest.raises(AssertionError, match="SIBLING harness branch"):
+        _inside(good, "<p>keyless</p>", start, end)
+    with pytest.raises(AssertionError, match="no longer renders"):
+        _inside(good, "<p>absent</p>", start, end)
+
+
 def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     """#9660 OWNER RULING (2026-10-23): the dashboard's connect step must offer
     ChatGPT as a first-class journey.
@@ -2031,48 +2159,23 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
 
     # 2. The connect step renders its own branch, ahead of the Claude key-less
     #    one it would otherwise fall into (that branch's copy is Claude-specific).
-    #    Only two SOURCE facts are pinned: the branch exists, and it comes before
-    #    the key-less one. Everything else below is a COPY fact, asserted by
-    #    presence INSIDE the chatgpt arm — no JSX-attribute literals, and the arm
-    #    is delimited by the NEXT branch's own selector (`wizardKeyless`, the
-    #    identifier no reflow can rename) rather than by a spelling of its
-    #    ternary, so a shape-preserving refactor of the branch does not red this
-    #    while the copy still ships (#4880: a guard deciding from the SHAPE of the
-    #    source is defeated by a source of a different shape).
-    branch = main.index("wizardConnectHarness === 'chatgpt'")
-
-    def next_branch(pos: int) -> int:
-        """Start of the NEXT harness branch, from `pos` — the end of the arm.
-
-        Keyed on the next branch's SELECTOR, not on a spelling of its ternary:
-        a bare `main.index(": wizardKeyless ? (")` is a slice terminator, it
-        moves under a reformat (`) :\n wizardKeyless ? (`), and it fails as an
-        uncaught `ValueError: substring not found` that names nothing. Guarded
-        here so a restructure says what moved (#9660 review).
-        """
-        found = main.find("wizardKeyless", pos)
-        assert found != -1, (
-            "the chatgpt arm's end anchor is gone from main.jsx: the connect step "
-            "no longer offers a `wizardKeyless` branch after the chatgpt one — "
-            "update `next_branch` (and the ordering claim that depends on it)")
-        return found
-
-    assert branch < next_branch(branch), (
-        "the chatgpt branch must come BEFORE the key-less Claude branch — "
-        "chatgpt is key-less too, so ordering decides which copy it gets")
+    #    TWO source facts are pinned — the branch exists, and it ends where the
+    #    key-less one begins — and both are enforced by `_chatgpt_arm_bounds`
+    #    (above), which names what moved instead of raising a bare ValueError.
+    #    Everything else below is a COPY fact, asserted by presence INSIDE the
+    #    chatgpt arm and nowhere else: `after()` is bounded at BOTH ends, since a
+    #    marker that survives only in a sibling branch is not this card's copy.
+    #    That makes the arm's end a real dependency, so a reflow of the next
+    #    ternary branch reds this on purpose while a reformat that keeps it reds
+    #    nothing — the guard reads the SELECTOR as a ternary terminator, not a
+    #    spelling, and `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`
+    #    proves each wrong shape actually fails (#4880: a guard deciding from the
+    #    SHAPE of the source is defeated by a source of a different shape).
+    arm_start, arm_end = _chatgpt_arm_bounds(main)
 
     def after(marker: str) -> int:
-        """Position of `marker` INSIDE the chatgpt branch.
-
-        Guarded rather than a bare `.index()`: a copy fact that disappears (or
-        survives only BEFORE the branch marker) must say which claim broke, not
-        fail as `ValueError: substring not found` with no context.
-        """
-        position = main.find(marker, branch)
-        assert position != -1, (
-            f"the chatgpt card no longer renders {marker!r} — the copy this test "
-            "pins is gone, or it now lives before the branch marker")
-        return position
+        """Position of `marker` inside the chatgpt arm — bounded at both ends."""
+        return _inside(main, marker, arm_start, arm_end)
 
     # 3. The three blocks, in the order the user performs them.
     titles = ["Add the Tortoise connector", "Install the Tortoise skills",
@@ -2104,7 +2207,7 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
         "render them in that order")
     # …and the Organization act survives on BOTH consent shapes. The consent page
     # has two: with ONE selectable org it NAMES the org (oauth.py
-    # `_consent_preview`, `len(orgs) == 1`), and with several it renders a
+    # `consent_preview`, `len(orgs) == 1`), and with several it renders a
     # CHOOSER, hides the named-org line and keeps Authorize disabled until one is
     # picked (the `len(orgs) > 1` memberships path + the page script). Copy that
     # says only "check the name the consent page shows" points at text that is
@@ -2118,7 +2221,7 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     #    Copy button — so an unbound slice passed even with a re-typed literal on
     #    screen (#9660 review). `in arm` subsumes the branch-wide presence check
     #    this used to carry, so that one is gone rather than kept as dead weight.
-    arm = main[branch:next_branch(branch)]
+    arm = main[arm_start:arm_end]
     assert "CANONICAL_MCP_URL" in arm, (
         "the card's Server URL must come from the constant, not a re-typed literal")
     assert "https://api.premiselabs.co/mcp" not in arm, (

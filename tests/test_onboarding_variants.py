@@ -525,7 +525,7 @@ def test_4365_served_document_sends_chatgpt_to_a_path_that_exists():
     # …and the ORGANIZATION act survives on BOTH consent shapes. The consent page
     # NAMES the organization only when the account has one selectable org; with
     # several it renders a chooser, hides the named-org line and leaves Authorize
-    # disabled until one is picked (tortoise/oauth.py `_consent_preview`, the
+    # disabled until one is picked (tortoise/oauth.py `consent_preview`, the
     # `len(orgs) > 1` memberships path). "Check the name" alone therefore points
     # at text a multi-org account never sees — the same class of defect as the
     # unnamed consent dialog — so the pick is pinned here (#9660 review).
