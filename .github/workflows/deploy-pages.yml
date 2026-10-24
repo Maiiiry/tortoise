@@ -672,6 +672,143 @@ jobs:
           fi
           echo "✅ every internal path is absent at ORIGIN (cache-bypassing) and at the EDGE, on both hosts"
 
+      # ── #9680: the IndexNow surfaces must be SERVED, not merely shipped ──
+      # A submission the endpoint cannot verify is worse than no submission: it
+      # answers 403 and the article reaches nobody, silently, from a vendor we do
+      # not watch. #7751 is the measurement of the alternative — the tracker
+      # recorded IndexNow as shipped while `/<key>.txt` answered 404 for weeks and
+      # nothing failed.
+      #
+      # ⛔ BLOCKING on purpose, and this is the ONLY place it can be: the read-only
+      # blog suite (`verify-blog`) is `continue-on-error: true`, so a red there is
+      # a red job on a green run — a signal, not a gate. A check that cannot fail
+      # anything is the #7751 failure one level up.
+      #
+      # The body is compared BYTE-EXACTLY against the key the submitter SENDS
+      # (`_shared/indexnow.ts`), not against `website/<key>.txt`: the desync that
+      # breaks ownership is what we send against what we serve. `$(cat …)` alone
+      # would HIDE a trailing newline (command substitution strips it), so the byte
+      # count is asserted too — one newline answers 403 to every submission.
+      - name: Post-deploy — the IndexNow key file and notify route are live (#9680)
+        if: always()
+        run: |
+          # Anchored, and the value is validated: an EXAMPLE of the constant quoted
+          # above it in a comment (`e.g. INDEXNOW_KEY = "…"`) must not be what this
+          # reads. A failure here says EXTRACTOR fault — blaming the deployed site
+          # would send an operator to debug a deploy that is fine.
+          KEY=$(sed -nE 's/^export const INDEXNOW_KEY[[:space:]]*=[[:space:]]*"([A-Za-z0-9-]+)".*/\1/p' \
+                  website/functions/blog/_shared/indexnow.ts | head -1)
+          case "$KEY" in
+            "")
+              echo '::error::EXTRACTOR fault: no `export const INDEXNOW_KEY = "…"` on ONE line in website/functions/blog/_shared/indexnow.ts. Nothing about the deployed site was checked — restore the constant to that shape.'
+              exit 1 ;;
+            *[!a-f0-9]*)
+              echo '::error::EXTRACTOR fault: INDEXNOW_KEY resolved to a value that is not lowercase hex — the extractor matched something else (an example in a comment, a renamed constant). Nothing about the deployed site was checked.'
+              exit 1 ;;
+          esac
+          if [ "${#KEY}" -ne 32 ]; then
+            echo "::error::EXTRACTOR fault: INDEXNOW_KEY is ${#KEY} characters, not the 32 lowercase hex the issue pins. Nothing about the deployed site was checked."
+            exit 1
+          fi
+          url="https://tortoise.premiselabs.co/$KEY.txt"
+          : > /tmp/indexnow-key.body
+          : > /tmp/indexnow-key.hdr
+          code=000
+          for attempt in $(seq 1 10); do
+            code=000
+            curl_rc=0
+            # `-D` so content-type is read from the RESPONSE rather than assumed;
+            # `|| curl_rc=$?` because bash -e would otherwise abort the step on the
+            # first transport blip and skip the retries (the trap the sign-in probe
+            # above documents).
+            code=$(curl -sS -o /tmp/indexnow-key.body -D /tmp/indexnow-key.hdr \
+                        -w '%{http_code}' -m 20 "$url" 2>/tmp/indexnow-key.err) || curl_rc=$?
+            [ "$curl_rc" -ne 0 ] && code="curl-failed(rc=$curl_rc)"
+            # The WHOLE predicate decides the break, not just the status: Pages can
+            # briefly serve the PREVIOUS deployment, and that one answers 200 with a
+            # CORRECT body — so "the first 200 wins" would PASS a deploy that stopped
+            # serving the file and notice it only on the following deploy (weeks, for
+            # this site). The final attempt's artifacts are what the checks below
+            # judge, exactly as the leak probe above does.
+            if [ "$code" = "200" ] \
+               && grep -qi '^content-type:[[:space:]]*text/plain' /tmp/indexnow-key.hdr \
+               && [ "$(wc -c < /tmp/indexnow-key.body | tr -d ' ')" = "${#KEY}" ] \
+               && [ "$(cat /tmp/indexnow-key.body)" = "$KEY" ]; then
+              break
+            fi
+            [ "$attempt" -lt 10 ] && sleep 10
+          done
+          ctype=$(grep -i '^content-type:' /tmp/indexnow-key.hdr 2>/dev/null | head -1 | tr -d '\r')
+          body_len=$(wc -c < /tmp/indexnow-key.body | tr -d ' ')
+          echo "$url -> $code | ${ctype:-no content-type} | $body_len bytes (the key is ${#KEY} bytes)"
+          if [ "$code" != "200" ]; then
+            echo "::error::$url answered $code — the IndexNow key file is not served, so the endpoint cannot fetch the proof of host ownership and answers 403 to every submission (#9680)."
+            exit 1
+          fi
+          case "$ctype" in
+            *text/plain*) ;;
+            *) echo "::error::$url is not text/plain (${ctype:-none}) — the endpoint reads the body as the key."; exit 1 ;;
+          esac
+          if [ "$body_len" != "${#KEY}" ] || [ "$(cat /tmp/indexnow-key.body)" != "$KEY" ]; then
+            echo "::error::$url must contain the key and NOTHING else: $body_len bytes, want ${#KEY}. Body follows — a trailing newline, a BOM or an error page all break ownership:"
+            od -c /tmp/indexnow-key.body | head -3
+            exit 1
+          fi
+
+          # The console's submission route (#9803). It fails OPEN by design — a
+          # missed notification must never fail a publish — so a route that stopped
+          # shipping is SILENT: one line in a browser console, and no publish would
+          # submit anything. The status alone is not evidence either: a path with no
+          # Function behind it answers 405 here (measured), so the admin gate's own
+          # `{"error":"unauthorized"}` is what is asserted.
+          : > /tmp/indexnow-gate.body
+          gate=000
+          for attempt in $(seq 1 5); do
+            gate=$(curl -sS -o /tmp/indexnow-gate.body -w '%{http_code}' -m 20 \
+                     -X POST https://tortoise.premiselabs.co/blog/api/notify-publish \
+                     -H 'Content-Type: application/json' -d '{}' 2>/dev/null) || gate=000
+            if [ "$gate" = "401" ] && grep -q '"unauthorized"' /tmp/indexnow-gate.body 2>/dev/null; then
+              break
+            fi
+            [ "$attempt" -lt 5 ] && sleep 10
+          done
+          gate_body=$(cat /tmp/indexnow-gate.body 2>/dev/null)
+          echo "notify-publish -> $gate $gate_body"
+          if [ "$gate" != "401" ] || ! printf '%s' "$gate_body" | grep -q '"unauthorized"'; then
+            echo "::error::/blog/api/notify-publish did not refuse an anonymous caller with the admin gate (status $gate) — the console's publish would submit nothing, and nothing else would say so."
+            exit 1
+          fi
+          # The hop the console actually fetches — the app-origin BFF proxy
+          # (apps/dashboard/functions/blog/api/[[path]].ts). A break here is silent
+          # from the server side: the browser console is the only witness.
+          #
+          # TWO differences from the hop above, both deliberate:
+          #   * it is the SESSION gate, not the admin gate — the proxy answers
+          #     `{"error":"not_signed_in"}` before any upstream call, so the body is
+          #     asserted against THAT (a bare 401 could be a route refusing for its
+          #     own reasons), and the wording below does not call it the admin gate;
+          #   * it POLLS. `deploy-dashboard` carries no `needs:` on this job and
+          #     re-uploads app.premiselabs.co concurrently, so a single shot can hit
+          #     that cutover and red the marketing deploy for an unrelated reason.
+          : > /tmp/indexnow-proxy.body
+          proxy=000
+          for attempt in $(seq 1 5); do
+            proxy=000
+            proxy=$(curl -sS -o /tmp/indexnow-proxy.body -w '%{http_code}' -m 20 \
+                      -X POST https://app.premiselabs.co/blog/api/notify-publish \
+                      -H 'Content-Type: application/json' -d '{"slug":"not-a-post"}' 2>/dev/null) || proxy=000
+            if [ "$proxy" = "401" ] && grep -q '"not_signed_in"' /tmp/indexnow-proxy.body 2>/dev/null; then
+              break
+            fi
+            [ "$attempt" -lt 5 ] && sleep 10
+          done
+          echo "app-origin notify-publish -> $proxy $(cat /tmp/indexnow-proxy.body 2>/dev/null)"
+          if [ "$proxy" != "401" ] || ! grep -q '"not_signed_in"' /tmp/indexnow-proxy.body 2>/dev/null; then
+            echo "::error::app-origin /blog/api/notify-publish did not answer the session gate (status $proxy) — the console's IndexNow call would not reach the handler, and only the browser console would say so."
+            exit 1
+          fi
+          echo "✅ the IndexNow key file serves the key alone; the notify route is live, admin-gated at the marketing origin and session-gated at the app proxy"
+
   # ── Dashboard (app.premiselabs.co → tortoise-dashboard Pages) ──────────
   # #1112: wire the dashboard into CI — closes #1086 + #1109 (two
   # stale-bundle incidents caused by the manual-only deploy.sh). Since #3775

@@ -31,9 +31,15 @@ re-implementing the rule in the mock.
 ⛔ WHAT THIS DOES NOT CLAIM. IndexNow does not reach Google (Google does not
 consume the protocol). Nothing here asserts, names or implies otherwise.
 
-V1 — the key file — is asserted from the repo, because that is where the fact
-lives: the deployed 200 cannot be observed before the deploy. The post-deploy
-check is the ``curl`` line in the IndexNow section of ``docs/blog-authoring.md``.
+V1 — the key file — is asserted from the repo here, because that is where the
+fact lives: the deployed 200 cannot be observed before the deploy. The DEPLOYED
+half is a blocking step in ``.github/workflows/deploy-pages.yml``
+("Post-deploy — the IndexNow key file and notify route are live (#9680)"), which also
+asserts the console's ``/blog/api/notify-publish`` route and its refusal of an
+anonymous caller on both hops (the admin gate at the marketing origin, the
+session gate at the app proxy); the
+``curl`` in the IndexNow section of ``docs/blog-authoring.md`` is the manual spot
+check, not the gate.
 """
 
 from __future__ import annotations

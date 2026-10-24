@@ -3091,3 +3091,264 @@ def test_the_d1_sessions_api_scan_is_not_vacuous() -> None:
         "reads are no longer visible to this scan, so it could not have detected "
         "a Sessions-API read"
     )
+
+
+# ── #9680: the IndexNow post-deploy gate ──────────────────────────────────
+# The gate asserts the DEPLOYED half of a capability whose repo half is pinned by
+# `tests/test_blog_indexnow.py`. It belongs in this file because the failure mode
+# is a deploy that stops serving the artifact — and because a gate whose REMOVAL
+# is invisible is the #7751 defect one level up (the tracker recorded IndexNow as
+# shipped while `/<key>.txt` answered 404 for weeks and nothing failed). So the
+# block is EXECUTED here against a stub `curl`, not string-matched.
+INDEXNOW_PROBE = "Post-deploy — the IndexNow key file and notify route are live (#9680)"
+
+#: The artifacts that quote the step by name to send a reader to it. A rename must
+#: red here rather than leave one of them pointing at a step that no longer
+#: exists — the provenance defect `tests/test_blog_indexnow.py`'s docstring was
+#: amended for in this same change.
+_INDEXNOW_PROBE_QUOTERS = (
+    REPO / "docs" / "blog-authoring.md",
+    REPO / "tests" / "test_blog_indexnow.py",
+)
+
+_INDEXNOW_MODULE_REL = "website/functions/blog/_shared/indexnow.ts"
+_INDEXNOW_KEY = "0123456789abcdef0123456789abcdef"
+
+#: The module fixture the step resolves the key from. The script runs with `cwd`
+#: set to this temp tree, so the step's own relative path reads THIS file — which
+#: is what lets the extractor cases be driven without touching the repo.
+_INDEXNOW_MODULE_OK = (
+    "// header\n"
+    f'export const INDEXNOW_KEY = "{_INDEXNOW_KEY}";\n'
+    'export const INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow";\n'
+)
+
+
+def _indexnow_script(tmp_path: Path, module_text: str = _INDEXNOW_MODULE_OK) -> Path:
+    """The shipped IndexNow gate with ONLY these benign rewrites:
+      - 10/5 attempts -> 2, sleep 10 -> sleep 0 (so the retry cases are fast)
+    The control flow under test — the `|| curl_rc=$?` guard, the per-attempt
+    predicate, both retry bounds and every `exit 1` arm — is untouched, and the
+    REAL bounds are pinned separately by
+    `test_the_indexnow_gate_polls_and_is_blocking`.
+    """
+    rewritten = (
+        _step_code(INDEXNOW_PROBE)
+        .replace("seq 1 10", "seq 1 2")
+        .replace("seq 1 5", "seq 1 2")
+        .replace("sleep 10", "sleep 0")
+    )
+    assert "seq 1 2" in rewritten, "the retry bounds were not rewritten"
+    assert "sleep 10" not in rewritten, "a sleep was left in the executed copy"
+    module = tmp_path / _INDEXNOW_MODULE_REL
+    module.parent.mkdir(parents=True, exist_ok=True)
+    module.write_text(module_text, encoding="utf-8")
+    script = tmp_path / "indexnow.sh"
+    script.write_text(rewritten, encoding="utf-8")
+    return script
+
+
+#: The two live surfaces plus the edge's own behaviour: a key-file GET, and one
+#: POST per hop (the marketing origin's Function, the app origin's BFF proxy).
+#: Every answer is an env var so a test can break exactly one of them.
+STUB_INDEXNOW_CURL = r"""#!/bin/bash
+out= hdr= fmt= url=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out=$2; shift 2;;
+    -D) hdr=$2; shift 2;;
+    -w) fmt=$2; shift 2;;
+    -m) shift 2;;
+    -X) shift 2;;
+    -H) shift 2;;
+    -d) shift 2;;
+    -s|-S|-sS|-f|--fail) shift;;
+    *) url=$1; shift;;
+  esac
+done
+printf '%s\n' "$url" >> "$STUB_DIR/calls"
+n=$(wc -l < "$STUB_DIR/calls" | tr -d ' ')
+if [ "${STUB_FAIL_FIRST}" = "1" ] && [ "$n" = "1" ]; then
+  echo 'curl: (7) Failed to connect to host' >&2
+  printf '000'
+  exit 7
+fi
+code=200
+ctype="${STUB_CTYPE}"
+body=""
+key="${url##*/}"; key="${key%.txt}"
+case "$url" in
+  *app.premiselabs.co*notify-publish)
+    code="${STUB_PROXY_CODE}"; body="${STUB_PROXY_BODY}";;
+  *tortoise.premiselabs.co*notify-publish)
+    code="${STUB_GATE_CODE}"; body="${STUB_GATE_BODY}";;
+  *.txt)
+    code="${STUB_GET_CODE}"
+    case "${STUB_BODY_MODE}" in
+      key) body="$key";;
+      newline) body="$key
+";;
+      other) body="not-the-key";;
+    esac;;
+  *) code=405;;
+esac
+[ -n "$out" ] && printf '%s' "$body" > "$out"
+[ -n "$hdr" ] && printf 'HTTP/2 %s\r\ncontent-type: %s\r\n\r\n' "$code" "$ctype" > "$hdr"
+case "$fmt" in *http_code*) printf '%s' "$code";; esac
+exit 0
+"""
+
+
+def _run_indexnow_gate(
+    tmp_path: Path,
+    get_code: str = "200",
+    ctype: str = "text/plain; charset=utf-8",
+    body_mode: str = "key",
+    gate_code: str = "401",
+    gate_body: str = '{"error":"unauthorized","message":"Session expired or not an admin"}',
+    proxy_code: str = "401",
+    proxy_body: str = '{"error":"not_signed_in"}',
+    fail_first: bool = False,
+    module_text: str = _INDEXNOW_MODULE_OK,
+) -> tuple[int, str, list[str]]:
+    """Run the shipped gate; return (rc, output, calls the stub `curl` saw)."""
+    bin_dir = _stub_bin(tmp_path, "curl", STUB_INDEXNOW_CURL)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "STUB_DIR": str(tmp_path),
+        "STUB_GET_CODE": get_code,
+        "STUB_CTYPE": ctype,
+        "STUB_BODY_MODE": body_mode,
+        "STUB_GATE_CODE": gate_code,
+        "STUB_GATE_BODY": gate_body,
+        "STUB_PROXY_CODE": proxy_code,
+        "STUB_PROXY_BODY": proxy_body,
+        "STUB_FAIL_FIRST": "1" if fail_first else "0",
+    }
+    r = subprocess.run(
+        ["bash", "-e", str(_indexnow_script(tmp_path, module_text))],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    calls_file = tmp_path / "calls"
+    calls = calls_file.read_text(encoding="utf-8").split() if calls_file.exists() else []
+    return r.returncode, r.stdout + r.stderr, calls
+
+
+def test_the_indexnow_gate_polls_and_is_blocking() -> None:
+    """A gate that cannot fail anything is the #7751 defect one level up.
+
+    `deploy` is the job whose failure fails the workflow, and this step carries no
+    `continue-on-error` — the property the advisory `verify-blog` job lacks. The
+    polling bounds are asserted here, on the SHIPPED text, because the executed
+    copies rewrite them to keep the tests fast.
+    """
+    steps = _deploy_steps()
+    names = [s.get("name", "") for s in steps]
+    assert INDEXNOW_PROBE in names, "the IndexNow post-deploy gate is gone"
+    assert names.index(INDEXNOW_PROBE) > names.index(DEPLOY), (
+        "the gate must run AFTER the upload — before it, it would be testing the "
+        "previous deployment"
+    )
+    step = steps[names.index(INDEXNOW_PROBE)]
+    assert not step.get("continue-on-error"), (
+        "the gate must not be advisory: `continue-on-error` would make a red here a "
+        "red job on a green run, which is what #7751's months of silent 404s look like"
+    )
+    assert step.get("if") == "always()", (
+        "`if: always()` is what keeps a failing earlier probe from MASKING this one"
+    )
+    code = _step_code(INDEXNOW_PROBE)
+    assert "seq 1 10" in code, "the key-file retry bound is gone (a single-shot probe reds on propagation)"
+    assert "seq 1 5" in code, "the notify-route retry bound is gone"
+    assert "sleep 10" in code, "the retry sleeps are gone — the bound would burn through instantly"
+
+
+def test_the_indexnow_gate_is_named_by_every_artifact_that_quotes_it() -> None:
+    """The doc and the unit suite both send a reader to this step BY NAME."""
+    for path in _INDEXNOW_PROBE_QUOTERS:
+        text = path.read_text(encoding="utf-8")
+        assert INDEXNOW_PROBE in text, (
+            f"{path.relative_to(REPO)} points a reader at an IndexNow deploy step that "
+            "does not exist — either the step was renamed or the pointer is stale"
+        )
+
+
+def test_the_indexnow_gate_passes_when_the_surface_is_correct(tmp_path) -> None:
+    rc, out, calls = _run_indexnow_gate(tmp_path)
+    assert rc == 0, out
+    # Non-vacuity: it must have actually read the key file and both hops.
+    assert [c for c in calls if c.endswith(f"{_INDEXNOW_KEY}.txt")], calls
+    assert any("tortoise.premiselabs.co" in c and c.endswith("notify-publish") for c in calls), calls
+    assert any("app.premiselabs.co" in c for c in calls), calls
+    assert "::error::" not in out, out
+
+
+@pytest.mark.parametrize(
+    "argv,needle",
+    [
+        ({"get_code": "404"}, "is not served"),
+        ({"body_mode": "newline"}, "must contain the key and NOTHING else"),
+        ({"body_mode": "other"}, "must contain the key and NOTHING else"),
+        ({"ctype": "text/html"}, "is not text/plain"),
+        ({"gate_code": "405"}, "did not refuse an anonymous caller"),
+        ({"gate_body": '{"error":"not_signed_in"}'}, "did not refuse an anonymous caller"),
+        ({"proxy_code": "200"}, "did not answer the session gate"),
+        ({"proxy_body": '{"error":"unauthorized"}'}, "did not answer the session gate"),
+    ],
+)
+def test_the_indexnow_gate_fails_for_each_broken_surface(tmp_path, argv: dict, needle: str) -> None:
+    """Every arm independently reds the deploy, and says which one broke."""
+    rc, out, _calls = _run_indexnow_gate(tmp_path, **argv)
+    assert rc == 1, f"{argv} should have red the gate, got rc={rc}:\n{out}"
+    assert "::error::" in out, out
+    assert needle in out, out
+
+
+def test_the_indexnow_gate_retries_a_transport_blip_instead_of_failing(tmp_path) -> None:
+    """Under `bash -e` a bare `$(curl …)` aborts the step on the first blip.
+
+    The `|| curl_rc=$?` guard is what keeps the retry reachable, and the call
+    count is what proves it: a guard that dropped the error would still exit 0
+    here with ONE request, i.e. a probe that never retried.
+    """
+    rc, out, calls = _run_indexnow_gate(tmp_path, fail_first=True)
+    assert rc == 0, out
+    key_calls = [c for c in calls if c.endswith(f"{_INDEXNOW_KEY}.txt")]
+    assert len(key_calls) == 2, f"the transport blip did not retry: {calls}"
+
+
+def test_the_indexnow_gate_reads_the_constant_not_an_example_above_it(tmp_path) -> None:
+    """An example of the constant in the module's header must not be what is read.
+
+    `_shared/indexnow.ts` documents the shape in its comment (`rotation = change
+    this constant AND rename the file`), so a comment quoting `INDEXNOW_KEY =
+    "…"` above the real declaration is a plausible future edit — and an unanchored
+    match would then verify the wrong file and PASS.
+    """
+    module = (
+        "// e.g. `INDEXNOW_KEY = \"deadbeefdeadbeefdeadbeefdeadbeef\"`\n"
+        f'export const INDEXNOW_KEY = "{_INDEXNOW_KEY}";\n'
+    )
+    rc, out, calls = _run_indexnow_gate(tmp_path, module_text=module)
+    assert rc == 0, out
+    requested = [c for c in calls if c.endswith(".txt")]
+    assert requested == [f"https://tortoise.premiselabs.co/{_INDEXNOW_KEY}.txt"], requested
+
+
+def test_the_indexnow_gate_reports_an_extractor_fault_without_touching_the_site(tmp_path) -> None:
+    """A reflowed constant is OUR fault, and must not be reported as a deploy fault.
+
+    The failure message is the operator's only diagnosis, so it names the fault
+    and states that nothing about the deployed site was checked — and no request
+    is made at all, because the key is what forms the URL.
+    """
+    module = f'export const INDEXNOW_KEY =\n  "{_INDEXNOW_KEY}";\n'
+    rc, out, calls = _run_indexnow_gate(tmp_path, module_text=module)
+    assert rc == 1, out
+    assert "EXTRACTOR fault" in out, out
+    assert "is not served" not in out, f"an extractor fault blamed the deploy: {out}"
+    assert calls == [], f"an unreadable constant still made requests: {calls}"
