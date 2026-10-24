@@ -932,7 +932,7 @@ class TestDocsPageAndSkillConfig:
             "Connect",                   # 3 — the OAuth grant is a SEPARATE act
             "Connect Tortoise",          # 3 — the consent dialog between Connect and Authorize
             "Authorize",                 # 3 — consent (key-less connect completes here)
-            "pick the one you are onboarding",  # 3 — the MULTI-org chooser (oauth.py)
+            "pick the Organization you are onboarding",  # 3 — the MULTI-org chooser (oauth.py)
                                        #     hides the named-org line and keeps
                                        #     Authorize disabled until it is picked
             "chatgpt.com/skills",        # 4 — the Skills surface the archives install on
@@ -2013,8 +2013,8 @@ def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
     """(start, end) of the ChatGPT connect card inside `main.jsx` source.
 
     `start` is the first character AFTER the arm's opening selector; `end` is the
-    start of the next harness arm's ternary terminator. Extracted (and unit-tested
-    on synthetic source by
+    start of the `) : wizardKeyless ? (` terminator — the key-less Claude arm that
+    follows the chatgpt one. Extracted (and unit-tested on synthetic source by
     `test_9660_the_chatgpt_arm_bounds_red_on_a_wrong_shape`) because the two ways
     this can go wrong are silent, not loud:
 
@@ -2026,9 +2026,15 @@ def _chatgpt_arm_bounds(main: str) -> tuple[int, int]:
       arm inserted in between, so `after()` can be satisfied by another harness's
       copy while this card lost it.
 
-    Both raise `AssertionError` naming what moved, not a bare `ValueError`.
+    Both raise `AssertionError` naming what moved — never a bare `ValueError` from
+    `str.index`.
     """
-    branch = main.index(_CHATGPT_ARM_MARKER)
+    branch = main.find(_CHATGPT_ARM_MARKER)
+    assert branch != -1, (
+        "the chatgpt connect arm is gone from main.jsx — the selector "
+        f"{_CHATGPT_ARM_MARKER!r} no longer appears, so every copy assertion in "
+        "the journey test would be judging some other arm. Restore the arm or "
+        "update this guard with it.")
     start = branch + len(_CHATGPT_ARM_MARKER)
     terminator = _KEYLESS_TERNARY.search(main, start)
     assert terminator is not None, (
@@ -2213,7 +2219,15 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     # says only "check the name the consent page shows" points at text that is
     # not on screen for a multi-org account — the same class of defect as the
     # unnamed consent dialog — so the pick is pinned, not merely described.
-    after("if it offers a chooser instead of a name, pick the one you are onboarding")
+    #
+    # AND IT COMES BEFORE `Authorize`: on the chooser branch the button is
+    # disabled until a value is picked (`disableAuthorize()`, then the select's
+    # onchange re-enables it), so "click Authorize, then pick" names an inert
+    # control. The two offsets are compared, not just their presence.
+    chooser_line = after("or asks you to choose when you belong to more than one")
+    assert chooser_line < after("Authorize</strong>"), (
+        "the card picks the Organization AFTER Authorize — on a multi-Organization "
+        "account that button is disabled until the chooser has a value")
     # 5. The skill hand-off is an INSTALL of the real archives, not a prose
     #    rendering: the branch must map over the archive names and link them.
     #    The server URL is bound to the ChatGPT ARM (not "somewhere after the
@@ -2239,3 +2253,56 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     assert "Plus" in plan_line, (
         "the plan warning must name the floor (Plus or higher), not just "
         "say the plan is paid")
+
+
+def test_9660_the_org_choice_precedes_authorize_on_the_other_three_surfaces():
+    """#9660: the ChatGPT recipe renders on four surfaces, and the CARD is pinned
+    by `test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end`. This
+    covers the other three — the docs row, the wizard step, and the served
+    document an agent reads aloud — because the same journey shipped wrong on all
+    four at once, and each rendering is edited by a different hand.
+
+    WHY ORDER, NOT PRESENCE. `tortoise/oauth.py` reveals the consent page's two
+    shapes: with one Organization it names it and Authorize is live, and with
+    several it hides that line, shows a "Choose an org…" chooser and calls
+    `disableAuthorize()`, re-enabling the button only from the chooser's onchange.
+    So "click Authorize, and check the Organization … if it offers a chooser, pick
+    one" tells a multi-Organization user to click a disabled control. A presence
+    assertion cannot see that; two offsets can.
+    """
+    root = Path(__file__).resolve().parent.parent
+    harnesses = (root / "website/apps/dashboard/src/harnesses.js").read_text(
+        encoding="utf-8")
+    docs = (root / "website/docs.html").read_text(encoding="utf-8")
+    skill = (root / "tortoise/onboarding/SKILL.md").read_text(encoding="utf-8")
+
+    def step_line(text: str, needle: str) -> str:
+        for line in text.splitlines():
+            if needle in line:
+                return line
+        raise AssertionError(f"no wizard step contains {needle!r} — moved or reworded")
+
+    row_at = docs.index('<h4 id="chatgpt">')
+    note_at = skill.index("#1701 — ChatGPT is a 7th harness")
+    blocks = [
+        ("wizard step", step_line(harnesses, "confirm Connect Tortoise in the dialog")),
+        ("docs row", docs[row_at:docs.index("</ol>", row_at)]),
+        ("served document",
+         skill[note_at:skill.index("installing the three reusable skills", note_at)]),
+    ]
+    for label, block in blocks:
+        # Squash markdown/JSX wrapping so a phrase split across source lines is
+        # still the phrase a reader sees (the served note wraps mid-sentence).
+        flat = " ".join(block.replace("> ", " ").split())
+        assert "asks you to choose" in flat, (
+            f"the {label} describes the consent page's single-Organization shape "
+            "only — a second-org user meets a chooser (tortoise/oauth.py)")
+        org = flat.find("Organization")
+        authorize = flat.find("Authorize")
+        assert -1 not in (org, authorize), (
+            f"the {label} no longer names both acts — Organization={org}, "
+            f"Authorize={authorize}")
+        assert org < authorize, (
+            f"the {label} puts the Organization choice AFTER Authorize; on a "
+            "multi-Organization account Authorize is disabled until a choice is "
+            "made, so the copy names an inert control")

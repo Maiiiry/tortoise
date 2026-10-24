@@ -9852,9 +9852,9 @@ function claimIntentInFlight() {
                                 <p className="wizard-caption">
                                   Tick <strong>I understand and want to continue</strong>, then click <strong>Create as a plugin</strong>. Now open
                                   {' '}<code>chatgpt.com/settings/plugins-settings</code> → <strong>Tortoise</strong> → <strong>View details</strong> → <strong>Connect</strong>,
-                                  then confirm <strong>Connect Tortoise</strong> in the dialog it opens. Sign in to Tortoise, click <strong>Authorize</strong>, and check
-                                  the Organization the consent page names before approving — if it offers a chooser instead of a name, pick the one you are onboarding,
-                                  which is the one the connector writes to.
+                                  then confirm <strong>Connect Tortoise</strong> in the dialog it opens. Sign in to Tortoise, pick the Organization
+                                  you are onboarding — the page names it, or asks you to choose when you belong to more than one —
+                                  then click <strong>Authorize</strong>. That Organization is the one the connector writes to.
                                 </p>
                               </WizardBlock>
                               <WizardBlock step={2} title="Install the Tortoise skills">

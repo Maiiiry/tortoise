@@ -529,10 +529,18 @@ def test_4365_served_document_sends_chatgpt_to_a_path_that_exists():
     # `len(orgs) > 1` memberships path). "Check the name" alone therefore points
     # at text a multi-org account never sees — the same class of defect as the
     # unnamed consent dialog — so the pick is pinned here (#9660 review).
-    assert "pick the one you are onboarding" in skill, (
+    assert "pick the Organization you are onboarding" in skill, (
         "the served document must keep the multi-org act: the consent page shows "
         "a CHOOSER (and no named organization) when the account has more than "
         "one selectable org, and Authorize stays disabled until one is picked")
+    # …and the pick must be placed BEFORE Authorize: on the chooser branch the
+    # button is disabled until a value is chosen (tortoise/oauth.py
+    # `disableAuthorize()`, re-enabled only by the select's onchange), so
+    # "click Authorize, then pick" names an inert control.
+    assert skill.index("pick the Organization") < skill.index("**Authorize**"), (
+        "the served document's ChatGPT recipe must pick the Organization before "
+        "Authorize — an agent reads this list aloud to a user who cannot see "
+        "which control is disabled")
     assert "ChatGPT tab" not in skill, (
         "the served document must not name the retired dashboard ChatGPT tab")
     # #9660 OWNER RULING (2026-10-23): the chooser DOES carry a ChatGPT
