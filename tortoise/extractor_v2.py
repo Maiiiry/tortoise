@@ -7031,7 +7031,13 @@ def execute_embed(embed_list: dict, search: dict, *, session_id: str,
         if not isinstance(p, dict):
             warnings.append(f"non-dict point entry {p!r} skipped")
             continue
-        _raw_content = str(p.get("content") or "").strip()
+        # ⚠️ `str(...)` NOT `str(... or "")`: #5060 made a falsy content
+        # WRITABLE as its coerced text (a `None` content is the claim "None"),
+        # and `tests/test_extractor_embed_coerce_5060.py` pins it. Collapsing a
+        # falsy value to "" here makes the `if not content: continue` guard
+        # below DROP the item silently — which reverses that contract and reds
+        # the #5060 battery. `_raw_content` exists for the verdict key only.
+        _raw_content = str(p.get("content", "")).strip()
         content = _raw_content[:_MAX_CONTENT]
         if not content:
             continue

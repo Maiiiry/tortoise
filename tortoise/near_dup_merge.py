@@ -63,10 +63,18 @@ becomes admissible because nothing is dropped:
 3. **The losing document's provenance survives as a `(Session)-[:CONTAINS]->
    (Point)` edge** — the second session's evidence is a member of the claim's
    memory, which is the same channel the exact-fold path (`#2104`) uses.
-4. **The merge itself is recorded** — `execute_embed` returns it in
-   `result["merges"]` (never inside the payload, exactly like `noops`), with
-   the losing candidate's `quote`, its content, and the union it wrote. A
-   merge a reader cannot find is indistinguishable from a silent drop.
+4. **The merge itself is recorded — at the EXTRACTOR boundary.** `execute_embed`
+   returns it in `result["merges"]` (never inside the payload), with the
+   losing candidate's `quote`, its content, and the union it wrote.
+   ⚠️ **The capture path does NOT forward that record**: `_extract_session_v2`
+   keeps only the failure warnings, so a `capture_session` caller can follow a
+   merge through `stats["merges"]` and the `(Session)-[:CONTAINS]->(Point)`
+   edge, but NOT the losing quote. Do not read this item as a promise about the
+   capture receipt — and note a `NOOP` fold IS surfaced there (as a classified
+   `dedup` entry, `sdk.py:12290-12302`), so the two are **not** alike on that
+   path. Tracked on #9871.
+   *A merge a reader cannot find is indistinguishable from a silent drop*, which
+   is why that gap is filed rather than absorbed here.
 
 FAIL-CLOSED HERE — the opposite direction to `_attachments_preserved`
 ---------------------------------------------------------------------
@@ -330,11 +338,17 @@ def apply_merge_union(proj: Any, record: dict, *, session_id: str,
     emits no payload point, so `bind_point_subjects` never runs for the
     candidate and its confidence-gated `aboutSubject` binding is dropped — the
     binder is the only gated `aboutSubject` producer and this write has no
-    binder. `skipped_subject` names those names, so "nothing it argued for is
-    silently dropped" is true of OBJECT attachments and is now REPORTED, not
-    assumed, for subject binding. Closing that needs a subject-resolution path
-    here; it is not a wider `MATCH` (which is the defect above), and it is not
-    introduced by this module. The same blind spot
+    binder. `skipped_subject` names those names, so the drop is REPORTED rather
+    than assumed — ⚠️ **but only for subject-kind names that appear in the
+    union's `about_entities`.** A participant that reaches the claim through the
+    point's SLOTS is dropped UNREPORTED: the ordinary path binds it via
+    `bind_point_subjects` (`sdk.py:12165`), a merge emits no payload point so
+    that call never runs for the candidate, and the slots are not carried onto
+    the merge record. So "nothing it argued for is silently dropped" is true of
+    OBJECT attachments, and for subject binding it holds only for the
+    `about_entities` channel — tracked on #9871. Closing that needs a
+    subject-resolution path here; it is not a wider `MATCH` (which is the defect
+    above), and it is not introduced by this module. The same blind spot
     `extractor_v2._attachment_ids` already has.
     """
     out: dict = {"point_id": "", "contained": 0, "linked": 0,

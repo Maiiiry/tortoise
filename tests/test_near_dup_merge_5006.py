@@ -323,26 +323,30 @@ class TestTheWritePathEmitsOneEntityAndKeepsTheLosersEvidence:
         assert result["stats"]["merges"] == 1, result.get("warnings")
         assert result["payload"]["points"] == []
 
-    def test_a_null_content_point_is_skipped_not_written_as_none(self):
-        """`content: null` must be SKIPPED, not minted as the claim "None".
+    def test_a_falsy_content_is_coerced_not_dropped(self):
+        """#5060's contract, pinned through the line this change SPLIT.
 
-        `_parse_json_robust` rung 1 returns unvalidated JSON, so this shape
-        reaches here from real model output (`_clip`'s own docstring says as
-        much). `str(None)` is `"None"`, which is truthy, so the
-        `if not content: continue` guard did not fire and a Point whose CLAIM IS
-        THE STRING "None" landed in the graph with no warning — a fabricated
-        claim. `str(x or "")` is the rule `_classify_item_id` already uses and
-        the rule `vet_gate._item_text` applies, so it also removes the one
-        shape where the verdict probe could diverge from VET's key.
+        `str(p.get("content", ""))` is deliberate: #5060 made a falsy content
+        WRITABLE as its coerced text (`None` → the claim "None", `0` → "0"),
+        because `_parse_json_robust` rung 1 returns unvalidated JSON and the
+        write gate, not the report, is the authority on what is writable.
+        `tests/test_extractor_embed_coerce_5060.py` pins it.
+
+        This test exists because the split into `_raw_content` (for the verdict
+        key) + `content` is one keystroke from `str(p.get("content") or "")`,
+        which collapses every falsy value to "" so the `if not content: continue`
+        guard DROPS the item with no warning — silently reversing #5060. That
+        regression was measured on this branch: the #5060 battery went 5 red.
         """
         embed = {"entities": [], "events": [], "operators": [],
                  "chain_notes": [], "link_before_create": [],
-                 "points": [{"content": None, "pointKind": "statement"},
-                            {"content": 0, "pointKind": "statement"}]}
+                 "points": [{"content": 0, "pointKind": "statement"},
+                            {"content": None, "pointKind": "statement"}]}
         result = v2.execute_embed(
             embed, {"points": [], "entities": []},
-            session_id="s_null", session_date="2026-10-24")
-        assert result["payload"]["points"] == [], result["payload"]["points"]
+            session_id="s_falsy", session_date="2026-10-24")
+        assert {p["content"] for p in result["payload"]["points"]} == {
+            "0", "None"}, result["payload"]["points"]
 
     def test_an_unflagged_embed_list_emits_no_merge_record(self):
         """The default is inert — the fusion is verdict-gated, not automatic."""
