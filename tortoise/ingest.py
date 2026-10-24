@@ -263,11 +263,16 @@ def _document_is_pending(needs_extraction, doc_status, *,
        SWEEP passes ``False``: pre-D10 discovery never selected it
        (``doc_status='captured' OR needs_extraction = true``), and selecting it
        would re-enter every pre-D10 full-ingest document. ``--upgrade`` passes
-       ``True``: pre-D10 ``_do_upgrade`` skipped on ``'extracted'`` **alone**
-       (``coalesce(d.doc_status,'captured')`` — a value of ``draft`` meant the
-       post-extraction flip never ran), so a document a crashed ingest left at
-       ``draft`` must still be upgradeable. The ``begin_ingest`` key remains the
-       gate against duplicate work.
+       ``True`` because pre-D10 ``_do_upgrade`` skipped on ``'extracted'``
+       **alone** (``coalesce(d.doc_status,'captured')``), so it upgraded a
+       ``draft`` document — that is PARITY, not evidence.
+       ⛔ ``draft`` does NOT mean "not extracted": pre-D10 the full-ingest path
+       WROTE ``draft`` as the default and never flipped it (only
+       ``_do_upgrade``/``_do_upgrade_all`` wrote ``'extracted'``), so ``draft``
+       is what every successfully full-ingested pre-D10 document still carries.
+       The ``begin_ingest`` key (content-hash + extractor version) is what stops
+       a re-extraction; at a BUMPED version this reprocesses and retracts that
+       source's earlier Points — the sweep's purpose, and a real cost.
     5. otherwise an ``is not None`` but non-``True`` signal is a stated
        "done" for the live axis: ``needs_extraction=false`` with no legacy
        marker → not pending.
@@ -333,9 +338,11 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
       legacy marker, → no-op (``_document_is_pending``)
     - A legacy capture (``doc_status='captured'``, even with the pre-D10
       boilerplate ``needs_extraction=false``), a document with NO signal, and a
-      document left at ``draft`` (the post-extraction flip never ran) →
-      PENDING (#5140 P1, the pre-D10 default restored): ``--upgrade`` names one
-      document, so it is upgraded rather than reported as already done.
+      document carrying any other retired value (``draft``) → PENDING (#5140
+      P1, the pre-D10 default restored): ``--upgrade`` names one document, so it
+      is upgraded rather than reported as already done. ``draft`` is parity, not
+      evidence — it is what every pre-D10 full ingest left behind; see
+      ``_document_is_pending``.
     - Non-Document transcript (no ``##`` sections) → warns, then still runs the
       completion SET: there is nothing to extract, and the operator named this
       document. (The SWEEP is stricter and keeps the marker — see
@@ -362,9 +369,10 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
         return
     needs_ext, doc_status = rows[0][0], rows[0][1]
     # `other_legacy_is_pending=True`: pre-D10 `--upgrade` skipped on
-    # `doc_status='extracted'` alone, so a document stuck at `draft` (the
-    # post-extraction flip never ran) is still upgradeable. Only the sweep
-    # treats the other retired values as done.
+    # `doc_status='extracted'` alone, so it also upgraded a `draft` document —
+    # parity, not evidence that extraction never ran (`draft` is what every
+    # pre-D10 full ingest left). Only the sweep treats other retired values as
+    # done.
     if not _document_is_pending(needs_ext, doc_status,
                                 other_legacy_is_pending=True):
         print(f"doc already extracted, skipped: {source_id}")
@@ -491,11 +499,15 @@ def _discover_pending_documents(proj, *, include_unstamped: bool = False) -> lis
     * ``doc_status = 'extracted'`` — a completion record, never pending;
     * ``needs_extraction = true`` — the live pending claim;
     * any other retired value (``draft``) — not a pending claim;
-    * no signal at all — only under ``include_unstamped``, because both writers
-      that mint a document Source without a signal are transcript writers
-      (``hosted_api._execute_commit_writes`` and ``_event_plain_merge``'s
+    * no signal at all — only under ``include_unstamped``. The two IN-TREE
+      writers that mint a document Source without a signal are transcript
+      writers (``hosted_api._execute_commit_writes`` and ``_event_plain_merge``'s
       ``objectType='Document'`` branch), and sweeping those up would queue every
-      captured session for LLM extraction.
+      captured session for LLM extraction. The widened set is not ONLY
+      transcripts — a caller-minted Source (``create_source``/``update_entity``
+      take a ``documentKind``; ``needs_extraction`` is not caller-settable) is
+      selected too. Whole-population widening is therefore an explicit operator
+      choice, never a default.
 
     Returns ``[(url, sourcePath, needs_extraction, doc_status), …]``.
     """
@@ -796,8 +808,11 @@ def main(argv=None):
                          "sessionCaptured Event, SKIP LLM point extraction "
                          "(sets needs_extraction=true; topics/summary from frontmatter)")
     ap.add_argument("--upgrade", action="store_true",
-                    help="#133: re-run full extraction on a captured document "
-                         "Source (requires transcript positional arg)")
+                    help="#133/#5140: re-run full extraction on a document Source "
+                         "awaiting extraction — needs_extraction=true, a surviving "
+                         "legacy doc_status other than 'extracted', or no signal at "
+                         "all (requires the transcript positional arg). A stored "
+                         "needs_extraction=false with no legacy marker still skips.")
     ap.add_argument("--upgrade-all", action="store_true",
                     help="#133/#5140: discover document Sources awaiting extraction "
                          "(an explicit needs_extraction=true, or a surviving legacy "
