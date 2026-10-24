@@ -333,14 +333,37 @@ def _summary_dict(summary) -> dict[str, Any]:
     }
 
 
+#: Known failure classes -> TOKENS. The health line embeds the reason inside a
+#: COMMA-DELIMITED field, so a token is what keeps its grammar intact.
+_REASON_TOKENS = (
+    ("TORTOISE_API_KEY", "no_credential"),
+    ("no session header id", "no_header_id"),
+    ("EACCES", "permission_denied"),
+    ("EPERM", "permission_denied"),
+    ("ENOSPC", "no_space"),
+    ("Unexpected token", "bad_json"),
+)
+
+
 def _reason_token(errors: list[Any]) -> str | None:
-    """The first error as a short TOKEN for the health line (never prose)."""
-    for err in errors:
-        text = str(err)
-        if "TORTOISE_API_KEY" in text:
-            return "no_credential"
-        return text.strip()[:80] or None
-    return None
+    """The first error as a short TOKEN for the health line (never free prose).
+
+    Truncation is NOT sanitisation: the raw errors that reach here carry commas
+    and em-dashes by nature (`…: no session header id — refused`,
+    `JSON.parse`'s `Unexpected token , in JSON at position 41`), and this string
+    is interpolated into `capture: OK (0 queued), store-sync FAILED (<reason>)`.
+    So a known class becomes a token, and the fallback has the punctuation that
+    would break that grammar replaced.
+    """
+    if not errors:
+        return None
+    text = str(errors[0])
+    for needle, token in _REASON_TOKENS:
+        if needle in text:
+            return token
+    replaced = set(",;—–\"'()\n\t")
+    cleaned = "".join("-" if ch in replaced else ch for ch in text)
+    return " ".join(cleaned.split())[:80] or None
 
 
 def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
@@ -363,6 +386,15 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
         # `0o700`, like every other `~/.tortoise` subdirectory this tree creates
         # (and like the worker's own `mkdirSync(dir, { mode: 0o700 })`).
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            # `mkdir`'s `mode` applies ONLY when it creates the directory. An
+            # upgraded box already has it, created 0755 by an earlier
+            # generation — so without this the 0700 intent stays unmet forever
+            # on any box whose sweeps SUCCEED (this writer is then the only one
+            # that runs). Best-effort: bookkeeping never fails a sweep.
+            target.chmod(0o700)
+        except OSError:
+            pass
         log = receipt.get("log") or {}
         errors = log.get("errors") or []
         # The persisted reason is a TOKEN, because the health line embeds it in a

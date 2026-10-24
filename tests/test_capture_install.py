@@ -3432,7 +3432,7 @@ def test_every_capture_artifact_ships_in_the_wheel():
 # also flags the missing script/entry on its own, so the bump is what carries
 # the change to an install whose bytes are frozen at generation 3.
 _EXPECTED_INSTALL_CONTRACT = {"claude": 11, "codex": 3, "cursor": 4,
-                             "pi": 12}
+                             "pi": 13}
 
 
 @pytest.mark.parametrize("harness", sorted(_EXPECTED_INSTALL_CONTRACT))
@@ -3528,12 +3528,12 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
     siblings, so a stale installed copy is comparable rather than
     unmeasurable (#4680).
 
-    Mutation: delete ``// tortoise-hook-version: 12`` from
+    Mutation: delete ``// tortoise-hook-version: 13`` from
     ``tortoise/pi-hooks/tortoise-capture.ts`` — ``read_hook_version`` returns
     ``None``, ``contract_version_for('pi')`` returns ``None``, and both this
     test and the generation pin RED.
     """
-    assert hook_install.read_hook_version(_PI_SRC) == 12
+    assert hook_install.read_hook_version(_PI_SRC) == 13
     assert hook_install.count_canonical_markers(_PI_SRC) == 1, (
         "the Pi seam must carry exactly ONE column-0 marker (a second one is a "
         "site marker that would be mistaken for the contract)")
@@ -3549,7 +3549,7 @@ def test_pi_seam_carries_exactly_one_canonical_marker():
 #: SHIPPED bytes and so compares equal by construction.  Edit the artifact, move
 #: the generation, update this pair — all three in one commit.
 _PINNED_PI_SEAM_INSTALL_CONTRACT = (
-    12, "e1183607af2862835a4601674be339ef0e9e7593d606e80d968c89862bff450e")
+    13, "4041c6e2dd02013a65b64169e3a0be98144031b59318f30e09883b6eeb1631f2")
 
 #: One digest per generation from generation 3 forward, so "bytes changed,
 #: generation left alone" cannot be certified by editing the pair above by itself:
@@ -3613,6 +3613,15 @@ _GENERATION_DIGESTS = {
     # (`no_credential`) rather than the CLI's free-form stderr prose, which the
     # generation-11 precedence fix had let reach the health line.
     12: "e1183607af2862835a4601674be339ef0e9e7593d606e80d968c89862bff450e",
+    # Generation 13: the exit-0 corroboration gained a ONE-SECOND tolerance on
+    # `at` (a coarse-but-fresh stamp otherwise read as older, and the branch then
+    # OVERWROTE a healthy status with `exit_0_without_status` on a box whose
+    # backstop worked — a fail-closed over-report, every sweep); the reason
+    # fallback strips the punctuation that breaks the health line's
+    # comma-delimited grammar (only known classes were tokenised before); and the
+    # CLI's writer narrows an EXISTING store directory to 0700 like the
+    # extension's does.
+    13: "4041c6e2dd02013a65b64169e3a0be98144031b59318f30e09883b6eeb1631f2",
 }
 
 

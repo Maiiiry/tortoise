@@ -1,4 +1,4 @@
-// tortoise-hook-version: 12
+// tortoise-hook-version: 13
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
@@ -41,17 +41,28 @@
 // wording is imprecise for this one generation; the classification and the
 // repair it prompts are right.
 //
+// Generation 13 (#3515 review): the exit-0 corroboration gained a ONE-SECOND
+// tolerance on `at`. Without it, any writer whose stamp is second-granular in the
+// same second read as older, and this branch OVERWROTE a healthy status and
+// reported `exit_0_without_status` on a box whose backstop was working — a
+// fail-closed over-report, every sweep. The reason fallback also strips the
+// punctuation that breaks the health line's comma-delimited grammar (only known
+// classes were tokenised before), and the CLI's writer now narrows an EXISTING
+// store directory to 0700 the way the extension's does.
+//
 // Generation 12 (#3515 review): exit 0 is corroborated, and the health line's
 // reason is a TOKEN. A sweep that exits 0 without writing a fresh status left the
 // PREVIOUS verdict standing — the CLI's bookkeeping write is best-effort, and a
 // `tortoise` on PATH that is not the shipped CLI can exit 0 without sweeping — so
 // the extension now reads the status on a zero exit and records
 // `exit_0_without_status` when it is absent or older than this spawn. The
-// persisted `reason` is also a token now (`no_credential`) instead of the CLI's
-// free-form stderr prose: the precedence fix is what made that prose reach the
-// line, where it duplicated the line's own "no TORTOISE_API_KEY" and embedded an
-// unquoted sentence in a comma-delimited field. The full text stays on stderr and
-// in `--json`.
+// persisted `reason` is a TOKEN for the classes that are known
+// (`no_credential`, `no_header_id`, `permission_denied`, `no_space`, `bad_json`)
+// instead of the CLI's free-form stderr prose: the precedence fix is what made
+// that prose reach the line, where it duplicated the line's own
+// "no TORTOISE_API_KEY" and embedded an unquoted sentence in a comma-delimited
+// field. Anything unrecognised has that punctuation replaced before it is
+// persisted. The full text stays on stderr and in `--json`.
 //
 // Generation 11 (#3515 review): the extension's record is now SUBORDINATE to the
 // CLI's own, and the spawn names the directory it writes to. `close` fires AFTER
@@ -2975,7 +2986,15 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
           // a backstop that never swept. A `tortoise` on PATH that is not the
           // shipped CLI does the same. Corroborate with data already in hand.
           const after = readSweepStatus(storeDir);
-          if (!after || (after.at ?? 0) < sweepStartedAt) {
+          // ONE SECOND OF TOLERANCE. `sweepStartedAt` is millisecond-precise,
+          // but `at` is whatever the writer stamped — `time.time()` is a float
+          // here, yet Python documents one-second resolution on some platforms.
+          // Without the tolerance a coarse-but-FRESH record reads as older, and
+          // this branch then OVERWRITES a healthy status and reports
+          // `exit_0_without_status` on a box whose backstop works, every sweep.
+          // A record from the previous sweep is far older than a second, so the
+          // tolerance cannot mask a genuinely stale verdict.
+          if (!after || (after.at ?? 0) < sweepStartedAt - 1) {
             noteFailure("exit_0_without_status");
             if (_SWEEP_UNAVAILABLE_WARNED) return;
             _SWEEP_UNAVAILABLE_WARNED = true;

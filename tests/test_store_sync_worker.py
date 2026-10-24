@@ -709,6 +709,26 @@ def test_the_persisted_reason_is_a_TOKEN_and_the_file_is_0600(tmp_path):
     assert store.stat().st_mode & 0o777 == 0o700
 
 
+def test_an_EXISTING_0755_store_directory_is_narrowed_by_the_CLI_too(tmp_path):
+    """`mkdir`'s `mode` applies only when it CREATES the directory.
+
+    An upgraded box already has the store, created 0755 by an earlier
+    generation — and on a box whose sweeps SUCCEED this writer is the only one
+    that ever runs, so without an explicit chmod the 0700 intent stays unmet
+    there forever, silently. The extension's writer narrows it; the CLI's must
+    too, or the two legs disagree about a directory they share.
+    """
+    from tortoise import store_sync
+
+    store = tmp_path / "store"
+    store.mkdir()
+    store.chmod(0o755)
+    assert store.stat().st_mode & 0o777 == 0o755, "the premise: an older generation's dir"
+    store_sync.write_sweep_status({"ok": True, "log": {"shipped": 1}}, str(store))
+    assert store.stat().st_mode & 0o777 == 0o700, "the CLI must narrow it too"
+    assert (store / "sweep-status.json").stat().st_mode & 0o777 == 0o600
+
+
 def test_a_dry_run_never_overwrites_a_real_failure(tmp_path, monkeypatch):
     """A PLAN is not an outcome — `--dry-run` must not turn a failure healthy.
 

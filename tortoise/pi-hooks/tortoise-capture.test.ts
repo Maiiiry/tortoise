@@ -26,6 +26,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+import { statSync } from "node:fs";
 import {
   CAPTURE_LANES,
   COHORT_COST_CAP_CODE,
@@ -986,9 +987,9 @@ test("#3515: hermetic test deps SEAL the sweep — a test can never spawn the re
  * the one place that needs the spawn. PATH holds only a shim and the spool is a
  * temp dir, so nothing real is read, written or uploaded.
  */
-async function sweepWithShim(
+async function sweepWithShimDetail(
   build: (storeDir: string) => string,
-): Promise<SweepStatus | undefined> {
+): Promise<{ status: SweepStatus | undefined; storeDir: string; mode: number | undefined }> {
   const dir = mkdtempSync(join(tmpdir(), "tortoise-capture-sweep-fail-"));
   const originalPath = process.env.PATH;
   process.env.PATH = `${dir}:${originalPath ?? ""}`;
@@ -1036,12 +1037,31 @@ async function sweepWithShim(
       if (existsSync(join(storeDir, "sweep-status.json"))) break;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    return readSweepStatus(storeDir);
+    // A row whose SHIM writes the status already has the file when the poll
+    // exits, but `close` may not have fired yet — and `close` is where the
+    // corroboration lives. Without this settle the positive control below would
+    // read the file BEFORE the code under test looked at it.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The mode is sampled HERE: the `finally` removes the tree, so a row cannot
+    // stat the directory after the helper returns.
+    let mode: number | undefined;
+    try {
+      mode = statSync(storeDir).mode & 0o777;
+    } catch {
+      mode = undefined;
+    }
+    return { status: readSweepStatus(storeDir), storeDir, mode };
   } finally {
     process.env.PATH = originalPath;
     rmSync(dir, { recursive: true, force: true });
     rmSync(parent, { recursive: true, force: true });
   }
+}
+
+async function sweepWithShim(
+  build: (storeDir: string) => string,
+): Promise<SweepStatus | undefined> {
+  return (await sweepWithShimDetail(build)).status;
 }
 
 /** ok/reason only: the record also carries `at`, which is asserted where it
@@ -1097,6 +1117,58 @@ test("#3515: exit 0 without a fresh status is NOT reported as healthy", async ()
     await sweepWithShim(() => "exit 0"),
     "exit_0_without_status",
     "a zero exit that left no fresh status must not read as a working backstop",
+  );
+});
+
+test("#3515: a FRESH healthy status is not overwritten by the exit-0 check", async () => {
+  if (process.platform === "win32") return;
+  // THE POSITIVE CONTROL. The exit-0 corroboration fires when no fresh status
+  // landed — and every row that exercises it so far is a NEGATIVE one, so
+  // inverting the comparison (firing on a fresh healthy status) left the whole
+  // suite green. That inversion is not cosmetic: it OVERWRITES a healthy record
+  // and makes every working box print `store-sync FAILED (exit_0_without_status)`
+  // on every sweep.
+  const { status } = await sweepWithShimDetail((store) =>
+    `node -e 'const f=require("fs");f.mkdirSync(${JSON.stringify(store)},{recursive:true});`
+      + `f.writeFileSync(${JSON.stringify(join(store, "sweep-status.json"))},`
+      + `JSON.stringify({version:1,ok:true,shipped:2,at:Date.now()/1000}))'; exit 0`);
+  assert.ok(status, "the CLI's healthy status must survive");
+  assert.equal(status.ok, true, "a working sweep must not be reported as failed");
+  assert.equal(status.reason, undefined, "and must not acquire a failure reason");
+});
+
+test("#3515: exit 0 over a STALE healthy status is a failure, not a pass", async () => {
+  if (process.platform === "win32") return;
+  // The other side of the tolerance: it exists so a coarse-but-FRESH stamp is
+  // not misread as stale, and it must not be wide enough to accept a verdict
+  // from a PREVIOUS sweep. An hour-old `ok: true` plus a zero exit means this
+  // sweep wrote nothing, so the line would otherwise keep printing a health it
+  // did not observe.
+  assertSweepFailure(
+    await sweepWithShim((store) =>
+      `node -e 'const f=require("fs");f.mkdirSync(${JSON.stringify(store)},{recursive:true});`
+        + `f.writeFileSync(${JSON.stringify(join(store, "sweep-status.json"))},`
+        + `JSON.stringify({version:1,ok:true,at:Date.now()/1000-3600}))'; exit 0`),
+    "exit_0_without_status",
+    "a healthy verdict from an HOUR ago is not evidence about this sweep",
+  );
+});
+
+test("#3515: an EXISTING 0755 store directory is narrowed to 0700", async () => {
+  if (process.platform === "win32") return;
+  // `mkdirSync`'s `mode` applies only when it CREATES the directory. The other
+  // way this directory exists is an EARLIER generation of this extension, which
+  // made it 0755 — so without an explicit chmod the 0700 intent stayed unmet
+  // forever on every upgraded box, silently.
+  // The shim CREATES it 0755 first, which is what an older generation left
+  // behind; the extension's write must then narrow it.
+  const { mode } = await sweepWithShimDetail(
+    (store) => `mkdir -p ${store} && chmod 755 ${store} && exit 3`,
+  );
+  assert.equal(
+    mode,
+    0o700,
+    "a pre-existing 0755 store must be narrowed, not left world-readable",
   );
 });
 
