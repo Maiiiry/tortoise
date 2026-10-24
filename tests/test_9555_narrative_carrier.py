@@ -357,10 +357,25 @@ def test_the_scope_proof_is_the_records_OWN_prologue():
     a zero-row answer meaningful: the GUC, not a table, decides.
     """
     source = Path(record_text.__file__).read_text()
-    assert "scope_connection" in source, (
-        "record_text no longer uses the record's own tenant prologue — a "
-        "hand-rolled scope read is either unprivileged (P1) or proves the wrong "
-        "table")
+
+    # ⛔ ON THE AST, NOT ON A SUBSTRING: the module's docstrings NAME
+    # `record_projection.scope_connection` while explaining the design, so a
+    # substring pin is satisfied by gutting `scoped()` and leaving the prose —
+    # a false PASS at the unit level, caught only by an armed live leg.
+    tree = ast.parse(source)
+    scoped_fn = next((n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == "scoped"),
+                     None)
+    assert scoped_fn is not None, "record_text.scoped() is gone"
+    # A CALL, not a name in the body: `scoped`'s own docstring names
+    # `scope_connection`, so dumping the body (or searching the source) is
+    # satisfied by prose. Only a call site proves the prologue runs.
+    called = {n.func.id for n in ast.walk(scoped_fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "scope_connection" in called, (
+        "record_text.scoped() no longer CALLS the record's own tenant prologue "
+        "(the name surviving only in prose is the false pass this pin exists "
+        "to prevent)")
 
     # The pin is on the SQL these two modules EXECUTE, not on their prose: their
     # docstrings explain the abandoned draft (and name `public.graphs` while

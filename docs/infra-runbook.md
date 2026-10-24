@@ -3048,10 +3048,14 @@ Approval* puts that behind Daniel's sign-off. This verb is the operator path.
 
 **Verification.** `tests/test_9555_narrative_carrier.py` — the carrier in the
 write path, the shape-keyed projection, the record-only read, and this verb's exit
-codes against a real Postgres (armed in CI's `test-record-postgres` job).
+codes against a real Postgres, **run as the app role** (armed in CI's
+`test-record-postgres` job, which asserts zero skips).
 `tests/test_9555_narrative_cache_rebuild.py` — the cache destroyed and rebuilt
 from the record alone, with the narrative and the redaction count identical across
-the wipe.
+the wipe. ⚠️ That leg needs **both** a record Postgres and a FalkorDB, and **no CI
+job arms both** (the armed record job provisions no cache; every FalkorDB job sets
+no record DSN), so it runs only on a manually-armed lane — stated here because an
+operator who read the line above as "CI defends this" would never run it.
 
 ## Secrets Matrix
 

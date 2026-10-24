@@ -1267,14 +1267,19 @@ def _cmd_record_text(args):
     * ``0`` — the record served the text (§9.1's narrative and/or the raw
       turns). The numbers are a MEASUREMENT: the turn count is what was read,
       not what ``--limit`` allowed to be printed.
-    * ``3`` — the record was READABLE for this scope and holds nothing for the
-      key. An honest absence (a session captured before the narrative carrier
-      landed, or one whose distillation produced no narrative).
+    * ``3`` — the TENANT was scoped and read, and the record holds nothing for
+      the key. An honest absence: a session captured before the narrative carrier
+      landed, one whose distillation produced no narrative — or a mistyped
+      ``--org``/``--graph``, which is a tenant that holds nothing. ⚠️ Do NOT read
+      ``3`` as "the record lost the data".
     * ``2`` — no verdict. No DSN, a malformed DSN, no ``psycopg2``, an
-      unreadable record — or **a scope this connection cannot see**. That last
-      one is not pedantry: a tenancy-filtered read returns 0 rows SILENTLY, so
-      reporting it as an absence would state a falsehood about a customer's
-      evidence (§9555 G1, #9600's app role).
+      unreadable record — or **a connection that cannot be SCOPED** (a role that
+      bypasses RLS, or a tenant GUC that did not stick) and therefore could not
+      prove the tenant at all. That last one is not pedantry: a tenancy-filtered
+      read returns 0 rows SILENTLY, so answering from an unscopable connection
+      would state a falsehood about a customer's evidence (§9555 G1, #9600's app
+      role). ⚠️ A *scope that does not exist* is NOT this case — it is a tenant
+      with no text, i.e. ``3``.
     """
     import json as _json
 
