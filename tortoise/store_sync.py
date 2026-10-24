@@ -44,6 +44,7 @@ an oversight:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -393,15 +394,13 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
         # `0o700`, like every other `~/.tortoise` subdirectory this tree creates
         # (and like the worker's own `mkdirSync(dir, { mode: 0o700 })`).
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            # `mkdir`'s `mode` applies ONLY when it creates the directory. An
-            # upgraded box already has it, created 0755 by an earlier
-            # generation — so without this the 0700 intent stays unmet forever
-            # on any box whose sweeps SUCCEED (this writer is then the only one
-            # that runs). Best-effort: bookkeeping never fails a sweep.
+        # `mkdir`'s `mode` applies ONLY when it creates the directory. An
+        # upgraded box already has it, created 0755 by an earlier
+        # generation — so without this the 0700 intent stays unmet forever
+        # on any box whose sweeps SUCCEED (this writer is then the only one
+        # that runs). Best-effort: bookkeeping never fails a sweep.
+        with contextlib.suppress(OSError):
             target.chmod(0o700)
-        except OSError:
-            pass
         log = receipt.get("log") or {}
         errors = log.get("errors") or []
         # The persisted reason is a TOKEN, because the health line embeds it in a
@@ -437,14 +436,12 @@ def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
         }
         tmp = target / "sweep-status.json.tmp"
         tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        try:
-            # `write_text` uses the umask (0644), while the extension writes the
-            # same file 0600 — so the SAME filename carried two modes, and the
-            # COMMON one was the loose one. The directory is 0700 either way, so
-            # this is consistency rather than exposure.
+        # `write_text` uses the umask (0644), while the extension writes the
+        # same file 0600 — so the SAME filename carried two modes, and the
+        # COMMON one was the loose one. The directory is 0700 either way, so
+        # this is consistency rather than exposure.
+        with contextlib.suppress(OSError):
             tmp.chmod(0o600)
-        except OSError:
-            pass
         tmp.replace(target / "sweep-status.json")
     except OSError:
         pass
