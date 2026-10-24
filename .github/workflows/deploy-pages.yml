@@ -775,39 +775,25 @@ jobs:
           gate_body=$(cat /tmp/indexnow-gate.body 2>/dev/null)
           echo "notify-publish -> $gate $gate_body"
           if [ "$gate" != "401" ] || ! printf '%s' "$gate_body" | grep -q '"unauthorized"'; then
-            echo "::error::/blog/api/notify-publish did not refuse an anonymous caller with the admin gate (status $gate) — the console's publish would submit nothing, and nothing else would say so."
+            # Two DIFFERENT 503s reach here, and neither means "the route is gone".
+            # Naming them is the difference between an operator re-running the job
+            # and an operator hunting a deleted Function (the #3485 class: a
+            # provider blip must never be reported as an absent route).
+            case "$gate_body" in
+              *'"unavailable"'*)
+                echo "::error::could not verify /blog/api/notify-publish — the admin gate answered 503 unavailable (session store / admin lookup outage, #3485). NOT a missing route; re-run the job and nothing about the route is disproven." ;;
+              *'"not_configured"'*)
+                echo "::error::/blog/api/notify-publish answered 503 not_configured — a required Pages binding is missing on the premise-labs project, so the route cannot answer anything (this one IS a config fault)." ;;
+              *)
+                echo "::error::/blog/api/notify-publish did not refuse an anonymous caller with the admin gate (status $gate) — the console's publish would submit nothing, and nothing else would say so." ;;
+            esac
             exit 1
           fi
-          # The hop the console actually fetches — the app-origin BFF proxy
-          # (apps/dashboard/functions/blog/api/[[path]].ts). A break here is silent
-          # from the server side: the browser console is the only witness.
-          #
-          # TWO differences from the hop above, both deliberate:
-          #   * it is the SESSION gate, not the admin gate — the proxy answers
-          #     `{"error":"not_signed_in"}` before any upstream call, so the body is
-          #     asserted against THAT (a bare 401 could be a route refusing for its
-          #     own reasons), and the wording below does not call it the admin gate;
-          #   * it POLLS. `deploy-dashboard` carries no `needs:` on this job and
-          #     re-uploads app.premiselabs.co concurrently, so a single shot can hit
-          #     that cutover and red the marketing deploy for an unrelated reason.
-          : > /tmp/indexnow-proxy.body
-          proxy=000
-          for attempt in $(seq 1 5); do
-            proxy=000
-            proxy=$(curl -sS -o /tmp/indexnow-proxy.body -w '%{http_code}' -m 20 \
-                      -X POST https://app.premiselabs.co/blog/api/notify-publish \
-                      -H 'Content-Type: application/json' -d '{"slug":"not-a-post"}' 2>/dev/null) || proxy=000
-            if [ "$proxy" = "401" ] && grep -q '"not_signed_in"' /tmp/indexnow-proxy.body 2>/dev/null; then
-              break
-            fi
-            [ "$attempt" -lt 5 ] && sleep 10
-          done
-          echo "app-origin notify-publish -> $proxy $(cat /tmp/indexnow-proxy.body 2>/dev/null)"
-          if [ "$proxy" != "401" ] || ! grep -q '"not_signed_in"' /tmp/indexnow-proxy.body 2>/dev/null; then
-            echo "::error::app-origin /blog/api/notify-publish did not answer the session gate (status $proxy) — the console's IndexNow call would not reach the handler, and only the browser console would say so."
-            exit 1
-          fi
-          echo "✅ the IndexNow key file serves the key alone; the notify route is live, admin-gated at the marketing origin and session-gated at the app proxy"
+          # ⛔ The app-origin hop the console also crosses is asserted in
+          # `deploy-dashboard`, NOT here — see the #9680 step in that job. Keeping
+          # it here inverted #2691: a dashboard-side break would red the unrelated
+          # marketing deploy, and this job has no `needs:` on that one by design.
+          echo "✅ the IndexNow key file serves the key alone; /blog/api/notify-publish is live and admin-gated at the marketing origin"
 
   # ── Dashboard (app.premiselabs.co → tortoise-dashboard Pages) ──────────
   # #1112: wire the dashboard into CI — closes #1086 + #1109 (two
@@ -1229,6 +1215,69 @@ jobs:
             exit 1
           fi
           echo "✅ missing assets 404 (non-HTML), real bundle serves, / and /team serve the shell, unknown path 404"
+
+      # ── #9680: the app-origin hop the publish console ACTUALLY crosses ──
+      # The console does not POST the marketing origin: it calls
+      # `/blog/api/notify-publish` on THIS origin and the BFF proxy
+      # (`apps/dashboard/functions/blog/api/[[path]].ts`) forwards it upstream.
+      # A route that stopped shipping is silent from the server side — one line
+      # in a browser console, and no publish would submit anything — so it is
+      # asserted here.
+      #
+      # ⛔ HERE, not in the marketing `deploy` job. `app.premiselabs.co` is THIS
+      # job's Pages project, and the two jobs carry no `needs:` between them on
+      # purpose: a step guarding one surface must not sit in the other surface's
+      # job, because that blocks the unrelated marketing deploy for a dashboard
+      # break (#2691, pinned by
+      # `tests/test_pages_bindings.py::test_the_onboarding_parity_check_guards_
+      # the_dashboard_job_only`).
+      #
+      # ⛔ WHAT THIS PROVES, precisely: the same-origin proxy route EXISTS and
+      # its own SESSION gate answers. It is NOT the admin gate — the proxy
+      # returns `{"error":"not_signed_in"}` at its cookie check, BEFORE any
+      # upstream call — so an anonymous probe cannot observe the handler from
+      # this origin at all. The admin gate is asserted on the marketing hop,
+      # where it IS reachable anonymously. Asserting the BODY, not just the
+      # status, is what separates this route from an edge/WAF 401: with the
+      # route deleted the call falls through to the app SPA shell (a 200 HTML
+      # page), so a status-only check would still red — but a 401 for the wrong
+      # reason would pass.
+      - name: Post-deploy — the app-origin IndexNow proxy answers its session gate (#9680)
+        if: always()
+        run: |
+          : > /tmp/indexnow-proxy.body
+          proxy=000
+          for attempt in $(seq 1 5); do
+            proxy=000
+            # `|| proxy=000` because bash -e would abort on the first transport
+            # blip and never reach the retry; a recorded 000 is a FAILURE, never
+            # a pass.
+            proxy=$(curl -sS -o /tmp/indexnow-proxy.body -w '%{http_code}' -m 20 \
+                      -X POST https://app.premiselabs.co/blog/api/notify-publish \
+                      -H 'Content-Type: application/json' -d '{"slug":"not-a-post"}' 2>/dev/null) || proxy=000
+            if [ "$proxy" = "401" ] && grep -q '"not_signed_in"' /tmp/indexnow-proxy.body 2>/dev/null; then
+              break
+            fi
+            [ "$attempt" -lt 5 ] && sleep 10
+          done
+          proxy_body=$(cat /tmp/indexnow-proxy.body 2>/dev/null)
+          echo "app-origin notify-publish -> $proxy $proxy_body"
+          if [ "$proxy" = "401" ] && printf '%s' "$proxy_body" | grep -q '"not_signed_in"'; then
+            echo "✅ the app-origin proxy route exists and answers its session gate (the admin gate itself is asserted on the marketing hop)"
+            exit 0
+          fi
+          # Fail closed, but never blame the route for what it is not: a 503 is
+          # the proxy's OWN `session_store_unavailable` (#3485 — a provider blip
+          # must not read as a missing route), and 000 is a transport failure.
+          case "$proxy" in
+            000)
+              echo "::error::could not verify app.premiselabs.co/blog/api/notify-publish — no response completed after 5 attempts. NOT evidence the route is gone; re-run the job." ;;
+            503)
+              echo "::error::could not verify app.premiselabs.co/blog/api/notify-publish — the proxy answered 503 (${proxy_body:-no body}), which is its session-store-unavailable path, NOT a missing route. Re-run the job." ;;
+            *)
+              echo "::error::app-origin /blog/api/notify-publish did not answer the proxy's session gate (status $proxy, body: ${proxy_body:-none}) — the console's IndexNow call would not reach the handler, and only the browser console would say so." ;;
+          esac
+          exit 1
 
   # ── Post-deploy verification: legal pages E2E suite (#677) ───────────
   #

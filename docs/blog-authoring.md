@@ -299,13 +299,16 @@ KEY=$(grep -o 'INDEXNOW_KEY = "[a-f0-9]*"' website/functions/blog/_shared/indexn
 curl -sS -D- "https://tortoise.premiselabs.co/$KEY.txt"
 ```
 
-That command is a spot check, not the gate. `deploy-pages` asserts the deployed surface in a
-**blocking** post-deploy step (`Post-deploy — the IndexNow key file and notify route are live (#9680)`):
-200, `text/plain`, and a body byte-identical to the constant the submitter sends — a trailing newline
-answers 403 to every submission, so the byte count is compared, not just the text. The same step
-asserts that `/blog/api/notify-publish` is deployed and refuses an anonymous caller on both hops the
-console crosses — the admin gate at the marketing origin, the session gate at the app proxy. No
-credential is needed and nothing is written.
+That command is a spot check, not the gate. `deploy-pages` asserts the deployed surface in two
+**blocking** post-deploy steps, each in the job that deploys the surface it speaks about. `deploy`
+(`Post-deploy — the IndexNow key file and notify route are live (#9680)`) asserts 200, `text/plain`,
+and a body byte-identical to the constant the submitter sends — a trailing newline answers 403 to
+every submission, so the byte count is compared, not just the text — and that `/blog/api/notify-publish`
+at the marketing origin still refuses an anonymous caller with its admin gate. `deploy-dashboard`
+(`Post-deploy — the app-origin IndexNow proxy answers its session gate (#9680)`) asserts the hop the
+console actually calls: that the app-origin proxy route exists and answers its own session gate. It is
+the route's presence that one proves, not the upstream handler — an anonymous call is refused at the
+cookie check, before anything is forwarded. No credential is needed and nothing is written.
 
 ### Backfilling the articles published before this existed
 

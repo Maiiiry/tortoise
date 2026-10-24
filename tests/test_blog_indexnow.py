@@ -33,13 +33,21 @@ consume the protocol). Nothing here asserts, names or implies otherwise.
 
 V1 — the key file — is asserted from the repo here, because that is where the
 fact lives: the deployed 200 cannot be observed before the deploy. The DEPLOYED
-half is a blocking step in ``.github/workflows/deploy-pages.yml``
-("Post-deploy — the IndexNow key file and notify route are live (#9680)"), which also
-asserts the console's ``/blog/api/notify-publish`` route and its refusal of an
-anonymous caller on both hops (the admin gate at the marketing origin, the
-session gate at the app proxy); the
-``curl`` in the IndexNow section of ``docs/blog-authoring.md`` is the manual spot
-check, not the gate.
+half is two blocking steps in ``.github/workflows/deploy-pages.yml``, each in
+the job that deploys the surface it speaks about:
+
+* ``deploy`` — "Post-deploy — the IndexNow key file and notify route are live
+  (#9680)" — the file those bytes are served from, plus
+  ``/blog/api/notify-publish`` at the marketing origin, whose admin gate
+  refuses an anonymous caller with ``{"error":"unauthorized"}``;
+* ``deploy-dashboard`` — "Post-deploy — the app-origin IndexNow proxy answers
+  its session gate (#9680)" — the hop the console actually calls. Its proxy
+  answers ``{"error":"not_signed_in"}`` at the cookie check, before any
+  upstream call, so an anonymous probe proves the ROUTE is there and says
+  nothing about the handler behind it.
+
+The ``curl`` in the IndexNow section of ``docs/blog-authoring.md`` is the manual
+spot check, not the gate.
 """
 
 from __future__ import annotations

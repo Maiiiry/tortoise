@@ -3093,17 +3093,26 @@ def test_the_d1_sessions_api_scan_is_not_vacuous() -> None:
     )
 
 
-# ── #9680: the IndexNow post-deploy gate ──────────────────────────────────
-# The gate asserts the DEPLOYED half of a capability whose repo half is pinned by
-# `tests/test_blog_indexnow.py`. It belongs in this file because the failure mode
+# ── #9680: the IndexNow post-deploy gates ─────────────────────────────────
+# Each asserts the DEPLOYED half of a capability whose repo half is pinned by
+# `tests/test_blog_indexnow.py`. They belong in this file because the failure mode
 # is a deploy that stops serving the artifact — and because a gate whose REMOVAL
 # is invisible is the #7751 defect one level up (the tracker recorded IndexNow as
-# shipped while `/<key>.txt` answered 404 for weeks and nothing failed). So the
-# block is EXECUTED here against a stub `curl`, not string-matched.
+# shipped while `/<key>.txt` answered 404 for weeks and nothing failed). So each
+# run block is EXECUTED here against a stub `curl`, not string-matched.
 INDEXNOW_PROBE = "Post-deploy — the IndexNow key file and notify route are live (#9680)"
+#: #9680: the hop the publish console actually crosses. `app.premiselabs.co` is
+#: the `tortoise-dashboard` Pages project, so this step belongs to
+#: `deploy-dashboard` — `test_the_indexnow_proxy_gate_is_the_dashboard_jobs`
+#: pins that, and it is the same rule as
+#: `test_the_onboarding_parity_check_guards_the_dashboard_job_only` (#2691): a
+#: step guarding one surface must not sit in the other surface's job.
+INDEXNOW_PROXY_PROBE = (
+    "Post-deploy — the app-origin IndexNow proxy answers its session gate (#9680)"
+)
 
-#: The artifacts that quote the step by name to send a reader to it. A rename must
-#: red here rather than leave one of them pointing at a step that no longer
+#: The artifacts that quote the steps by name to send a reader to them. A rename
+#: must red here rather than leave one of them pointing at a step that no longer
 #: exists — the provenance defect `tests/test_blog_indexnow.py`'s docstring was
 #: amended for in this same change.
 _INDEXNOW_PROBE_QUOTERS = (
@@ -3124,17 +3133,22 @@ _INDEXNOW_MODULE_OK = (
 )
 
 
-def _indexnow_script(tmp_path: Path, module_text: str = _INDEXNOW_MODULE_OK) -> Path:
-    """The shipped IndexNow gate with ONLY these benign rewrites:
-      - 10/5 attempts -> 2, sleep 10 -> sleep 0 (so the retry cases are fast)
-    The control flow under test — the `|| curl_rc=$?` guard, the per-attempt
-    predicate, both retry bounds and every `exit 1` arm — is untouched, and the
-    REAL bounds are pinned separately by
-    `test_the_indexnow_gate_polls_and_is_blocking`.
+def _dashboard_step_code(name: str) -> str:
+    step = next(s for s in _dashboard_steps() if s.get("name") == name)
+    return _strip_bash_comments(step["run"])
+
+
+def _indexnow_fixture(tmp_path: Path, code: str, module_text: str) -> Path:
+    """Write `code` (with only the benign retry rewrites) and the module fixture.
+
+    Rewrites, both benign: 10/5 attempts -> 2 and `sleep 10` -> `sleep 0`, so the
+    retry cases run fast. The control flow under test — the `|| curl_rc=$?` /
+    `|| proxy=000` guards, the per-attempt predicate, every `exit 1` arm and the
+    error text — is untouched; the REAL bounds are pinned separately on the
+    shipped text by the two `*_is_blocking` / `*_is_the_dashboard_jobs` tests.
     """
     rewritten = (
-        _step_code(INDEXNOW_PROBE)
-        .replace("seq 1 10", "seq 1 2")
+        code.replace("seq 1 10", "seq 1 2")
         .replace("seq 1 5", "seq 1 2")
         .replace("sleep 10", "sleep 0")
     )
@@ -3148,9 +3162,9 @@ def _indexnow_script(tmp_path: Path, module_text: str = _INDEXNOW_MODULE_OK) -> 
     return script
 
 
-#: The two live surfaces plus the edge's own behaviour: a key-file GET, and one
-#: POST per hop (the marketing origin's Function, the app origin's BFF proxy).
-#: Every answer is an env var so a test can break exactly one of them.
+#: A key-file GET, one POST per hop (the marketing origin's Function, the app
+#: origin's BFF proxy), and the edge's own answer for an unmatched path. Every
+#: answer is an env var so a test can break exactly one of them.
 STUB_INDEXNOW_CURL = r"""#!/bin/bash
 out= hdr= fmt= url=
 while [ $# -gt 0 ]; do
@@ -3206,12 +3220,10 @@ def _run_indexnow_gate(
     body_mode: str = "key",
     gate_code: str = "401",
     gate_body: str = '{"error":"unauthorized","message":"Session expired or not an admin"}',
-    proxy_code: str = "401",
-    proxy_body: str = '{"error":"not_signed_in"}',
     fail_first: bool = False,
     module_text: str = _INDEXNOW_MODULE_OK,
 ) -> tuple[int, str, list[str]]:
-    """Run the shipped gate; return (rc, output, calls the stub `curl` saw)."""
+    """Run the shipped marketing-origin gate; return (rc, output, urls requested)."""
     bin_dir = _stub_bin(tmp_path, "curl", STUB_INDEXNOW_CURL)
     env = {
         **os.environ,
@@ -3222,12 +3234,49 @@ def _run_indexnow_gate(
         "STUB_BODY_MODE": body_mode,
         "STUB_GATE_CODE": gate_code,
         "STUB_GATE_BODY": gate_body,
+        "STUB_PROXY_CODE": "401",
+        "STUB_PROXY_BODY": '{"error":"not_signed_in"}',
+        "STUB_FAIL_FIRST": "1" if fail_first else "0",
+    }
+    script = _indexnow_fixture(tmp_path, _step_code(INDEXNOW_PROBE), module_text)
+    r = subprocess.run(
+        ["bash", "-e", str(script)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    calls_file = tmp_path / "calls"
+    calls = calls_file.read_text(encoding="utf-8").split() if calls_file.exists() else []
+    return r.returncode, r.stdout + r.stderr, calls
+
+
+def _run_indexnow_proxy(
+    tmp_path: Path,
+    proxy_code: str = "401",
+    proxy_body: str = '{"error":"not_signed_in"}',
+    fail_first: bool = False,
+) -> tuple[int, str, list[str]]:
+    """Run the shipped app-origin proxy gate; return (rc, output, urls requested)."""
+    bin_dir = _stub_bin(tmp_path, "curl", STUB_INDEXNOW_CURL)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "STUB_DIR": str(tmp_path),
+        "STUB_GET_CODE": "200",
+        "STUB_CTYPE": "text/plain",
+        "STUB_BODY_MODE": "key",
+        "STUB_GATE_CODE": "401",
+        "STUB_GATE_BODY": '{"error":"unauthorized"}',
         "STUB_PROXY_CODE": proxy_code,
         "STUB_PROXY_BODY": proxy_body,
         "STUB_FAIL_FIRST": "1" if fail_first else "0",
     }
+    script = _indexnow_fixture(
+        tmp_path, _dashboard_step_code(INDEXNOW_PROXY_PROBE), _INDEXNOW_MODULE_OK
+    )
     r = subprocess.run(
-        ["bash", "-e", str(_indexnow_script(tmp_path, module_text))],
+        ["bash", "-e", str(script)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -3267,23 +3316,69 @@ def test_the_indexnow_gate_polls_and_is_blocking() -> None:
     assert "sleep 10" in code, "the retry sleeps are gone — the bound would burn through instantly"
 
 
-def test_the_indexnow_gate_is_named_by_every_artifact_that_quotes_it() -> None:
-    """The doc and the unit suite both send a reader to this step BY NAME."""
+def test_the_indexnow_proxy_gate_is_the_dashboard_jobs() -> None:
+    """#2691: the app-origin hop guards the DASHBOARD's surface, so it must fail
+    the dashboard job — not the marketing deploy.
+
+    The failure it prevents, named: `app.premiselabs.co` is the
+    `tortoise-dashboard` Pages project and the two jobs carry no `needs:` between
+    them on purpose, so a proxy break asserted from `deploy` would block the
+    unrelated marketing deploy while the dashboard's own job stayed green — the
+    coupling `test_the_onboarding_parity_check_guards_the_dashboard_job_only`
+    was written for.
+    """
+    assert INDEXNOW_PROXY_PROBE not in [s.get("name", "") for s in _deploy_steps()], (
+        "the app-origin probe is back in the marketing `deploy` job — a dashboard "
+        "break would block the landing deploy (#2691)"
+    )
+    steps = _dashboard_steps()
+    names = [s.get("name", "") for s in steps]
+    assert INDEXNOW_PROXY_PROBE in names, "the app-origin IndexNow probe is gone"
+    assert names.index(INDEXNOW_PROXY_PROBE) > names.index(DASHBOARD_DEPLOY), (
+        "the probe must run AFTER the dashboard upload — before it, it would test "
+        "the previous deployment"
+    )
+    step = steps[names.index(INDEXNOW_PROXY_PROBE)]
+    assert not step.get("continue-on-error"), "the app-origin probe must not be advisory"
+    assert step.get("if") == "always()", (
+        "`if: always()` is what keeps a failing earlier dashboard step from MASKING "
+        "this probe"
+    )
+    code = _dashboard_step_code(INDEXNOW_PROXY_PROBE)
+    assert "seq 1 5" in code, "the app-origin retry bound is gone"
+    assert "sleep 10" in code, "the retry sleeps are gone — the bound would burn through instantly"
+    assert '"not_signed_in"' in code, (
+        "the body assertion is gone — a bare 401 cannot tell the proxy's own gate "
+        "from a catch-all/edge refusal, which is the whole point of the probe"
+    )
+
+
+def test_the_indexnow_gates_are_named_by_every_artifact_that_quotes_them() -> None:
+    """The doc and the unit suite both send a reader to these steps BY NAME.
+
+    Whitespace is normalised on both sides: a Markdown/docstring line WRAP inside
+    a step name is a legitimate reflow, and a pin that red on it would be pushed
+    back rather than obeyed. A renamed step still reds.
+    """
     for path in _INDEXNOW_PROBE_QUOTERS:
-        text = path.read_text(encoding="utf-8")
-        assert INDEXNOW_PROBE in text, (
-            f"{path.relative_to(REPO)} points a reader at an IndexNow deploy step that "
-            "does not exist — either the step was renamed or the pointer is stale"
-        )
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        for step in (INDEXNOW_PROBE, INDEXNOW_PROXY_PROBE):
+            assert " ".join(step.split()) in text, (
+                f"{path.relative_to(REPO)} points a reader at an IndexNow deploy step "
+                f"that does not exist ({step!r}) — either it was renamed or the "
+                "pointer is stale"
+            )
 
 
 def test_the_indexnow_gate_passes_when_the_surface_is_correct(tmp_path) -> None:
     rc, out, calls = _run_indexnow_gate(tmp_path)
     assert rc == 0, out
-    # Non-vacuity: it must have actually read the key file and both hops.
+    # Non-vacuity: it must have actually read the key file and the marketing hop.
     assert [c for c in calls if c.endswith(f"{_INDEXNOW_KEY}.txt")], calls
     assert any("tortoise.premiselabs.co" in c and c.endswith("notify-publish") for c in calls), calls
-    assert any("app.premiselabs.co" in c for c in calls), calls
+    # #2691, executably: the marketing gate must not touch the dashboard's origin
+    # at all — that surface is asserted by `deploy-dashboard`.
+    assert not [c for c in calls if "app.premiselabs.co" in c], calls
     assert "::error::" not in out, out
 
 
@@ -3296,8 +3391,16 @@ def test_the_indexnow_gate_passes_when_the_surface_is_correct(tmp_path) -> None:
         ({"ctype": "text/html"}, "is not text/plain"),
         ({"gate_code": "405"}, "did not refuse an anonymous caller"),
         ({"gate_body": '{"error":"not_signed_in"}'}, "did not refuse an anonymous caller"),
-        ({"proxy_code": "200"}, "did not answer the session gate"),
-        ({"proxy_body": '{"error":"unauthorized"}'}, "did not answer the session gate"),
+        # A provider blip is NOT "the route is gone" (#3485) — the message must
+        # say so, or the operator hunts a Function that was never deleted.
+        (
+            {"gate_code": "503", "gate_body": '{"error":"unavailable","message":"try later"}'},
+            "could not verify",
+        ),
+        (
+            {"gate_code": "503", "gate_body": '{"error":"not_configured"}'},
+            "required Pages binding is missing",
+        ),
     ],
 )
 def test_the_indexnow_gate_fails_for_each_broken_surface(tmp_path, argv: dict, needle: str) -> None:
@@ -3306,6 +3409,44 @@ def test_the_indexnow_gate_fails_for_each_broken_surface(tmp_path, argv: dict, n
     assert rc == 1, f"{argv} should have red the gate, got rc={rc}:\n{out}"
     assert "::error::" in out, out
     assert needle in out, out
+
+
+@pytest.mark.parametrize(
+    "argv,needle",
+    [
+        # the route is gone: the call falls through to the app SPA shell (200 HTML)
+        ({"proxy_code": "200", "proxy_body": "<!doctype html>"}, "did not answer the proxy's session gate"),
+        ({"proxy_code": "405", "proxy_body": ""}, "did not answer the proxy's session gate"),
+        # a 401 for the WRONG reason — the handler's own body, not the proxy's
+        (
+            {"proxy_body": '{"error":"unauthorized","message":"Session expired"}'},
+            "did not answer the proxy's session gate",
+        ),
+        # the proxy's own session-store path (#3485): could not verify, not "gone"
+        (
+            {"proxy_code": "503", "proxy_body": '{"error":"session_store_unavailable"}'},
+            "could not verify",
+        ),
+    ],
+)
+def test_the_indexnow_proxy_gate_fails_for_each_broken_surface(
+    tmp_path, argv: dict, needle: str
+) -> None:
+    rc, out, calls = _run_indexnow_proxy(tmp_path, **argv)
+    assert rc == 1, f"{argv} should have red the proxy gate, got rc={rc}:\n{out}"
+    assert "::error::" in out, out
+    assert needle in out, out
+    assert any("app.premiselabs.co" in c and c.endswith("notify-publish") for c in calls), calls
+
+
+def test_the_indexnow_proxy_gate_passes_when_the_route_answers(tmp_path) -> None:
+    rc, out, calls = _run_indexnow_proxy(tmp_path)
+    assert rc == 0, out
+    assert [c for c in calls if "app.premiselabs.co" in c and c.endswith("notify-publish")], calls
+    # Non-vacuity: it must NOT claim more than it proves. The admin gate is the
+    # marketing hop's; this one proves the route is there.
+    assert "session gate" in out, out
+    assert "::error::" not in out, out
 
 
 def test_the_indexnow_gate_retries_a_transport_blip_instead_of_failing(tmp_path) -> None:
@@ -3319,6 +3460,13 @@ def test_the_indexnow_gate_retries_a_transport_blip_instead_of_failing(tmp_path)
     assert rc == 0, out
     key_calls = [c for c in calls if c.endswith(f"{_INDEXNOW_KEY}.txt")]
     assert len(key_calls) == 2, f"the transport blip did not retry: {calls}"
+
+
+def test_the_indexnow_proxy_gate_retries_a_transport_blip_instead_of_failing(tmp_path) -> None:
+    """Same guard, same trap, on the dashboard hop (`|| proxy=000`)."""
+    rc, out, calls = _run_indexnow_proxy(tmp_path, fail_first=True)
+    assert rc == 0, out
+    assert len(calls) == 2, f"the transport blip did not retry: {calls}"
 
 
 def test_the_indexnow_gate_reads_the_constant_not_an_example_above_it(tmp_path) -> None:
