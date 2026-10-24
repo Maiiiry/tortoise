@@ -255,7 +255,7 @@ codex mcp add tortoise --url https://api.premiselabs.co/mcp/ --bearer-token-env-
       <p>In claude.ai go to <strong>Settings → Connectors → Add custom connector</strong>, name it <code>Tortoise</code>, and use the Server URL above. Claude Web has no environment to read a variable from, so its request header holds the key literally: <code>Authorization: Bearer YOUR_KEY</code>. The key is held by Anthropic in your account — keep it private and revoke it from the dashboard if it leaks.</p>
 
       <h4 id="chatgpt">ChatGPT</h4>
-      <p>Connect it once — ChatGPT is key-less, so there is no config file to edit and no key to store:</p>
+      <p>Connect it once — ChatGPT is key-less, so there is no config file to edit and no key to store. Custom connectors need a paid ChatGPT plan (<strong>Plus</strong> or higher).</p>
       <ol>
         <li>Open <code>chatgpt.com/plugins</code> → the <strong>Add</strong> button (top right) → <strong>Add custom MCP server</strong>.</li>
         <li>Fill in the dialog it opens:

@@ -63,10 +63,13 @@ export const servedSkillUrl = (name) => `${SERVED_SKILLS_ORIGIN}/skills/${name}/
 //
 // The archives are `.skill` files (a zip whose single entry is
 // `<name>/SKILL.md`): each downloads under its own filename, and several can be
-// picked in ONE upload. They are served by the DOCS origin — the same site that
-// publishes `website/skills/<name>/SKILL.md` — because the dashboard's
-// `public/` tree carries the documents, not the archives, and duplicating ~46 KB
-// of zips into it would be a second artifact to keep in step.
+// picked in ONE upload. They are built from the SERVED copies under
+// `public/skills/<name>/SKILL.md` and published by the DOCS origin under
+// `website/skills/`, because the dashboard's `public/` tree carries the
+// documents, not the archives, and duplicating the zips into it would be a
+// second artifact to keep in step. The deploy stages that directory but excludes
+// `*.md` at any depth, so only the `.skill` files (~21 KB in total) are published
+// from it — by design, since the documents are served from the app origin.
 //
 // The card lives on the APP origin, so these links are cross-origin, which means
 // browsers IGNORE the `download` attribute on them. The download is therefore
@@ -989,7 +992,8 @@ export function analyticsHarnessOf(leaf) {
 //     `get_tool`); chatgpt cannot, because its grant is built from `tools/list`
 //     and retired names are not advertised there, so its body names
 //     `tortoise_overview(section="health")` (wizardPrompts.js
-//     VERIFY_FILE_STEP_TEXT). The workflows prompt is asserted too, but it embeds
+//     ADVERTISED_VERIFY_FILE_STEP_TEXT / the legacy list). The workflows prompt is
+//     asserted too, but it embeds
 //     that same step-2 text, so it is a restatement, not second coverage;
 //   • the key never lands in a project-scoped/committable config (env-var
 //     indirection) — pinned on the rendered prompt, never on a literal (the

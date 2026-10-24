@@ -2,7 +2,14 @@
 // no jsdom/React needed) (#1998 W2 — universal command, surface 5).
 import { test } from 'node:test'
 import * as HARNESS_MODULE from './harnesses.js'
-import { wizardPromptText, wizardWorkflowsText } from './wizardPrompts.js'
+import {
+  ADVERTISED_VERIFY_FILE_STEP_TEXT,
+  LEGACY_VERIFY_HARNESSES,
+  WIZARD_STEP2_TEXT,
+  verifyFileStepText,
+  wizardPromptText,
+  wizardWorkflowsText,
+} from './wizardPrompts.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
@@ -254,22 +261,42 @@ test('DE2E-5: EVERY harness verifies through an ADVERTISED tool — the clause i
   assert.deepEqual(rendered.slice().sort(),
     ['chatgpt', 'claude', 'claude-desktop', 'claude-web', 'codex', 'cursor', 'pi'],
     'the verify contract covers every harness with a rendered surface')
+  // The legacy list is ASSERTED, not inferred: a leaf that is not named here must
+  // get the advertised call, so a future grant-based harness cannot silently
+  // inherit the retired name (the fail-open the reviewer found in the first cut
+  // of this guard, where `else` REQUIRED `tortoise_health` of any non-chatgpt
+  // harness — the guard itself pushed the next author at the wrong name).
+  assert.deepEqual([...LEGACY_VERIFY_HARNESSES].sort(),
+    ['claude', 'claude-desktop', 'claude-web', 'codex', 'cursor', 'pi'],
+    'the leaves that keep the legacy `tortoise_health` body, listed by name')
   for (const h of rendered) {
     const step2 = wizardPromptText(h, 2, KEY, 'included') || ''
     assert.match(step2, /tortoise_(health|overview)/, `${h}: rendered step 2 names the verify tool`)
     assert.match(step2, /tortoise_create_point/, `${h}: rendered step 2 files the first memory`)
-    if (h === 'chatgpt') {
+    if (LEGACY_VERIFY_HARNESSES.includes(h)) {
+      assert.match(step2, /tortoise_health/, `${h}: the shared body keeps the legacy name`)
+    } else {
       assert.match(step2, /tortoise_overview\(section="health"\)/,
-        'chatgpt: the verify call is the ADVERTISED tool (tools/list), not the retired alias')
+        `${h}: the verify call is the ADVERTISED tool (tools/list), not the retired alias`)
       assert.ok(!step2.includes('tortoise_health'),
-        'chatgpt: never the retired tortoise_health — it is absent from tools/list (#3883)')
+        `${h}: never the retired tortoise_health — it is absent from tools/list (#3883)`)
       // the same body must be what its step-1 first job ends with, or the
       // copyable prompt and the pinned step disagree.
-      assert.ok(wizardPromptText('chatgpt', 1, KEY, 'included').endsWith(step2),
-        'chatgpt: the first-job prompt must end with that same verify/file body')
-    } else {
-      assert.match(step2, /tortoise_health/, `${h}: the shared body keeps the legacy name`)
+      assert.ok(wizardPromptText(h, 1, KEY, 'included').endsWith(step2),
+        `${h}: the first-job prompt must end with that same verify/file body`)
     }
+  }
+  // POLARITY: an unregistered leaf gets the call EVERY client can make. This is
+  // the mutation the old `else` could not catch — a new harness whose branch
+  // calls verifyFileStepText() and is never classified here.
+  for (const unclassified of ['a-future-harness', 'codexDesktop']) {
+    assert.equal(verifyFileStepText(unclassified), ADVERTISED_VERIFY_FILE_STEP_TEXT,
+      `${unclassified}: an unregistered leaf must get the ADVERTISED verify call, `
+      + 'not the retired one — the default is the safe side')
+  }
+  for (const legacy of LEGACY_VERIFY_HARNESSES) {
+    assert.equal(verifyFileStepText(legacy), WIZARD_STEP2_TEXT,
+      `${legacy}: a config-writing leaf keeps the shared legacy body`)
   }
   // …and the connector leaves' other delivery surface: the workflows prompt. This is
   // belt-and-braces on the SAME fact, not independent coverage — WORKFLOWS_PROMPT

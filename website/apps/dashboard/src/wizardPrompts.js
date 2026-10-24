@@ -45,18 +45,24 @@ export const WIZARD_STEP2_TEXT = `Call tortoise_health to verify the connection,
 // grant-based client asks it for a call it can never make, so the verify half of
 // its first job fails or reports a missing tool.
 //
-// ONE table, so the two texts sit side by side and neither can drift into the
-// other's harness:
-export const VERIFY_FILE_STEP_TEXT = {
-  // Shared by every harness that reads a config file or runs an installer: the
-  // legacy name still answers there (`get_tool`), so the copy stays as it is.
-  default: WIZARD_STEP2_TEXT,
-  // Chatgpt: the ADVERTISED tool, i.e. the one a tool-grant client can call.
-  // tests/test_harness_mcp_config.py pins the same rule on the docs row.
-  chatgpt: `Call tortoise_overview(section="health") to verify the connection, then tortoise_create_point to file my first memory.\nDocs: https://tortoise.premiselabs.co/docs`,
-}
+// POLARITY: the ADVERTISED call is the DEFAULT and the legacy name is the
+// EXCEPTION, listed by name. That direction is what keeps the next harness safe
+// — a new leaf whose branch calls verifyFileStepText() without being registered
+// below gets the call every client can actually make, and the JS guard reds
+// until someone classifies it. The other polarity (default = legacy) would hand
+// a future grant-based harness a retired name silently, which is this very bug.
+export const ADVERTISED_VERIFY_FILE_STEP_TEXT = `Call tortoise_overview(section="health") to verify the connection, then tortoise_create_point to file my first memory.\nDocs: https://tortoise.premiselabs.co/docs`
 
-export const verifyFileStepText = (harness) => VERIFY_FILE_STEP_TEXT[harness] || VERIFY_FILE_STEP_TEXT.default
+//: The leaves that write a config file (or run the installer) and therefore see
+//: the RETIRED name answered on `get_tool`. #2827's shared body is correct for
+//: them, and only for them.
+export const LEGACY_VERIFY_HARNESSES = Object.freeze([
+  'pi', 'cursor', 'claude', 'codex', 'claude-desktop', 'claude-web',
+])
+
+export const verifyFileStepText = (harness) => (
+  LEGACY_VERIFY_HARNESSES.includes(harness) ? WIZARD_STEP2_TEXT : ADVERTISED_VERIFY_FILE_STEP_TEXT
+)
 
 export function wizardPromptText(harness, step, key, mode) {
   // #2865: the keyed URL comes from harnesses.js — a third hardcoded copy
@@ -141,7 +147,7 @@ export function wizardPromptText(harness, step, key, mode) {
     // does not have. Name the served document as the fallback instead.
     // The verify call is `tortoise_overview(section="health")`, NOT the retired
     // `tortoise_health`: a tool-grant client builds its grant from `tools/list`,
-    // which does not advertise retired names (see VERIFY_FILE_STEP_TEXT above).
+    // which does not advertise retired names (see ADVERTISED_VERIFY_FILE_STEP_TEXT).
     if (step === 1) return `You have Tortoise connected over MCP (the tortoise_* tools).\nRead the how-to-use-tortoise skill before your first write — it is the source of truth for how to add memories, the links between them, and when to use which. If it is not installed, read it at ${servedSkillUrl('how-to-use-tortoise')} first.\n${onboardingInstructions}\n${verifyFileStepText('chatgpt')}`
     if (step === 2) return verifyFileStepText('chatgpt')
   }

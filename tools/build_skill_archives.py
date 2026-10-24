@@ -4,7 +4,7 @@
 Why an archive at all (#9660): the ChatGPT skill uploader accepts ONLY a file
 named `SKILL.md`, a `.zip`, or a `.skill` (verified in the live UI — a file
 named `tortoise-file-finding.md` is refused: "Choose a .zip, .skill, or
-SKILL.md file"). Four skills therefore cannot ship as four `SKILL.md`
+SKILL.md file"). Several skills therefore cannot ship as several `SKILL.md`
 downloads: they collide in the user's Downloads folder, and the renamed copies
 are rejected. A `.skill` archive carries the skill folder inside it, so each
 file downloads with its own name and uploads as-is.

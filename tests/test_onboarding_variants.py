@@ -149,20 +149,21 @@ def assert_copies_parity(canonical: Path, mirror: Path) -> None:
 
 
 def test_m8_deploy_mirror_matches_canonical():
-    """The dashboard deploy mirror is byte-identical to the canonical
-    SKILL.md (drift-proofing — the old stage_variants concat guarantee
-    carried forward).
+    """The dashboard deploy mirror is byte-identical to the canonical SKILL.md
+    (drift-proofing — the old stage_variants concat guarantee carried forward).
 
-    #3673: every tracked copy is compared to the canonical one, so this is a
-    parity gate and not a one-file no-op gate. The two copies are the canonical
-    live skill and the dashboard deploy mirror; the `.skill` archives of the
-    THREE served skills are one hop further out and are covered by
-    test_9660_skill_archive_holds_exactly_its_own_skill, which compares each
-    archive's payload to its served `SKILL.md` byte for byte. #9660 briefly added
-    a THIRD copy of the onboarding document on the docs origin, for an archive
-    that made onboarding an installed skill — removed with that archive, because
-    #4365 says onboarding is read, not installed.
-    Watched failing in BOTH directions — a canonical-only edit and a served-only
+    #3673: a copy that cannot be read is a FAILURE, not a skip (see
+    assert_copies_parity), so this gate can never report a comparison it did not
+    perform. It compares the TWO copies of the onboarding document that exist —
+    the canonical live skill and the dashboard deploy mirror; #9660 briefly made
+    it three (a docs-origin copy, to build an archive that made onboarding an
+    installed skill) and removed it with that archive, because #4365 says
+    onboarding is READ, not installed. The `.skill` archives of the three served
+    skills are a different hop and are covered by
+    test_9660_skill_archive_holds_exactly_its_own_skill (archive payload vs the
+    served `SKILL.md`, byte for byte) plus
+    test_9660_skill_archive_is_built_from_the_SERVED_source (no third copy).
+    Watched failing in BOTH directions — a canonical-only edit and a mirror-only
     edit each exit non-zero — then restored to green."""
     assert_copies_parity(LIVE_SKILL, MIRROR_SKILL)
 
@@ -199,13 +200,13 @@ def test_9660_skill_archive_holds_exactly_its_own_skill(name):
 
     The ChatGPT uploader enforces the filename — a file named
     `tortoise-file-finding.md` is refused with "Choose a .zip, .skill, or
-    SKILL.md file" — so four skills cannot ship as four `SKILL.md` downloads:
-    they collide in the user's Downloads folder and the renamed copies are
-    rejected. The archive (verified accepted by the live uploader) carries the
+    SKILL.md file" — so several skills cannot ship as several `SKILL.md`
+    downloads: they collide in the user's Downloads folder and the renamed copies
+    are rejected. The archive (verified accepted by the live uploader) carries the
     skill folder, so each file keeps its own name.
 
     Two properties this pins, both observed in the live UI:
-    * exactly ONE skill per archive — a `.zip` holding four skill folders is
+    * exactly ONE skill per archive — a `.zip` holding several skill folders is
       rejected ("Couldn't upload this skill"), so merging them must fail here;
     * the entry is `<name>/SKILL.md` at the archive root, with the skill's own
       frontmatter `name`, which is how the uploader derives the skill name.

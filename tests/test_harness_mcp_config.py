@@ -961,6 +961,13 @@ class TestDocsPageAndSkillConfig:
         assert top_level.count("<li>") == 5, (
             "the ChatGPT procedure is 5 steps; if you deliberately changed the "
             "journey, update this count and the per-step literals together")
+        # #9660 owner ruling (copy): the plan floor is a CLAIM about OpenAI's
+        # product, so it is stated on BOTH surfaces — the docs row is the
+        # reference copy the served document points at, and a Free-plan visitor
+        # who reads only it must learn why the Add button is absent.
+        assert "paid ChatGPT plan" in row and "Plus" in row, (
+            "the ChatGPT row must warn that custom connectors need a paid "
+            "ChatGPT plan (Plus or higher)")
         # #9660: the hand-over is a `.skill` ARCHIVE per skill, not a `SKILL.md`
         # download. The uploader enforces the filename — a file named
         # `tortoise-file-finding.md` is refused ("Choose a .zip, .skill, or
@@ -2042,10 +2049,23 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     assert positions == sorted(positions), (
         "the ChatGPT journey is connect → install → first job; the blocks must "
         "render in that order")
-    # 4. The connector facts verified in the live UI.
-    for fact in ("chatgpt.com/plugins", "Add custom MCP server", "Create as a plugin",
-                 "settings/plugins-settings", "View details", "Connect", "Authorize"):
+    # 4. The connector facts verified in the live UI. Anchored to the MARKUP a
+    #    user reads, not to bare words: `Connect` alone matches the identifier
+    #    `wizardConnectHarness` on the branch line itself, so it would survive the
+    #    deletion of the OAuth-grant step it is meant to protect (found in review,
+    #    #9660).
+    for fact in ("chatgpt.com/plugins", "Add custom MCP server", "Create as a plugin</strong>",
+                 "settings/plugins-settings", "View details</strong>",
+                 "<strong>Connect</strong>", "Authorize</strong>"):
         after(fact)
+    # …and the GRANT is a sequence, so its three controls must be in order:
+    # View details → Connect → Authorize. Deleting the middle one (the only act
+    # that actually connects) reds this, which bare-word presence did not.
+    grant = [after(m) for m in ("View details</strong>", "<strong>Connect</strong>",
+                                "Authorize</strong>")]
+    assert grant == sorted(grant), (
+        "the OAuth grant reads View details → Connect → Authorize; the card must "
+        "render them in that order")
     assert "CANONICAL_MCP_URL" in main[branch:], (
         "the server URL must come from the constant, not a re-typed literal")
     # 5. The skill hand-off is an INSTALL of the real archives, not a prose
