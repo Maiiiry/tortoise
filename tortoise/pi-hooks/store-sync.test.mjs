@@ -981,6 +981,69 @@ test("the maxWindow high-water mark SURVIVES a reload so the guard cannot drift 
   assert.equal(recorded.maxWindow, 2, "maxWindow must round-trip through the cursor store");
 });
 
+test("a window that shrinks with NO compaction entry is refused too", async () => {
+  // #3515 review ISSUE 1: the length arm used to be gated on `compacted`, so the
+  // code was NARROWER than the invariant it printed ("a window may never SHRINK
+  // below what this file already delivered"). Pi's log is a TREE, so an active
+  // branch can also shorten without a compaction entry — and a shipped 4->2
+  // shrink is the same hard DETACH DELETE the guard exists to prevent.
+  const root = tmp("sessions-noshrink-");
+  const cursorDir = tmp("cursor-noshrink-");
+  const path = join(root, "s.jsonl");
+  const full = [
+    HEADER("sid-noshrink"),
+    entry("q0", null, "user", "q0"),
+    entry("a0", "q0", "assistant", "a0"),
+    entry("q1", "a0", "user", "q1"),
+    entry("a1", "q1", "assistant", "a1"),
+  ];
+  writeFileSync(path, `${full.join("\n")}\n`);
+  const first = stubFetch([200]);
+  const r1 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: first, ...FAST });
+  assert.equal(r1.shipped, 1);
+  assert.equal(first.calls[0].body.conversation.length, 4, "four turns delivered");
+  const before = statSync(path).size;
+
+  // The file GROWS while the ACTIVE BRANCH shortens: a new entry whose parentId
+  // is not the old leaf re-points the tree at a shorter chain. This is the
+  // reachable shape — a file that got shorter would re-anchor instead, which is
+  // the legitimate `_rewriteFile` case.
+  appendFileSync(path, `${entry("x1", null, "user", "a different branch")}\n`);
+  assert.ok(statSync(path).size > before, "the premise: the FILE grows");
+  const second = stubFetch([200]);
+  const r2 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: second, ...FAST });
+  assert.equal(second.calls.length, 0, "a branch shrink must NOT be posted");
+  assert.equal(r2.shrunk, 1, "the refusal is COUNTED, never silent");
+  assert.equal(r2.files[0].reason, "window_shrunk");
+  assert.equal(loadCursor(cursorDir).state.files[path].maxWindow, 4, "the high-water mark is kept");
+});
+
+test("a ZERO-BYTE session file is DEFERRED, not reported as a hard error", async () => {
+  // #3515 review ISSUE 2: an empty `.jsonl` is the normal on-disk state while Pi
+  // truncate-then-rewrites a file and between an explicit `--session` file being
+  // created and its first write. A 0-byte buffer has no partial line to detect,
+  // so `scan.partial` was false and the sweep reported `errors` + exit 1 on an
+  // ordinary transient. It must defer (cursor unmoved), like a torn header.
+  const root = tmp("sessions-empty-");
+  const cursorDir = tmp("cursor-empty-");
+  const path = join(root, "s.jsonl");
+  writeFileSync(path, "");
+  const fetchImpl = stubFetch([200]);
+  const receipt = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl, ...FAST });
+  assert.deepEqual(receipt.errors, [], "an empty file is a transient, never an error");
+  assert.equal(fetchImpl.calls.length, 0);
+  assert.equal(receipt.files[0].action, "partial");
+  assert.equal(loadCursor(cursorDir).state.files[path], undefined, "nothing is recorded for it");
+
+  // A file that HAS complete lines and still carries no session header is a
+  // genuinely foreign `.jsonl` and stays a hard error.
+  const foreign = join(root, "foreign.jsonl");
+  writeFileSync(foreign, `${entry("x", null, "user", "not a session")}\n`);
+  const f2 = stubFetch([200]);
+  const r2 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: f2, ...FAST });
+  assert.equal(r2.errors.length, 1, "a non-empty headerless file is still refused loudly");
+});
+
 test("a no-turns window is COUNTED as examined-but-awaiting, never as shipped", async () => {
   const root = tmp("sessions-noturns-");
   const cursorDir = tmp("cursor-noturns-");

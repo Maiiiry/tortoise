@@ -61,10 +61,14 @@
  *    refusal (401/403/407) is retained like 402, because crossing the cursor
  *    past it would destroy exactly the sessions this backstop exists for.
  *  - **A window may never SHRINK below what this file already delivered.**
- *    `activeBranch` cuts at a `compaction` entry, so a post-`/compact` window
- *    is strictly shorter; the turn store's shorter-re-capture rule then
- *    hard-DELETES the turns beyond the new window. So a shrinking window is
- *    REFUSED (cursor retained, counted) rather than shipped.
+ *    A shrink is not only a compaction: Pi's log is a TREE, so appending an
+ *    entry whose `parentId` points back past the old leaf makes the active
+ *    branch shorter while the FILE grows. Either way the turn store's
+ *    shorter-re-capture rule hard-DELETES the turns beyond the new window, so a
+ *    shrinking window is REFUSED (cursor retained, counted) rather than shipped.
+ *    The ONE exception is a RE-ANCHORED plan (truncate-then-rewrite, dev/ino or
+ *    header change): the cursor was reset to 0 and the file is being read as a
+ *    new one, so what was delivered before is not the same index space.
  *  - **Bounded per run** (piece 10): files SHIPPED, requests, and attempts. An
  *    up-to-date file is skipped from its `stat`, its header line and at most a
  *    64 KiB tail read (`completeThroughCheap`), so a sweep does not read whole
@@ -701,9 +705,14 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     }
     // Piece 6: the session id comes from the header, ONLY.
     const sessionId = scan.headerId;
-    if (!sessionId && scan.headerIndex === -1 && scan.partial) {
+    if (!sessionId && scan.headerIndex === -1 && (scan.partial || identity.size === 0)) {
       // The header line itself is half-written (a kill during Pi's
-      // truncate-then-rewrite). That is the partial-tail rule, not a defect:
+      // truncate-then-rewrite), OR the file is EMPTY — which is the normal
+      // on-disk state between that truncate and the rewrite, and between an
+      // explicit `--session` file being created and its first write. A 0-byte
+      // buffer has no partial line to detect (`lastEnd(0) < len(0)` is false), so
+      // `scan.partial` alone missed it and the sweep reported a HARD ERROR —
+      // `receipt.errors` non-empty, `main()` exit 1 — on an ordinary transient. That is the partial-tail rule, not a defect:
       // defer it and leave the cursor where it is. A permanently red sweep for
       // one torn historical file would be noise, not signal.
       receipt.files.push({
@@ -806,7 +815,27 @@ export async function runStoreSync(options: SyncOptions): Promise<RunReceipt> {
     // (`lastWindow = turns.length >= 1`), so they are what unproven means.
     const priorWindow = Math.max(prior?.maxWindow ?? 0, prior?.lastWindow ?? 0);
     const unproven = compacted && priorWindow === 0 && (prior?.delivered ?? 0) === 0;
-    if (compacted && (unproven || turns.length < priorWindow)) {
+    // `compacted` gates the UNPROVEN arm only, NOT the length arm. The invariant
+    // this guard states is "a window may never shrink below what this file
+    // already delivered", and a shrink is not a property of compaction: Pi's log
+    // is a TREE, so appending an entry whose `parentId` points back past the old
+    // leaf makes the active branch SHORTER while the file GROWS. A shipped
+    // shrink is the same hard DETACH DELETE the guard exists to prevent.
+    //
+    // `reanchored` is the exception, and it is not a loophole: when the plan
+    // re-anchored (`cursor_past_eof`, dev/ino, header sha/id), the cursor was
+    // reset to 0 and this file is being read as a NEW file, so "what was
+    // delivered" is not the same index space. That is exactly Pi's
+    // `_rewriteFile` (truncate, then rewrite for a migration or a label edit) —
+    // following it is the pinned behaviour of
+    // `a TRUNCATED file is re-read from the header, not skipped forever`.
+    //
+    // The length arm cannot fire on legitimate GROWTH: `extractTurns` tail-caps
+    // at MAX_TURNS, so `turns.length` saturates and is non-decreasing for a file
+    // that only appends. A refusal is the safe direction — the cursor is
+    // retained and the refusal is counted (`shrunk`), never silent.
+    const reanchored = plan.action === "reanchor";
+    if (unproven || (!reanchored && turns.length < priorWindow)) {
       // A dry run reports the refusal WITHOUT persisting it (see the dry-run
       // contract above): the report is the whole product of that mode.
       if (!dryRun) {
