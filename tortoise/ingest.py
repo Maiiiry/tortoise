@@ -222,17 +222,20 @@ def _document_is_pending(needs_extraction, doc_status, *,
     with the ``needs_extraction`` clear (``_do_upgrade``'s final SET), so a
     post-D10 node has no ``doc_status`` at all.
 
-    1. ``doc_status='captured'`` → PENDING, **even beside a stored
-       ``needs_extraction=false``** — that pair IS the legacy backlog. It means
-       "never PROVEN extracted", not "never extracted": the deleted
-       ``graph-scripts/backfill_doc_status.py`` stamped ``'captured'`` on every
-       ``:Document`` whose ``doc_status`` was NULL (``MATCH (d:Document) WHERE
-       d.doc_status IS NULL``), so a pre-``doc_status`` node that HAD been
-       extracted carries it too. Re-selecting such a node costs a
-       ``begin_ingest`` gate check, and the extraction runs only when the
-       content-hash/extractor-version key no longer matches — exact pre-D10
-       parity, which discovered on ``doc_status='captured' OR
-       needs_extraction=true``.
+    1. ``doc_status='captured'`` → PENDING, even beside a stored
+       ``needs_extraction=false``. ⛔ WHAT THIS ARM CAN AND CANNOT REACH (measured
+       at #5140 review round 3, and it is narrower than it looks): pre-D10 EVERY
+       document writer MERGEd a ``:Document {id}`` node (``_upsert_document``,
+       ``_event_plain_merge``, ``hosted_api``'s transcript MERGE), so the
+       historical backlog carries ``doc_status`` on a node **both readers here
+       exclude** (they MATCH ``:Source {url}``, and the labels are what they
+       are — ``migrate_kinds.py`` only SETs kind properties, it never relocates
+       a node between labels, and D10 shipped no relabel). This arm therefore
+       matches a ``:Source`` document whose retired marker SURVIVED — an
+       operator/graph that was relabelled — and nothing this product writes
+       today (the post-D10 fold REMOVEs ``doc_status``). Reaching the un-migrated
+       population is the relabel migration #5140 finding 8 asks for, NOT a
+       precedence choice, and it is deliberately not attempted here.
     2. ``doc_status='extracted'`` → done. It is a completion record, and it
        outranks a stale ``needs_extraction=true``; without that precedence a
        sweep would re-discover a document the per-document path always skips.
@@ -259,8 +262,18 @@ def _document_is_pending(needs_extraction, doc_status, *,
        ``objectType='Document'`` branch, which stamps
        ``documentKind='transcript'``), and selecting those would queue every
        captured session for LLM extraction. ``--include-unstamped`` is the
-       operator's explicit opt-in to that wider population — the discoverability
-       half of the deleted ``graph-scripts/backfill_doc_status.py``, as a read.
+       operator's explicit opt-in to that wider population.
+
+    ⛔ The REBUILT-graph legacy shape is NOT covered, and that is a decision this
+    PR deliberately did not take. Replaying a pre-D10 journal folds the old
+    record's boilerplate ``needs_extraction=false`` onto a ``:Source`` and scrubs
+    ``doc_status``, so such a document reads as arm 5 (done) although it was
+    never extracted. Telling it apart from a REAL completion needs extraction
+    evidence — ``contentHash`` (written only by the extracting path, #5422) or a
+    journal read — and neither is a clean discriminator by itself: extractions
+    predating #5422 carry no anchor, and the transcript genre (which must NOT be
+    swept) carries none either. That is a product decision with a real
+    re-extraction cost, recorded on #5140, not a default to flip here.
 
     Completion must therefore clear BOTH when it can (see ``_do_upgrade``): an
     upgrade that only cleared ``needs_extraction`` would leave
@@ -268,7 +281,9 @@ def _document_is_pending(needs_extraction, doc_status, *,
     forever. On the SWEEP path, a document it cannot complete (unreadable path,
     file gone, no ``##`` sections, content already claimed at this extractor
     version) deliberately KEEPS its marker and is reported in its own bucket —
-    clearing it would silently record "extracted" for work that never ran. The
+    clearing it would record "extracted" for work that never ran. A PARTIAL
+    extraction (``failed_sections``) still clears, matching pre-D10 — the
+    sections that succeeded are written, and the bucket is reported. The
     explicit ``--upgrade`` path is the pre-D10 behaviour and DOES clear after a
     "no ## sections" outcome: the operator named that document, there is nothing
     to extract, and it says so.
@@ -408,7 +423,14 @@ def _do_upgrade(transcript, text, source_id, proj, api, args):
         "SET s.needs_extraction = false REMOVE s.doc_status",
         params={"id": source_id},
     )
-    print("  needs_extraction: true → false")
+    # Print the transition that actually happened: the pre-fix line said
+    # "true → false" unconditionally, but this path now also admits documents
+    # whose stored value was false, absent, or a `draft` marker — so the
+    # operator would read "upgrading X (needs_extraction=False)" followed by
+    # "needs_extraction: true → false" (review round 3, P2).
+    print(f"  needs_extraction: {needs_ext} → False")
+    if doc_status is not None:
+        print(f"  doc_status: {doc_status!r} → removed (retired by D10)")
 
     # 5. Lazy EP re-propagation on affected subgraph (#133 Task 3)
     _run_ep_propagation(proj, api)
@@ -434,9 +456,11 @@ def _discover_pending_documents(proj, *, include_unstamped: bool = False) -> lis
     ``other_legacy_is_pending=False``, its value for the sweep), so a change to
     one that is not made to the other is a visible diff in the same commit.
 
-    * ``doc_status = 'captured'`` — the pre-D10 capture marker, pending EVEN
-      beside the boilerplate ``needs_extraction=false`` the old writer stamped.
-      A second source of this marker is the deleted
+    * ``doc_status = 'captured'`` — a surviving pre-D10 capture marker (a
+      relabelled graph: the marker rode the retired ``:Document`` label, so a
+      node that still has it on ``:Source`` was moved there deliberately).
+      Pending even beside the boilerplate ``needs_extraction=false`` the old
+      writer stamped. A second source of this marker is the deleted
       ``graph-scripts/backfill_doc_status.py``, which stamped it on every
       ``:Document`` with a NULL ``doc_status`` — so it means "never PROVEN
       extracted", and a node it stamps is re-selected even if it had been
@@ -474,9 +498,10 @@ def _do_upgrade_all(proj, api, args):
 
     D10 (ONTOLOGY v3.15 §4.4): ``doc_status`` is retired — the extraction
     signal is ``needs_extraction``, set true by the ``--capture-metadata`` path
-    and cleared here after a successful extraction. The retired
-    ``doc_status='captured'`` marker is still honoured as a PENDING claim so the
-    pre-D10 backlog stays discoverable (#5140 finding 3); the rule lives in
+    and cleared here after a successful extraction. A SURVIVING
+    ``doc_status='captured'`` marker is still honoured as a PENDING claim (a
+    relabelled/legacy graph; the un-migrated ``:Document`` population is #5140
+    finding 8's relabel, not this sweep's); the rule lives in
     ``_discover_pending_documents`` / ``_document_is_pending``, never inline.
 
     Uses inline Cypher via proj.g.query (no SDK method needed — plan §Task 2).
@@ -629,7 +654,8 @@ def _do_upgrade_all(proj, api, args):
             "SET s.needs_extraction = false REMOVE s.doc_status",
             params={"id": source_id},
         )
-        print("    needs_extraction: true → false")
+        print(f"    needs_extraction: {needs_ext} → False"
+              + (f", doc_status: {doc_status!r} → removed" if doc_status is not None else ""))
         upgraded += 1
 
     # Lazy EP re-propagation ONCE after all upgrades (#133 Task 3 — review P2:
@@ -753,14 +779,18 @@ def main(argv=None):
                     help="#133: discover needs_extraction document Sources and upgrade each")
     ap.add_argument("--include-unstamped", action="store_true",
                     help="#5140: with --upgrade-all, also select document Sources "
-                         "that carry NO extraction signal at all. The default sweep "
-                         "selects an explicit needs_extraction=true or the pre-D10 "
-                         "doc_status='captured' marker; the sanctioned session-capture "
-                         "writer mints transcripts with no signal, so widening the "
-                         "sweep to them is an explicit choice. This is the "
-                         "discoverability half of the deleted "
-                         "graph-scripts/backfill_doc_status.py, as a read (nothing is "
-                         "written by selecting).")
+                         "that carry NO `needs_extraction` property at all. The default "
+                         "sweep selects an explicit needs_extraction=true or a "
+                         "surviving doc_status='captured' marker; the sanctioned "
+                         "session-capture writer mints transcripts with no signal, so "
+                         "widening the sweep to them is an explicit choice. "
+                         "⛔ It does NOT select a document whose stored "
+                         "needs_extraction=false came from a REPLAYED pre-D10 record "
+                         "(that value is indistinguishable from a real completion "
+                         "without extraction evidence — see #5140), and it does NOT "
+                         "see un-migrated :Document-labelled nodes at all (no relabel "
+                         "migration exists yet — #5140 finding 8). Selecting writes "
+                         "nothing.")
     args = ap.parse_args(argv)
 
     # #5140: --include-unstamped is a discovery MODIFIER, not a mode — it can

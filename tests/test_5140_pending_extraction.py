@@ -564,12 +564,103 @@ def test_upgrade_all_not_a_document_bucket_is_stable_across_runs(monkeypatch):
     assert "already processed" not in second, second
     # The document is still pending (the sweep never completed it) …
     assert _read(uri, doc.name) == (False, "captured")
-    # … and no IngestStarted claim was journaled for it.
+    # … and the first run did not CLAIM the content, which is what the two
+    # bucket assertions above prove: a minted claim is exactly what makes the
+    # second run say "already processed". (An earlier version of this test also
+    # counted nodes whose `content` contains the path — vacuous, because
+    # `IngestStarted` has no projection effect at all: `record_projection.py`
+    # folds it to a no-op. Review round 3, P2.)
+
+
+# ── what this sweep CANNOT reach — pinned, so it is not re-claimed ─────────
+#
+# Review round 3 measured both of these and refused to accept a green suite as
+# proof of coverage. They are boundaries of the FIX, not of the bug: reaching
+# them is a migration (#5140 finding 8) and a product decision respectively.
+# Pinning them here means the next lane that changes either has to change a
+# test whose docstring says why, instead of discovering the gap from a corpus
+# that silently never got upgraded.
+
+@_live_db
+def test_sweep_cannot_reach_unmigrated_document_labelled_nodes():
+    """The historical backlog lives on ``:Document {id}`` — a label BOTH readers
+    exclude, because D10 shipped no relabel and ``migrate_kinds`` only SETs kind
+    properties (it cannot relocate a node between labels).
+
+    So a pre-D10 capture with ``doc_status='captured'`` on its ``:Document`` node
+    is NOT selected — not by the default sweep, not with ``--include-unstamped``.
+    Closing that is the relabel migration #5140 finding 8 asks for; this test
+    exists so nobody reads the ``doc_status`` arm as having covered it.
+    """
+    from tortoise.ingest import _discover_pending_documents
+
+    if not _require_live_falkor():
+        return
+    uri = _live_uri(f"test_5140_legacylab_{os.urandom(4).hex()}")
+    _reset(uri)
     proj = FalkorProjection.from_uri(uri)
     try:
-        claims = proj.g.query(
-            "MATCH (n) WHERE n.content CONTAINS 'no_sections.md' RETURN count(n)"
-        ).result_set
+        # The EXACT pre-D10 shape: `:Document`, keyed `id`, marker present.
+        proj.g.query(
+            "CREATE (d:Document {id:'doc/pre-d10.md', title:'Pre D10', "
+            "documentKind:'research', doc_status:'captured', "
+            "needs_extraction:false, sourcePath:'/corpus/pre-d10.md'})"
+        )
+        assert _discover_pending_documents(proj) == [], (
+            "an un-migrated :Document node is not reachable by the sweep — if "
+            "this now selects one, the relabel migration (#5140 finding 8) "
+            "landed and this boundary test should be updated")
+        assert _discover_pending_documents(proj, include_unstamped=True) == [], (
+            "--include-unstamped must not reach :Document-labelled nodes either")
     finally:
         proj.close()
-    assert claims[0][0] == 0, f"a claim was minted for a no-sections document: {claims}"
+
+
+@_live_db
+def test_include_unstamped_does_not_reach_a_replayed_legacy_false(monkeypatch):
+    """A REPLAYED pre-D10 record folds a boilerplate ``needs_extraction=false``
+    onto a ``:Source`` and scrubs ``doc_status``, so it reads as completed.
+
+    ``--include-unstamped`` widens only the no-property arm, so it does not
+    select this shape either. Distinguishing it from a REAL completion needs
+    extraction evidence (``contentHash``, #5422 — absent for extractions that
+    predate it, and absent for transcripts too), which is a product decision
+    recorded on #5140, not a default this command flips.
+    """
+    from tortoise.ingest import _discover_pending_documents
+
+    if not _require_live_falkor():
+        return
+    uri = _live_uri(f"test_5140_replayed_{os.urandom(4).hex()}")
+    _reset(uri)
+    base = tempfile.mkdtemp(prefix="tortoise_5140_corpus_")
+    monkeypatch.setenv("TORTOISE_INGEST_BASE_DIR", base)
+    doc = Path(base) / "replayed_legacy.md"
+    doc.write_text(TEXT, encoding="utf-8")
+    # No doc_status (fold scrubbed it), boilerplate false from the old payload.
+    _seed_document(uri, doc.name, str(doc), needs_extraction=False)
+
+    proj = FalkorProjection.from_uri(uri)
+    try:
+        assert _discover_pending_documents(proj) == []
+        assert _discover_pending_documents(proj, include_unstamped=True) == [], (
+            "--include-unstamped is documented as selecting documents with NO "
+            "needs_extraction PROPERTY; a stored false must not be swept. If "
+            "this changes, the evidence-based rule landed and this test (and "
+            "the help text) must be updated deliberately")
+    finally:
+        proj.close()
+    # … and the EXPLICIT command does not reach it either: the replayed
+    # boilerplate `false` is read as a completion by every reader, including the
+    # operator naming the file. That is the second half of the open decision —
+    # ignoring a stored `false` here would reverse the D10 expectation pinned by
+    # `tests/test_ingest.py::test_upgrade_on_already_extracted_is_noop`, so it is
+    # recorded on #5140 rather than flipped in a P1 bugfix.
+    out = _run([str(doc), "--db", uri,
+                "--log", _tmp("events.jsonl"), "--out", _tmp("graph.html"),
+                "--upgrade", "--point-model", "mock:cheap",
+                "--relation-model", "mock:reason"], capture=True)
+    assert "doc already extracted, skipped" in out, (
+        "the replayed legacy shape became reachable — if that is deliberate, "
+        "the discriminator is now extraction evidence and BOTH this test and the "
+        f"help text must change deliberately:\n{out}")
