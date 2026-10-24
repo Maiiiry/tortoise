@@ -3213,9 +3213,9 @@ def test_9192_guard_runs_on_the_diff_that_can_break_it():
 
 
 def test_9664_capstone_runs_on_the_middleware_diff_that_can_break_it():
-    # #9664 review P2: `tests/test_9664_capstone_connector_to_record.py` is the
-    # end-to-end pin of "an authenticated CONNECTOR request reaches the record
-    # under the request's OWN tenant". It was registered `core`-only, and
+    # `tests/test_9664_capstone_connector_to_record.py` is the end-to-end pin of
+    # "an authenticated CONNECTOR request reaches the record under the request's
+    # OWN tenant". It was registered `core`-only, and
     # `tortoise/mcp_auth.py` — the per-request tenant install it drives, AND the
     # module that produces the 401 body its refusal leg asserts — is an EXACT
     # `SOURCE_PATTERNS["api"]` entry, so a middleware-only diff selects `api` and

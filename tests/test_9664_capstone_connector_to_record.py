@@ -19,13 +19,13 @@ Each leg below is the measurable form of one of the capstone's four questions,
 and the ABSENCE that motivated each is named on it. What is proven elsewhere and
 is therefore CITED rather than duplicated:
 
-* **step 2 — the served skill equals the repo.** `tests/test_onboarding_variants.py`
+* **the served skill equals the repo.** `tests/test_onboarding_variants.py`
   pins the dashboard deploy mirror byte-for-byte (`test_m8_deploy_mirror_matches_canonical`)
   and the `.skill` archive payload against its served `SKILL.md`
   (`test_9660_skill_archive_holds_exactly_its_own_skill`). Measured at
   `a999be41e`: `diff tortoise/onboarding/SKILL.md
   website/apps/dashboard/public/skills/tortoise-onboarding/SKILL.md` → identical.
-* **step 2's copy is not merely stored but ADVERTISED-name-clean.**
+* **the served skill's copy is not merely stored but ADVERTISED-name-clean.**
   `test_9660_chatgpt_first_job_names_only_ADVERTISED_tools` asserts the rendered
   ChatGPT first job names no retired tool. The same rule applied to the tool
   DESCRIPTIONS is `test_a_live_tool_description_never_recommends_a_retired_tool`
@@ -63,11 +63,11 @@ import pytest
 #: `test-record-postgres` job exports (`.github/actions/postgres-provision`).
 RECORD_DB_ENV = "TEST_RECORD_DB_URI"
 
-#: The tools this file drives, in order: verify, file the first memory, then read
-#: it back by id — plus the two listing tools the capstone's step 3 exercises.
-#: The served ChatGPT first job names only the first two (verify, then file), so
-#: this tuple is a SUPERSET of that job rather than a transcription of it; the
-#: read-back and the listing pair come from the capstone's own journey.
+#: The tools this file ASSERTS ARE ADVERTISED: the three it drives — verify,
+#: file the first memory, read it back by id — plus `tortoise_query` and
+#: `tortoise_list_graphs`, which it only checks are granted, never calls. The
+#: served ChatGPT first job names only the first two (verify, then file), so
+#: this tuple is a SUPERSET of that job rather than a transcription of it.
 #: `tortoise_health` is deliberately NOT here — it is retired (#3883), so it is
 #: absent from `tools/list` and a connector's tool grant cannot contain it. The
 #: served skill already says so (`tortoise/onboarding/SKILL.md`, the
@@ -157,7 +157,7 @@ def _assert_call_succeeded(body, what):
 
     ⚠️ `mcp_server._safe` deliberately produces the OTHER shape — an ORDINARY
     successful result carrying `{"error": …}` (`_SafeError`), `isError` false.
-    Pairing the two producers is the mistake `_SafeError`'s own module docstring
+    Pairing the two producers is the mistake `_SafeError`'s class docstring
     spends its length keeping apart ("two separate questions, two separate
     gates"), and it is why the verify step's payload check below cannot rely on
     the absence of `error`: only POSITIVE evidence separates the two.
@@ -176,7 +176,8 @@ def _assert_healthy_verify_payload(payload):
 
     ⛔ NOT `"error" not in payload` ALONE: `_SafeError` — a
     dict subclass whose only key is `error`, returned as an ORDINARY successful
-    `tools/call` result and never as `isError` (`mcp_server._safe`: "every tool
+    `tools/call` result and never as `isError` (the J-6 error-contract note,
+    `mcp_server.py`: "every tool
     returns the SDK result on success or `{"error": message}` on failure") — is
     the shape a RAISED exception in `tortoise_health()` produces. Neither
     `isError` nor a JSON-RPC `error` key accompanies it, and an empty/absent
@@ -429,8 +430,8 @@ def test_an_unauthenticated_connector_gets_a_legible_refusal(connector, monkeypa
     All three layer tables the fold touches are then asserted empty, because
     `point` alone would miss a partial write that stopped at the identity row.
 
-    ⛔ THE TENANT-SCOPED COUNTS ARE NOT THE WHOLE RECORD HALF (P3, PR #9852
-    review): they only see a row under the tenant THIS fixture resolved, so a
+    ⛔ THE TENANT-SCOPED COUNTS ARE NOT THE WHOLE RECORD HALF: they only see a
+    row under the tenant THIS fixture resolved, so a
     regressed tenancy resolver that installed a different (default/static)
     tenant would write happily and leave all three at 0. Two further assertions
     close that: a GLOBAL count on this leg's own unique payload, and an unmoved
@@ -599,7 +600,8 @@ def test_one_onboarding_call_reaches_the_record_and_its_id_reads_back(
       distinguishable from "landed";
     * the **identifier** is asserted to be the record's own `node_key`, and then
       used again through a second call — an id that reads nothing back is not an
-      identifier a user can reuse, which is what step 3 of the capstone asks for;
+      identifier a user can reuse, which is what the capstone's graph and read
+      steps ask for;
     * the **content** is asserted, so a row that exists with the wrong payload
       cannot pass as a record.
     """
