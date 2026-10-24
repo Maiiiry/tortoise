@@ -1,4 +1,4 @@
-// tortoise-hook-version: 9
+// tortoise-hook-version: 10
 // tortoise-capture — the in-repo Pi capture extension (#3575, #1727 T1).
 //
 // The `tortoise-hook-version` marker above is the install-contract generation
