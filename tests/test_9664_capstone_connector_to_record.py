@@ -163,22 +163,36 @@ def _assert_call_succeeded(body, what):
 def _assert_healthy_verify_payload(payload, body):
     """The journey's verify step really measured a healthy graph.
 
-    ⛔ NOT `"error" not in payload` (P2, PR #9852 review): `monitoring.metrics()`
-    exists to report a failure **truthfully without raising**, and its payload has
-    no `error` key — `"degraded" means an OBSERVED probe FAILURE`
-    (`tortoise/monitoring.py`) and `graph_size_error is None` is the marker that
-    the size was actually MEASURED. Asserting the absence of a key the healthy and
-    the broken report both lack cannot tell them apart; these are the report's own
-    success terms instead.
+    ⛔ NOT `"error" not in payload` ALONE (P2, PR #9852 review): `_SafeError` — a
+    dict subclass whose only key is `error`, returned as an ORDINARY successful
+    `tools/call` result and never as `isError` (`mcp_server._safe`: "every tool
+    returns the SDK result on success or `{"error": message}` on failure") — is
+    the shape a RAISED exception in `tortoise_health()` produces. Neither
+    `isError` nor a JSON-RPC `error` key accompanies it, and an empty/absent
+    result carries no `error` either, so the check has to demand POSITIVE evidence.
+
+    The positive terms are `monitoring.metrics()`'s own:
+
+    * `status == "ok"` is the report's success verdict, and it is set only when
+      the db probe observed success (`monitoring.py`, the `db["ok"] is True`
+      branch) — so it is False for the `degraded`/`unknown` and the
+      `_SafeError`/empty shapes alike (they carry no `status` at all);
+    * `graph_size_error is None` stays because it is the UNIQUE marker that
+      `graph_size` was really MEASURED — a 0 from a failed count is otherwise
+      indistinguishable from a genuinely empty graph (#3253).
+
+    The `db.ok` clause the first cut carried was dropped: `status` is DERIVED
+    from `db["ok"]` (`monitoring.py`), so it could never fail once `status` had
+    been asserted — a check with no failure behind it.
     """
-    assert payload.get("status") != "degraded", (
-        "the journey's verify step reported a DEGRADED graph — the probe ran and "
-        f"failed, so nothing downstream of it is measured: {json.dumps(payload)[:600]}")
+    assert payload.get("status") == "ok", (
+        "the journey's verify step did not report a measured-healthy graph — "
+        "`status` is `ok` only when the probe observed success, so a degraded, "
+        "unknown, empty or `_SafeError` payload cannot pass here: "
+        f"{json.dumps(payload)[:600]}")
     assert payload.get("graph_size_error") is None, (
         "the journey's verify step could not MEASURE the graph size, so its "
-        f"graph_size is not evidence of an empty graph: {json.dumps(payload)[:600]}")
-    assert (payload.get("db") or {}).get("ok") is not False, (
-        f"the journey's verify step reports the db probe as failed: {json.dumps(body)[:600]}")
+        f"graph_size is not evidence of an empty graph: {json.dumps(body)[:600]}")
 
 
 # ── the record's database, provisioned the way the CI job provisions it ────
@@ -484,8 +498,11 @@ def test_the_verify_step_assertions_reject_the_failure_envelopes_they_name():
     the healthy report must pass, so this cannot be satisfied by a check that
     always raises.
 
-    Mutation check: restore `assert "error" not in _tool_payload(body)` → every
-    `pytest.raises` below fails, because that spelling passes all four.
+    Mutation check: restore `assert "error" not in _tool_payload(body)` for the
+    call check → every `pytest.raises` below fails, because that spelling passes
+    all four. The POSITIVE cases matter as much as the raises: a check that
+    always fails, or one that rejects the `_SafeError`/empty shapes only by
+    accident, would otherwise satisfy this test.
     """
     protocol_error = {"jsonrpc": "2.0", "id": 1,
                       "error": {"code": -32603, "message": "boom"}}
@@ -505,6 +522,23 @@ def test_the_verify_step_assertions_reject_the_failure_envelopes_they_name():
     with pytest.raises(AssertionError):
         _assert_call_succeeded(tool_error, "the journey's verify step")
 
+    # the POSITIVE half, so "the check always raises" cannot satisfy this test
+    _assert_call_succeeded({"jsonrpc": "2.0", "id": 1,
+                            "result": {"content": [], "isError": False}},
+                           "a healthy call")
+
+    # ⛔ the shapes the FIRST cut of this fix let through (P2, PR #9852 review):
+    # `_SafeError` is a dict with only `error`, returned as a SUCCESSFUL result;
+    # an empty result and a missing result carry no `error` key at all.
+    safe_error = {"error": "Authentication required. MCP transport mode not "
+                           "initialized."}
+    with pytest.raises(AssertionError):
+        _assert_healthy_verify_payload(safe_error, {"result": {}})
+    with pytest.raises(AssertionError):
+        _assert_healthy_verify_payload({}, {"result": {}})
+    with pytest.raises(AssertionError):
+        _assert_healthy_verify_payload({"content": []}, {"result": {}})
+
     degraded = {"status": "degraded", "db": {"ok": False}, "graph_size": 0,
                 "graph_size_error": "graph_size_unavailable: db probe failed"}
     with pytest.raises(AssertionError):
@@ -514,6 +548,13 @@ def test_the_verify_step_assertions_reject_the_failure_envelopes_they_name():
                   "graph_size_error": "graph_size_unavailable: timed out"}
     with pytest.raises(AssertionError):
         _assert_healthy_verify_payload(unmeasured, {"result": {}})
+
+    # `status: degraded` with a MEASURED size is still a failure (the db probe
+    # failed for a reason that is not the count) — the status term is load-bearing.
+    measured_but_degraded = {"status": "degraded", "db": {"ok": False},
+                             "graph_size": 7, "graph_size_error": None}
+    with pytest.raises(AssertionError):
+        _assert_healthy_verify_payload(measured_but_degraded, {"result": {}})
 
     healthy = {"status": "ok", "db": {"ok": True}, "graph_size": 0,
                "graph_size_error": None}
@@ -728,10 +769,24 @@ def test_the_retired_name_matcher_reads_whole_tool_names_not_substrings():
     `_retired_names_in_text` → the first assertion reds (the live
     `tortoise_get_entity` is reported as naming retired `tortoise_get`) and the
     second reports two names where one is written. Measured, not assumed.
+
+    The last assertion pins the INSTRUMENT: a name whose spelling falls outside
+    `tortoise_[a-z0-9_]+` would be invisible to the matcher, i.e. a stale
+    description naming it would measure CLEAN without having been looked at
+    (P3, PR #9852 review). Every name in both registries matches today; this reds
+    on the first one that does not, so the matcher is re-examined instead of
+    silently under-reporting.
     """
     from tortoise import tool_registry as tr
 
     retired = {t.name for t in tr.RETIRED_TOOL_REGISTRY}
+    assert all(_TOOL_NAME_TOKEN.fullmatch(t.name)
+               for t in (*tr.TOOL_REGISTRY, *tr.RETIRED_TOOL_REGISTRY)), (
+        "a registry tool name is not spellable as a `tortoise_*` token, so "
+        "`_retired_names_in_text` cannot see it and a stale description naming "
+        "it would measure clean: fix the token pattern before trusting the "
+        f"measurement. Unmatched: "
+        f"{sorted(t.name for t in (*tr.TOOL_REGISTRY, *tr.RETIRED_TOOL_REGISTRY) if not _TOOL_NAME_TOKEN.fullmatch(t.name))!r}")
     assert _retired_names_in_text('use tortoise_get_entity(id, type="point")',
                                   retired) == (), (
         "the LIVE canonical read tool is reported as a retired name — the "
