@@ -842,13 +842,23 @@ jobs:
             # Naming them is the difference between an operator re-running the job
             # and an operator hunting a deleted Function (the #3485 class: a
             # provider blip must never be reported as an absent route).
-            case "$gate_body" in
-              *'"unavailable"'*)
+            # The status is part of the subject, not only the body: an empty or
+            # HTML 503 body is the common shape, and keying on the body alone let it
+            # fall through to the arm that blames the route.
+            case "$gate|$gate_body" in
+              503*'"unavailable"'*)
                 echo "::error::could not verify /blog/api/notify-publish — the admin gate answered 503 unavailable (session store / admin lookup outage, #3485). NOT a missing route; re-run the job and nothing about the route is disproven." ;;
-              *'"not_configured"'*)
+              503*'"not_configured"'*)
                 echo "::error::/blog/api/notify-publish answered 503 not_configured — a required Pages binding is missing on the premise-labs project, so the route cannot answer anything (this one IS a config fault)." ;;
+              # ANY other 503 (an edge/platform 503, an empty body, an HTML error
+              # page) is the same #3485 class: nothing about the route is disproven,
+              # and calling it "did not refuse an anonymous caller" would send the
+              # operator hunting a deleted Function. The sibling app-origin step
+              # already handles this shape this way.
+              503*)
+                echo "::error::could not verify /blog/api/notify-publish — the answer was ${gate%|*} (body: ${gate_body:-<empty>}), which is an outage, not a missing route (#3485). Re-run the job; nothing about the route is disproven." ;;
               *)
-                echo "::error::/blog/api/notify-publish did not refuse an anonymous caller with the admin gate (status $gate) — the console's publish would submit nothing, and nothing else would say so." ;;
+                echo "::error::/blog/api/notify-publish did not refuse an anonymous caller with the admin gate (status $gate, body: ${gate_body:-<empty>}) — the console's publish would submit nothing, and nothing else would say so." ;;
             esac
             exit 1
           fi
@@ -1282,7 +1292,7 @@ jobs:
       # ── #9680: the app-origin hop the publish console ACTUALLY crosses ──
       # The console does not POST the marketing origin: it calls
       # `/blog/api/notify-publish` on THIS origin and the BFF proxy
-      # (`apps/dashboard/functions/blog/api/[[path]].ts`) forwards it upstream.
+      # (`website/apps/dashboard/functions/blog/api/[[path]].ts`) forwards it upstream.
       # A route that stopped shipping is silent from the server side — one line
       # in a browser console, and no publish would submit anything — so it is
       # asserted here.

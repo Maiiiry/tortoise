@@ -3483,6 +3483,16 @@ def test_the_indexnow_gate_passes_when_the_surface_is_correct(tmp_path) -> None:
             {"gate_code": "503", "gate_body": '{"error":"not_configured"}'},
             "required Pages binding is missing",
         ),
+        # An UNRECOGNISED 503 — an edge/platform 503, an empty body, an HTML error
+        # page — is the same #3485 class as the two named ones and must not be
+        # reported as "did not refuse an anonymous caller": that sends an operator
+        # hunting a deleted Function during a provider outage. The status-only
+        # fallback used to say exactly that.
+        ({"gate_code": "503", "gate_body": ""}, "could not verify"),
+        (
+            {"gate_code": "503", "gate_body": "<html><body>503</body></html>"},
+            "could not verify",
+        ),
     ],
 )
 def test_the_indexnow_gate_fails_for_each_broken_surface(tmp_path, argv: dict, needle: str) -> None:
@@ -3669,3 +3679,35 @@ def test_the_indexnow_gate_reports_an_extractor_fault_without_touching_the_site(
     assert "EXTRACTOR fault" in out, out
     assert "is not served" not in out, f"an extractor fault blamed the deploy: {out}"
     assert calls == [], f"an unreadable constant still made requests: {calls}"
+
+
+@pytest.mark.parametrize(
+    "module,needle",
+    [
+        # The two constant-VALIDATION arms. Both are load-bearing in the same way:
+        # a value that is not 32 lowercase hex is not a key an engine will accept,
+        # and — the reason they exist — a request made with it fails at the endpoint
+        # and gets reported as a DEPLOY fault, sending the operator to debug a site
+        # that is fine.
+        (
+            'export const INDEXNOW_KEY = "A7C41F0E9B2D63584E1C0AF7D3B925E6";\n',
+            "not lowercase hex",
+        ),
+        (
+            'export const INDEXNOW_KEY = "a7c41f0e9b2d63584e1c0af7d3b925e6dead";\n',
+            "36 characters",
+        ),
+        # Uppercase hex would ALSO pass a [0-9a-z] anchor check, so the case is a
+        # real shape rather than a hypothetical one.
+    ],
+)
+def test_the_indexnow_gate_validates_the_constant_before_it_requests_anything(
+    tmp_path, module: str, needle: str
+) -> None:
+    """A syntactically readable but INVALID constant is an EXTRACTOR fault too."""
+    rc, out, calls = _run_indexnow_gate(tmp_path, module_text=module)
+    assert rc == 1, out
+    assert "EXTRACTOR fault" in out, out
+    assert needle in out, out
+    assert "is not served" not in out, f"an extractor fault blamed the deploy: {out}"
+    assert calls == [], f"an invalid constant still made requests: {calls}"
