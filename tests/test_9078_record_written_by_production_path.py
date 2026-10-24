@@ -281,6 +281,15 @@ RECORD_REAPPLY_EXCLUDED: dict[str, str] = {
         "base shape — created by the release that creates `journal_event`",
     "20261012000005_record_org_purge_rpc.sql":
         "base shape — created by the release that creates `journal_event`",
+    # #9555/R7: `COMMENT ON` only. It contributes NO column, no refusal and no
+    # policy, and every schema reader in this tree parses the migration FILES
+    # (`table_columns()`, `refused_props_names()`, `RECORD_MUTATIONS`), so a
+    # container that never applies it reads IDENTICALLY. Re-applying it would add
+    # a step to the reapply list for a migration that cannot change what the tests
+    # measure — an exclusion with a stated reason is the honest classification,
+    # and this dict is where the decision is recorded rather than left silent.
+    "20261024000001_record_session_narrative_carrier.sql":
+        "COMMENT ON only — no column, refusal or policy, and the readers parse files",
 }
 
 #: The minimum Supabase-shaped substrate the record migrations need: the three
@@ -3315,6 +3324,17 @@ _JUNIT_DESELECTED = """<testsuites><testsuite name="pytest" tests="1" \
             name="test_the_public_capture_path_writes_the_record"/>
 </testsuite></testsuites>"""
 
+#: ⛔ Two files — but not the two this job arms. A gate that counted DISTINCT
+#: files (`len(armed_files) >= 2`) would certify this; requiring the SET does not
+#: (PR #9862 review round 4). The third module is a real one from another lane.
+_JUNIT_WRONG_FILES = """<testsuites><testsuite name="pytest" tests="2" failures="0" \
+ errors="0" skipped="0">
+  <testcase classname="tests.test_9078_record_written_by_production_path"
+            name="test_the_public_capture_path_writes_the_record"/>
+  <testcase classname="tests.test_9664_capstone"
+            name="test_the_public_capture_path_lands_the_narrative_in_the_record"/>
+</testsuite></testsuites>"""
+
 #: A red leg (the ordinary failing case).
 _JUNIT_FAILED = """<testsuites><testsuite name="pytest" tests="3" failures="1" \
  errors="0" skipped="0">
@@ -3379,8 +3399,24 @@ def test_the_arm_gate_reds_when_only_ONE_FILE_contributed_legs(tmp_path):
         "the gate certified a run in which a whole FILE's armed legs never ran:\n"
         f"{result.stdout}")
     errors = _gate_errors(result)
-    assert any("from only 1 file" in line for line in errors), errors
+    assert any("no armed capture leg ran from "
+               "test_9078_record_written_by_production_path" in line
+               for line in errors), errors
     assert "from_files=1" in result.stdout, result.stdout
+
+
+def test_the_arm_gate_reds_when_the_WRONG_two_files_contributed(tmp_path):
+    """A distinct-file COUNT is the same defect one level down (round 4).
+
+    `len(armed_files) >= 2` is satisfied by any two modules. The requirement is
+    the SET this job arms, so a run whose second file is some other suite's is a
+    certificate for nothing — the carrier's legs never executed.
+    """
+    result = _run_leg_gate(tmp_path, _JUNIT_WRONG_FILES)
+    assert result.returncode == 1, result.stdout
+    errors = _gate_errors(result)
+    assert any("test_9555_narrative_carrier" in line for line in errors), errors
+    assert "from_files=2" in result.stdout, result.stdout
 
 
 def test_the_arm_gate_passes_a_green_armed_run(tmp_path):
@@ -3467,7 +3503,7 @@ def test_deleting_the_skip_clause_reds_the_arm_gate(tmp_path):
     """
     source = RECORD_LEG_GATE.read_text(encoding="utf-8")
     start = source.find("    if skipped:")
-    end = source.find("    if len(armed_files) < MIN_ARMED_LEG_FILES:")
+    end = source.find("    missing_files = sorted(ARMED_LEG_FILES - set(armed_files))")
     assert start != -1 and end > start, (
         "the skip clause moved — re-point this mutation test at it instead of "
         "deleting the proof that the pin discriminates")
@@ -3502,14 +3538,18 @@ def test_the_arm_gate_is_a_file_the_job_calls_never_an_inline_heredoc():
         "the gate script exposes no `decide`/`main` — a module whose logic is "
         "unreachable cannot be tested against a fixture, which is the whole "
         "point of moving it out of the YAML")
-    # ⛔ PER FILE, not per leg: a flat leg count was satisfiable with a whole
-    # file's legs deselected once this job ran two files (PR #9862 review round
-    # 3). The number is a property of the JOB's pytest argument list, so adding a
-    # third file there means re-deriving this, not retyping it.
-    assert module.MIN_ARMED_LEG_FILES == 2, (
-        "the armed FILE count moved — the job arms two files (the four-layer "
-        "proof and R7's narrative carrier), so a third needs the fixtures "
-        "re-derived, not a number retyped")
+    # ⛔ BY NAME, not by count: a flat leg count was satisfiable with a whole
+    # file's legs deselected, and a COUNT of distinct files is the same defect one
+    # level down (two files that are not these two would pass). The set is a
+    # property of the JOB's pytest argument list, so adding a third file there
+    # means re-deriving this, not retyping it.
+    assert frozenset({
+        "test_9078_record_written_by_production_path",
+        "test_9555_narrative_carrier",
+    }) == module.ARMED_LEG_FILES, (
+        "the armed FILE SET moved — the job arms the four-layer proof and R7's "
+        "narrative carrier, so a third file needs the fixtures re-derived rather "
+        "than the set retyped")
     _name, job = _record_ci_job()
     called = [str(step.get("run", "")) for step in (job.get("steps") or [])]
     assert any(RECORD_LEG_GATE.name in run for run in called), (

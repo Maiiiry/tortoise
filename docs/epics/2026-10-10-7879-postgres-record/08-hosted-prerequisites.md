@@ -654,9 +654,11 @@ work that already exists.
    rebuilt from the record alone, narrative and redaction count identical across
    the wipe — needs **both** a record Postgres and a FalkorDB, and **no CI job
    arms both** (the armed record job provisions no cache, and every FalkorDB job
-   sets no record DSN), so it runs only on a manually-armed lane. Measured there:
-   21 tests, 0 skipped, on a throwaway `postgres:16` plus a private lane
-   FalkorDB. ⛔ The gap is named rather than papered over: until a job arms both,
+   sets no record DSN), so it runs only on a manually-armed lane. Measured there,
+   on a throwaway `postgres:16` plus a private lane FalkorDB: that file is **1
+   test, 0 skipped** (`--collect-only` is the authority — it is one leg, and one
+   is what it takes to destroy and rebuild the cache), and the two files together
+   are 23, 0 skipped. ⛔ The gap is named rather than papered over: until a job arms both,
    a regression in the record→cache narrative restore would merge green.
 
 **⚠️ THE ORIGINAL REMAINDER, kept verbatim so the two statements above stay checkable:**
