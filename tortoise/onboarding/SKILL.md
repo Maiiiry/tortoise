@@ -126,8 +126,9 @@ mode → teach-human fallback).
 > **Server URL**, Server URL `https://api.premiselabs.co/mcp`, Authentication
 > **OAuth** → tick **I understand and want to continue** → **Create as a
 > plugin** → **Connect** on the plugin and confirm **Connect Tortoise** →
-> **Authorize**, checking the organization the consent page names — that is the
-> one it writes to), and then receives the Tortoise workflows by
+> **Authorize**; check the Organization the consent page names, and if it offers
+> a chooser instead of a name, pick the one you are onboarding — that is the one
+> it writes to), and then receives the Tortoise workflows by
 > installing the three reusable skills (chatgpt.com/skills → Add → Upload from
 > your computer) or by pasting them into one chat. This document itself is NOT
 > one of them — read it here, at the served URL above, or paste it into one

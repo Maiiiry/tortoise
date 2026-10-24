@@ -932,6 +932,9 @@ class TestDocsPageAndSkillConfig:
             "Connect",                   # 3 — the OAuth grant is a SEPARATE act
             "Connect Tortoise",          # 3 — the consent dialog between Connect and Authorize
             "Authorize",                 # 3 — consent (key-less connect completes here)
+            "pick the one you are onboarding",  # 3 — the MULTI-org chooser (oauth.py)
+                                       #     hides the named-org line and keeps
+                                       #     Authorize disabled until it is picked
             "chatgpt.com/skills",        # 4 — the Skills surface the archives install on
             "Install the Tortoise skills",  # 4 — the hand-over is an INSTALL, not a paste
             "Upload from your computer", # 4 — ChatGPT's own Skills surface is the hand-off
@@ -2028,21 +2031,48 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
 
     # 2. The connect step renders its own branch, ahead of the Claude key-less
     #    one it would otherwise fall into (that branch's copy is Claude-specific).
-    #    The ordering is the one structural fact only this side can see, so it is
-    #    the only shape this test pins: every claim below is a COPY fact, asserted
-    #    by presence after the branch marker — no JSX-attribute literals and no
-    #    slice terminator, so a shape-preserving refactor of the branch does not
-    #    red this while the copy still ships (#4880: a guard deciding from the
-    #    SHAPE of the source is defeated by a source of a different shape).
+    #    Only two SOURCE facts are pinned: the branch exists, and it comes before
+    #    the key-less one. Everything else below is a COPY fact, asserted by
+    #    presence INSIDE the chatgpt arm — no JSX-attribute literals, and the arm
+    #    is delimited by the NEXT branch's own selector (`wizardKeyless`, the
+    #    identifier no reflow can rename) rather than by a spelling of its
+    #    ternary, so a shape-preserving refactor of the branch does not red this
+    #    while the copy still ships (#4880: a guard deciding from the SHAPE of the
+    #    source is defeated by a source of a different shape).
     branch = main.index("wizardConnectHarness === 'chatgpt'")
-    assert branch < main.index("wizardKeyless ? ("), (
+
+    def next_branch(pos: int) -> int:
+        """Start of the NEXT harness branch, from `pos` — the end of the arm.
+
+        Keyed on the next branch's SELECTOR, not on a spelling of its ternary:
+        a bare `main.index(": wizardKeyless ? (")` is a slice terminator, it
+        moves under a reformat (`) :\n wizardKeyless ? (`), and it fails as an
+        uncaught `ValueError: substring not found` that names nothing. Guarded
+        here so a restructure says what moved (#9660 review).
+        """
+        found = main.find("wizardKeyless", pos)
+        assert found != -1, (
+            "the chatgpt arm's end anchor is gone from main.jsx: the connect step "
+            "no longer offers a `wizardKeyless` branch after the chatgpt one — "
+            "update `next_branch` (and the ordering claim that depends on it)")
+        return found
+
+    assert branch < next_branch(branch), (
         "the chatgpt branch must come BEFORE the key-less Claude branch — "
         "chatgpt is key-less too, so ordering decides which copy it gets")
 
     def after(marker: str) -> int:
-        """Position of `marker` INSIDE the chatgpt branch (raises if it is not
-        in main.jsx at all, or only before the branch)."""
-        return main.index(marker, branch)
+        """Position of `marker` INSIDE the chatgpt branch.
+
+        Guarded rather than a bare `.index()`: a copy fact that disappears (or
+        survives only BEFORE the branch marker) must say which claim broke, not
+        fail as `ValueError: substring not found` with no context.
+        """
+        position = main.find(marker, branch)
+        assert position != -1, (
+            f"the chatgpt card no longer renders {marker!r} — the copy this test "
+            "pins is gone, or it now lives before the branch marker")
+        return position
 
     # 3. The three blocks, in the order the user performs them.
     titles = ["Add the Tortoise connector", "Install the Tortoise skills",
@@ -2072,15 +2102,23 @@ def test_9660_chatgpt_is_a_live_onboarding_journey_not_a_docs_dead_end():
     assert grant == sorted(grant), (
         "the OAuth grant reads View details → Connect → Authorize; the card must "
         "render them in that order")
-    assert "CANONICAL_MCP_URL" in main[branch:], (
-        "the server URL must come from the constant, not a re-typed literal")
+    # …and the Organization act survives on BOTH consent shapes. The consent page
+    # has two: with ONE selectable org it NAMES the org (oauth.py
+    # `_consent_preview`, `len(orgs) == 1`), and with several it renders a
+    # CHOOSER, hides the named-org line and keeps Authorize disabled until one is
+    # picked (the `len(orgs) > 1` memberships path + the page script). Copy that
+    # says only "check the name the consent page shows" points at text that is
+    # not on screen for a multi-org account — the same class of defect as the
+    # unnamed consent dialog — so the pick is pinned, not merely described.
+    after("if it offers a chooser instead of a name, pick the one you are onboarding")
     # 5. The skill hand-off is an INSTALL of the real archives, not a prose
     #    rendering: the branch must map over the archive names and link them.
     #    The server URL is bound to the ChatGPT ARM (not "somewhere after the
     #    branch"): the card uses the constant twice — the visible URL and the
     #    Copy button — so an unbound slice passed even with a re-typed literal on
-    #    screen (#9660 review).
-    arm = main[branch:main.index(": wizardKeyless ? (", branch)]
+    #    screen (#9660 review). `in arm` subsumes the branch-wide presence check
+    #    this used to carry, so that one is gone rather than kept as dead weight.
+    arm = main[branch:next_branch(branch)]
     assert "CANONICAL_MCP_URL" in arm, (
         "the card's Server URL must come from the constant, not a re-typed literal")
     assert "https://api.premiselabs.co/mcp" not in arm, (
