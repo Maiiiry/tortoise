@@ -2408,6 +2408,31 @@ export function readSweepStatus(dir: string): SweepStatus | undefined {
   }
 }
 
+/**
+ * Record a sweep failure the CLI could not record itself.
+ *
+ * `sweep-status.json` is written by the CLI's own `main`, so a failure that
+ * happens BEFORE it runs — `node` too old to parse the shipped worker, `node`
+ * removed, a truncated artifact — writes NOTHING, and whatever an earlier
+ * healthy sweep left stays on disk. That stale `ok: true` would render
+ * `capture: OK` over a backstop that just died, which is the exact silent death
+ * this seam exists to end. The extension is the only observer of the exit code,
+ * so it records the failure rather than merely warning about it.
+ *
+ * Best-effort by contract: bookkeeping must never fail a sweep.
+ */
+export function recordSweepFailure(storeDir: string, reason: string): void {
+  try {
+    mkdirSync(storeDir, { recursive: true });
+    const payload = { version: 1, ok: false, reason, shipped: 0, at: Date.now() / 1000 };
+    const tmp = join(storeDir, "sweep-status.json.tmp");
+    writeFileSync(tmp, JSON.stringify(payload));
+    renameSync(tmp, join(storeDir, "sweep-status.json"));
+  } catch {
+    // Nothing else to do: the health line simply keeps its previous reading.
+  }
+}
+
 export function captureHealthLine(
   dir: string,
   opts: { apiKey?: string; storeSyncDir?: string } = {},
@@ -2844,7 +2869,12 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
       // `sweep-status.json` carries the REASON onto the health line; this is the
       // immediate, once-per-process warning.
       child.on("exit", (code) => {
-        if (code === 0 || _SWEEP_UNAVAILABLE_WARNED) return;
+        if (code === 0) return;
+        // Record FIRST and unconditionally: the once-per-process warn flag must
+        // not stop later failures from being written down, or the health line
+        // would go quiet after the first one.
+        recordSweepFailure(join(dirname(spoolDir), "store-sync"), `exit_${String(code)}`);
+        if (_SWEEP_UNAVAILABLE_WARNED) return;
         _SWEEP_UNAVAILABLE_WARNED = true;
         warn("store-sync sweep FAILED (exit " + String(code) + ") — killed/crashed "
           + "sessions are not being recovered; run `tortoise store-sync --json`");

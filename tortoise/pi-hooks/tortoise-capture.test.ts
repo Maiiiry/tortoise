@@ -49,6 +49,7 @@ import {
   buildCapturePayload,
   captureHealthLine,
   readSweepStatus,
+  recordSweepFailure,
   countStoreSyncDeadLetters,
   captureKey,
   carriedWindow,
@@ -3060,6 +3061,24 @@ test("#2100: the per-box health line is present in every state", async () => {
     captureHealthLine(withDrops, { apiKey: "tt_x" }).line,
     "capture: OK (0 queued), 2 store-sync dead-lettered",
     "a healthy sweep must not add a suffix",
+  );
+
+  // A failure that happens BEFORE the CLI's own `main` (node cannot parse the
+  // worker) writes NO status, so the healthy `ok: true` written just above would
+  // SURVIVE and render `capture: OK` over a backstop that just died — the very
+  // silent death this seam exists to end. The extension is the only observer of
+  // the exit code, so it records the failure. Order matters here: the healthy
+  // status must already be on disk, or this row would only prove that a stale
+  // FAILED status gets replaced (which nothing depends on).
+  recordSweepFailure(join(parent, "store-sync"), "exit_1");
+  assert.equal(
+    captureHealthLine(withDrops, { apiKey: "tt_x" }).line,
+    "capture: OK (0 queued), 2 store-sync dead-lettered, store-sync FAILED (exit_1)",
+    "an exit-code failure OVERWRITES a stale healthy status the CLI could not update",
+  );
+  assert.deepEqual(
+    readSweepStatus(join(parent, "store-sync")),
+    { ok: false, reason: "exit_1" },
   );
 
   // A HEALTH CHECK MUST NOT MUTATE WHAT IT DESCRIBES. `listSpoolEntries` (the
