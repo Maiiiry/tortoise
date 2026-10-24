@@ -3021,16 +3021,26 @@ python -m tortoise record-text … --session <id> --limit 20 --json
 | code | meaning | next step |
 |---|---|---|
 | `0` | served: the narrative and/or the turns came back, with `redactions`, `turn_count` and `turns` **read from the record** | use the text; `--json` carries the same numbers |
-| `3` | the record was **READABLE for this scope** and holds no §9.1 text for that key — an honest absence (a session captured before the narrative carrier landed, or one whose distillation produced no narrative) | check the session id; do NOT read it as "the record lost the data" |
-| `2` | **no verdict**: no/invalid DSN, `psycopg2` absent, an unreadable record — **or a scope this connection cannot see** | fix the DSN/scope. ⛔ A scope that does not resolve is reported HERE, never as `3` |
+| `3` | the tenant was **SCOPED AND READ** and the record holds no §9.1 text for that key — an honest absence (a session captured before the narrative carrier landed, one whose distillation produced no narrative, or a mistyped `--org`/`--graph`, which is a tenant that holds nothing) | check the session id / scope; do NOT read it as "the record lost the data" |
+| `2` | **no verdict**: no/invalid DSN, `psycopg2` absent, an unreadable record — **or a connection the tenant prologue REFUSES** (a role that bypasses RLS; a tenant GUC that did not stick) | fix the DSN/role. ⛔ A connection that cannot be scoped is reported HERE, never as `3` |
 
-⛔ **Why an unreadable scope is `2` and not `3`.** A tenancy-filtered read returns
-**0 rows silently**: the app role with no tenant GUC, or a transaction-mode pooler
-that dropped it, answers "this session has no narrative" about a session that has
-one. The verb therefore reads the scope row (`public.graphs`) before it reports a
-miss, and refuses to call an unseeable scope an absence — a false absence about a
-customer's evidence is worse than no answer. This is #9555's G1 note and #9600's
-app role, not a hypothetical.
+⛔ **Why an unscopable connection is `2` and not `3`.** A tenancy-filtered read
+returns **0 rows silently**: the app role with no tenant GUC, or a transaction-mode
+pooler that dropped it, answers "this session has no narrative" about a session
+that has one. So the verb installs the record's **own tenant prologue**
+(`record_projection.scope_connection`) before any read: it sets
+`app.current_org_id` transaction-locally, **reads it back**, and refuses a
+connection whose role can bypass RLS — every refusal is `2`. Once it returns, the
+connection is provably scoped to one tenant, so a zero-row answer is a true
+statement about that tenant and `3` is an answer rather than a guess. This is
+#9555's G1 note and #9600's app role, not a hypothetical.
+
+⛔ **The DSN must therefore be the app role** (`tortoise_record_app`), exactly as
+`record-restore` requires: a `postgres`/superuser DSN exits `2` with the role
+named. ⚠️ If you spell the role as a libpq connect option
+(`…?options=-c%20role=tortoise_record_app`) rather than as the DSN's user, that
+still works here — the verb no longer passes its own `options=` to `connect()`,
+which would have replaced yours (a measured defect in the first draft).
 
 **What it does NOT do.** The hosted ask/answer path's own verbatim fetch is not
 wired here: it is an MCP/SDK **surface** change, and `AGENTS.md` → *MCP/SDK Surface

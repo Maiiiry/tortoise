@@ -1283,7 +1283,7 @@ def _cmd_record_text(args):
         EXIT_SERVED,
         EXIT_UNAVAILABLE,
         log_result,
-        record_scope_readable,
+        scoped,
         serve_from_record,
     )
 
@@ -1335,10 +1335,25 @@ def _cmd_record_text(args):
     conn = None
     try:
         try:
-            conn = psycopg2.connect(
-                dsn,
-                connect_timeout=RECORD_CONNECT_TIMEOUT_S,
-                options=f"-c statement_timeout={RECORD_STATEMENT_TIMEOUT_MS}",
+            conn = psycopg2.connect(dsn, connect_timeout=RECORD_CONNECT_TIMEOUT_S)
+            # ⛔ THE BOUND IS SET AS A SESSION SETTING, NOT AS A CONNECT KWARG.
+            # Passing `options=…` to `connect()` REPLACES the DSN's own
+            # `options` parameter — and libpq's `options=-c role=<name>` is the
+            # connect-time spelling of `SET ROLE`, which is how a deployment
+            # (and this verb's live tests) connects as `tortoise_record_app`
+            # without a separate credential. Overriding it left the session on
+            # the provisioning superuser, which the tenant prologue then
+            # correctly refused — measured: the verb exited 2 on a DSN that
+            # worked everywhere else (PR #9862 review, P1). `set_config` also
+            # accepts a bind parameter, which `SET` does not.
+            # (autocommit for this one statement: `set_config` would otherwise
+            # open a transaction, and `conn.autocommit = False` below cannot be
+            # assigned inside one — measured, "set_session cannot be used inside
+            # a transaction".)
+            conn.autocommit = True
+            conn.cursor().execute(
+                "SELECT set_config('statement_timeout', %s, false)",
+                (str(int(RECORD_STATEMENT_TIMEOUT_MS)),),
             )
         except Exception as e:
             print(f"Error: the record is unreadable ({type(e).__name__}) — no "
@@ -1346,25 +1361,33 @@ def _cmd_record_text(args):
                   file=sys.stderr)
             return EXIT_UNAVAILABLE
 
-        # ⛔ A MISS IS PROVEN BEFORE IT IS REPORTED. Without this read, a
-        # tenancy-filtered connection (the app role with no GUC, or a
-        # transaction-mode pooler that dropped it) answers "this session has
-        # no narrative" about a session that has one.
+        # ⛔ THE TENANT SCOPE IS INSTALLED — AND PROVEN — BEFORE ANY READ, and
+        # this is the whole 3-versus-2 split. The record's policies treat a
+        # missing GUC as "no rows", never as an error, so an unscoped read
+        # answers "this session has no narrative" about a session that has one.
+        # `scoped` is the record's OWN prologue (`record_projection.
+        # scope_connection`), shared with its two doors: it sets
+        # `app.current_org_id` transaction-locally, READS IT BACK, and refuses a
+        # connection whose role can bypass RLS. Once it returns, a zero-row
+        # answer is a true statement about this tenant — which is what makes
+        # EXIT_ABSENT an answer and not a guess.
+        #
+        # ⚠️ The GUC is transaction-local, so the connection is NOT autocommit
+        # and every read below runs in this one transaction.
+        conn.autocommit = False
         try:
-            readable = record_scope_readable(conn, org_id=args.org,
-                                             graph_id=args.graph)
+            scoped(conn, org_id=args.org)
         except Exception as e:
-            print(f"Error: the record's scope could not be read "
-                  f"({type(e).__name__}) — that is NOT an absence, and this "
-                  f"verb will not report it as one.", file=sys.stderr)
-            return EXIT_UNAVAILABLE
-        if not readable:
-            print(f"Error: scope org={args.org!r} graph={args.graph!r} is not "
-                  f"visible to this connection. A tenancy-filtered read "
-                  f"returns 0 rows SILENTLY, so this run cannot tell a "
-                  f"mistyped --org/--graph from a role that may not see the "
-                  f"tenant. No verdict was produced; use a record DSN whose "
-                  f"role can read this scope.", file=sys.stderr)
+            from tortoise.record_projection import RecordProjectionError
+            if isinstance(e, RecordProjectionError):
+                print(f"Error: the record's connection could not be scoped to "
+                      f"org={args.org!r} — {e} No verdict was produced: a "
+                      f"tenant-filtered read would otherwise report a session "
+                      f"that HAS text as an absent one.", file=sys.stderr)
+            else:
+                print(f"Error: the record is unreadable ({type(e).__name__}) — "
+                      f"no text was served and no verdict was produced.",
+                      file=sys.stderr)
             return EXIT_UNAVAILABLE
 
         try:

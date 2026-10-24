@@ -31,10 +31,20 @@ session"* would be the worst answer this verb could give: it is a false absence
 about a customer's evidence, and it is indistinguishable from a mistyped
 ``--org``/``--graph``.
 
-So a miss is PROVEN before it is reported: the verb reads the scope row itself
-(``public.graphs``) and returns :data:`EXIT_UNAVAILABLE` — *no verdict* — when
-the scope cannot be read. ``EXIT_ABSENT`` means the record was READABLE and held
-nothing, which is the only shape in which an absence is an answer.
+So a miss is PROVEN before it is reported: the verb installs the record's OWN
+tenant prologue (:func:`scoped` → ``record_projection.scope_connection``), which
+sets ``app.current_org_id`` transaction-locally, READS IT BACK, and refuses a
+connection whose role can bypass RLS — and every refusal is
+:data:`EXIT_UNAVAILABLE`, *no verdict*. ``EXIT_ABSENT`` therefore means the
+tenant was provably scoped and holds no text for this key, which is the only
+shape in which an absence is an answer.
+
+⛔ An earlier draft read ``public.graphs`` as the scope proof. Measured in review:
+that table is granted to NO record role, so as ``tortoise_record_app`` the verb
+exited ``2`` on every call — and where it was readable it proved the wrong
+predicate (the text tables' policy could still have filtered the text), so a
+filtered read was still reported as an honest absence. The shared prologue is
+the correct proof and needs no new grant.
 
 WHAT THIS IS NOT
 ================
@@ -61,7 +71,7 @@ __all__ = [
     "LOG_NAME",
     "TextOutcome",
     "log_result",
-    "record_scope_readable",
+    "scoped",
     "serve_from_record",
 ]
 
@@ -74,7 +84,8 @@ EXIT_SERVED = 0
 EXIT_UNAVAILABLE = 2
 #: The record was READABLE for this scope and holds no §9.1 text for the key.
 #: An honest absence — the distinction from :data:`EXIT_UNAVAILABLE` is the
-#: whole point of :func:`record_scope_readable`.
+#: whole point of :func:`scoped`: the tenant prologue proves the connection was
+#: scoped (and cannot bypass RLS) before any zero-row answer is called one.
 EXIT_ABSENT = 3
 
 #: How the key was resolved, so a served answer names its own door.
@@ -145,37 +156,51 @@ class TextOutcome:
             body += ["", "── summary ──", sess.summary]
         body += ["", "── transcript (§9.4 verbatim) ──"]
         turns = sess.turns[: self.shown]
-        body += [t.line for t in turns] or ["(none recorded)"]
+        # ⚠️ "(none recorded)" is a claim about the RECORD, so it may only be
+        # printed when the record holds no turn at all. `--limit 0` renders no
+        # turn while the record holds several, and the bare `or` fallback made
+        # the transcript block say "(none recorded)" one line under "turns in
+        # record: 1" — the false half of a two-line contradiction.
+        if turns:
+            body += [t.line for t in turns]
+        elif not self.turns:
+            body.append("(none recorded)")
         if self.limit is not None and self.turns > self.shown:
             body.append(f"… {self.turns - self.shown} more turn(s) not shown "
                         f"(--limit {self.limit})")
         return "\n".join(head + body)
 
 
-def record_scope_readable(conn: Any, *, org_id: str, graph_id: str) -> bool:
-    """Can this connection SEE the scope at all — i.e. is a miss an answer?
+def scoped(conn: Any, *, org_id: str) -> Any:
+    """Install the record's TENANT SCOPE on ``conn`` — the record's own prologue.
 
-    The scope row is ``public.graphs``, the tenancy parent every record table
-    cascades from. It is read with the SAME ``(org_id, graph_id)`` binding as
-    the text lookups, so it is filtered by exactly the predicate that could
-    have hidden the text: a role that cannot see the scope cannot be trusted
-    to report its absence.
+    ⛔ THIS REPLACES A HAND-ROLLED ``SELECT 1 FROM public.graphs`` PROOF, and the
+    reason is a measured P1 (PR #9862 review): `public.graphs` is granted to no
+    record role — R6's migration grants the ten record TABLES — so as
+    `tortoise_record_app` (the role the runbook mandates) that SELECT raises
+    ``InsufficientPrivilege``, and the verb answered exit ``2`` on every
+    invocation. Worse, where the scope row IS readable the check was proving the
+    wrong thing: "can I see `graphs`" says nothing about whether the record
+    tables' policy filtered the text, so a filtered read was still reported as an
+    honest absence (exit ``3``) — the exact answer this module exists to refuse.
 
-    A read that RAISES propagates: a broken record is not an answer either, and
-    :func:`serve_from_record`'s caller classifies it as ``unavailable``.
+    The record already has ONE correct prologue for this, shared by its two doors
+    (`record_projection.scope_connection` → `_apply_tenant_scope`): it sets
+    ``app.current_org_id`` transaction-locally and then READS IT BACK, refusing
+    when the value did not stick (an autocommit connection, a renamed GUC, a
+    pooler that dropped it) or when the connection's role can BYPASS RLS. Once it
+    returns, the connection is provably scoped to this tenant — so a subsequent
+    zero-row read is a true statement about that tenant, and no grant on the
+    tenancy parent is needed.
+
+    ⚠️ It needs a TRANSACTION (the GUC is transaction-local), so the caller must
+    open a non-autocommit connection and keep every read on it. The refusals
+    raise :class:`tortoise.record_projection.RecordProjectionError`, which the
+    verb reports as ``EXIT_UNAVAILABLE`` — never as an absence.
     """
-    cursor = conn.cursor()
-    # ⚠️ The scope COLUMN is `graphs.id`, not `graphs.graph_id` — every record
-    # table calls it `graph_id` and keys it to `graphs(org_id, id)`, so the two
-    # names are one fact spelled twice. A `graph_id` here is an
-    # `UndefinedColumn`, which this function's caller reports as *"the scope
-    # could not be read"* — a true statement about a typo, and a false one about
-    # the record.
-    cursor.execute(
-        "SELECT 1 FROM public.graphs WHERE org_id = %s AND id = %s",
-        (org_id, graph_id),
-    )
-    return bool(cursor.fetchall())
+    from tortoise.record_projection import scope_connection
+
+    return scope_connection(conn, org_id)
 
 
 def serve_from_record(

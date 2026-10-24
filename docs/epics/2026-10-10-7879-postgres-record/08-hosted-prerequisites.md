@@ -645,11 +645,18 @@ work that already exists.
    ⛔ The hosted ask/answer path's own verbatim fetch is NOT wired and is not
    claimed: it is an MCP/SDK SURFACE change, which `AGENTS.md` puts behind
    Daniel's approval.
-3. **Measured, not asserted:** `tests/test_9555_narrative_carrier.py` (carrier,
-   projection, §9.4 fetch; armed in CI's `test-record-postgres` job) and
-   `tests/test_9555_narrative_cache_rebuild.py` (the derived cache destroyed and
-   rebuilt from the record alone — the narrative and the redaction count are
-   identical across the wipe).
+3. **Measured, not asserted — with the ARMING stated, because a leg that skips
+   everywhere defends nothing:** `tests/test_9555_narrative_carrier.py` (carrier,
+   projection, §9.4 fetch, and the verb's exit codes run AS THE APP ROLE) arms in
+   CI's `test-record-postgres` job, which asserts zero skips.
+   `tests/test_9555_narrative_cache_rebuild.py` — the derived cache DESTROYED and
+   rebuilt from the record alone, narrative and redaction count identical across
+   the wipe — needs **both** a record Postgres and a FalkorDB, and **no CI job
+   arms both** (the armed record job provisions no cache, and every FalkorDB job
+   sets no record DSN), so it runs only on a manually-armed lane. Measured there:
+   21 tests, 0 skipped, on a throwaway `postgres:16` plus a private lane
+   FalkorDB. ⛔ The gap is named rather than papered over: until a job arms both,
+   a regression in the record→cache narrative restore would merge green.
 
 **⚠️ THE ORIGINAL REMAINDER, kept verbatim so the two statements above stay checkable:**
 

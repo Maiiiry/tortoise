@@ -34,14 +34,17 @@ WHAT THIS FILE PINS, AND THE ONE THING EACH PIN IS FOR
    carriers (narrative vs counts) cannot clobber each other in EITHER arrival
    order, and the type is dispatched by no graph fold — which is the §9.1 point,
    not an omission (§1's `_NO_PROJECTION_FOLD` membership is the declaration).
-§3 the READ PATH is record-only, and the verb's 3-versus-2 split is real: an
-   unreadable SCOPE can never be reported as an absent SESSION, because a
-   tenancy-filtered read returns 0 rows SILENTLY (§9555's G1, #9600's app role).
+§3 the READ PATH is record-only, and the verb's 3-versus-2 split is real: no
+   absence is reported until the record's OWN tenant prologue has scoped the
+   connection and read the GUC back, because a tenancy-filtered read returns 0
+   rows SILENTLY (§9555's G1, #9600's app role).
 §4 the LIVE legs, against a real Postgres (`TEST_RECORD_DB_URI`, armed in CI by
    the `test-record-postgres` job, #9551): a journal replay produces the
-   narrative + the redaction count in the record, the record serves §9.4's text,
-   and — (b)'s own words — **deleting the derived cache and rebuilding from the
-   record alone reproduces the same narrative.**
+   narrative + the redaction count in the record, and the record serves §9.4's
+   text — through the verb, **as the app role**, which is the configuration the
+   runbook mandates. ((b)'s cache-destroying leg lives in
+   `tests/test_9555_narrative_cache_rebuild.py`: it needs a FalkorDB as well, and
+   the armed record job provisions none.)
 
 ⛔ WHAT THIS DOES NOT CLAIM. The record's DSN is still unarmed in production
 (R1, #9548), so "a live hosted capture lands the text" is proven here against a
@@ -292,9 +295,9 @@ def test_the_verb_is_WIRED_to_the_composition():
     assert "serve_from_record" in called, (
         "`_cmd_record_text` does not call `serve_from_record` — the verb would "
         "be an import with a story")
-    assert "record_scope_readable" in called, (
-        "the verb lost its scope proof — a tenancy-filtered read would then be "
-        "reported as an honest absence (the G1 defect)")
+    assert "scoped" in called, (
+        "the verb lost the record's tenant prologue — a tenancy-filtered read "
+        "would then be reported as an honest absence (the G1 defect)")
     routes = [n for n in ast.walk(tree)
               if isinstance(n, ast.Compare)
               and isinstance(n.left, ast.Attribute) and n.left.attr == "cmd"
@@ -336,22 +339,84 @@ class _Conn:
         return _C([])
 
 
-def test_a_tenancy_filtered_scope_is_NOT_an_absent_session():
-    """The G1 refusal: 0 rows silently is indistinguishable from "none written".
+def test_the_scope_proof_is_the_records_OWN_prologue():
+    """The G1 refusal, fixed the way the review demanded (PR #9862, P1).
 
-    `serve_from_record` on a readable scope with no text is an ABSENCE (exit 3).
-    The SCOPE read is what makes that an answer: without it, the same empty
-    result would be reported for a mistyped `--org` and for a role the tenant
-    policy filtered — a false absence about a customer's evidence.
+    ⛔ A first draft proved the scope by reading `public.graphs`. Measured in
+    review: that table is granted to NO record role, so as
+    `tortoise_record_app` (the role the runbook mandates) the SELECT raises
+    `InsufficientPrivilege` and the verb answered exit 2 on every call; and
+    where it WAS readable it proved the wrong predicate, because "can I see
+    `graphs`" says nothing about whether the text tables' policy filtered the
+    text — so a filtered read still came back as an honest absence (exit 3).
+
+    The proof must be the record's own tenant prologue
+    (`record_projection.scope_connection`): it sets `app.current_org_id`
+    transaction-locally, READS IT BACK, and refuses a connection whose role can
+    bypass RLS. This pin holds the verb to that, and to the property that makes
+    a zero-row answer meaningful: the GUC, not a table, decides.
     """
-    empty = _Conn([("session_narrative", []), ("public.point", []), ("public.graphs", [])])
-    assert record_text.record_scope_readable(empty, org_id="o", graph_id="g") is False
+    source = Path(record_text.__file__).read_text()
+    assert "scope_connection" in source, (
+        "record_text no longer uses the record's own tenant prologue — a "
+        "hand-rolled scope read is either unprivileged (P1) or proves the wrong "
+        "table")
+
+    # The pin is on the SQL these two modules EXECUTE, not on their prose: their
+    # docstrings explain the abandoned draft (and name `public.graphs` while
+    # doing so), so a substring search over the file reds on its own
+    # explanation. Walk every `.execute(<string literal>, …)` call instead.
+    executed: list[str] = []
+    for module in (record_text, record_read):
+        tree = ast.parse(Path(module.__file__).read_text())
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "execute" and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)):
+                executed.append(node.args[0].value)
+    assert executed, (
+        "no SQL found in either module — this pin stopped looking at anything")
+    assert not [q for q in executed if "public.graphs" in q], (
+        "these modules EXECUTE a read of `public.graphs`: no record role is "
+        "granted that table, so the verb would exit 2 on every sanctioned DSN")
+
+    # And a library-level miss is still an honest `None` (the VERB is what turns
+    # an unserialisable scope into EXIT_UNAVAILABLE, not the reader).
+    empty = _Conn([("session_narrative", []), ("public.point", [])])
     assert record_text.serve_from_record(
         empty, org_id="o", graph_id="g", session_id=SESSION).session is None
-    # The composition itself reports the absence; the VERB turns an unreadable
-    # scope into `unavailable` (2) — pinned by the wiring test above, and by
-    # `record_text.EXIT_UNAVAILABLE` being a distinct code from EXIT_ABSENT.
     assert record_text.EXIT_ABSENT != record_text.EXIT_UNAVAILABLE
+
+
+def test_an_unrepresentable_limit_never_claims_the_transcript_is_empty():
+    """`--limit 0` renders no turn while the record holds several.
+
+    The bare `or ["(none recorded)"]` fallback then printed "(none recorded)"
+    one line under "turns in record: 2" — a false statement about the RECORD,
+    made by the very block that exists to serve its evidence (PR #9862 review,
+    P2).
+    """
+    sess = record_read.SessionText(
+        session_id=SESSION, narrative=NARRATIVE, redactions=4, turn_count=2,
+        turns=(record_read.Turn(turn_id=f"{SESSION}_t0", index=0,
+                                content="[user] hi", speaker="user"),
+               record_read.Turn(turn_id=f"{SESSION}_t1", index=1,
+                                content="[assistant] there", speaker="assistant")))
+    rendered = record_text.TextOutcome(key=SESSION, resolved_by=record_text.BY_SESSION,
+                                       session=sess, shown=0, limit=0).render()
+    assert "(none recorded)" not in rendered.split("── transcript")[1], (
+        "`--limit 0` claims the record holds no turn: the transcript block is "
+        "false about the record it is serving")
+    assert "turns in record: 2" in rendered
+    assert "2 more turn(s) not shown" in rendered
+
+    # A record that genuinely holds NO turn still says so — the fallback is
+    # correct where it is true.
+    bare = record_read.SessionText(session_id=SESSION, narrative=NARRATIVE)
+    assert "(none recorded)" in record_text.TextOutcome(
+        key=SESSION, resolved_by=record_text.BY_SESSION, session=bare).render()
 
 
 def test_the_exit_code_for_a_served_and_an_absent_answer():
@@ -565,12 +630,21 @@ def test_the_public_capture_path_serves_S9_4_text_through_the_VERB(tmp_path):
 
     The library legs above prove the reader; this one proves an OPERATOR can
     reach it, which is the whole difference between a reader and a path (the
-    measured #9555 defect was a reader with no caller). Exit codes are asserted
-    explicitly, because they are the operator's next step:
+    measured #9555 defect was a reader with no caller).
+
+    ⛔ THE VERB RUNS AS THE APP ROLE, not as the provisioning superuser, and that
+    is not incidental — it is the P1 the review of this PR measured. `record-text`
+    installs the record's tenant prologue, which (a) refuses a role that can
+    bypass RLS, so the superuser DSN exits `2`, and (b) is what makes a zero-row
+    answer meaningful. A leg that ran as the superuser would pass while the
+    sanctioned configuration was inert. Exit codes are asserted explicitly,
+    because they are the operator's next step:
 
     * `0` and the text for a session the record holds,
-    * `3` for a session it does not — a READABLE scope, so an honest absence,
-    * `2` for a scope this connection cannot see — never an absence.
+    * `3` for a session (or a whole org) it does not — the tenant was SCOPED and
+      READ, so an honest absence,
+    * `2` for a connection that cannot be scoped at all — no verdict, never an
+      absence.
 
     The `--json` shape is asserted on the keys R7's indicators are measured
     from (`narrative`, `redactions`, `turns`), so a rendering change cannot
@@ -583,6 +657,9 @@ def test_the_public_capture_path_serves_S9_4_text_through_the_VERB(tmp_path):
     if not dsn:
         pytest.skip(f"{RECORD_DB_ENV} not set — no Postgres for the R7 verb proof")
     pytest.importorskip("psycopg2", reason="psycopg2 is the record's driver")
+
+    from test_9078_record_written_by_production_path import _app_role_dsn
+
     conn = _record_db()
     try:
         _ensure_schema(conn)
@@ -591,10 +668,13 @@ def test_the_public_capture_path_serves_S9_4_text_through_the_VERB(tmp_path):
     finally:
         conn.close()
 
-    def _run(*extra):
+    app_dsn = _app_role_dsn(dsn)
+
+    def _run(*extra, dsn_override=None):
         return subprocess.run(
             [sys.executable, "-m", "tortoise", "record-text",
-             "--record-dsn", dsn, "--org", org_id, "--graph", graph_id, *extra],
+             "--record-dsn", dsn_override or app_dsn,
+             "--org", org_id, "--graph", graph_id, *extra],
             capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=180)
 
     served = _run("--session", SESSION, "--json")
@@ -623,17 +703,49 @@ def test_the_public_capture_path_serves_S9_4_text_through_the_VERB(tmp_path):
     assert absent.returncode == 3, absent.stderr
     assert json.loads(absent.stdout)["served"] is False
 
-    # A scope that does not exist is NOT reported as an absent session: this
-    # verb cannot tell a mistyped scope from a role the tenancy policy filtered,
-    # and it says so instead of answering (the #9555 G1 hazard).
-    unseen = subprocess.run(
-        [sys.executable, "-m", "tortoise", "record-text", "--record-dsn", dsn,
-         "--org", "org-does-not-exist", "--graph", "g", "--session", SESSION],
-        capture_output=True, text=True, cwd=str(REPO_ROOT), timeout=180)
-    assert unseen.returncode == record_text.EXIT_UNAVAILABLE, unseen.stderr
-    assert "not visible" in unseen.stderr
+    # ⛔ THE P1 THIS LEG EXISTS FOR: the provisioning superuser BYPASSES RLS, so
+    # the tenant prologue refuses it. A `2` here is the verb declining to answer
+    # from a connection whose "0 rows" would not mean anything about one tenant.
+    bypassing = _run("--session", SESSION, dsn_override=dsn)
+    assert bypassing.returncode == record_text.EXIT_UNAVAILABLE, bypassing.stderr
+    assert "could not be scoped" in bypassing.stderr
 
     # Both keys (or neither) is refused before anything is read.
     both = _run("--session", SESSION, "--source-url", "u")
     assert both.returncode == record_text.EXIT_UNAVAILABLE
     assert "exactly one" in both.stderr
+
+
+# ── §5 the record type's CLASSIFICATIONS (each one is a refusal if wrong) ────
+
+def test_a_torn_narrative_line_cannot_block_recovery():
+    """`log.TORN_TAIL_HARMLESS_EVENT_TYPES` — the polarity is REFUSE by default.
+
+    A new journal type that is NOT listed there makes `tortoise rebuild`,
+    `recover_from_log` and `backup.restore` REFUSE a journal whose final line was
+    cut off mid-append (the S15 case the tolerance exists for). For a type whose
+    loss is a graph no-op that trade is backwards, and PR #9862's review measured
+    exactly that: a SIGKILL-truncated `SessionNarrated` tail refused the replay
+    while `EntityBindingRefused` (folded nowhere, like this one) was allowed.
+
+    The assertion is derived from the FOLD classification rather than re-typed:
+    any record type in `_NO_PROJECTION_FOLD` folds nowhere, so dropping a torn
+    one cannot revive graph state.
+    """
+    from tortoise import log as tlog
+    from tortoise.projection import _NO_PROJECTION_FOLD
+    assert rp.NARRATIVE_RECORD_TYPE in _NO_PROJECTION_FOLD
+    assert rp.NARRATIVE_RECORD_TYPE in tlog.TORN_TAIL_HARMLESS_EVENT_TYPES, (
+        "a torn `SessionNarrated` line would block `rebuild`/`recover_from_log`/"
+        "`backup.restore` — its loss is a graph no-op (it folds nowhere), so the "
+        "refusal buys nothing and costs the whole journal's recovery")
+
+
+def test_the_record_type_cannot_bypass_the_replay_registry():
+    """`mutations_for` is TOTAL: an undeclared type must still raise, and this
+    one must be declared on BOTH sides of the vocabulary assert."""
+    with pytest.raises(rp.UnknownJournalRecordType):
+        rp.mutations_for({"type": "SessionNarratedTypo", "id": "x"},
+                         org_id="o", graph_id="g")
+    assert rp.NARRATIVE_RECORD_TYPE in rp.RECORD_MUTATIONS
+    assert rp.NARRATIVE_RECORD_TYPE in rp.JOURNAL_EVENT_TYPES
