@@ -464,7 +464,10 @@ def _discover_pending_documents(proj, *, include_unstamped: bool = False) -> lis
       ``graph-scripts/backfill_doc_status.py``, which stamped it on every
       ``:Document`` with a NULL ``doc_status`` — so it means "never PROVEN
       extracted", and a node it stamps is re-selected even if it had been
-      extracted (the ``begin_ingest`` key still gates the actual work).
+      extracted. The ``begin_ingest`` key gates the work only at an UNCHANGED
+      extractor version: a version bump takes the reprocess path and retracts
+      that source's earlier Points before re-extracting, which is what a sweep
+      is for — but it is a real re-extraction cost, not a no-op.
     * ``doc_status = 'extracted'`` — a completion record, never pending;
     * ``needs_extraction = true`` — the live pending claim;
     * any other retired value (``draft``) — not a pending claim;
@@ -776,7 +779,9 @@ def main(argv=None):
                     help="#133: re-run full extraction on a captured document "
                          "Source (requires transcript positional arg)")
     ap.add_argument("--upgrade-all", action="store_true",
-                    help="#133: discover needs_extraction document Sources and upgrade each")
+                    help="#133/#5140: discover document Sources awaiting extraction "
+                         "(an explicit needs_extraction=true, or a surviving legacy "
+                         "doc_status='captured' marker) and upgrade each")
     ap.add_argument("--include-unstamped", action="store_true",
                     help="#5140: with --upgrade-all, also select document Sources "
                          "that carry NO `needs_extraction` property at all. The default "
@@ -789,8 +794,10 @@ def main(argv=None):
                          "(that value is indistinguishable from a real completion "
                          "without extraction evidence — see #5140), and it does NOT "
                          "see un-migrated :Document-labelled nodes at all (no relabel "
-                         "migration exists yet — #5140 finding 8). Selecting writes "
-                         "nothing.")
+                         "migration exists yet — #5140 finding 8). The WIDENING is a "
+                         "read (no stamping, unlike the deleted backfill) — but the "
+                         "sweep then upgrades what it selects, so this is not a dry "
+                         "run.")
     args = ap.parse_args(argv)
 
     # #5140: --include-unstamped is a discovery MODIFIER, not a mode — it can
