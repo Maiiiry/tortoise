@@ -1310,31 +1310,42 @@ def cmux_session_records() -> tuple[list[dict[str, Any]], str, str]:
     return [], "", "; ".join(errors)
 
 
+#: The rendered bound on `_cmux_said`'s output. Applied AFTER `repr`, because
+#: `repr` expands each non-printable character four-fold — slicing the input first
+#: produced up to 802 characters from a 200-byte input (measured), 2.5x the 320-char
+#: window the harness reads a cause through (review of #2401).
+_CMUX_SAID_BOUND = 200
+
+
 def _cmux_said(text: str) -> str:
     """One short, quotable rendering of what a cmux grammar SAID, for a cause.
 
     A JSON error object becomes ``'usage.invalid: --all needs a value'`` — the one
     form an operator can act on — and anything else becomes its first non-empty
-    line (bounded). Never raises: this only ever runs on text that is already a
-    failure, and a formatter that threw here would lose the cause entirely.
+    line. Never raises: this only ever runs on text that is already a failure, and
+    a formatter that threw here would lose the cause entirely.
+
+    ⛔ THE BOUND IS ON THE RENDERED String, NOT ON ITS INPUT (review of #2401).
+    Slicing the input to 200 and then calling ``repr`` produced up to **802**
+    characters — ``repr`` expands every non-printable character four-fold
+    (``\\x01`` → ``\\x01``, measured ``len == 802`` for 200 control bytes) — which is
+    2.5x the 320-char bound this message is read through, so an ANSI- or CR-laden
+    refusal would still overrun ``liveness_error`` and the persisted board cache.
+    ``_BOUND`` is therefore applied AFTER the repr.
     """
     body = (text or "").strip()
     if not body:
         return "no output"
+    first = body.splitlines()[0]
     try:
         data = json.loads(body)
     except Exception:
-        return repr(body.splitlines()[0][:200])
+        return repr(first)[:_CMUX_SAID_BOUND]
     if isinstance(data, dict) and (data.get("code") or data.get("message")):
-        # ⛔ BOUNDED ON EVERY PATH, INCLUDING THIS ONE (review of #2401). The other
-        # arms slice to 200; this one rendered `code: message` whole, so a cmux that
-        # reported a very long `message` field put it — unbounded — into `liveness_error`
-        # and from there into the persisted board cache. Display readers cut at 320/400,
-        # so it was invisible; the memory cost was not.
         return repr(
-            f"{data.get('code') or '?'}: {data.get('message') or ''}".strip()[:200]
-        )
-    return repr(body.splitlines()[0][:200])
+            f"{data.get('code') or '?'}: {data.get('message') or ''}".strip()
+        )[:_CMUX_SAID_BOUND]
+    return repr(first)[:_CMUX_SAID_BOUND]
 
 
 def pi_processes() -> tuple[list[dict[str, Any]], str]:
@@ -1780,12 +1791,22 @@ def live_sessions() -> LiveSessions:
                     (refused[p] for p in still_alive if p in refused), None
                 )
                 more = "" if len(still_alive) <= 5 else f" (+{len(still_alive) - 5} more)"
+                # ⛔ THE SAMPLE IS BOUNDED TOO, AND IT KEEPS ITS TAIL (review of #2401).
+                # The remedy has to survive the 320-char window the harness cuts the first
+                # cause at, and a Mac worktree path is routinely 90+ characters — so an
+                # unbounded sample put the remedy straight back outside the bound this
+                # message exists to fit (measured: `orphan` fell out of `[:320]` at
+                # pathlen 90). The TAIL is what identifies the directory, so it is the
+                # part kept.
+                sample_txt = ""
+                if sample:
+                    sample_txt = sample if len(sample) <= 60 else "…" + sample[-59:]
                 proc_error = (
                     f"live pi pid(s) {pids_txt}{more} have no ATTRIBUTABLE cwd"
                     + (
-                        f" — e.g. {sample!r} (a removed directory or a reader "
+                        f" — e.g. {sample_txt!r} (a removed directory or a reader "
                         "placeholder)"
-                        if sample else ""
+                        if sample_txt else ""
                     )
                     + " — an unattributable lane means 'nobody holds it' is "
                     "unprovable; reaping the orphan is the fix, not the gate"

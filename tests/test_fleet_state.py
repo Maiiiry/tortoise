@@ -2280,6 +2280,11 @@ def test_a_placeholder_cwd_is_unresolved_not_a_lane(monkeypatch) -> None:
         cwds, err = fs.process_cwds([8])
     assert cwds == {} and err == "", (
         "lsof's placeholder is not a path — it must read as UNRESOLVED")
+    # ⛔ AND THE RAW DATUM TRAVELS OUT OF THE `lsof` BRANCH TOO (review of #2401). The
+    # macOS reader is the one the Mac fleet runs, and deleting its `refused[cur] = raw`
+    # left this suite green while that fleet reverted to "no cwd could be read".
+    assert cwds.refused == {8: placeholder}, (
+        "the lsof reader must carry the rejected string, not only drop it")
 
     # The same rule on the `/proc` reader: a removed directory.
     monkeypatch.setattr(fs, "_proc_cwd_is_readable", lambda: True)
@@ -2345,11 +2350,17 @@ def test_a_reaped_worktree_is_named_in_the_gap_not_hidden(monkeypatch) -> None:
     raw = "/tmp/cell-wt-adv-reaping (deleted)"
 
     class _Cwds(dict):
-        refused = {2559943: raw}
+        pass
+
+    cwds = _Cwds()
+    # ⛔ AN INSTANCE ATTRIBUTE, NOT A CLASS ONE (review of #2401): a mutable class
+    # attribute trips ruff's RUF012, and the repo's own `python` leg runs
+    # `ruff check .` — so the datum test would have redded the tree it protects.
+    cwds.refused = {2559943: raw}
 
     monkeypatch.setattr(fs, "cmux_session_records", lambda: ([], "", "no cmux"))
     monkeypatch.setattr(fs, "pi_processes", lambda: ([{"pid": 2559943, "ppid": 1}], ""))
-    monkeypatch.setattr(fs, "process_cwds", lambda pids: (_Cwds(), ""))
+    monkeypatch.setattr(fs, "process_cwds", lambda pids: (cwds, ""))
     monkeypatch.setattr(fs, "pid_alive", lambda pid: True)
     live = fs.live_sessions()
     assert live.measured is False, "a live pid with no attributable cwd is still a gap"
@@ -2455,6 +2466,16 @@ def test_a_guest_cli_error_object_is_not_a_session_store(monkeypatch) -> None:
         "produced nothing is the falsehood this pins")
     assert seen[0][1] == "sessions", "the Mac grammar is still tried first"
 
+    # ⛔ THE BOUND IS ON THE RENDERED STRING, NOT ON ITS INPUT (review of #2401):
+    # `repr` expands each non-printable character four-fold, so slicing the input to
+    # 200 and THEN calling repr produced up to 802 characters — 2.5x the 320-char
+    # window the harness reads a cause through. A control-laden refusal is the case
+    # that catches it.
+    assert len(fs._cmux_said("\x01" * 200)) <= fs._CMUX_SAID_BOUND
+    assert len(fs._cmux_said("\\" * 200)) <= fs._CMUX_SAID_BOUND
+    assert fs._cmux_said("usage.invalid: --all needs a value") == (
+        "'usage.invalid: --all needs a value'"), "a plain cause is untouched"
+
 
 def test_a_session_store_from_a_FAILED_command_is_named_and_refused(
         monkeypatch) -> None:
@@ -2536,6 +2557,27 @@ def test_the_gap_fits_the_bound_its_readers_apply(monkeypatch) -> None:
     assert "orphan" in head, "and so did the remedy"
     assert len(live.error) < 400, (
         f"the whole sentence should fit one bound: {len(live.error)} chars")
+
+    # ⛔ AND A REAL FLEET PATH IS LONG (review of #2401). The case above uses a
+    # 40-character path, which cannot see the failure that matters: Mac worktrees are
+    # `/Users/…/tortoise/.worktrees/cell-wt-…`, routinely 90+ characters, and an
+    # unbounded sample put the remedy straight back outside the window this message
+    # exists to fit (`orphan` fell out of `[:320]` at pathlen 90 — measured).
+    long_path = (
+        "/Users/danielospina/Documents/GitHub/tortoise/.worktrees/"
+        "cell-wt-adv-runnerprov-land-0123456789 (deleted)"
+    )
+    long_refused = {2510100 + i: long_path for i in range(5)}
+    cwds.refused = long_refused
+    monkeypatch.setattr(fs, "pi_processes", lambda: (
+        [{"pid": p, "ppid": 1} for p in long_refused], ""))
+    live = fs.live_sessions()
+    head = live.error[:320]
+    for pid in long_refused:
+        assert str(pid) in head, f"pid {pid} fell outside the window on a long path"
+    assert "orphan" in head, "the remedy must survive a long pathlen too"
+    assert "runnerprov-land-0123456789 (deleted)" in head, (
+        "and the datum must keep the part that IDENTIFIES the directory — its tail")
 
 
 def test_the_plural_grammar_is_preferred_and_a_later_one_can_answer(monkeypatch) -> None:
