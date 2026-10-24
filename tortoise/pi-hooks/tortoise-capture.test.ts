@@ -48,6 +48,7 @@ import {
   backoffDelay,
   buildCapturePayload,
   captureHealthLine,
+  readSweepStatus,
   countStoreSyncDeadLetters,
   captureKey,
   carriedWindow,
@@ -3027,6 +3028,38 @@ test("#2100: the per-box health line is present in every state", async () => {
     captureHealthLine(tmpSpool(), { apiKey: "tt_x" }).line,
     "capture: OK (0 queued)",
     "a sibling store that does not exist adds nothing",
+  );
+
+  // #3515 review (P2, fail-open): a sweep that RAN and FAILED must not read as a
+  // healthy box. `stdio: "ignore"` discards the CLI's own stderr, so without the
+  // persisted status the only line a user sees says `capture: OK` while the
+  // crash/kill recovery is inert — a dead backstop indistinguishable from a
+  // working one.
+  writeFileSync(
+    join(parent, "store-sync", "sweep-status.json"),
+    JSON.stringify({ version: 1, ok: false, reason: "node_unavailable", shipped: 0 }),
+  );
+  const failed = captureHealthLine(withDrops, { apiKey: "tt_x" });
+  assert.equal(
+    failed.line,
+    "capture: OK (0 queued), 2 store-sync dead-lettered, store-sync FAILED (node_unavailable)",
+    "a FAILED sweep is named on the human line with its reason",
+  );
+  assert.equal(failed.state, "ok", "the backstop's health is not the spool's state");
+  assert.deepEqual(
+    readSweepStatus(join(parent, "store-sync")),
+    { ok: false, reason: "node_unavailable" },
+  );
+
+  // A status that says `ok` adds nothing — the line must not become noisy.
+  writeFileSync(
+    join(parent, "store-sync", "sweep-status.json"),
+    JSON.stringify({ version: 1, ok: true, shipped: 3 }),
+  );
+  assert.equal(
+    captureHealthLine(withDrops, { apiKey: "tt_x" }).line,
+    "capture: OK (0 queued), 2 store-sync dead-lettered",
+    "a healthy sweep must not add a suffix",
   );
 
   // A HEALTH CHECK MUST NOT MUTATE WHAT IT DESCRIBES. `listSpoolEntries` (the

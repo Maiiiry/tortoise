@@ -622,6 +622,36 @@ def test_the_worker_gets_the_key_in_its_ENVIRONMENT_not_its_argv(monkeypatch):
     )
 
 
+def test_a_failed_sweep_leaves_its_reason_where_the_caller_can_read_it(tmp_path):
+    """The production caller DISCARDED our output, so the outcome must be a file.
+
+    The Pi extension spawns this detached with ``stdio="ignore"``: stdout and
+    stderr — where ``main`` prints every diagnosis — go nowhere. Without the
+    status file a worker that RAN AND FAILED (``node`` too old, no receipt) is
+    indistinguishable from one that never ran, and the box reports
+    ``capture: OK`` while the crash/kill recovery is inert.
+    """
+    from tortoise import store_sync
+
+    cursor = tmp_path / "store-sync"
+    # A worker that cannot even start is a FAILED sweep, not an absent one.
+    receipt = store_sync.run_worker(
+        session_dir=str(tmp_path / "s"), cursor_dir=str(cursor),
+        node=str(tmp_path / "no-such-node"),
+    )
+    assert receipt["ok"] is False, receipt
+    store_sync.write_sweep_status(receipt, str(cursor))
+
+    status = json.loads((cursor / "sweep-status.json").read_text())
+    assert status["ok"] is False
+    assert status["reason"], "a FAILED sweep must carry a reason, not just ok=false"
+    assert status["version"] == 1
+    # Best-effort by contract: unwritable bookkeeping must not raise into a sweep.
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory")
+    store_sync.write_sweep_status(receipt, str(blocker))
+
+
 # ── the SPOOL half: consent, credential, and the two filters ──────────────
 
 

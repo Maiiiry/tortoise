@@ -15,6 +15,7 @@ import { join } from "node:path";
 import {
   activeBranch,
   classifyStatus,
+  completeThroughCheap,
   cutAtCompaction,
   planFile,
   readCompleteLines,
@@ -981,6 +982,100 @@ test("the maxWindow high-water mark SURVIVES a reload so the guard cannot drift 
   assert.equal(recorded.maxWindow, 2, "maxWindow must round-trip through the cursor store");
 });
 
+test("the cheap complete-through NEVER crosses a torn tail", () => {
+  // #3515 review (P3): this value feeds `planFile`'s cheap skip check, so a
+  // value that CROSSES a partial line would make the sweep believe it has
+  // settled a tail it has not. Returning `size` for a torn file is the
+  // mutation: it costs nothing visible when the full scan re-plans afterwards
+  // (that scan is authoritative), which is exactly why it needs a row of its
+  // own — the damage is a wrong skip, and a wrong skip is silent.
+  const root = tmp("cheap-tail-");
+  const path = join(root, "t.jsonl");
+  const complete = `${HEADER("sid-cheap")}\n${entry("a", null, "user", "hi")}\n`;
+  const torn = '{"type":"message","id":"b","parentId":"a","message":{"role":"assistant","con';
+  writeFileSync(path, complete + torn);
+  const size = statSync(path).size;
+  assert.equal(
+    completeThroughCheap(path, size),
+    Buffer.byteLength(complete, "utf8"),
+    "a torn tail stops the cheap scan at the last COMPLETE line",
+  );
+
+  // A file that ends in a newline is complete through its size — the fast path
+  // is the whole point of the function.
+  writeFileSync(path, complete);
+  assert.equal(completeThroughCheap(path, statSync(path).size), Buffer.byteLength(complete, "utf8"));
+
+  // An empty file has nothing to settle.
+  writeFileSync(path, "");
+  assert.equal(completeThroughCheap(path, 0), 0);
+
+  // A single line larger than the 64 KiB window holds no newline at all: the
+  // honest answer is `undefined` (fall back to the full scan), never a guess.
+  const huge = tmp("cheap-huge-");
+  const hugePath = join(huge, "h.jsonl");
+  writeFileSync(hugePath, "x".repeat(70 * 1024));
+  assert.equal(
+    completeThroughCheap(hugePath, statSync(hugePath).size),
+    undefined,
+    "no newline in the window is UNKNOWN, not 'complete'",
+  );
+});
+
+test("a RE-ANCHORED plan that also hits the unproven arm is still REFUSED", async () => {
+  // #3515 review (P2): the length arm's `reanchored` exception must NOT reach the
+  // UNPROVEN arm. Re-anchoring means "this file is being read as a new file", so
+  // a LENGTH comparison is meaningless (different index space) — but "we cannot
+  // prove we ever delivered anything, and the window is compacted" is a fact
+  // about THIS delivery, and following the rewrite there ships a short window
+  // whose turns the store hard-DETACH-DELETEs (#1920).
+  //
+  // Without this row, `if (unproven) ...` -> `if (unproven && !reanchored) ...`
+  // leaves all 44 rows green while the guard fail-opens on the compound path.
+  const root = tmp("sessions-reanchor-unproven-");
+  const cursorDir = tmp("cursor-reanchor-unproven-");
+  const path = join(root, "s.jsonl");
+
+  // 1. A header-only file advances at `delivered: 0` with NO window — a row that
+  //    proves nothing (the same shape `noTurns` and a RETAINED first POST leave).
+  writeFileSync(path, `${HEADER("sid-a")}\n`);
+  const r0 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: stubFetch([200]), ...FAST });
+  assert.equal(r0.noTurns, 1, "the premise: nothing to ship yet");
+  const row0 = loadCursor(cursorDir).state.files[path];
+  assert.equal(row0.delivered, 0, "the premise: a row that proves nothing");
+  assert.equal(row0.maxWindow ?? undefined, undefined, "the premise: no window held");
+
+  // 2. The path is REWRITTEN under a different session id — Pi's `_rewriteFile`
+  //    shape, so the plan re-anchors to 0 — and the new window is COMPACTED.
+  writeFileSync(path, [
+    HEADER("sid-b"),
+    entry("q0", null, "user", "kept question"),
+    entry("a0", "q0", "assistant", "kept answer"),
+    JSON.stringify({
+      type: "compaction", id: "z", parentId: "a0",
+      timestamp: "2026-10-23T11:00:00.000Z", summary: "S", firstKeptEntryId: "q0",
+    }),
+  ].join("\n") + "\n");
+
+  const fetch2 = stubFetch([200]);
+  const logLines = [];
+  const r2 = await runStoreSync({
+    sessionDir: root, cursorDir, fetchImpl: fetch2, ...FAST,
+    log: (l) => logLines.push(l),
+  });
+  assert.equal(
+    fetch2.calls.length, 0,
+    "a re-anchored, UNPROVEN, compacted window must not be posted — the exception "
+      + "covers the length arm only",
+  );
+  assert.equal(r2.shrunk, 1, "the refusal is COUNTED, never silent");
+  assert.equal(r2.files[0].reason, "window_shrunk");
+  assert.ok(
+    logLines.some((l) => l.includes("REFUSED a shrunk window")),
+    "the refusal is logged",
+  );
+});
+
 test("a window that shrinks with NO compaction entry is refused too", async () => {
   // #3515 review ISSUE 1: the length arm used to be gated on `compacted`, so the
   // code was NARROWER than the invariant it printed ("a window may never SHRINK
@@ -1011,7 +1106,11 @@ test("a window that shrinks with NO compaction entry is refused too", async () =
   appendFileSync(path, `${entry("x1", null, "user", "a different branch")}\n`);
   assert.ok(statSync(path).size > before, "the premise: the FILE grows");
   const second = stubFetch([200]);
-  const r2 = await runStoreSync({ sessionDir: root, cursorDir, fetchImpl: second, ...FAST });
+  const shrinkLog = [];
+  const r2 = await runStoreSync({
+    sessionDir: root, cursorDir, fetchImpl: second, ...FAST,
+    log: (l) => shrinkLog.push(l),
+  });
   assert.equal(second.calls.length, 0, "a branch shrink must NOT be posted");
   assert.equal(r2.shrunk, 1, "the refusal is COUNTED, never silent");
   assert.equal(r2.files[0].reason, "window_shrunk");
@@ -1024,6 +1123,18 @@ test("a window that shrinks with NO compaction entry is refused too", async () =
     loadCursor(cursorDir).state.files[path].failures ?? 0,
     0,
     "a refusal must not spend the POST retry budget",
+  );
+  // #3515 review (P3): the diagnosis is CAUSE-NEUTRAL. `compacted` is a fact
+  // about the window, not about the shrink, so naming `/compact` categorically
+  // sends a user hunting a compaction that never happened. Pinned as TEXT
+  // because the message is the only surface that explains a refusal.
+  assert.ok(
+    shrinkLog.some((l) => l.includes("a shorter branch")),
+    `the log names the real cause; got: ${JSON.stringify(shrinkLog)}`,
+  );
+  assert.ok(
+    !shrinkLog.some((l) => l.includes("/compact")),
+    `a tree-append shrink must not be blamed on /compact; got: ${JSON.stringify(shrinkLog)}`,
   );
 });
 

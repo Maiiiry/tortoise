@@ -49,6 +49,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -332,6 +333,46 @@ def _summary_dict(summary) -> dict[str, Any]:
     }
 
 
+def write_sweep_status(receipt: dict, cursor_dir: Path | str | None) -> None:
+    """Persist the last sweep's outcome where a caller that DISCARDED our output can read it.
+
+    The production caller is the Pi extension, which spawns this as a detached
+    child with ``stdio="ignore"`` — so ``stdout``/``stderr``, where every
+    diagnosis in ``main`` is printed, go nowhere. Without this file a worker that
+    RAN AND FAILED (a ``node`` too old for the shipped ``.ts`` worker, a missing
+    artifact, a non-zero exit) is indistinguishable from one that never ran, and
+    the box reports ``capture: OK`` while the crash/kill recovery it was
+    installed for is inert. A status file is the smallest seam that closes it:
+    the health line already reads this directory for the dead-letter count.
+
+    Best-effort by contract: a sweep must never fail because bookkeeping could
+    not be written.
+    """
+    try:
+        target = Path(cursor_dir) if cursor_dir else default_cursor_dir()
+        target.mkdir(parents=True, exist_ok=True)
+        log = receipt.get("log") or {}
+        errors = log.get("errors") or []
+        reason = log.get("worker_status") or (errors[0] if errors else None)
+        if not reason and receipt.get("ok") is False:
+            spool = receipt.get("spool") or {}
+            reason = spool.get("error") if isinstance(spool, dict) else None
+        if not reason and receipt.get("ok") is False:
+            reason = "worker exited non-zero"
+        payload = {
+            "version": 1,
+            "ok": bool(receipt.get("ok")),
+            "reason": reason,
+            "shipped": log.get("shipped", 0),
+            "at": time.time(),
+        }
+        tmp = target / "sweep-status.json.tmp"
+        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        tmp.replace(target / "sweep-status.json")
+    except OSError:
+        pass
+
+
 def main(args) -> int:
     """``tortoise store-sync`` — print a receipt; never raise into the CLI."""
     receipt = run_sweep(
@@ -374,4 +415,5 @@ def main(args) -> int:
                   file=sys.stderr)
         if receipt.get("spool"):
             print(f"store-sync: spool — {receipt['spool']}", file=sys.stderr)
+    write_sweep_status(receipt, getattr(args, "cursor_dir", None))
     return 0 if receipt.get("ok") else 1

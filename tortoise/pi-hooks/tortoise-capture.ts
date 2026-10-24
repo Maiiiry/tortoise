@@ -2378,6 +2378,36 @@ export function countStoreSyncDeadLetters(dir: string): number {
  * worker's receipt, which the extension throws away (`stdio: "ignore"`). A
  * count nothing reads is a silent drop; this is the one line a user sees.
  */
+export interface SweepStatus {
+  ok: boolean;
+  reason?: string;
+}
+
+/**
+ * The last sweep's outcome, as the CLI persisted it.
+ *
+ * The extension spawns the worker with `stdio: "ignore"`, so the CLI's stderr —
+ * where every post-spawn failure is named (`worker_status`, `no_receipt`, a
+ * non-zero exit) — is discarded. Without this the box reports `capture: OK`
+ * while the crash/kill recovery is inert: a dead backstop indistinguishable
+ * from a working one. `undefined` means "no sweep has reported yet", which is
+ * NOT a failure and must never be rendered as one.
+ */
+export function readSweepStatus(dir: string): SweepStatus | undefined {
+  try {
+    const path = join(dir, "sweep-status.json");
+    if (!existsSync(path)) return undefined;
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const rec = parsed as Record<string, unknown>;
+    const ok = rec.ok === true;
+    const reason = typeof rec.reason === "string" && rec.reason ? rec.reason : undefined;
+    return { ok, reason };
+  } catch {
+    return undefined;
+  }
+}
+
 export function captureHealthLine(
   dir: string,
   opts: { apiKey?: string; storeSyncDir?: string } = {},
@@ -2386,14 +2416,18 @@ export function captureHealthLine(
   // The store is DERIVED from the spool root (both live under `~/.tortoise/`)
   // rather than from `homedir()`: a caller that hands in a temp spool — every
   // test does — must not read the machine's real cursor store (#3721).
-  const deadLettered = countStoreSyncDeadLetters(
-    opts.storeSyncDir ?? join(dirname(dir), "store-sync"),
-  );
-  if (deadLettered <= 0) return base;
-  return {
-    ...base,
-    line: `${base.line}, ${deadLettered} store-sync dead-lettered`,
-  };
+  const storeDir = opts.storeSyncDir ?? join(dirname(dir), "store-sync");
+  const deadLettered = countStoreSyncDeadLetters(storeDir);
+  const sweep = readSweepStatus(storeDir);
+  const parts: string[] = [];
+  if (deadLettered > 0) parts.push(`${deadLettered} store-sync dead-lettered`);
+  // A sweep that RAN and failed is strictly worse than a dead-letter count: the
+  // backstop is inert. Absence of the file is "not yet reported", never a fault.
+  if (sweep && !sweep.ok) {
+    parts.push(`store-sync FAILED${sweep.reason ? ` (${sweep.reason})` : ""}`);
+  }
+  if (!parts.length) return base;
+  return { ...base, line: `${base.line}, ${parts.join(", ")}` };
 }
 
 function spoolHealthLine(dir: string, opts: { apiKey?: string } = {}): CaptureHealth {
@@ -2802,6 +2836,18 @@ export default function tortoiseCapture(pi: ExtensionAPI, deps: CaptureDeps = {}
         _SWEEP_UNAVAILABLE_WARNED = true;
         warn("store-sync sweep: no `tortoise` CLI on PATH — killed/crashed sessions "
           + "are only caught when it is installed (`tortoise store-sync`)");
+      });
+      // A spawn that SUCCEEDED can still fail (`node` too old for the shipped
+      // `.ts` worker, missing artifact, no receipt). `stdio: "ignore"` throws
+      // away the CLI's own diagnosis, so the exit code is the only signal left
+      // on this path — and without it those failures are silent. The persisted
+      // `sweep-status.json` carries the REASON onto the health line; this is the
+      // immediate, once-per-process warning.
+      child.on("exit", (code) => {
+        if (code === 0 || _SWEEP_UNAVAILABLE_WARNED) return;
+        _SWEEP_UNAVAILABLE_WARNED = true;
+        warn("store-sync sweep FAILED (exit " + String(code) + ") — killed/crashed "
+          + "sessions are not being recovered; run `tortoise store-sync --json`");
       });
       child.unref();
     } catch {
